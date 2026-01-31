@@ -5,9 +5,13 @@ import json
 import subprocess
 from pathlib import Path
 
+import ctypes
+from ctypes import wintypes
+
 import requests
 import urllib3
 import obsws_python as obs
+from obsws_python.error import OBSSDKRequestError
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
@@ -154,9 +158,10 @@ def launch_obs():
     cmd = [obs_exe, "--portable", "--minimize-to-tray"]
 
     try:
-        subprocess.Popen(cmd, cwd=working_dir)
+        process = subprocess.Popen(cmd, cwd=working_dir)
         print("⏳ OBSの起動を待機中...")
         time.sleep(5)
+        return process
     except Exception as e:
         print(f"❌ OBS起動エラー: {e}")
         sys.exit(1)
@@ -215,17 +220,34 @@ def save_payload(path, payload):
 
 
 class LoLAutoRecorder:
-    def __init__(self):
+    def __init__(self, obs_process=None):
         self.client = None
-        self.output_file = None
         self.my_name = None
+        self.obs_process = obs_process
+        self.reset_session()
+        self.connect_obs()
+
+    def reset_session(self):
+        self.output_file = None
         self.sync_game_time = 0.0
         self.record_path = None
+        self.recording_started = False
+        self.session_started = False
         self.saved_events = []
         self.all_events = []
         self.processed_event_keys = set()
         self.all_event_keys = set()
-        self.connect_obs()
+        self.my_name = None
+
+    def has_session_data(self):
+        return (
+            self.session_started
+            or self.recording_started
+            or self.record_path is not None
+            or self.sync_game_time > 0.0
+            or bool(self.saved_events)
+            or bool(self.all_events)
+        )
 
     def connect_obs(self):
         """OBS WebSocketに接続"""
@@ -276,13 +298,22 @@ class LoLAutoRecorder:
                     print(f"🔥 試合開始検知！ GameTime: {game_time:.2f}s")
                     self.output_file = build_output_path()
                     self.try_update_player_name()
+                    self.session_started = True
                     return
             time.sleep(1)
 
     def start_recording(self):
         """録画開始 -> 同期マーカー"""
         print("🎥 録画を開始します...")
-        self.client.start_record()
+        try:
+            self.client.start_record()
+            self.recording_started = True
+        except OBSSDKRequestError as e:
+            print(f"⚠️ 録画開始エラー: {e}")
+            return
+        except Exception as e:
+            print(f"⚠️ 録画開始エラー: {e}")
+            return
         time.sleep(2)
 
         item_id = self.get_source_id()
@@ -385,13 +416,54 @@ class LoLAutoRecorder:
     def stop_recording(self):
         if not self.client or self.record_path is not None:
             return
+        if not self.recording_started:
+            return
+
+        try:
+            status = self.client.get_record_status()
+            is_active = getattr(status, "output_active", None)
+            if is_active is False:
+                self.recording_started = False
+                return
+        except Exception:
+            pass
+
         try:
             res = self.client.stop_record()
             self.record_path = getattr(res, "output_path", None)
             if self.record_path:
                 print(f"💾 保存完了: {self.record_path}")
+            self.recording_started = False
+        except OBSSDKRequestError as e:
+            if e.code == 501:
+                self.recording_started = False
+                return
+            print(f"⚠️ 録画停止エラー: {e}")
         except Exception as e:
             print(f"⚠️ 録画停止エラー: {e}")
+
+    def shutdown_obs(self):
+        if not self.obs_process:
+            return
+        print("🧹 OBSを終了しています...")
+
+        if self.obs_process.poll() is not None:
+            return
+
+        def enum_windows_callback(hwnd, lparam):
+            pid = wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == self.obs_process.pid:
+                ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+            return True
+
+        callback = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        ctypes.windll.user32.EnumWindows(callback(enum_windows_callback), 0)
+
+        time.sleep(1)
+
+        if self.client:
+            self.client.disconnect()
 
     def save_json(self):
         if self.output_file is None:
@@ -422,17 +494,23 @@ if __name__ == "__main__":
     apply_settings(settings)
 
     setup_environment()
-    launch_obs()
+    obs_process = launch_obs()
 
-    app = LoLAutoRecorder()
-    app.wait_for_game_start()
-    app.start_recording()
-
+    app = LoLAutoRecorder(obs_process=obs_process)
     try:
-        app.record_until_end()
+        while True:
+            app.reset_session()
+            app.wait_for_game_start()
+            app.start_recording()
+            app.record_until_end()
+            app.stop_recording()
+            app.save_json()
+            print("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
-        print("\nログ収集を終了します。")
+        print("\n中断を検知しました。終了処理を行います。")
     finally:
         app.stop_recording()
-        app.save_json()
+        if app.has_session_data():
+            app.save_json()
+        app.shutdown_obs()
         print("👋 全ての処理が完了しました。")

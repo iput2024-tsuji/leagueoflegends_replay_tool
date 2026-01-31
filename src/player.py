@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, 
                              QFileDialog, QLabel, QSlider, QMessageBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QKeySequence, QShortcut
 
 class SyncWorker(QThread):
     """バックグラウンドで同期マーカーを探すスレッド"""
@@ -109,6 +110,8 @@ class LoLReplayPlayer(QMainWindow):
         self.is_fullscreen_mode = False # フルスクリーン状態管理
         self.video_fps = 30.0
 
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
         # メインウィジェット
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -125,13 +128,14 @@ class LoLReplayPlayer(QMainWindow):
         # 1. MPV描画エリア
         self.video_frame = QWidget()
         self.video_frame.setStyleSheet("background-color: black;")
-        self.video_layout.addWidget(self.video_frame)
+        self.video_layout.addWidget(self.video_frame, stretch=1)
 
         # 2. コントロールパネル (フルスクリーン時に隠すため self にする)
         self.control_panel = QWidget()
         self.control_panel.setStyleSheet("background-color: #222; color: white;")
         control_layout = QHBoxLayout(self.control_panel)
-        control_layout.setContentsMargins(10, 5, 10, 5)
+        control_layout.setContentsMargins(10, 4, 10, 4)
+        self.control_panel.setFixedHeight(44)
 
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self.toggle_playback)
@@ -150,7 +154,7 @@ class LoLReplayPlayer(QMainWindow):
         control_layout.addWidget(self.slider)
         control_layout.addWidget(self.time_label)
         
-        self.video_layout.addWidget(self.control_panel)
+        self.video_layout.addWidget(self.control_panel, stretch=0)
 
         # --- 右側: イベントリスト (フルスクリーン時に隠すため self にする) ---
         self.right_panel = QWidget()
@@ -183,19 +187,34 @@ class LoLReplayPlayer(QMainWindow):
         # --- MPV初期化 ---
         self.init_mpv()
 
+        # キーショートカット（フォーカスに依存しない）
+        self.register_shortcuts()
+
         # ファイルオープン
         self.open_file_dialog()
 
     def init_mpv(self):
         try:
-            self.player = mpv.MPV(wid=str(int(self.video_frame.winId())), 
-                                  input_default_bindings=True, 
-                                  input_vo_keyboard=True)
+            self.player = mpv.MPV(
+                wid=str(int(self.video_frame.winId())),
+                input_default_bindings=False,
+                input_vo_keyboard=False,
+                keepaspect=True
+            )
             self.player.observe_property('time-pos', self.on_time_update)
             self.player.observe_property('duration', self.on_duration_update)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"MPV Init Failed: {e}")
             sys.exit(1)
+
+    def register_shortcuts(self):
+        QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.toggle_playback)
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=lambda: self.step_frame(1))
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self, activated=lambda: self.step_frame(-1))
+        QShortcut(QKeySequence(Qt.Key.Key_F), self, activated=self.toggle_fullscreen)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.on_escape)
+        QShortcut(QKeySequence(Qt.Key.Key_N), self, activated=self.next_event)
+        QShortcut(QKeySequence(Qt.Key.Key_P), self, activated=self.prev_event)
 
     # --- キーボードイベント処理 (ここが重要) ---
     def keyPressEvent(self, event):
@@ -253,6 +272,22 @@ class LoLReplayPlayer(QMainWindow):
             self.control_panel.show()
             self.is_fullscreen_mode = False
 
+    def on_escape(self):
+        if self.is_fullscreen_mode:
+            self.toggle_fullscreen()
+
+    def next_event(self):
+        row = self.event_list.currentRow()
+        if row < self.event_list.count() - 1:
+            self.event_list.setCurrentRow(row + 1)
+            self.on_event_clicked(self.event_list.currentItem())
+
+    def prev_event(self):
+        row = self.event_list.currentRow()
+        if row > 0:
+            self.event_list.setCurrentRow(row - 1)
+            self.on_event_clicked(self.event_list.currentItem())
+
     def open_file_dialog(self):
         initial_dir = str(ROOT_DIR)
         fname, _ = QFileDialog.getOpenFileName(self, "Open JSON Log", initial_dir, "JSON Files (*.json)")
@@ -291,6 +326,7 @@ class LoLReplayPlayer(QMainWindow):
             
             self.player.play(str(self.current_video_path))
             self.player.pause = True
+            self.video_frame.setFocus()
             
             self.update_video_fps()
             self.start_sync_worker()

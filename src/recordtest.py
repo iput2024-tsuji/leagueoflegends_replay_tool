@@ -58,9 +58,7 @@ GLOBAL_OBJECTIVES = [
 
 # ▼ 自分が関与しているかチェックするイベント
 COMBAT_EVENTS = [
-    "ChampionKill",  # キル
-    "TurretKilled",  # タワー破壊
-    "InhibKilled"    # インヒビター破壊
+    "ChampionKill"   # キル / デス（自分が関与したものだけ）
 ]
 
 # SSL警告の無視
@@ -363,11 +361,8 @@ class LoLAutoRecorder:
                 victim = event.get("VictimName")
                 assisters = event.get("Assisters", [])
 
-                is_involved = (
-                    killer == self.my_name or
-                    victim == self.my_name or
-                    self.my_name in assisters
-                )
+                # 自分が関与したキル or デスのみ
+                is_involved = killer == self.my_name or victim == self.my_name
 
                 if is_involved:
                     should_save = True

@@ -2,3 +2,4 @@ obsws-python
 opencv-python
 python-mpv
 requests
+PyQt6

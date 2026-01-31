@@ -2,11 +2,13 @@ import requests
 import json
 import time
 import urllib3
+from pathlib import Path
 
 # SSL警告を無視
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 BASE_URL = "https://127.0.0.1:2999/liveclientdata"
+END_TIMEOUT_SEC = 5
 
 # ▼ 全員分保存する重要なイベント（オブジェクト）
 GLOBAL_OBJECTIVES = [
@@ -47,6 +49,28 @@ def get_event_data():
     except:
         return None
 
+def build_output_path(my_name):
+    """重複回避のため、存在しないファイル名を返す"""
+    output_dir = Path(__file__).resolve().parent.parent / "recordings" / "json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    base_name = f"lol_{timestamp}.json"
+    candidate = output_dir / base_name
+    if not candidate.exists():
+        return candidate
+    # 同一秒での重複を避ける
+    for i in range(1, 100):
+        candidate = output_dir / f"lol_events_{my_name}_{timestamp}_{i:02d}.json"
+        if not candidate.exists():
+            return candidate
+    # ここに来るのは稀なので、最後は時間を少し待って再生成
+    time.sleep(1)
+    return build_output_path(my_name)
+
+def save_events(path, events):
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(events, f, indent=4, ensure_ascii=False)
+
 def main():
     print("--- LoL Hybrid Event Logger ---")
     print("試合開始とプレイヤー名を待機中...")
@@ -60,25 +84,36 @@ def main():
         else:
             time.sleep(2)
 
-    output_file = f"lol_events_{my_name}.json"
+    output_file = build_output_path(my_name)
     processed_event_ids = set()
+    all_event_ids = set()
     saved_events = []
+    all_events = []
 
     print(f"ログ収集開始。出力先: {output_file}")
+    last_success = time.time()
 
     try:
         while True:
             data = get_event_data()
             if data is None:
-                time.sleep(5)
+                if time.time() - last_success >= END_TIMEOUT_SEC:
+                    print("ゲーム終了を検知。ログを保存します。")
+                    break
+                time.sleep(2)
                 continue
+            last_success = time.time()
 
             events = data.get("Events", [])
-            new_data_found = False
 
             for event in events:
                 event_id = event.get("EventID")
                 event_name = event.get("EventName")
+
+                # 全イベント保存（重複回避）
+                if event_id not in all_event_ids:
+                    all_events.append(event)
+                    all_event_ids.add(event_id)
 
                 # すでに処理済みのイベントはスキップ
                 if event_id in processed_event_ids:
@@ -117,21 +152,28 @@ def main():
                 if should_save:
                     print(f"{log_message} (Time: {event.get('EventTime'):.1f})")
                     saved_events.append(event)
-                    new_data_found = True
                 
                 # 保存したかどうかにかかわらず、IDは処理済みとして記録
                 # (関係ない他人のキルなども、毎回チェックしないようにするため)
                 processed_event_ids.add(event_id)
 
-            # ファイルへの書き込み
-            if new_data_found:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    json.dump(saved_events, f, indent=4, ensure_ascii=False)
-            
             time.sleep(1)
 
     except KeyboardInterrupt:
         print("\nログ収集を終了します。")
+    finally:
+        payload = {
+            "summoner_name": my_name,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "events": saved_events,
+            "events_all": all_events,
+            "counts": {
+                "filtered": len(saved_events),
+                "all": len(all_events)
+            }
+        }
+        save_events(output_file, payload)
+        print(f"ログ保存完了: {output_file}")
 
 if __name__ == "__main__":
     main()

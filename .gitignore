@@ -210,4 +210,4 @@ __marimo__/
 bin/
 recordings/
 logs/
-config/settings.json
+config/setting.json

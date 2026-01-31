@@ -9,19 +9,40 @@ import requests
 import urllib3
 import obsws_python as obs
 
-# --- ユーザー設定 ---
-OBS_PASSWORD = 'password'  # OBSのWebSocketパスワード
-OBS_SCENE_NAME = 'lol_seen'  # OBSのシーン名
-OBS_SOURCE_NAME = 'color'  # 同期用の赤色ソース名
+ROOT_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
+SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
 
 LIVECLIENT_BASE = "https://127.0.0.1:2999/liveclientdata"
 ACTIVE_PLAYER_URL = f"{LIVECLIENT_BASE}/activeplayername"
 EVENT_URL = f"{LIVECLIENT_BASE}/eventdata"
 ALL_GAME_URL = f"{LIVECLIENT_BASE}/allgamedata"
 
-END_ERROR_LIMIT = 3
-END_POLL_SEC = 5
-EVENT_POLL_SEC = 1
+DEFAULT_OBS_PASSWORD = "password"
+DEFAULT_OBS_SCENE_NAME = "lol_seen"
+DEFAULT_OBS_SOURCE_NAME = "color"
+DEFAULT_OBS_DIR = "C:/dev/lol/bin/OBS-Studio"
+DEFAULT_BIN_DIR = "bin"
+DEFAULT_RECORDINGS_DIR = "recordings"
+DEFAULT_JSON_DIR = "recordings/json"
+DEFAULT_OBS_HOST = "localhost"
+DEFAULT_OBS_PORT = 4455
+DEFAULT_END_ERROR_LIMIT = 3
+DEFAULT_END_POLL_SEC = 5
+DEFAULT_EVENT_POLL_SEC = 1
+
+OBS_PASSWORD = DEFAULT_OBS_PASSWORD
+OBS_SCENE_NAME = DEFAULT_OBS_SCENE_NAME
+OBS_SOURCE_NAME = DEFAULT_OBS_SOURCE_NAME
+OBS_DIR = DEFAULT_OBS_DIR
+BIN_DIR = DEFAULT_BIN_DIR
+RECORDINGS_DIR = None
+JSON_DIR = None
+OBS_HOST = DEFAULT_OBS_HOST
+OBS_PORT = DEFAULT_OBS_PORT
+END_ERROR_LIMIT = DEFAULT_END_ERROR_LIMIT
+END_POLL_SEC = DEFAULT_END_POLL_SEC
+EVENT_POLL_SEC = DEFAULT_EVENT_POLL_SEC
 
 # ▼ 全員分保存する重要なイベント（オブジェクト）
 GLOBAL_OBJECTIVES = [
@@ -38,27 +59,90 @@ COMBAT_EVENTS = [
     "InhibKilled"    # インヒビター破壊
 ]
 
-# フォルダパスの定義 (スクリプトの場所を基準にする)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OBS_DIR = r"C:/dev/lol/bin/OBS-Studio"
-BIN_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "bin"))
-
 # SSL警告の無視
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+def resolve_path(value, base_dir):
+    if value is None:
+        return None
+    value = os.path.expandvars(str(value))
+    path = Path(value)
+    if not path.is_absolute():
+        path = (base_dir / path).resolve()
+    return path
+
+
+def load_settings():
+    if not CONFIG_PATH.exists():
+        print("❌ 設定ファイルが見つかりません。")
+        print(f"作成先: {CONFIG_PATH}")
+        print(f"雛形: {SAMPLE_CONFIG_PATH}")
+        print("雛形をコピーして setting.json を作成してください。")
+        sys.exit(1)
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def apply_settings(cfg):
+    global OBS_PASSWORD, OBS_SCENE_NAME, OBS_SOURCE_NAME, OBS_DIR, BIN_DIR
+    global RECORDINGS_DIR, JSON_DIR, OBS_HOST, OBS_PORT
+    global END_ERROR_LIMIT, END_POLL_SEC, EVENT_POLL_SEC
+
+    obs_cfg = cfg.get("obs", {})
+    path_cfg = cfg.get("paths", {})
+    poll_cfg = cfg.get("polling", {})
+
+    OBS_PASSWORD = obs_cfg.get("password", DEFAULT_OBS_PASSWORD)
+    OBS_SCENE_NAME = obs_cfg.get("scene_name", DEFAULT_OBS_SCENE_NAME)
+    OBS_SOURCE_NAME = obs_cfg.get("source_name", DEFAULT_OBS_SOURCE_NAME)
+    OBS_HOST = obs_cfg.get("host", DEFAULT_OBS_HOST)
+    OBS_PORT = int(obs_cfg.get("port", DEFAULT_OBS_PORT))
+
+    obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), ROOT_DIR)
+    OBS_DIR = str(obs_dir) if obs_dir else None
+
+    bin_dir = resolve_path(path_cfg.get("bin_dir", DEFAULT_BIN_DIR), ROOT_DIR)
+    BIN_DIR = str(bin_dir) if bin_dir else ""
+
+    recordings_dir = resolve_path(path_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), ROOT_DIR)
+    json_dir_value = path_cfg.get("json_dir", DEFAULT_JSON_DIR)
+    json_dir = resolve_path(json_dir_value, ROOT_DIR)
+    if not json_dir and recordings_dir:
+        json_dir = recordings_dir / "json"
+
+    RECORDINGS_DIR = recordings_dir
+    JSON_DIR = json_dir
+
+    END_ERROR_LIMIT = int(poll_cfg.get("end_error_limit", DEFAULT_END_ERROR_LIMIT))
+    END_POLL_SEC = float(poll_cfg.get("end_poll_sec", DEFAULT_END_POLL_SEC))
+    EVENT_POLL_SEC = float(poll_cfg.get("event_poll_sec", DEFAULT_EVENT_POLL_SEC))
+
+    if JSON_DIR is None:
+        print("❌ json_dir の設定が無効です。")
+        sys.exit(1)
+    JSON_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def setup_environment():
     """環境変数の設定 (MPVのDLLを読み込めるようにする)"""
-    os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ["PATH"]
+    if BIN_DIR:
+        os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ["PATH"]
 
-    if not os.path.exists(os.path.join(BIN_DIR, "mpv-1.dll")) and \
-       not os.path.exists(os.path.join(BIN_DIR, "libmpv-1.dll")):
-        print("⚠️ 警告: 'bin' フォルダ内に mpv-1.dll (または libmpv-1.dll) が見つかりません。")
-        print(f"探した場所: {BIN_DIR}")
+        if not os.path.exists(os.path.join(BIN_DIR, "mpv-1.dll")) and \
+           not os.path.exists(os.path.join(BIN_DIR, "libmpv-1.dll")):
+            print("⚠️ 警告: 'bin' フォルダ内に mpv-1.dll (または libmpv-1.dll) が見つかりません。")
+            print(f"探した場所: {BIN_DIR}")
+    else:
+        print("⚠️ 警告: bin_dir が未設定です。")
 
 
 def launch_obs():
     """OBSを最小化モードで起動する"""
+    if not OBS_DIR:
+        print("❌ エラー: OBSのパスが未設定です。")
+        sys.exit(1)
+
     obs_exe = os.path.join(OBS_DIR, "bin", "64bit", "obs64.exe")
     working_dir = os.path.join(OBS_DIR, "bin", "64bit")
 
@@ -113,14 +197,12 @@ def get_all_game_data():
 
 def build_output_path():
     """重複回避のため、存在しないファイル名を返す"""
-    output_dir = Path(__file__).resolve().parent.parent / "recordings" / "json"
-    output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    candidate = output_dir / f"lol_{timestamp}.json"
+    candidate = JSON_DIR / f"lol_{timestamp}.json"
     if not candidate.exists():
         return candidate
     for i in range(1, 100):
-        candidate = output_dir / f"lol_{timestamp}_{i:02d}.json"
+        candidate = JSON_DIR / f"lol_{timestamp}_{i:02d}.json"
         if not candidate.exists():
             return candidate
     time.sleep(1)
@@ -150,7 +232,11 @@ class LoLAutoRecorder:
         retry_count = 0
         while retry_count < 5:
             try:
-                self.client = obs.ReqClient(host='localhost', port=4455, password=OBS_PASSWORD)
+                self.client = obs.ReqClient(
+                    host=OBS_HOST,
+                    port=OBS_PORT,
+                    password=OBS_PASSWORD
+                )
                 version = self.client.get_version()
                 print(f"✅ OBS接続成功 (v{version.obs_version})")
                 return
@@ -316,6 +402,10 @@ class LoLAutoRecorder:
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "sync_game_time": self.sync_game_time,
             "obs_record_path": self.record_path,
+            "paths": {
+                "recordings_dir": str(RECORDINGS_DIR) if RECORDINGS_DIR else None,
+                "json_path": str(self.output_file)
+            },
             "events": self.saved_events,
             "events_all": self.all_events,
             "counts": {
@@ -328,6 +418,9 @@ class LoLAutoRecorder:
 
 
 if __name__ == "__main__":
+    settings = load_settings()
+    apply_settings(settings)
+
     setup_environment()
     launch_obs()
 

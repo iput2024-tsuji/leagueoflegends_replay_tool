@@ -1,1 +1,4 @@
-pip install requests
+obsws-python
+opencv-python
+python-mpv
+requests

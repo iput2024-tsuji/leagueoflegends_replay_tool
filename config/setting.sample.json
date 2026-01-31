@@ -1,0 +1,20 @@
+{
+    "obs": {
+        "host": "localhost",
+        "port": 4455,
+        "password": "your_password_here",
+        "scene_name": "lol_seen",
+        "source_name": "color",
+        "dir": "C:/dev/lol/bin/OBS-Studio"
+    },
+    "paths": {
+        "bin_dir": "bin",
+        "recordings_dir": "recordings",
+        "json_dir": "recordings/json"
+    },
+    "polling": {
+        "end_error_limit": 3,
+        "end_poll_sec": 5,
+        "event_poll_sec": 1
+    }
+}

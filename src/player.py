@@ -35,34 +35,64 @@ class SyncWorker(QThread):
     finished = pyqtSignal(float)
     progress = pyqtSignal(str)
 
-    def __init__(self, video_path):
+    def __init__(self, video_path, max_seconds=180):
         super().__init__()
         self.video_path = str(video_path)
+        self.max_seconds = max_seconds
 
     def run(self):
-        self.progress.emit("同期マーカーを捜索中...")
+        self.progress.emit("同期マーカーを高速捜索中...")
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             self.finished.emit(-1.0)
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS)
-        max_frames = int(fps * 15) # 最初の15秒
+        if fps <= 0:
+            fps = 60.0
+        max_frames = int(fps * self.max_seconds)
         found_time = -1.0
 
-        for i in range(max_frames):
-            ret, frame = cap.read()
-            if not ret: break
-            
-            # 左上チェック
-            roi = frame[0:100, 0:100]
-            avg_color = np.mean(roi, axis=(0, 1)) # B, G, R
-            b, g, r = avg_color
-            
-            if r > 200 and g < 60 and b < 60:
-                found_time = i / fps
+        skip_step = 30
+        roi_size = 120
+        lower_red1 = np.array([0, 100, 100])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([160, 100, 100])
+        upper_red2 = np.array([180, 255, 255])
+        progress_step = max(1, int(fps * 5))
+
+        frame_idx = 0
+        while frame_idx < max_frames:
+            if not cap.grab():
                 break
-        
+
+            if frame_idx % skip_step != 0:
+                frame_idx += 1
+                continue
+
+            ret, frame = cap.retrieve()
+            if not ret:
+                break
+
+            if frame.shape[0] >= roi_size and frame.shape[1] >= roi_size:
+                roi = frame[0:roi_size, 0:roi_size]
+                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+                mask = cv2.inRange(hsv, lower_red1, upper_red1)
+                mask += cv2.inRange(hsv, lower_red2, upper_red2)
+
+                red_pixels = cv2.countNonZero(mask)
+                threshold = (roi_size * roi_size) * 0.1
+                if red_pixels > threshold:
+                    found_time = frame_idx / fps
+                    break
+
+            if frame_idx % progress_step == 0:
+                sec = frame_idx / fps
+                self.progress.emit(f"高速捜索中... {sec:.0f}秒地点")
+
+            frame_idx += 1
+
         cap.release()
         self.finished.emit(found_time)
 
@@ -72,11 +102,12 @@ class LoLReplayPlayer(QMainWindow):
         self.setWindowTitle("LoL Smart Replay Player")
         self.resize(1280, 720)
         
-        self.offset = 0.0
+        self.offset = None
         self.duration = 0
         self.is_slider_pressed = False
         self.current_video_path = None
         self.is_fullscreen_mode = False # フルスクリーン状態管理
+        self.video_fps = 30.0
 
         # メインウィジェット
         central_widget = QWidget()
@@ -140,6 +171,7 @@ class LoLReplayPlayer(QMainWindow):
         """)
         self.event_list.setFocusPolicy(Qt.FocusPolicy.NoFocus) # キー入力をウィンドウに譲る
         self.event_list.itemClicked.connect(self.on_event_clicked)
+        self.event_list.setEnabled(False)
 
         right_layout.addWidget(self.info_label)
         right_layout.addWidget(self.event_list)
@@ -175,15 +207,11 @@ class LoLReplayPlayer(QMainWindow):
         
         # [→] コマ送り (1フレーム進む)
         elif key == Qt.Key.Key_Right:
-            self.player.command('frame-step')
-            self.player.pause = True
-            self.play_btn.setText("Play") # 停止状態の表記へ
+            self.step_frame(1)
 
         # [←] コマ戻し (1フレーム戻る)
         elif key == Qt.Key.Key_Left:
-            self.player.command('frame-back-step')
-            self.player.pause = True
-            self.play_btn.setText("Play")
+            self.step_frame(-1)
 
         # [F] フルスクリーン切り替え
         elif key == Qt.Key.Key_F:
@@ -255,6 +283,8 @@ class LoLReplayPlayer(QMainWindow):
             if not self.events:
                 self.events = data.get("events_all", [])
             self.my_name = data.get("summoner_name", "Unknown")
+            self.offset = None
+            self.event_list.setEnabled(False)
 
             self.info_label.setText(f"Player: {self.my_name}\nSyncing...")
             self.populate_event_list()
@@ -262,13 +292,14 @@ class LoLReplayPlayer(QMainWindow):
             self.player.play(str(self.current_video_path))
             self.player.pause = True
             
+            self.update_video_fps()
             self.start_sync_worker()
 
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
 
     def start_sync_worker(self):
-        self.worker = SyncWorker(self.current_video_path)
+        self.worker = SyncWorker(self.current_video_path, max_seconds=180)
         self.worker.progress.connect(lambda s: self.info_label.setText(s))
         self.worker.finished.connect(self.on_sync_finished)
         self.worker.start()
@@ -280,8 +311,20 @@ class LoLReplayPlayer(QMainWindow):
         else:
             self.offset = found_time - self.sync_game_time
             self.info_label.setText(f"✅ Synced\nOffset: {self.offset:.2f}s")
+        self.event_list.setEnabled(True)
         self.player.pause = False
         self.play_btn.setText("Pause")
+
+    def update_video_fps(self):
+        try:
+            cap = cv2.VideoCapture(str(self.current_video_path))
+            if cap.isOpened():
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if fps and fps > 0:
+                    self.video_fps = fps
+            cap.release()
+        except Exception:
+            pass
 
     def populate_event_list(self):
         self.event_list.clear()
@@ -305,6 +348,8 @@ class LoLReplayPlayer(QMainWindow):
         self.event_list.addItem(item)
 
     def on_event_clicked(self, item):
+        if self.offset is None:
+            return
         game_time = item.data(Qt.ItemDataRole.UserRole)
         target = game_time + self.offset
         seek_pos = max(0, target - 5.0)
@@ -318,6 +363,21 @@ class LoLReplayPlayer(QMainWindow):
     def toggle_playback(self):
         self.player.pause = not self.player.pause
         self.play_btn.setText("Play" if self.player.pause else "Pause")
+
+    def step_frame(self, direction):
+        if not self.player:
+            return
+        if self.video_fps <= 0:
+            self.video_fps = 30.0
+        try:
+            current = float(self.player.time_pos or 0.0)
+        except Exception:
+            current = 0.0
+        step = 1.0 / float(self.video_fps)
+        target = max(0.0, current + (step * direction))
+        self.player.pause = True
+        self.player.seek(target, reference='absolute', precision='exact')
+        self.play_btn.setText("Play")
 
     def on_time_update(self, name, time_pos):
         if time_pos is None: return

@@ -29,6 +29,7 @@ DEFAULT_OBS_DIR = "C:/dev/lol/bin/OBS-Studio"
 DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
 DEFAULT_JSON_DIR = "recordings/json"
+DEFAULT_CHAMPION_ICONS_DIR = "assets/champions/icons"
 DEFAULT_OBS_HOST = "localhost"
 DEFAULT_OBS_PORT = 4455
 DEFAULT_END_ERROR_LIMIT = 3
@@ -42,6 +43,7 @@ OBS_DIR = DEFAULT_OBS_DIR
 BIN_DIR = DEFAULT_BIN_DIR
 RECORDINGS_DIR = None
 JSON_DIR = None
+CHAMPION_ICONS_DIR = None
 OBS_HOST = DEFAULT_OBS_HOST
 OBS_PORT = DEFAULT_OBS_PORT
 END_ERROR_LIMIT = DEFAULT_END_ERROR_LIMIT
@@ -88,7 +90,7 @@ def load_settings():
 
 def apply_settings(cfg):
     global OBS_PASSWORD, OBS_SCENE_NAME, OBS_SOURCE_NAME, OBS_DIR, BIN_DIR
-    global RECORDINGS_DIR, JSON_DIR, OBS_HOST, OBS_PORT
+    global RECORDINGS_DIR, JSON_DIR, OBS_HOST, OBS_PORT, CHAMPION_ICONS_DIR
     global END_ERROR_LIMIT, END_POLL_SEC, EVENT_POLL_SEC
 
     obs_cfg = cfg.get("obs", {})
@@ -110,11 +112,13 @@ def apply_settings(cfg):
     recordings_dir = resolve_path(path_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), ROOT_DIR)
     json_dir_value = path_cfg.get("json_dir", DEFAULT_JSON_DIR)
     json_dir = resolve_path(json_dir_value, ROOT_DIR)
+    champion_icons_dir = resolve_path(path_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), ROOT_DIR)
     if not json_dir and recordings_dir:
         json_dir = recordings_dir / "json"
 
     RECORDINGS_DIR = recordings_dir
     JSON_DIR = json_dir
+    CHAMPION_ICONS_DIR = champion_icons_dir
 
     END_ERROR_LIMIT = int(poll_cfg.get("end_error_limit", DEFAULT_END_ERROR_LIMIT))
     END_POLL_SEC = float(poll_cfg.get("end_poll_sec", DEFAULT_END_POLL_SEC))
@@ -236,6 +240,11 @@ class LoLAutoRecorder:
         self.processed_event_keys = set()
         self.all_event_keys = set()
         self.my_name = None
+        self.last_game_data = None
+        self.champion_name = None
+        self.player_team = None
+        self.game_result = None
+        self.winning_team = None
 
     def has_session_data(self):
         return (
@@ -284,6 +293,31 @@ class LoLAutoRecorder:
         if name and name != self.my_name:
             self.my_name = name
             print(f"プレイヤー名を特定: {self.my_name}")
+
+    def update_player_info_from_game_data(self, data):
+        if not data or not self.my_name:
+            return
+        players = data.get("allPlayers", [])
+        for player in players:
+            summoner = player.get("summonerName") or player.get("summoner_name")
+            if summoner == self.my_name:
+                self.champion_name = player.get("championName") or player.get("champion_name")
+                self.player_team = player.get("team")
+                return
+
+    def update_result_from_events(self, events):
+        if not events:
+            return
+        end_names = {"GameEnd", "EndGame", "GameEnded", "GameComplete"}
+        for event in events:
+            name = event.get("EventName")
+            if name not in end_names:
+                continue
+            result_value = event.get("Result") or event.get("result") or event.get("GameResult") or event.get("gameResult")
+            winning_team = event.get("WinningTeam") or event.get("winningTeam") or event.get("Team") or event.get("team")
+            self.game_result = result_value
+            self.winning_team = winning_team
+            return
 
     def wait_for_game_start(self):
         """LoLの試合開始を監視"""
@@ -399,12 +433,16 @@ class LoLAutoRecorder:
                 continue
 
             error_count = 0
+            self.last_game_data = data
             if not self.my_name:
                 self.try_update_player_name()
+            self.update_player_info_from_game_data(data)
 
             event_data = get_event_data()
             if event_data:
-                self.process_events(event_data.get("Events", []))
+                events = event_data.get("Events", [])
+                self.process_events(events)
+                self.update_result_from_events(events)
 
             time.sleep(EVENT_POLL_SEC)
 
@@ -464,8 +502,18 @@ class LoLAutoRecorder:
         if self.output_file is None:
             self.output_file = build_output_path()
 
+        if self.last_game_data and self.game_result is None:
+            game_data = self.last_game_data.get("gameData", {})
+            if isinstance(game_data, dict):
+                self.game_result = game_data.get("gameResult") or game_data.get("result")
+                self.winning_team = self.winning_team or game_data.get("winningTeam") or game_data.get("winning_team")
+
         payload = {
             "summoner_name": self.my_name,
+            "champion_name": self.champion_name,
+            "player_team": self.player_team,
+            "game_result": self.game_result,
+            "winning_team": self.winning_team,
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "sync_game_time": self.sync_game_time,
             "obs_record_path": self.record_path,

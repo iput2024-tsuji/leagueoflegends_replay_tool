@@ -6,7 +6,9 @@ from pathlib import Path
 
 # --- 1. MPVのパス設定 ---
 ROOT_DIR = Path(__file__).resolve().parent.parent
+CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
 BIN_DIR = ROOT_DIR / "bin"
+ICON_DIR = ROOT_DIR / "assets" / "champions" / "icons"
 
 if BIN_DIR.exists():
     os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ["PATH"]
@@ -25,11 +27,12 @@ except OSError:
 # --- 3. PyQt & その他ライブラリ ---
 import cv2
 import numpy as np
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QListWidget, QListWidgetItem, QPushButton, 
-                             QFileDialog, QLabel, QSlider, QMessageBox)
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QListWidget, QListWidgetItem, QPushButton,
+                             QFileDialog, QLabel, QSlider, QMessageBox, QDialog,
+                             QDialogButtonBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtGui import QKeySequence, QShortcut, QPixmap, QFont
 
 class SyncWorker(QThread):
     """バックグラウンドで同期マーカーを探すスレッド"""
@@ -97,6 +100,187 @@ class SyncWorker(QThread):
         cap.release()
         self.finished.emit(found_time)
 
+
+def normalize_result(result_value, team_value=None, winning_team=None):
+    if isinstance(result_value, str):
+        val = result_value.strip().lower()
+        if "win" in val:
+            return "Win"
+        if "lose" in val or "loss" in val or "defeat" in val:
+            return "Loss"
+    if isinstance(result_value, bool):
+        return "Win" if result_value else "Loss"
+
+    team = None
+    if isinstance(team_value, str):
+        team = team_value.strip().upper()
+    elif isinstance(team_value, int):
+        team = "ORDER" if team_value == 100 else "CHAOS" if team_value == 200 else None
+
+    winner = None
+    if isinstance(winning_team, str):
+        winner = winning_team.strip().upper()
+    elif isinstance(winning_team, int):
+        winner = "ORDER" if winning_team == 100 else "CHAOS" if winning_team == 200 else None
+
+    if team and winner:
+        return "Win" if team == winner else "Loss"
+    return "Unknown"
+
+
+def find_champion_icon(champion_name):
+    if not champion_name:
+        return None
+    normalized = str(champion_name).replace(" ", "")
+    if ICON_DIR and ICON_DIR.exists():
+        for ext in (".png", ".jpg", ".jpeg", ".webp"):
+            candidate = ICON_DIR / f"{normalized}{ext}"
+            if candidate.exists():
+                return candidate
+    return None
+
+
+class ReplaySelectDialog(QDialog):
+    def __init__(self, parent=None, json_dir=None):
+        super().__init__(parent)
+        self.setWindowTitle("Replay Select")
+        self.resize(720, 520)
+        self.selected_path = None
+        self.json_dir = json_dir or (ROOT_DIR / "recordings" / "json")
+
+        layout = QVBoxLayout(self)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setSpacing(6)
+        self.list_widget.itemDoubleClicked.connect(self.accept_selected)
+        layout.addWidget(self.list_widget)
+
+        btn_row = QHBoxLayout()
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_list)
+        btn_row.addWidget(self.refresh_btn)
+
+        self.open_btn = QPushButton("Open JSON...")
+        self.open_btn.clicked.connect(self.open_file_dialog)
+        btn_row.addWidget(self.open_btn)
+
+        btn_row.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept_selected)
+        buttons.rejected.connect(self.reject)
+        btn_row.addWidget(buttons)
+
+        layout.addLayout(btn_row)
+        self.refresh_list()
+
+    def refresh_list(self):
+        self.list_widget.clear()
+        if not self.json_dir.exists():
+            return
+
+        files = sorted(self.json_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in files:
+            meta = self.load_meta(path)
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            widget = self.build_item_widget(meta)
+            item.setSizeHint(widget.sizeHint())
+            self.list_widget.addItem(item)
+            self.list_widget.setItemWidget(item, widget)
+
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
+
+    def load_meta(self, path):
+        meta = {
+            "path": path,
+            "champion_name": "Unknown",
+            "result": "Unknown",
+            "summoner": "Unknown",
+            "saved_at": path.stem,
+            "video_exists": True
+        }
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            meta["champion_name"] = data.get("champion_name") or data.get("player_champion") or "Unknown"
+            meta["summoner"] = data.get("summoner_name") or "Unknown"
+            meta["saved_at"] = data.get("saved_at") or path.stem
+            result = data.get("game_result")
+            team = data.get("player_team")
+            winning = data.get("winning_team")
+            meta["result"] = normalize_result(result, team_value=team, winning_team=winning)
+
+            video_path = data.get("obs_record_path")
+            if video_path:
+                meta["video_exists"] = Path(video_path).exists()
+        except Exception:
+            pass
+        return meta
+
+    def build_item_widget(self, meta):
+        widget = QWidget()
+        layout = QHBoxLayout(widget)
+        layout.setContentsMargins(8, 6, 8, 6)
+
+        icon_label = QLabel()
+        icon_label.setFixedSize(48, 48)
+        icon_label.setStyleSheet("background-color: #222; border-radius: 6px;")
+        icon_path = find_champion_icon(meta["champion_name"])
+        if icon_path:
+            pixmap = QPixmap(str(icon_path)).scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
+                                                    Qt.TransformationMode.SmoothTransformation)
+            icon_label.setPixmap(pixmap)
+        else:
+            icon_label.setText("?")
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(icon_label)
+
+        text_col = QVBoxLayout()
+        title = QLabel(meta["champion_name"])
+        title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        text_col.addWidget(title)
+
+        result_text = meta["result"]
+        result_label = QLabel(result_text)
+        if result_text == "Win":
+            result_label.setStyleSheet("color: #4CAF50;")
+        elif result_text == "Loss":
+            result_label.setStyleSheet("color: #F44336;")
+        else:
+            result_label.setStyleSheet("color: #9E9E9E;")
+
+        sub_row = QHBoxLayout()
+        sub_row.setContentsMargins(0, 0, 0, 0)
+        sub_row.addWidget(result_label)
+
+        detail_label = QLabel(f"· {meta['summoner']} · {meta['saved_at']}")
+        detail_label.setStyleSheet("color: #aaa;")
+        sub_row.addWidget(detail_label)
+        sub_row.addStretch(1)
+        text_col.addLayout(sub_row)
+        layout.addLayout(text_col, stretch=1)
+
+        status_label = QLabel("OK" if meta["video_exists"] else "Missing")
+        status_label.setStyleSheet("color: #888;")
+        layout.addWidget(status_label)
+        return widget
+
+    def accept_selected(self):
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        self.selected_path = item.data(Qt.ItemDataRole.UserRole)
+        self.accept()
+
+    def open_file_dialog(self):
+        fname, _ = QFileDialog.getOpenFileName(self, "Open JSON Log", str(ROOT_DIR), "JSON Files (*.json)")
+        if fname:
+            self.selected_path = fname
+            self.accept()
+
+
 class LoLReplayPlayer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -109,6 +293,8 @@ class LoLReplayPlayer(QMainWindow):
         self.current_video_path = None
         self.is_fullscreen_mode = False # フルスクリーン状態管理
         self.video_fps = 30.0
+
+        self.load_settings()
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
@@ -190,8 +376,8 @@ class LoLReplayPlayer(QMainWindow):
         # キーショートカット（フォーカスに依存しない）
         self.register_shortcuts()
 
-        # ファイルオープン
-        self.open_file_dialog()
+        # リプレイ選択ダイアログ
+        self.open_replay_selector()
 
     def init_mpv(self):
         try:
@@ -207,6 +393,22 @@ class LoLReplayPlayer(QMainWindow):
             QMessageBox.critical(self, "Error", f"MPV Init Failed: {e}")
             sys.exit(1)
 
+    def load_settings(self):
+        global ICON_DIR
+        if not CONFIG_PATH.exists():
+            return
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            paths = data.get("paths", {})
+            icons = paths.get("champion_icons_dir")
+            if icons:
+                path = Path(icons)
+                if not path.is_absolute():
+                    path = (ROOT_DIR / path).resolve()
+                ICON_DIR = path
+        except Exception:
+            pass
     def register_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.toggle_playback)
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=lambda: self.step_frame(1))
@@ -293,6 +495,11 @@ class LoLReplayPlayer(QMainWindow):
         fname, _ = QFileDialog.getOpenFileName(self, "Open JSON Log", initial_dir, "JSON Files (*.json)")
         if fname:
             self.load_data(fname)
+
+    def open_replay_selector(self):
+        dialog = ReplaySelectDialog(self, json_dir=ROOT_DIR / "recordings" / "json")
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_path:
+            self.load_data(dialog.selected_path)
 
     def load_data(self, json_path):
         json_path = Path(json_path)

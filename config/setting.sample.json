@@ -11,7 +11,8 @@
         "bin_dir": "bin",
         "recordings_dir": "recordings",
         "json_dir": "recordings/json",
-        "champion_icons_dir": "assets/champions/icons"
+        "champion_icons_dir": "assets/champions/icons",
+        "champion_aliases_path": "config/champion_aliases.json"
     },
     "polling": {
         "end_error_limit": 3,

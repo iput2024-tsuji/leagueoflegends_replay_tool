@@ -2,13 +2,17 @@ import sys
 import os
 import json
 import time
+import re
 from pathlib import Path
 
 # --- 1. MPVのパス設定 ---
 ROOT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
+ALIASES_PATH = ROOT_DIR / "config" / "champion_aliases.json"
 BIN_DIR = ROOT_DIR / "bin"
 ICON_DIR = ROOT_DIR / "assets" / "champions" / "icons"
+ICON_INDEX = None
+ICON_ALIASES = None
 
 if BIN_DIR.exists():
     os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ["PATH"]
@@ -128,15 +132,88 @@ def normalize_result(result_value, team_value=None, winning_team=None):
     return "Unknown"
 
 
+def normalize_icon_key(value):
+    return re.sub(r"[^\w]+", "", str(value or ""), flags=re.UNICODE).lower()
+
+
+def build_icon_index():
+    global ICON_INDEX
+    ICON_INDEX = {}
+    if not ICON_DIR or not ICON_DIR.exists():
+        return
+    for path in ICON_DIR.iterdir():
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            continue
+        key = normalize_icon_key(path.stem)
+        if key and key not in ICON_INDEX:
+            ICON_INDEX[key] = path
+
+
+def load_icon_aliases():
+    global ICON_ALIASES
+    ICON_ALIASES = {}
+    if not ALIASES_PATH.exists():
+        return
+    try:
+        with open(ALIASES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            ICON_ALIASES = data
+    except Exception:
+        ICON_ALIASES = {}
+
+
 def find_champion_icon(champion_name):
     if not champion_name:
         return None
-    normalized = str(champion_name).replace(" ", "")
-    if ICON_DIR and ICON_DIR.exists():
-        for ext in (".png", ".jpg", ".jpeg", ".webp"):
-            candidate = ICON_DIR / f"{normalized}{ext}"
-            if candidate.exists():
-                return candidate
+    global ICON_INDEX, ICON_ALIASES
+    if ICON_INDEX is None:
+        build_icon_index()
+    if not ICON_INDEX:
+        return None
+
+    key = normalize_icon_key(champion_name)
+    path = ICON_INDEX.get(key)
+    if path:
+        return path
+
+    if ICON_ALIASES is None:
+        load_icon_aliases()
+
+    alias_map = {
+        "nunuwillump": "nunu",
+        "renataglasc": "renata",
+        "wukong": "monkeyking",
+        "belveth": "belveth",
+        "chogath": "chogath",
+        "kaisa": "kaisa",
+        "khazix": "khazix",
+        "velkoz": "velkoz",
+        "leblanc": "leblanc",
+        "reksai": "reksai",
+        "tahmkench": "tahmkench",
+        "twistedfate": "twistedfate",
+        "xinzhao": "xinzhao",
+        "missfortune": "missfortune",
+        "masteryi": "masteryi",
+        "drmundo": "drmundo",
+        "aurelionsol": "aurelionsol",
+        "ksante": "ksante",
+        "jarvaniv": "jarvaniv",
+        "leesin": "leesin"
+    }
+
+    alias_value = None
+    if ICON_ALIASES:
+        alias_value = ICON_ALIASES.get(champion_name) or ICON_ALIASES.get(key)
+    for candidate in (alias_value, alias_map.get(key)):
+        if not candidate:
+            continue
+        path = ICON_INDEX.get(normalize_icon_key(candidate))
+        if path:
+            return path
     return None
 
 
@@ -394,7 +471,7 @@ class LoLReplayPlayer(QMainWindow):
             sys.exit(1)
 
     def load_settings(self):
-        global ICON_DIR
+        global ICON_DIR, ICON_INDEX, ICON_ALIASES, ALIASES_PATH
         if not CONFIG_PATH.exists():
             return
         try:
@@ -407,8 +484,17 @@ class LoLReplayPlayer(QMainWindow):
                 if not path.is_absolute():
                     path = (ROOT_DIR / path).resolve()
                 ICON_DIR = path
+                ICON_INDEX = None
+            aliases_path = paths.get("champion_aliases_path")
+            if aliases_path:
+                alias_path = Path(aliases_path)
+                if not alias_path.is_absolute():
+                    alias_path = (ROOT_DIR / alias_path).resolve()
+                ALIASES_PATH = alias_path
+                ICON_ALIASES = None
         except Exception:
             pass
+
     def register_shortcuts(self):
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.toggle_playback)
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=lambda: self.step_frame(1))

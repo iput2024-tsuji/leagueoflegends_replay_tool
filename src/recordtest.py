@@ -35,6 +35,7 @@ DEFAULT_OBS_PORT = 4455
 DEFAULT_END_ERROR_LIMIT = 3
 DEFAULT_END_POLL_SEC = 5
 DEFAULT_EVENT_POLL_SEC = 1
+DEFAULT_MAX_STORAGE_GB = 50
 
 OBS_PASSWORD = DEFAULT_OBS_PASSWORD
 OBS_SCENE_NAME = DEFAULT_OBS_SCENE_NAME
@@ -49,6 +50,7 @@ OBS_PORT = DEFAULT_OBS_PORT
 END_ERROR_LIMIT = DEFAULT_END_ERROR_LIMIT
 END_POLL_SEC = DEFAULT_END_POLL_SEC
 EVENT_POLL_SEC = DEFAULT_EVENT_POLL_SEC
+MAX_STORAGE_BYTES = None
 
 # ▼ 全員分保存する重要なイベント（オブジェクト）
 GLOBAL_OBJECTIVES = [
@@ -91,11 +93,12 @@ def load_settings():
 def apply_settings(cfg):
     global OBS_PASSWORD, OBS_SCENE_NAME, OBS_SOURCE_NAME, OBS_DIR, BIN_DIR
     global RECORDINGS_DIR, JSON_DIR, OBS_HOST, OBS_PORT, CHAMPION_ICONS_DIR
-    global END_ERROR_LIMIT, END_POLL_SEC, EVENT_POLL_SEC
+    global END_ERROR_LIMIT, END_POLL_SEC, EVENT_POLL_SEC, MAX_STORAGE_BYTES
 
     obs_cfg = cfg.get("obs", {})
     path_cfg = cfg.get("paths", {})
     poll_cfg = cfg.get("polling", {})
+    storage_cfg = cfg.get("storage", {})
 
     OBS_PASSWORD = obs_cfg.get("password", DEFAULT_OBS_PASSWORD)
     OBS_SCENE_NAME = obs_cfg.get("scene_name", DEFAULT_OBS_SCENE_NAME)
@@ -124,6 +127,8 @@ def apply_settings(cfg):
     END_POLL_SEC = float(poll_cfg.get("end_poll_sec", DEFAULT_END_POLL_SEC))
     EVENT_POLL_SEC = float(poll_cfg.get("event_poll_sec", DEFAULT_EVENT_POLL_SEC))
 
+    MAX_STORAGE_BYTES = parse_max_storage_bytes(storage_cfg)
+
     if JSON_DIR is None:
         print("❌ json_dir の設定が無効です。")
         sys.exit(1)
@@ -135,12 +140,133 @@ def setup_environment():
     if BIN_DIR:
         os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ["PATH"]
 
-        if not os.path.exists(os.path.join(BIN_DIR, "mpv-1.dll")) and \
-           not os.path.exists(os.path.join(BIN_DIR, "libmpv-1.dll")):
-            print("⚠️ 警告: 'bin' フォルダ内に mpv-1.dll (または libmpv-1.dll) が見つかりません。")
+        if not (
+            os.path.exists(os.path.join(BIN_DIR, "mpv-1.dll")) or
+            os.path.exists(os.path.join(BIN_DIR, "libmpv-1.dll")) or
+            os.path.exists(os.path.join(BIN_DIR, "mpv-2.dll")) or
+            os.path.exists(os.path.join(BIN_DIR, "libmpv-2.dll"))
+        ):
+            print("⚠️ 警告: 'bin' フォルダ内に mpv-1.dll / mpv-2.dll (または libmpv-1.dll / libmpv-2.dll) が見つかりません。")
             print(f"探した場所: {BIN_DIR}")
     else:
         print("⚠️ 警告: bin_dir が未設定です。")
+
+
+def parse_max_storage_bytes(storage_cfg):
+    max_bytes = storage_cfg.get("max_size_bytes")
+    if isinstance(max_bytes, (int, float)) and max_bytes > 0:
+        return int(max_bytes)
+    max_gb = storage_cfg.get("max_size_gb", DEFAULT_MAX_STORAGE_GB)
+    if isinstance(max_gb, (int, float)) and max_gb > 0:
+        return int(float(max_gb) * 1024 * 1024 * 1024)
+    max_mb = storage_cfg.get("max_size_mb")
+    if isinstance(max_mb, (int, float)) and max_mb > 0:
+        return int(float(max_mb) * 1024 * 1024)
+    return None
+
+
+def is_within(child, parent):
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def get_dir_size(path):
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            if item.is_file():
+                try:
+                    total += item.stat().st_size
+                except Exception:
+                    continue
+    except Exception:
+        return 0
+    return total
+
+
+def total_storage_size():
+    roots = []
+    if RECORDINGS_DIR:
+        roots.append(Path(RECORDINGS_DIR))
+    if JSON_DIR:
+        json_path = Path(JSON_DIR)
+        if not roots or not is_within(json_path, roots[0]):
+            roots.append(json_path)
+    return sum(get_dir_size(root) for root in roots if root.exists())
+
+
+def parse_saved_at(value):
+    if not value:
+        return None
+    try:
+        return time.mktime(time.strptime(value, "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+
+def load_json_metadata(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        saved_at = parse_saved_at(data.get("saved_at"))
+        video_path = data.get("obs_record_path")
+        return saved_at, Path(video_path) if video_path else None
+    except Exception:
+        return None, None
+
+
+def enforce_storage_limit(keep_paths=None):
+    if not MAX_STORAGE_BYTES:
+        return
+
+    keep_paths = {Path(p).resolve() for p in keep_paths or [] if p}
+    total = total_storage_size()
+    if total <= MAX_STORAGE_BYTES:
+        return
+
+    if JSON_DIR and Path(JSON_DIR).exists():
+        entries = []
+        for json_path in Path(JSON_DIR).glob("*.json"):
+            saved_at, video_path = load_json_metadata(json_path)
+            ts = saved_at if saved_at else json_path.stat().st_mtime
+            entries.append((ts, json_path, video_path))
+        entries.sort(key=lambda item: item[0])
+
+        for _, json_path, video_path in entries:
+            if json_path.resolve() in keep_paths:
+                continue
+            try:
+                if video_path and video_path.exists() and video_path.resolve() not in keep_paths:
+                    video_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                json_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            total = total_storage_size()
+            if total <= MAX_STORAGE_BYTES:
+                return
+
+    if RECORDINGS_DIR and Path(RECORDINGS_DIR).exists():
+        video_exts = {".mp4", ".mkv", ".flv", ".mov", ".avi"}
+        video_files = sorted(
+            [p for p in Path(RECORDINGS_DIR).rglob("*") if p.is_file() and p.suffix.lower() in video_exts],
+            key=lambda p: p.stat().st_mtime
+        )
+        for video_path in video_files:
+            if video_path.resolve() in keep_paths:
+                continue
+            try:
+                video_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            total = total_storage_size()
+            if total <= MAX_STORAGE_BYTES:
+                return
 
 
 def launch_obs():
@@ -180,6 +306,15 @@ def get_active_player_name():
             return response.text.strip().replace('"', '')
     except Exception:
         return None
+
+
+def normalize_summoner_name(value):
+    if not value:
+        return None
+    name = str(value).strip()
+    if "#" in name:
+        name = name.split("#", 1)[0]
+    return name.strip()
 
 
 def get_event_data():
@@ -240,6 +375,7 @@ class LoLAutoRecorder:
         self.processed_event_keys = set()
         self.all_event_keys = set()
         self.my_name = None
+        self.my_name_short = None
         self.last_game_data = None
         self.champion_name = None
         self.player_team = None
@@ -292,6 +428,7 @@ class LoLAutoRecorder:
         name = get_active_player_name()
         if name and name != self.my_name:
             self.my_name = name
+            self.my_name_short = normalize_summoner_name(name)
             print(f"プレイヤー名を特定: {self.my_name}")
 
     def update_player_info_from_game_data(self, data):
@@ -300,7 +437,7 @@ class LoLAutoRecorder:
         players = data.get("allPlayers", [])
         for player in players:
             summoner = player.get("summonerName") or player.get("summoner_name")
-            if summoner == self.my_name:
+            if summoner == self.my_name or summoner == self.my_name_short:
                 self.champion_name = player.get("championName") or player.get("champion_name")
                 self.player_team = player.get("team")
                 return
@@ -353,6 +490,8 @@ class LoLAutoRecorder:
             print(f"⚠️ エラー: ソース '{OBS_SOURCE_NAME}' が見つかりません。同期なしで録画します。")
             return
 
+        event_time = self.wait_until_game_start_event()
+
         print("⚡ 同期シグナル送信 (Marker ON)")
         self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, True)
 
@@ -360,6 +499,8 @@ class LoLAutoRecorder:
         data = get_all_game_data()
         if data:
             sync_time = data.get('gameData', {}).get('gameTime', 0.0)
+        if (not sync_time or sync_time <= 0) and event_time is not None:
+            sync_time = float(event_time)
 
         self.sync_game_time = sync_time
         print(f"📝 同期ログ記録: {sync_time:.4f}s")
@@ -367,6 +508,18 @@ class LoLAutoRecorder:
         time.sleep(0.5)
         self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, False)
         print("✅ シグナル消灯。録画継続中。")
+
+    def wait_until_game_start_event(self, timeout_sec=180):
+        start = time.time()
+        while time.time() - start < timeout_sec:
+            event_data = get_event_data()
+            if event_data:
+                for event in event_data.get("Events", []):
+                    if event.get("EventName") == "GameStart":
+                        return event.get("EventTime", 0.0)
+            time.sleep(0.5)
+        print("⚠️ GameStart を検知できませんでした。現在のゲーム時間で同期します。")
+        return None
 
     def process_events(self, events):
         for event in events:
@@ -396,7 +549,10 @@ class LoLAutoRecorder:
                 assisters = event.get("Assisters", [])
 
                 # 自分が関与したキル or デスのみ
-                is_involved = killer == self.my_name or victim == self.my_name
+                is_involved = (
+                    killer == self.my_name or victim == self.my_name or
+                    killer == self.my_name_short or victim == self.my_name_short
+                )
 
                 if is_involved:
                     should_save = True
@@ -530,6 +686,7 @@ class LoLAutoRecorder:
         }
         save_payload(self.output_file, payload)
         print(f"ログ保存完了: {self.output_file}")
+        enforce_storage_limit(keep_paths=[self.output_file, self.record_path])
 
 
 if __name__ == "__main__":

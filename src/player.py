@@ -62,12 +62,13 @@ class SyncWorker(QThread):
         found_time = -1.0
 
         skip_step = 30
-        roi_size = 120
+        roi_size = 140
         lower_red1 = np.array([0, 100, 100])
         upper_red1 = np.array([10, 255, 255])
         lower_red2 = np.array([160, 100, 100])
         upper_red2 = np.array([180, 255, 255])
         progress_step = max(1, int(fps * 5))
+        threshold_ratio = 0.05
 
         frame_idx = 0
         while frame_idx < max_frames:
@@ -83,16 +84,23 @@ class SyncWorker(QThread):
                 break
 
             if frame.shape[0] >= roi_size and frame.shape[1] >= roi_size:
-                roi = frame[0:roi_size, 0:roi_size]
-                hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-
-                mask = cv2.inRange(hsv, lower_red1, upper_red1)
-                mask += cv2.inRange(hsv, lower_red2, upper_red2)
-
-                red_pixels = cv2.countNonZero(mask)
-                threshold = (roi_size * roi_size) * 0.1
-                if red_pixels > threshold:
-                    found_time = frame_idx / fps
+                h, w = frame.shape[:2]
+                rois = [
+                    frame[0:roi_size, 0:roi_size],
+                    frame[0:roi_size, w - roi_size:w],
+                    frame[h - roi_size:h, 0:roi_size],
+                    frame[h - roi_size:h, w - roi_size:w],
+                ]
+                for roi in rois:
+                    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                    mask = cv2.inRange(hsv, lower_red1, upper_red1)
+                    mask += cv2.inRange(hsv, lower_red2, upper_red2)
+                    red_pixels = cv2.countNonZero(mask)
+                    threshold = (roi_size * roi_size) * threshold_ratio
+                    if red_pixels > threshold:
+                        found_time = frame_idx / fps
+                        break
+                if found_time >= 0:
                     break
 
             if frame_idx % progress_step == 0:
@@ -130,6 +138,15 @@ def normalize_result(result_value, team_value=None, winning_team=None):
     if team and winner:
         return "Win" if team == winner else "Loss"
     return "Unknown"
+
+
+def normalize_summoner_name(value):
+    if not value:
+        return None
+    name = str(value).strip()
+    if "#" in name:
+        name = name.split("#", 1)[0]
+    return name.strip()
 
 
 def normalize_icon_key(value):
@@ -370,6 +387,10 @@ class LoLReplayPlayer(QMainWindow):
         self.current_video_path = None
         self.is_fullscreen_mode = False # フルスクリーン状態管理
         self.video_fps = 30.0
+        self.events = []
+        self.events_all = []
+        self.my_name = None
+        self.my_name_short = None
 
         self.load_settings()
 
@@ -607,10 +628,10 @@ class LoLReplayPlayer(QMainWindow):
 
             self.current_video_path = video_path
             self.sync_game_time = data.get("sync_game_time", 0.0)
-            self.events = data.get("events", [])
-            if not self.events:
-                self.events = data.get("events_all", [])
+            self.events = data.get("events", []) or []
+            self.events_all = data.get("events_all", []) or []
             self.my_name = data.get("summoner_name", "Unknown")
+            self.my_name_short = normalize_summoner_name(self.my_name)
             self.offset = None
             self.event_list.setEnabled(False)
 
@@ -656,16 +677,47 @@ class LoLReplayPlayer(QMainWindow):
             pass
 
     def populate_event_list(self):
+        def build_events():
+            if self.events:
+                return list(self.events)
+            if self.events_all:
+                return list(self.events_all)
+            return []
+
+        events = build_events()
         self.event_list.clear()
         self.add_event_item("🎬 Game Start", 0.0, "#4CAF50")
-        for evt in self.events:
+        for evt in events:
             name = evt.get("EventName", "Event")
             time_sec = evt.get("EventTime", 0)
             killer = evt.get("KillerName", "")
-            display = f"⚔️ {name} ({killer})" if killer else f"🛡️ {name}"
-            color = "#FFFFFF"
-            if "Kill" in name and "Champion" in name: color = "#FF5252"
-            elif "Dragon" in name or "Baron" in name: color = "#E040FB"
+            victim = evt.get("VictimName", "")
+
+            if name == "ChampionKill":
+                if self.my_name_short:
+                    if killer not in (self.my_name, self.my_name_short) and victim not in (self.my_name, self.my_name_short):
+                        continue
+                display = f"⚔️ {killer} → {victim}" if killer or victim else "⚔️ ChampionKill"
+                if self.my_name and (victim == self.my_name or victim == self.my_name_short):
+                    color = "#FFB74D"
+                else:
+                    color = "#FF5252"
+            elif name == "DragonKill":
+                display = "🐉 Dragon"
+                color = "#29B6F6"
+            elif name == "BaronKill":
+                display = "🟣 Baron"
+                color = "#8E24AA"
+            elif name == "HeraldKill":
+                display = "👁 Herald"
+                color = "#7CB342"
+            elif name == "HordeKill":
+                display = "🟠 Voidgrub"
+                color = "#FF8A65"
+            else:
+                display = f"🛡️ {name}"
+                color = "#FFFFFF"
+
             self.add_event_item(display, time_sec, color)
 
     def add_event_item(self, text, game_time, color_hex):

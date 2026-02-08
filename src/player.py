@@ -375,11 +375,10 @@ class ReplaySelectDialog(QDialog):
             self.accept()
 
 
-class LoLReplayPlayer(QMainWindow):
-    def __init__(self):
+class PlayerWidget(QWidget):
+    def __init__(self, auto_open=True, fullscreen_cb=None):
         super().__init__()
-        self.setWindowTitle("LoL Smart Replay Player")
-        self.resize(1280, 720)
+        self.fullscreen_cb = fullscreen_cb
         
         self.offset = None
         self.duration = 0
@@ -396,10 +395,8 @@ class LoLReplayPlayer(QMainWindow):
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        # メインウィジェット
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        self.main_layout = QHBoxLayout(central_widget) # selfをつけてアクセス可能に
+        # メインレイアウト
+        self.main_layout = QHBoxLayout(self) # selfをつけてアクセス可能に
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
@@ -412,6 +409,9 @@ class LoLReplayPlayer(QMainWindow):
         # 1. MPV描画エリア
         self.video_frame = QWidget()
         self.video_frame.setStyleSheet("background-color: black;")
+        self.video_frame.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.video_frame.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self.video_frame.setAutoFillBackground(False)
         self.video_layout.addWidget(self.video_frame, stretch=1)
 
         # 2. コントロールパネル (フルスクリーン時に隠すため self にする)
@@ -475,7 +475,8 @@ class LoLReplayPlayer(QMainWindow):
         self.register_shortcuts()
 
         # リプレイ選択ダイアログ
-        self.open_replay_selector()
+        if auto_open:
+            self.open_replay_selector()
 
     def init_mpv(self):
         try:
@@ -483,7 +484,9 @@ class LoLReplayPlayer(QMainWindow):
                 wid=str(int(self.video_frame.winId())),
                 input_default_bindings=False,
                 input_vo_keyboard=False,
-                keepaspect=True
+                keepaspect=True,
+                vo="gpu",
+                gpu_context="d3d11"
             )
             self.player.observe_property('time-pos', self.on_time_update)
             self.player.observe_property('duration', self.on_duration_update)
@@ -572,11 +575,23 @@ class LoLReplayPlayer(QMainWindow):
             # フルスクリーン化
             self.right_panel.hide()    # サイドバーを消す
             self.control_panel.hide()  # 下のバーを消す
-            self.showFullScreen()      # ウィンドウ枠を消して最大化
+            self.set_fullscreen_mode(True)
+            if self.fullscreen_cb:
+                self.fullscreen_cb(True)
+            else:
+                window = self.window()
+                if window:
+                    window.showFullScreen()      # ウィンドウ枠を消して最大化
             self.is_fullscreen_mode = True
         else:
             # 通常モードへ復帰
-            self.showNormal()
+            self.set_fullscreen_mode(False)
+            if self.fullscreen_cb:
+                self.fullscreen_cb(False)
+            else:
+                window = self.window()
+                if window:
+                    window.showNormal()
             self.right_panel.show()
             self.control_panel.show()
             self.is_fullscreen_mode = False
@@ -745,6 +760,29 @@ class LoLReplayPlayer(QMainWindow):
         self.player.pause = not self.player.pause
         self.play_btn.setText("Play" if self.player.pause else "Pause")
 
+    def stop_playback(self):
+        if not hasattr(self, "player"):
+            return
+        try:
+            self.player.command("stop")
+        except Exception:
+            pass
+        try:
+            self.player.pause = True
+        except Exception:
+            pass
+
+    def set_fullscreen_mode(self, enabled):
+        if not hasattr(self, "player"):
+            return
+        try:
+            self.player["panscan"] = 1.0 if enabled else 0.0
+        except Exception:
+            try:
+                self.player.panscan = 1.0 if enabled else 0.0
+            except Exception:
+                pass
+
     def step_frame(self, direction):
         if not self.player:
             return
@@ -789,8 +827,17 @@ class LoLReplayPlayer(QMainWindow):
             self.player.terminate()
         event.accept()
 
+
+class PlayerWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("LoL Smart Replay Player")
+        self.resize(1280, 720)
+        self.player_widget = PlayerWidget(auto_open=True)
+        self.setCentralWidget(self.player_widget)
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = LoLReplayPlayer()
+    window = PlayerWindow()
     window.show()
     sys.exit(app.exec())

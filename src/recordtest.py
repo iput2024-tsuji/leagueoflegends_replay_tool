@@ -357,12 +357,28 @@ def save_payload(path, payload):
 
 
 class LoLAutoRecorder:
-    def __init__(self, obs_process=None):
+    def __init__(self, obs_process=None, status_cb=None):
         self.client = None
         self.my_name = None
         self.obs_process = obs_process
+        self.status_cb = status_cb
+        self.stop_requested = False
         self.reset_session()
         self.connect_obs()
+
+    def log(self, message):
+        print(message)
+        if self.status_cb:
+            try:
+                self.status_cb(message)
+            except Exception:
+                pass
+
+    def request_stop(self):
+        self.stop_requested = True
+
+    def should_stop(self):
+        return self.stop_requested
 
     def reset_session(self):
         self.output_file = None
@@ -429,7 +445,7 @@ class LoLAutoRecorder:
         if name and name != self.my_name:
             self.my_name = name
             self.my_name_short = normalize_summoner_name(name)
-            print(f"プレイヤー名を特定: {self.my_name}")
+            self.log(f"プレイヤー名を特定: {self.my_name}")
 
     def update_player_info_from_game_data(self, data):
         if not data or not self.my_name:
@@ -458,41 +474,45 @@ class LoLAutoRecorder:
 
     def wait_for_game_start(self):
         """LoLの試合開始を監視"""
-        print("⚔️  LoLの試合開始を待機中 (API監視)...")
+        self.log("⚔️  LoLの試合開始を待機中 (API監視)...")
         while True:
+            if self.should_stop():
+                return False
             data = get_all_game_data()
             if data:
                 game_time = data.get('gameData', {}).get('gameTime', 0)
                 if game_time > 0:
-                    print(f"🔥 試合開始検知！ GameTime: {game_time:.2f}s")
+                    self.log(f"🔥 試合開始検知！ GameTime: {game_time:.2f}s")
                     self.output_file = build_output_path()
                     self.try_update_player_name()
                     self.session_started = True
-                    return
+                    return True
             time.sleep(1)
 
     def start_recording(self):
         """録画開始 -> 同期マーカー"""
-        print("🎥 録画を開始します...")
+        self.log("🎥 録画を開始します...")
         try:
             self.client.start_record()
             self.recording_started = True
         except OBSSDKRequestError as e:
-            print(f"⚠️ 録画開始エラー: {e}")
+            self.log(f"⚠️ 録画開始エラー: {e}")
             return
         except Exception as e:
-            print(f"⚠️ 録画開始エラー: {e}")
+            self.log(f"⚠️ 録画開始エラー: {e}")
             return
         time.sleep(2)
 
         item_id = self.get_source_id()
         if not item_id:
-            print(f"⚠️ エラー: ソース '{OBS_SOURCE_NAME}' が見つかりません。同期なしで録画します。")
+            self.log(f"⚠️ エラー: ソース '{OBS_SOURCE_NAME}' が見つかりません。同期なしで録画します。")
             return
 
         event_time = self.wait_until_game_start_event()
+        if self.should_stop():
+            return
 
-        print("⚡ 同期シグナル送信 (Marker ON)")
+        self.log("⚡ 同期シグナル送信 (Marker ON)")
         self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, True)
 
         sync_time = 0.0
@@ -503,22 +523,24 @@ class LoLAutoRecorder:
             sync_time = float(event_time)
 
         self.sync_game_time = sync_time
-        print(f"📝 同期ログ記録: {sync_time:.4f}s")
+        self.log(f"📝 同期ログ記録: {sync_time:.4f}s")
 
         time.sleep(0.5)
         self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, False)
-        print("✅ シグナル消灯。録画継続中。")
+        self.log("✅ シグナル消灯。録画継続中。")
 
     def wait_until_game_start_event(self, timeout_sec=180):
         start = time.time()
         while time.time() - start < timeout_sec:
+            if self.should_stop():
+                return None
             event_data = get_event_data()
             if event_data:
                 for event in event_data.get("Events", []):
                     if event.get("EventName") == "GameStart":
                         return event.get("EventTime", 0.0)
             time.sleep(0.5)
-        print("⚠️ GameStart を検知できませんでした。現在のゲーム時間で同期します。")
+        self.log("⚠️ GameStart を検知できませんでした。現在のゲーム時間で同期します。")
         return None
 
     def process_events(self, events):
@@ -576,15 +598,17 @@ class LoLAutoRecorder:
 
     def record_until_end(self):
         """試合終了まで待機して録画停止"""
-        print("🛡️  試合終了を監視中...")
+        self.log("🛡️  試合終了を監視中...")
         error_count = 0
         while True:
+            if self.should_stop():
+                return False
             data = get_all_game_data()
             if not data:
                 error_count += 1
                 if error_count >= END_ERROR_LIMIT:
-                    print("🏁 試合終了検知。録画を停止します。")
-                    break
+                    self.log("🏁 試合終了検知。録画を停止します。")
+                    return True
                 time.sleep(END_POLL_SEC)
                 continue
 
@@ -601,6 +625,7 @@ class LoLAutoRecorder:
                 self.update_result_from_events(events)
 
             time.sleep(EVENT_POLL_SEC)
+        return True
 
     def stop_recording(self):
         if not self.client or self.record_path is not None:
@@ -621,20 +646,20 @@ class LoLAutoRecorder:
             res = self.client.stop_record()
             self.record_path = getattr(res, "output_path", None)
             if self.record_path:
-                print(f"💾 保存完了: {self.record_path}")
+                self.log(f"💾 保存完了: {self.record_path}")
             self.recording_started = False
         except OBSSDKRequestError as e:
             if e.code == 501:
                 self.recording_started = False
                 return
-            print(f"⚠️ 録画停止エラー: {e}")
+            self.log(f"⚠️ 録画停止エラー: {e}")
         except Exception as e:
-            print(f"⚠️ 録画停止エラー: {e}")
+            self.log(f"⚠️ 録画停止エラー: {e}")
 
     def shutdown_obs(self):
         if not self.obs_process:
             return
-        print("🧹 OBSを終了しています...")
+        self.log("🧹 OBSを終了しています...")
 
         if self.obs_process.poll() is not None:
             return
@@ -685,7 +710,7 @@ class LoLAutoRecorder:
             }
         }
         save_payload(self.output_file, payload)
-        print(f"ログ保存完了: {self.output_file}")
+        self.log(f"ログ保存完了: {self.output_file}")
         enforce_storage_limit(keep_paths=[self.output_file, self.record_path])
 
 

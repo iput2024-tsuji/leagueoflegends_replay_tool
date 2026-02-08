@@ -12,7 +12,10 @@ import requests
 import urllib3
 import obsws_python as obs
 from obsws_python.error import OBSSDKRequestError
-from app_paths import get_app_root
+try:
+    from .app_paths import get_app_root
+except ImportError:
+    from app_paths import get_app_root
 
 ROOT_DIR = get_app_root()
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"

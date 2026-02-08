@@ -3,10 +3,14 @@ import os
 import json
 import time
 import re
+import shutil
 from pathlib import Path
 
 # --- 1. MPVのパス設定 ---
-from app_paths import get_app_root
+try:
+    from .app_paths import get_app_root
+except ImportError:
+    from app_paths import get_app_root
 
 ROOT_DIR = get_app_root()
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
@@ -16,17 +20,54 @@ ICON_DIR = ROOT_DIR / "assets" / "champions" / "icons"
 ICON_INDEX = None
 ICON_ALIASES = None
 
+def ensure_mpv_dll(bin_dir: Path, root_dir: Path):
+    candidates = []
+    for base in (bin_dir, root_dir):
+        if not base or not base.exists():
+            continue
+        for name in ("mpv-1.dll", "libmpv-1.dll", "mpv-2.dll", "libmpv-2.dll"):
+            path = base / name
+            if path.exists():
+                candidates.append(path)
+
+    if not candidates:
+        return
+
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+
+    mpv1 = bin_dir / "mpv-1.dll"
+    libmpv1 = bin_dir / "libmpv-1.dll"
+    if mpv1.exists() or libmpv1.exists():
+        return
+
+    for src in candidates:
+        if src.name in ("mpv-1.dll", "libmpv-1.dll"):
+            try:
+                shutil.copy2(src, mpv1)
+            except Exception:
+                pass
+            return
+
+    for src in candidates:
+        if src.name in ("mpv-2.dll", "libmpv-2.dll"):
+            try:
+                shutil.copy2(src, mpv1)
+            except Exception:
+                pass
+            return
+
+ensure_mpv_dll(BIN_DIR, ROOT_DIR)
 if BIN_DIR.exists():
     os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ["PATH"]
-else:
-    # 警告だけ出して続行（importエラーで詳細を出すため）
-    pass
 
 # --- 2. MPVインポート ---
 try:
     import mpv
 except OSError:
-    print("❌ Error: mpv-1.dll が見つかりません。")
+    print("❌ Error: mpv DLL が見つかりません。")
     print(f"   場所: {BIN_DIR}")
     sys.exit(1)
 

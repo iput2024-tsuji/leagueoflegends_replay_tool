@@ -11,7 +11,7 @@ LoLの試合録画（OBS自動制御）と、イベントログ同期再生プ�
 - Windows
 - Python 3.10+ 推奨
 - OBS Studio（WebSocket 5.x 有効、ポート/パスワード設定）
-- mpv の DLL（`bin/` に `mpv-1.dll` または `libmpv-1.dll`）
+- mpv の DLL（`bin/` に `mpv-1.dll` / `libmpv-1.dll` / `libmpv-2.dll` のいずれか）
 
 ## セットアップ
 ```powershell

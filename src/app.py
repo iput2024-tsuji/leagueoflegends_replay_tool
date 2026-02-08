@@ -18,13 +18,17 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
-SRC_DIR = Path(__file__).resolve().parent
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
-
-import recordtest
-from player import PlayerWidget
-from app_paths import get_app_root
+try:
+    from . import recordtest
+    from .player import PlayerWidget
+    from .app_paths import get_app_root
+except ImportError:
+    SRC_DIR = Path(__file__).resolve().parent
+    if str(SRC_DIR) not in sys.path:
+        sys.path.insert(0, str(SRC_DIR))
+    import recordtest
+    from player import PlayerWidget
+    from app_paths import get_app_root
 
 
 ROOT_DIR = get_app_root()
@@ -34,6 +38,7 @@ SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
 
 def load_config():
     if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         if SAMPLE_CONFIG_PATH.exists():
             CONFIG_PATH.write_text(SAMPLE_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
         else:

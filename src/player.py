@@ -491,6 +491,9 @@ class PlayerWidget(QWidget):
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("font-weight: bold; padding: 10px; color: #aaa;")
 
+        self.offset_label = QLabel("Offset: --")
+        self.offset_label.setStyleSheet("padding: 0 10px 6px 10px; color: #ccc;")
+
         self.event_list = QListWidget()
         self.event_list.setStyleSheet("""
             QListWidget { border: none; background-color: #2b2b2b; }
@@ -503,6 +506,7 @@ class PlayerWidget(QWidget):
         self.event_list.setEnabled(False)
 
         right_layout.addWidget(self.info_label)
+        right_layout.addWidget(self.offset_label)
 
         filter_row = QHBoxLayout()
         self.filter_kill = QCheckBox("Kill")
@@ -518,6 +522,15 @@ class PlayerWidget(QWidget):
         filter_row.addWidget(self.filter_objective)
         filter_row.addWidget(self.filter_other)
         right_layout.addLayout(filter_row)
+
+        offset_row = QHBoxLayout()
+        offset_row.setContentsMargins(8, 0, 8, 6)
+        for label, value in [("-5s", -5.0), ("-1s", -1.0), ("-0.1s", -0.1), ("+0.1s", 0.1), ("+1s", 1.0), ("+5s", 5.0)]:
+            btn = QPushButton(label)
+            btn.setFixedHeight(26)
+            btn.clicked.connect(lambda _, v=value: self.adjust_offset(v))
+            offset_row.addWidget(btn)
+        right_layout.addLayout(offset_row)
         right_layout.addWidget(self.event_list)
 
         # レイアウト統合
@@ -732,6 +745,7 @@ class PlayerWidget(QWidget):
         else:
             self.offset = found_time - self.sync_game_time
             self.info_label.setText(f"✅ Synced\nOffset: {self.offset:.2f}s")
+        self.update_offset_label()
         self.event_list.setEnabled(True)
         self.player.pause = False
         self.play_btn.setText("Pause")
@@ -802,6 +816,18 @@ class PlayerWidget(QWidget):
                 color = "#FFFFFF"
 
             self.add_event_item(display, time_sec, color)
+
+    def update_offset_label(self):
+        if self.offset is None:
+            self.offset_label.setText("Offset: --")
+        else:
+            self.offset_label.setText(f"Offset: {self.offset:+.2f}s")
+
+    def adjust_offset(self, delta):
+        if self.offset is None:
+            self.offset = 0.0
+        self.offset += delta
+        self.update_offset_label()
 
     def add_event_item(self, text, game_time, color_hex):
         m, s = divmod(int(game_time), 60)

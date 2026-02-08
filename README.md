@@ -60,6 +60,20 @@ python src\player.py
 - Esc: フルスクリーン解除
 - N / P: 次/前のイベント
 
+## 配布用ビルド（PyInstaller）
+Windows向けに `onedir` でビルドします（設定ファイルを書き込むため）。
+
+```powershell
+pip install pyinstaller
+.\scripts\build.ps1
+```
+
+出力先: `dist\LoLReplayTool\`
+- 初回起動時に `config\setting.json` が自動生成されます
+- `config\setting.json` を編集して OBS パス等を設定してください
+- mpv DLL は `bin\` に同梱されます
+- OBS 本体は同梱しません（各自でインストール）
+
 ## JSONの内容（例）
 ```json
 {

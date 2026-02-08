@@ -12,8 +12,9 @@ import requests
 import urllib3
 import obsws_python as obs
 from obsws_python.error import OBSSDKRequestError
+from app_paths import get_app_root
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = get_app_root()
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
 SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
 
@@ -25,7 +26,7 @@ ALL_GAME_URL = f"{LIVECLIENT_BASE}/allgamedata"
 DEFAULT_OBS_PASSWORD = "password"
 DEFAULT_OBS_SCENE_NAME = "lol_seen"
 DEFAULT_OBS_SOURCE_NAME = "color"
-DEFAULT_OBS_DIR = "C:/dev/lol/bin/OBS-Studio"
+DEFAULT_OBS_DIR = "C:/Program Files/obs-studio"
 DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
 DEFAULT_JSON_DIR = "recordings/json"

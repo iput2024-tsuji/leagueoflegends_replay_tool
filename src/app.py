@@ -24,9 +24,10 @@ if str(SRC_DIR) not in sys.path:
 
 import recordtest
 from player import PlayerWidget
+from app_paths import get_app_root
 
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = get_app_root()
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
 SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
 

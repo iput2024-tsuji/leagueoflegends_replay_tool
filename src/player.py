@@ -6,7 +6,9 @@ import re
 from pathlib import Path
 
 # --- 1. MPVのパス設定 ---
-ROOT_DIR = Path(__file__).resolve().parent.parent
+from app_paths import get_app_root
+
+ROOT_DIR = get_app_root()
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
 ALIASES_PATH = ROOT_DIR / "config" / "champion_aliases.json"
 BIN_DIR = ROOT_DIR / "bin"

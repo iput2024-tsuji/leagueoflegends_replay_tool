@@ -34,7 +34,7 @@ import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidget, QListWidgetItem, QPushButton,
                              QFileDialog, QLabel, QSlider, QMessageBox, QDialog,
-                             QDialogButtonBox)
+                             QDialogButtonBox, QLineEdit, QComboBox, QCheckBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut, QPixmap, QFont
 
@@ -238,11 +238,30 @@ class ReplaySelectDialog(QDialog):
     def __init__(self, parent=None, json_dir=None):
         super().__init__(parent)
         self.setWindowTitle("Replay Select")
-        self.resize(720, 520)
+        self.resize(820, 560)
         self.selected_path = None
         self.json_dir = json_dir or (ROOT_DIR / "recordings" / "json")
+        self.meta_cache = []
 
         layout = QVBoxLayout(self)
+
+        filter_row = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("検索: チャンピオン / サモナー")
+        self.search_input.textChanged.connect(self.apply_filters)
+        filter_row.addWidget(self.search_input, stretch=1)
+
+        self.result_filter = QComboBox()
+        self.result_filter.addItems(["All", "Win", "Loss"])
+        self.result_filter.currentIndexChanged.connect(self.apply_filters)
+        filter_row.addWidget(self.result_filter)
+
+        self.sort_filter = QComboBox()
+        self.sort_filter.addItems(["新しい順", "古い順"])
+        self.sort_filter.currentIndexChanged.connect(self.apply_filters)
+        filter_row.addWidget(self.sort_filter)
+
+        layout.addLayout(filter_row)
 
         self.list_widget = QListWidget()
         self.list_widget.setSpacing(6)
@@ -269,19 +288,12 @@ class ReplaySelectDialog(QDialog):
         self.refresh_list()
 
     def refresh_list(self):
-        self.list_widget.clear()
-        if not self.json_dir.exists():
-            return
-
-        files = sorted(self.json_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for path in files:
-            meta = self.load_meta(path)
-            item = QListWidgetItem()
-            item.setData(Qt.ItemDataRole.UserRole, str(path))
-            widget = self.build_item_widget(meta)
-            item.setSizeHint(widget.sizeHint())
-            self.list_widget.addItem(item)
-            self.list_widget.setItemWidget(item, widget)
+        self.meta_cache = []
+        if self.json_dir.exists():
+            files = sorted(self.json_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            for path in files:
+                self.meta_cache.append(self.load_meta(path))
+        self.apply_filters()
 
         if self.list_widget.count() > 0:
             self.list_widget.setCurrentRow(0)
@@ -360,6 +372,35 @@ class ReplaySelectDialog(QDialog):
         status_label.setStyleSheet("color: #888;")
         layout.addWidget(status_label)
         return widget
+
+    def apply_filters(self):
+        self.list_widget.clear()
+        if not self.meta_cache:
+            return
+
+        query = self.search_input.text().strip().lower()
+        result_filter = self.result_filter.currentText()
+        sort_mode = self.sort_filter.currentText()
+
+        def matches(meta):
+            if result_filter != "All" and meta["result"] != result_filter:
+                return False
+            if query:
+                hay = f"{meta['champion_name']} {meta['summoner']}".lower()
+                return query in hay
+            return True
+
+        filtered = [m for m in self.meta_cache if matches(m)]
+        reverse = sort_mode == "新しい順"
+        filtered.sort(key=lambda m: m.get("saved_at") or "", reverse=reverse)
+
+        for meta in filtered:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, str(meta["path"]))
+            widget = self.build_item_widget(meta)
+            item.setSizeHint(widget.sizeHint())
+            self.list_widget.addItem(item)
+            self.list_widget.setItemWidget(item, widget)
 
     def accept_selected(self):
         item = self.list_widget.currentItem()
@@ -449,7 +490,7 @@ class PlayerWidget(QWidget):
         self.info_label = QLabel("Load JSON to start")
         self.info_label.setWordWrap(True)
         self.info_label.setStyleSheet("font-weight: bold; padding: 10px; color: #aaa;")
-        
+
         self.event_list = QListWidget()
         self.event_list.setStyleSheet("""
             QListWidget { border: none; background-color: #2b2b2b; }
@@ -462,6 +503,21 @@ class PlayerWidget(QWidget):
         self.event_list.setEnabled(False)
 
         right_layout.addWidget(self.info_label)
+
+        filter_row = QHBoxLayout()
+        self.filter_kill = QCheckBox("Kill")
+        self.filter_objective = QCheckBox("Objective")
+        self.filter_other = QCheckBox("Other")
+        self.filter_kill.setChecked(True)
+        self.filter_objective.setChecked(True)
+        self.filter_other.setChecked(True)
+        self.filter_kill.stateChanged.connect(self.populate_event_list)
+        self.filter_objective.stateChanged.connect(self.populate_event_list)
+        self.filter_other.stateChanged.connect(self.populate_event_list)
+        filter_row.addWidget(self.filter_kill)
+        filter_row.addWidget(self.filter_objective)
+        filter_row.addWidget(self.filter_other)
+        right_layout.addLayout(filter_row)
         right_layout.addWidget(self.event_list)
 
         # レイアウト統合
@@ -712,24 +768,36 @@ class PlayerWidget(QWidget):
                 if self.my_name_short:
                     if killer not in (self.my_name, self.my_name_short) and victim not in (self.my_name, self.my_name_short):
                         continue
+                if not self.filter_kill.isChecked():
+                    continue
                 display = f"⚔️ {killer} → {victim}" if killer or victim else "⚔️ ChampionKill"
                 if self.my_name and (victim == self.my_name or victim == self.my_name_short):
                     color = "#FFB74D"
                 else:
                     color = "#FF5252"
             elif name == "DragonKill":
+                if not self.filter_objective.isChecked():
+                    continue
                 display = "🐉 Dragon"
                 color = "#29B6F6"
             elif name == "BaronKill":
+                if not self.filter_objective.isChecked():
+                    continue
                 display = "🟣 Baron"
                 color = "#8E24AA"
             elif name == "HeraldKill":
+                if not self.filter_objective.isChecked():
+                    continue
                 display = "👁 Herald"
                 color = "#7CB342"
             elif name == "HordeKill":
+                if not self.filter_objective.isChecked():
+                    continue
                 display = "🟠 Voidgrub"
                 color = "#FF8A65"
             else:
+                if not self.filter_other.isChecked():
+                    continue
                 display = f"🛡️ {name}"
                 color = "#FFFFFF"
 

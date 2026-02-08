@@ -34,7 +34,8 @@ import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidget, QListWidgetItem, QPushButton,
                              QFileDialog, QLabel, QSlider, QMessageBox, QDialog,
-                             QDialogButtonBox, QLineEdit, QComboBox, QCheckBox)
+                             QDialogButtonBox, QLineEdit, QComboBox, QCheckBox,
+                             QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut, QPixmap, QFont
 
@@ -261,6 +262,11 @@ class ReplaySelectDialog(QDialog):
         self.sort_filter.currentIndexChanged.connect(self.apply_filters)
         filter_row.addWidget(self.sort_filter)
 
+        self.missing_filter = QCheckBox("Missingを非表示")
+        self.missing_filter.setChecked(True)
+        self.missing_filter.stateChanged.connect(self.apply_filters)
+        filter_row.addWidget(self.missing_filter)
+
         layout.addLayout(filter_row)
 
         self.list_widget = QListWidget()
@@ -320,7 +326,18 @@ class ReplaySelectDialog(QDialog):
 
             video_path = data.get("obs_record_path")
             if video_path:
-                meta["video_exists"] = Path(video_path).exists()
+                video_path = Path(video_path)
+                if not video_path.exists():
+                    fallback = path.parent / video_path.name
+                    if fallback.exists():
+                        video_path = fallback
+                        meta["video_exists"] = True
+                    else:
+                        meta["video_exists"] = False
+                else:
+                    meta["video_exists"] = True
+            else:
+                meta["video_exists"] = False
         except Exception:
             pass
         return meta
@@ -381,8 +398,11 @@ class ReplaySelectDialog(QDialog):
         query = self.search_input.text().strip().lower()
         result_filter = self.result_filter.currentText()
         sort_mode = self.sort_filter.currentText()
+        hide_missing = self.missing_filter.isChecked()
 
         def matches(meta):
+            if hide_missing and not meta["video_exists"]:
+                return False
             if result_filter != "All" and meta["result"] != result_filter:
                 return False
             if query:
@@ -397,6 +417,7 @@ class ReplaySelectDialog(QDialog):
         for meta in filtered:
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, str(meta["path"]))
+            item.setData(Qt.ItemDataRole.UserRole + 1, bool(meta.get("video_exists", False)))
             widget = self.build_item_widget(meta)
             item.setSizeHint(widget.sizeHint())
             self.list_widget.addItem(item)
@@ -405,6 +426,10 @@ class ReplaySelectDialog(QDialog):
     def accept_selected(self):
         item = self.list_widget.currentItem()
         if not item:
+            return
+        video_exists = item.data(Qt.ItemDataRole.UserRole + 1)
+        if video_exists is False:
+            QMessageBox.warning(self, "Missing Video", "このリプレイの動画ファイルが見つかりません。")
             return
         self.selected_path = item.data(Qt.ItemDataRole.UserRole)
         self.accept()
@@ -524,13 +549,19 @@ class PlayerWidget(QWidget):
         right_layout.addLayout(filter_row)
 
         offset_row = QHBoxLayout()
-        offset_row.setContentsMargins(8, 0, 8, 6)
+        offset_row.setContentsMargins(8, 0, 8, 2)
         for label, value in [("-5s", -5.0), ("-1s", -1.0), ("-0.1s", -0.1), ("+0.1s", 0.1), ("+1s", 1.0), ("+5s", 5.0)]:
             btn = QPushButton(label)
             btn.setFixedHeight(26)
             btn.clicked.connect(lambda _, v=value: self.adjust_offset(v))
             offset_row.addWidget(btn)
         right_layout.addLayout(offset_row)
+        
+        sync_btn = QPushButton("現在位置で同期")
+        sync_btn.setFixedHeight(28)
+        sync_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        sync_btn.clicked.connect(self.sync_to_current_position)
+        right_layout.addWidget(sync_btn)
         right_layout.addWidget(self.event_list)
 
         # レイアウト統合
@@ -827,6 +858,24 @@ class PlayerWidget(QWidget):
         if self.offset is None:
             self.offset = 0.0
         self.offset += delta
+        self.update_offset_label()
+
+    def sync_to_current_position(self):
+        if not hasattr(self, "player"):
+            return
+        try:
+            current = float(self.player.time_pos or 0.0)
+        except Exception:
+            current = None
+        if current is None:
+            return
+        selected = self.event_list.currentItem()
+        if not selected:
+            return
+        game_time = selected.data(Qt.ItemDataRole.UserRole)
+        if game_time is None:
+            return
+        self.offset = current - float(game_time)
         self.update_offset_label()
 
     def add_event_item(self, text, game_time, color_hex):

@@ -71,8 +71,30 @@ pip install pyinstaller
 出力先: `dist\LoLReplayTool\`
 - 初回起動時に `config\setting.json` が自動生成されます
 - `config\setting.json` を編集して OBS パス等を設定してください
-- mpv DLL は `bin\` に同梱されます
+- mpv DLL は同梱せず、利用者が `bin\` に配置します
 - OBS 本体は同梱しません（各自でインストール）
+
+## 配布運用（固定手順）
+
+### 1. 配布者の手順
+1. リポジトリ直下でビルドする。
+   ```powershell
+   .\venv\Scripts\Activate.ps1
+   .\scripts\build.ps1
+   ```
+2. `dist\LoLReplayTool\` ディレクトリを丸ごとZIP化して配布する。
+3. ZIP化前に以下が入っているか確認する。
+   - `LoLReplayTool.exe`
+   - `config\setting.sample.json`
+   - `config\champion_aliases.json`
+   - `assets\champions\icons\`
+   - `bin\`（空でも可）
+
+### 2. 受け取り側の初回セットアップ
+1. ZIPを展開する。
+2. `bin\` に mpv DLL を配置する（`mpv-1.dll` / `libmpv-1.dll` / `libmpv-2.dll` のいずれか）。
+3. `LoLReplayTool.exe` を起動し、`config\setting.json` が生成されることを確認する。
+4. アプリの設定画面で `obs.dir` / WebSocketポート / パスワード / シーン名 / ソース名を設定する。
 
 ## JSONの内容（例）
 ```json

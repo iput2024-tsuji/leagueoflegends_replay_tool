@@ -63,6 +63,8 @@ python src\player.py
 ## 配布用ビルド（PyInstaller）
 Windows向けに `onedir` でビルドします（設定ファイルを書き込むため）。
 
+アプリアイコンを設定したい場合は `assets\app\app.ico` を用意してください。
+
 ```powershell
 pip install pyinstaller
 .\scripts\build.ps1
@@ -72,7 +74,14 @@ pip install pyinstaller
 - 初回起動時に `config\setting.json` が自動生成されます
 - `config\setting.json` を編集して OBS パス等を設定してください
 - mpv DLL は同梱せず、利用者が `bin\` に配置します
+- `assets\app\app.ico` が存在する場合、exeアイコンとウィンドウアイコンに反映されます
 - OBS 本体は同梱しません（各自でインストール）
+
+### アイコン画像の推奨仕様
+- 形式: `.ico`（複数サイズ同梱）
+- 推奨サイズ: `16x16`, `32x32`, `48x48`, `256x256`
+- 背景: 透過PNGベースで作成してから `.ico` 化
+- ファイル配置: `assets\app\app.ico`
 
 ## 配布運用（固定手順）
 

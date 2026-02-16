@@ -13,6 +13,14 @@ $pyArgs = @(
   "--add-data", "assets\\champions\\icons;assets\\champions\\icons"
 )
 
+$iconPath = "assets\\app\\app.ico"
+if (Test-Path $iconPath) {
+  $pyArgs += "--icon"
+  $pyArgs += $iconPath
+  $pyArgs += "--add-data"
+  $pyArgs += "$iconPath;assets\\app"
+}
+
 $binCandidates = @(
   "bin\\mpv-1.dll",
   "bin\\libmpv-1.dll",

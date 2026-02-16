@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon
 
 try:
     from . import recordtest
@@ -34,6 +35,17 @@ except ImportError:
 ROOT_DIR = get_app_root()
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
 SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
+APP_ICON_CANDIDATES = [
+    ROOT_DIR / "assets" / "app" / "app.ico",
+    ROOT_DIR / "assets" / "app" / "app.png",
+]
+
+
+def get_app_icon():
+    for path in APP_ICON_CANDIDATES:
+        if path.exists():
+            return QIcon(str(path))
+    return None
 
 
 def load_config():
@@ -326,6 +338,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("LoL Replay Tool")
         self.resize(1200, 720)
+        icon = get_app_icon()
+        if icon:
+            self.setWindowIcon(icon)
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -365,6 +380,9 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication([])
+    icon = get_app_icon()
+    if icon:
+        app.setWindowIcon(icon)
     app.setStyleSheet("""
         QWidget { background-color: #1e1e1e; color: #e0e0e0; }
         QLabel { color: #e0e0e0; }

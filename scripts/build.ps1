@@ -4,8 +4,10 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location (Join-Path $scriptDir "..")
 
 $pyArgs = @(
+  "-y",
   "--noconsole",
   "--onedir",
+  "--contents-directory", ".",
   "--name", "LoLReplayTool",
   "--clean",
   "--add-data", "config\\setting.sample.json;config",
@@ -36,4 +38,14 @@ foreach ($path in $binCandidates) {
 }
 
 $pyArgs += "main.py"
-pyinstaller @pyArgs
+$pyInstallerCmd = Get-Command pyinstaller -ErrorAction SilentlyContinue
+if (-not $pyInstallerCmd) {
+  $venvPyInstaller = Join-Path (Get-Location) "venv\\Scripts\\pyinstaller.exe"
+  if (Test-Path $venvPyInstaller) {
+    & $venvPyInstaller @pyArgs
+    exit $LASTEXITCODE
+  }
+  throw "pyinstaller が見つかりません。venv を有効化するか、pip install pyinstaller を実行してください。"
+}
+
+& $pyInstallerCmd.Source @pyArgs

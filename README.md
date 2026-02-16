@@ -76,6 +76,7 @@ pip install pyinstaller
 - mpv DLL は同梱せず、利用者が `bin\` に配置します
 - `assets\app\app.ico` が存在する場合、exeアイコンとウィンドウアイコンに反映されます
 - OBS 本体は同梱しません（各自でインストール）
+- ビルド成果物は `LoLReplayTool.exe` と同じ階層に `config` / `assets` / `bin` が配置されます（`_internal` 非使用）
 
 ### アイコン画像の推奨仕様
 - 形式: `.ico`（複数サイズ同梱）

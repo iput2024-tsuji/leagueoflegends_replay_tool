@@ -23,29 +23,35 @@ if (Test-Path $iconPath) {
   $pyArgs += "$iconPath;assets\\app"
 }
 
-$binCandidates = @(
-  "bin\\mpv-1.dll",
-  "bin\\libmpv-1.dll",
-  "bin\\mpv-2.dll",
-  "bin\\libmpv-2.dll"
-)
-
-foreach ($path in $binCandidates) {
-  if (Test-Path $path) {
-    $pyArgs += "--add-binary"
-    $pyArgs += "$path;bin"
-  }
-}
-
 $pyArgs += "main.py"
 $pyInstallerCmd = Get-Command pyinstaller -ErrorAction SilentlyContinue
+$buildExitCode = 0
 if (-not $pyInstallerCmd) {
   $venvPyInstaller = Join-Path (Get-Location) "venv\\Scripts\\pyinstaller.exe"
   if (Test-Path $venvPyInstaller) {
     & $venvPyInstaller @pyArgs
-    exit $LASTEXITCODE
+    $buildExitCode = $LASTEXITCODE
+  } else {
+    throw "pyinstaller が見つかりません。venv を有効化するか、pip install pyinstaller を実行してください。"
   }
-  throw "pyinstaller が見つかりません。venv を有効化するか、pip install pyinstaller を実行してください。"
+} else {
+  & $pyInstallerCmd.Source @pyArgs
+  $buildExitCode = $LASTEXITCODE
 }
 
-& $pyInstallerCmd.Source @pyArgs
+if ($buildExitCode -ne 0) {
+  exit $buildExitCode
+}
+
+$distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
+$distBinDir = Join-Path $distRootDir "bin"
+New-Item -ItemType Directory -Path $distBinDir -Force | Out-Null
+
+# Keep distribution clean: mpv DLLs must be user-provided, not bundled.
+$mpvDllPattern = '^(lib)?mpv-\d+\.dll$'
+$bundledMpvDlls = Get-ChildItem -Path $distRootDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+  $_.Name -match $mpvDllPattern
+}
+foreach ($dll in $bundledMpvDlls) {
+  Remove-Item -Path $dll.FullName -Force -ErrorAction SilentlyContinue
+}

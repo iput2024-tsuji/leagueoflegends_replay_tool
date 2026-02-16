@@ -74,6 +74,7 @@ pip install pyinstaller
 - 初回起動時に `config\setting.json` が自動生成されます
 - `config\setting.json` を編集して OBS パス等を設定してください
 - mpv DLL は同梱せず、利用者が `bin\` に配置します
+- ビルド時に `dist\LoLReplayTool\bin\` は空フォルダとして作成されます
 - `assets\app\app.ico` が存在する場合、exeアイコンとウィンドウアイコンに反映されます
 - OBS 本体は同梱しません（各自でインストール）
 - ビルド成果物は `LoLReplayTool.exe` と同じ階層に `config` / `assets` / `bin` が配置されます（`_internal` 非使用）

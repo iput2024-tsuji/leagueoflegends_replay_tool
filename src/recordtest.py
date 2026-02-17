@@ -94,6 +94,238 @@ def detect_obs_dir():
             return str(candidate)
     return None
 
+
+def _ensure_section_dict(root, key):
+    value = root.get(key)
+    if isinstance(value, dict):
+        return value, False
+    root[key] = {}
+    return root[key], True
+
+
+def _safe_int(value, default, minimum=None, maximum=None):
+    try:
+        parsed = int(value)
+    except Exception:
+        return default, False
+    if minimum is not None and parsed < minimum:
+        return default, False
+    if maximum is not None and parsed > maximum:
+        return default, False
+    return parsed, True
+
+
+def _safe_float(value, default, minimum=None):
+    try:
+        parsed = float(value)
+    except Exception:
+        return default, False
+    if minimum is not None and parsed < minimum:
+        return default, False
+    return parsed, True
+
+
+def _has_mpv_dll(bin_path):
+    names = (
+        "mpv-1.dll",
+        "libmpv-1.dll",
+        "mpv-2.dll",
+        "libmpv-2.dll",
+    )
+    return any((bin_path / name).exists() for name in names)
+
+
+def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
+    report = {
+        "config": cfg if isinstance(cfg, dict) else {},
+        "changed": False,
+        "notes": [],
+        "warnings": [],
+        "errors": [],
+    }
+    data = report["config"]
+    if data is not cfg:
+        report["changed"] = True
+        report["notes"].append("設定形式が不正だったため初期化しました。")
+
+    obs_cfg, replaced = _ensure_section_dict(data, "obs")
+    if replaced:
+        report["changed"] = True
+    paths_cfg, replaced = _ensure_section_dict(data, "paths")
+    if replaced:
+        report["changed"] = True
+    poll_cfg, replaced = _ensure_section_dict(data, "polling")
+    if replaced:
+        report["changed"] = True
+    storage_cfg, replaced = _ensure_section_dict(data, "storage")
+    if replaced:
+        report["changed"] = True
+
+    obs_defaults = {
+        "host": DEFAULT_OBS_HOST,
+        "port": DEFAULT_OBS_PORT,
+        "password": "",
+        "scene_name": DEFAULT_OBS_SCENE_NAME,
+        "source_name": DEFAULT_OBS_SOURCE_NAME,
+        "dir": DEFAULT_OBS_DIR,
+    }
+    path_defaults = {
+        "bin_dir": DEFAULT_BIN_DIR,
+        "recordings_dir": DEFAULT_RECORDINGS_DIR,
+        "json_dir": DEFAULT_JSON_DIR,
+        "champion_icons_dir": DEFAULT_CHAMPION_ICONS_DIR,
+        "champion_aliases_path": "config/champion_aliases.json",
+    }
+    poll_defaults = {
+        "end_error_limit": DEFAULT_END_ERROR_LIMIT,
+        "end_poll_sec": DEFAULT_END_POLL_SEC,
+        "event_poll_sec": DEFAULT_EVENT_POLL_SEC,
+    }
+    storage_defaults = {"max_size_gb": DEFAULT_MAX_STORAGE_GB}
+
+    def apply_defaults(target, defaults):
+        for key, value in defaults.items():
+            if target.get(key) in (None, ""):
+                if auto_fix:
+                    target[key] = value
+                    report["changed"] = True
+                    report["notes"].append(f"{key} を既定値で補完しました。")
+                else:
+                    report["errors"].append(f"{key} が未設定です。")
+
+    apply_defaults(obs_cfg, obs_defaults)
+    apply_defaults(paths_cfg, path_defaults)
+    apply_defaults(poll_cfg, poll_defaults)
+    apply_defaults(storage_cfg, storage_defaults)
+
+    if str(obs_cfg.get("password", "")).strip() == "your_password_here":
+        if auto_fix:
+            obs_cfg["password"] = ""
+            report["changed"] = True
+            report["notes"].append("OBSパスワードのプレースホルダを空欄にしました。")
+        else:
+            report["warnings"].append("OBSパスワードがプレースホルダのままです。")
+
+    port, ok = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
+    if not ok:
+        if auto_fix:
+            obs_cfg["port"] = port
+            report["changed"] = True
+        report["warnings"].append(f"OBSポートが不正だったため {port} を使用します。")
+
+    end_error_limit, ok = _safe_int(poll_cfg.get("end_error_limit"), DEFAULT_END_ERROR_LIMIT, minimum=1)
+    if not ok:
+        if auto_fix:
+            poll_cfg["end_error_limit"] = end_error_limit
+            report["changed"] = True
+        report["warnings"].append("end_error_limit が不正だったため既定値を使用します。")
+
+    end_poll_sec, ok = _safe_float(poll_cfg.get("end_poll_sec"), DEFAULT_END_POLL_SEC, minimum=0.1)
+    if not ok:
+        if auto_fix:
+            poll_cfg["end_poll_sec"] = end_poll_sec
+            report["changed"] = True
+        report["warnings"].append("end_poll_sec が不正だったため既定値を使用します。")
+
+    event_poll_sec, ok = _safe_float(poll_cfg.get("event_poll_sec"), DEFAULT_EVENT_POLL_SEC, minimum=0.1)
+    if not ok:
+        if auto_fix:
+            poll_cfg["event_poll_sec"] = event_poll_sec
+            report["changed"] = True
+        report["warnings"].append("event_poll_sec が不正だったため既定値を使用します。")
+
+    max_size_gb, ok = _safe_float(storage_cfg.get("max_size_gb"), DEFAULT_MAX_STORAGE_GB, minimum=0.1)
+    if not ok:
+        if auto_fix:
+            storage_cfg["max_size_gb"] = max_size_gb
+            report["changed"] = True
+        report["warnings"].append("max_size_gb が不正だったため既定値を使用します。")
+
+    recordings_dir = resolve_path(paths_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), ROOT_DIR)
+    json_dir = resolve_path(paths_cfg.get("json_dir", DEFAULT_JSON_DIR), ROOT_DIR)
+    bin_dir = resolve_path(paths_cfg.get("bin_dir", DEFAULT_BIN_DIR), ROOT_DIR)
+    icons_dir = resolve_path(paths_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), ROOT_DIR)
+
+    if recordings_dir is None:
+        report["errors"].append("recordings_dir の設定が無効です。")
+    if json_dir is None and recordings_dir is not None:
+        json_dir = recordings_dir / "json"
+        if auto_fix:
+            paths_cfg["json_dir"] = str(json_dir)
+            report["changed"] = True
+            report["notes"].append("json_dir が未設定のため recordings/json を設定しました。")
+
+    if ensure_dirs:
+        for path_value, label in (
+            (recordings_dir, "録画ディレクトリ"),
+            (json_dir, "JSONディレクトリ"),
+            (bin_dir, "binディレクトリ"),
+            (icons_dir, "チャンピオンアイコンディレクトリ"),
+        ):
+            if path_value is None:
+                continue
+            try:
+                path_value.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                report["errors"].append(f"{label} を作成できません: {path_value} ({e})")
+
+    if bin_dir and not _has_mpv_dll(bin_dir):
+        report["warnings"].append(
+            "binフォルダに mpv DLL が見つかりません。プレーヤー利用時に配置が必要です。"
+        )
+
+    current_obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), ROOT_DIR)
+    has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
+    if not has_valid_obs:
+        detected_obs_dir = detect_obs_dir()
+        if detected_obs_dir and auto_fix:
+            obs_cfg["dir"] = detected_obs_dir
+            report["changed"] = True
+            report["notes"].append(f"OBSフォルダを自動検出しました: {detected_obs_dir}")
+            current_obs_dir = resolve_path(detected_obs_dir, ROOT_DIR)
+            has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
+
+    if not has_valid_obs:
+        current = obs_cfg.get("dir")
+        report["errors"].append(
+            f"OBSフォルダが無効です: {current}\n"
+            "OBS Studio のインストール先、または bin/OBS-Studio を確認してください。"
+        )
+
+    return report
+
+
+def format_preflight_report(report):
+    lines = []
+    for note in report.get("notes", []):
+        lines.append(f"- {note}")
+    for warning in report.get("warnings", []):
+        lines.append(f"⚠️ {warning}")
+    for error in report.get("errors", []):
+        lines.append(f"❌ {error}")
+    return "\n".join(lines)
+
+
+def test_obs_connection(host, port, password, timeout=2.5):
+    client = None
+    try:
+        client = obs.ReqClient(
+            host=host,
+            port=int(port),
+            password=password or "",
+            timeout=timeout,
+        )
+        version = client.get_version()
+        return True, f"接続成功: OBS {version.obs_version}"
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if client:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+
 # ▼ 全員分保存する重要なイベント（オブジェクト）
 GLOBAL_OBJECTIVES = [
     "DragonKill",   # ドラゴン
@@ -131,6 +363,12 @@ def load_settings():
         )
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def save_settings(cfg):
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
 
 
 def apply_settings(cfg):
@@ -848,6 +1086,16 @@ if __name__ == "__main__":
     app = None
     try:
         settings = load_settings()
+        preflight = run_preflight_checks(settings, auto_fix=True, ensure_dirs=True)
+        if preflight.get("changed"):
+            save_settings(preflight["config"])
+            print("🛠️ 設定を自動補完しました。")
+        for warning in preflight.get("warnings", []):
+            print(f"⚠️ {warning}")
+        if preflight.get("errors"):
+            raise RecorderError("\n".join(preflight["errors"]))
+        settings = preflight["config"]
+
         apply_settings(settings)
         setup_environment()
         obs_process = launch_obs()

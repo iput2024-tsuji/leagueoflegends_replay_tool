@@ -6,6 +6,7 @@ LoLの試合録画（OBS自動制御）と、イベントログ同期再生プ�
 - 試合開始/終了の自動検知とOBS録画制御
 - 重要イベントのログ保存（自分のキル/デス + オブジェクト）
 - 録画動画とイベントの同期再生プレーヤー
+- 初回セットアップウィザード（OBS検出・接続テスト・自動診断）
 
 ## 必要環境
 - Windows
@@ -28,6 +29,8 @@ copy config\setting.sample.json config\setting.json
 - OBS WebSocket のポート/パスワード
 - シーン名 (`scene_name`) / 同期用の赤色ソース名 (`source_name`)
 - JSON保存先 (`paths.json_dir`)
+
+または、アプリ起動後に表示される「初回セットアップ」で自動検出・保存できます。
 
 ※ `config/setting.json` は `.gitignore` 済みです。
 
@@ -73,6 +76,7 @@ pip install pyinstaller
 出力先: `dist\LoLReplayTool\`
 - 初回起動時に `config\setting.json` が自動生成されます
 - `config\setting.json` を編集して OBS パス等を設定してください
+- 初回起動時はセットアップウィザードで設定できます
 - OBS は `bin\OBS-Studio` (ポータブル) を優先して利用します
 - シーン/同期用色ソースが不足している場合は起動時に自動作成します
 - mpv DLL は同梱せず、利用者が `bin\` に配置します
@@ -108,6 +112,7 @@ pip install pyinstaller
 2. `bin\` に mpv DLL を配置する（`mpv-1.dll` / `libmpv-1.dll` / `libmpv-2.dll` のいずれか）。
 3. `LoLReplayTool.exe` を起動し、`config\setting.json` が生成されることを確認する。
 4. アプリの設定画面で `obs.dir` / WebSocketポート / パスワード / シーン名 / ソース名を設定する。
+   - 迷った場合は「設定 > 録画前チェックを実行」で自動修復できます。
 
 ## JSONの内容（例）
 ```json

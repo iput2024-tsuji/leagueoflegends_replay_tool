@@ -15,8 +15,9 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QFormLayout,
     QLineEdit,
+    QDialog,
     QDialogButtonBox,
-    QMessageBox
+    QMessageBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon
@@ -71,6 +72,7 @@ def apply_auto_defaults(data, force_obs_detect=False):
     paths = data.setdefault("paths", {})
     polling = data.setdefault("polling", {})
     storage = data.setdefault("storage", {})
+    app_cfg = data.setdefault("app", {})
 
     defaults_obs = {
         "host": recordtest.DEFAULT_OBS_HOST,
@@ -96,10 +98,12 @@ def apply_auto_defaults(data, force_obs_detect=False):
             obs["dir"] = detected_obs_dir
             changed = True
             notes.append(f"OBSフォルダを自動検出しました: {detected_obs_dir}")
+            has_valid_dir = True
     elif not has_valid_dir and detected_obs_dir:
         obs["dir"] = detected_obs_dir
         changed = True
         notes.append(f"OBSフォルダを自動検出しました: {detected_obs_dir}")
+        has_valid_dir = True
     elif not current_obs_dir:
         obs["dir"] = recordtest.DEFAULT_OBS_DIR
         changed = True
@@ -130,7 +134,26 @@ def apply_auto_defaults(data, force_obs_detect=False):
         storage["max_size_gb"] = recordtest.DEFAULT_MAX_STORAGE_GB
         changed = True
 
+    if app_cfg.get("setup_completed") is None:
+        app_cfg["setup_completed"] = bool(has_valid_dir)
+        changed = True
+
     return data, changed, notes
+
+
+def format_report_lines(lines):
+    if not lines:
+        return "- なし"
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def run_preflight(config_data=None, auto_fix=True, force_obs_detect=True):
+    data = config_data if config_data is not None else load_config()
+    data, changed_defaults, default_notes = apply_auto_defaults(data, force_obs_detect=force_obs_detect)
+    report = recordtest.run_preflight_checks(data, auto_fix=auto_fix, ensure_dirs=True)
+    report["changed"] = bool(changed_defaults or report.get("changed"))
+    report["notes"] = list(default_notes) + list(report.get("notes", []))
+    return report
 
 
 def load_config():
@@ -169,7 +192,21 @@ class RecorderWorker(QThread):
 
     def run(self):
         try:
-            settings = recordtest.load_settings()
+            settings = load_config()
+            report = run_preflight(settings, auto_fix=True, force_obs_detect=True)
+            if report.get("changed"):
+                save_config(report["config"])
+
+            for note in report.get("notes", []):
+                self.status.emit(f"🛠️ {note}")
+            for warning in report.get("warnings", []):
+                self.status.emit(f"⚠️ {warning}")
+
+            errors = report.get("errors", [])
+            if errors:
+                raise recordtest.RecorderError("\n".join(errors))
+
+            settings = report["config"]
             recordtest.apply_settings(settings)
             recordtest.setup_environment()
             obs_process = recordtest.launch_obs()
@@ -214,6 +251,140 @@ class RecorderWorker(QThread):
         self.stop_flag = True
         if self.recorder:
             self.recorder.request_stop()
+
+
+class SetupWizardDialog(QDialog):
+    def __init__(self, parent=None, startup_mode=False):
+        super().__init__(parent)
+        self.startup_mode = startup_mode
+        self.setWindowTitle("初回セットアップ")
+        self.resize(520, 320)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "必要な設定を自動補完します。\n"
+            "OBSフォルダ・WebSocket設定・保存先を確認して保存してください。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        self.fields = {
+            "obs.dir": QLineEdit(),
+            "obs.port": QLineEdit(),
+            "obs.password": QLineEdit(),
+            "paths.recordings_dir": QLineEdit(),
+            "paths.json_dir": QLineEdit(),
+        }
+        form.addRow("OBSフォルダ", self.fields["obs.dir"])
+        form.addRow("OBSポート", self.fields["obs.port"])
+        form.addRow("OBSパスワード", self.fields["obs.password"])
+        form.addRow("録画ディレクトリ", self.fields["paths.recordings_dir"])
+        form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
+        layout.addLayout(form)
+
+        action_row = QHBoxLayout()
+        self.detect_btn = QPushButton("OBSを自動検出")
+        self.detect_btn.clicked.connect(self.auto_detect_obs_dir)
+        action_row.addWidget(self.detect_btn)
+
+        self.test_btn = QPushButton("接続テスト")
+        self.test_btn.clicked.connect(self.test_obs_connection)
+        action_row.addWidget(self.test_btn)
+
+        self.preflight_btn = QPushButton("自動診断")
+        self.preflight_btn.clicked.connect(self.run_diagnosis)
+        action_row.addWidget(self.preflight_btn)
+        layout.addLayout(action_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.save_and_accept)
+        buttons.rejected.connect(self.reject)
+        save_btn = buttons.button(QDialogButtonBox.StandardButton.Save)
+        if save_btn:
+            save_btn.setText("保存して開始" if self.startup_mode else "保存")
+        layout.addWidget(buttons)
+
+        self.load_values()
+
+    def load_values(self):
+        data = load_config()
+        obs = data.get("obs", {})
+        paths = data.get("paths", {})
+        self.fields["obs.dir"].setText(str(obs.get("dir", "")))
+        self.fields["obs.port"].setText(str(obs.get("port", "")))
+        self.fields["obs.password"].setText(str(obs.get("password", "")))
+        self.fields["paths.recordings_dir"].setText(str(paths.get("recordings_dir", "")))
+        self.fields["paths.json_dir"].setText(str(paths.get("json_dir", "")))
+
+    def collect_data(self):
+        data = load_config()
+        data.setdefault("obs", {})
+        data.setdefault("paths", {})
+        data.setdefault("app", {})
+
+        data["obs"]["dir"] = self.fields["obs.dir"].text().strip()
+        data["obs"]["password"] = self.fields["obs.password"].text().strip()
+        try:
+            data["obs"]["port"] = int(self.fields["obs.port"].text().strip())
+        except ValueError:
+            data["obs"]["port"] = self.fields["obs.port"].text().strip()
+
+        data["paths"]["recordings_dir"] = self.fields["paths.recordings_dir"].text().strip()
+        data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
+        return data
+
+    def auto_detect_obs_dir(self):
+        detected = recordtest.detect_obs_dir()
+        if not detected:
+            QMessageBox.warning(self, "自動検出", "OBSフォルダを検出できませんでした。手動で指定してください。")
+            return
+        self.fields["obs.dir"].setText(detected)
+        QMessageBox.information(self, "自動検出", f"OBSフォルダを検出しました。\n{detected}")
+
+    def test_obs_connection(self):
+        data = self.collect_data()
+        host = data.get("obs", {}).get("host", recordtest.DEFAULT_OBS_HOST)
+        port = data.get("obs", {}).get("port", recordtest.DEFAULT_OBS_PORT)
+        password = data.get("obs", {}).get("password", "")
+        ok, detail = recordtest.test_obs_connection(host, port, password)
+        if ok:
+            QMessageBox.information(self, "接続テスト", detail)
+        else:
+            QMessageBox.warning(
+                self,
+                "接続テスト",
+                f"接続に失敗しました。\n{detail}\n\nOBS起動後に再試行してください。"
+            )
+
+    def run_diagnosis(self):
+        data = self.collect_data()
+        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        if report.get("changed"):
+            save_config(report["config"])
+        self.load_values()
+
+        message = (
+            f"修正内容:\n{format_report_lines(report.get('notes', []))}\n\n"
+            f"警告:\n{format_report_lines(report.get('warnings', []))}"
+        )
+        if report.get("errors"):
+            message += f"\n\nエラー:\n{format_report_lines(report.get('errors', []))}"
+            QMessageBox.warning(self, "自動診断", message)
+        else:
+            QMessageBox.information(self, "自動診断", message)
+
+    def save_and_accept(self):
+        data = self.collect_data()
+        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        report["config"].setdefault("app", {})["setup_completed"] = True
+
+        if report.get("errors"):
+            QMessageBox.critical(self, "保存できません", format_report_lines(report.get("errors", [])))
+            return
+
+        save_config(report["config"])
+        self.accept()
 
 
 class HomePage(QWidget):
@@ -369,11 +540,13 @@ class SettingsPage(QWidget):
         super().__init__()
         self.form = QFormLayout(self)
         self.fields = {}
+        self.advanced_visible = False
 
         back_btn = QPushButton("← 戻る")
         back_btn.clicked.connect(on_back)
         self.form.addRow(back_btn)
 
+        self.fields["obs.host"] = QLineEdit()
         self.fields["obs.dir"] = QLineEdit()
         self.fields["obs.password"] = QLineEdit()
         self.fields["obs.port"] = QLineEdit()
@@ -384,20 +557,45 @@ class SettingsPage(QWidget):
         self.fields["paths.json_dir"] = QLineEdit()
         self.fields["paths.champion_icons_dir"] = QLineEdit()
         self.fields["storage.max_size_gb"] = QLineEdit()
+        self.fields["polling.end_error_limit"] = QLineEdit()
+        self.fields["polling.end_poll_sec"] = QLineEdit()
+        self.fields["polling.event_poll_sec"] = QLineEdit()
 
         self.form.addRow("OBSフォルダ", self.fields["obs.dir"])
         self.form.addRow("OBSパスワード", self.fields["obs.password"])
         self.form.addRow("OBSポート", self.fields["obs.port"])
-        self.form.addRow("シーン名", self.fields["obs.scene_name"])
-        self.form.addRow("ソース名", self.fields["obs.source_name"])
         self.form.addRow("録画ディレクトリ", self.fields["paths.recordings_dir"])
         self.form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
         self.form.addRow("アイコンディレクトリ", self.fields["paths.champion_icons_dir"])
         self.form.addRow("最大容量(GB)", self.fields["storage.max_size_gb"])
 
+        self.advanced_toggle_btn = QPushButton("詳細設定を表示")
+        self.advanced_toggle_btn.clicked.connect(self.toggle_advanced_settings)
+        self.form.addRow(self.advanced_toggle_btn)
+
+        self.advanced_widget = QWidget()
+        advanced_form = QFormLayout(self.advanced_widget)
+        advanced_form.setContentsMargins(0, 0, 0, 0)
+        advanced_form.addRow("OBSホスト", self.fields["obs.host"])
+        advanced_form.addRow("シーン名", self.fields["obs.scene_name"])
+        advanced_form.addRow("ソース名", self.fields["obs.source_name"])
+        advanced_form.addRow("終了検知エラー閾値", self.fields["polling.end_error_limit"])
+        advanced_form.addRow("終了監視間隔(秒)", self.fields["polling.end_poll_sec"])
+        advanced_form.addRow("イベント監視間隔(秒)", self.fields["polling.event_poll_sec"])
+        self.advanced_widget.setVisible(False)
+        self.form.addRow(self.advanced_widget)
+
+        self.setup_btn = QPushButton("初回セットアップを開く")
+        self.setup_btn.clicked.connect(self.open_setup_wizard)
+        self.form.addRow(self.setup_btn)
+
         self.auto_fill_btn = QPushButton("設定を自動補完")
         self.auto_fill_btn.clicked.connect(self.auto_fill_settings)
         self.form.addRow(self.auto_fill_btn)
+
+        self.preflight_btn = QPushButton("録画前チェックを実行")
+        self.preflight_btn.clicked.connect(self.run_preflight_fix)
+        self.form.addRow(self.preflight_btn)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Reset)
         buttons.accepted.connect(self.save_settings)
@@ -406,12 +604,19 @@ class SettingsPage(QWidget):
 
         self.load_settings()
 
+    def toggle_advanced_settings(self):
+        self.advanced_visible = not self.advanced_visible
+        self.advanced_widget.setVisible(self.advanced_visible)
+        self.advanced_toggle_btn.setText("詳細設定を隠す" if self.advanced_visible else "詳細設定を表示")
+
     def load_settings(self):
         data = load_config()
         obs = data.get("obs", {})
         paths = data.get("paths", {})
         storage = data.get("storage", {})
+        polling = data.get("polling", {})
 
+        self.fields["obs.host"].setText(str(obs.get("host", "")))
         self.fields["obs.dir"].setText(str(obs.get("dir", "")))
         self.fields["obs.password"].setText(str(obs.get("password", "")))
         self.fields["obs.port"].setText(str(obs.get("port", "")))
@@ -421,13 +626,19 @@ class SettingsPage(QWidget):
         self.fields["paths.json_dir"].setText(str(paths.get("json_dir", "")))
         self.fields["paths.champion_icons_dir"].setText(str(paths.get("champion_icons_dir", "")))
         self.fields["storage.max_size_gb"].setText(str(storage.get("max_size_gb", "")))
+        self.fields["polling.end_error_limit"].setText(str(polling.get("end_error_limit", "")))
+        self.fields["polling.end_poll_sec"].setText(str(polling.get("end_poll_sec", "")))
+        self.fields["polling.event_poll_sec"].setText(str(polling.get("event_poll_sec", "")))
 
     def save_settings(self):
         data = load_config()
         data.setdefault("obs", {})
         data.setdefault("paths", {})
         data.setdefault("storage", {})
+        data.setdefault("polling", {})
+        data.setdefault("app", {})
 
+        data["obs"]["host"] = self.fields["obs.host"].text().strip()
         data["obs"]["dir"] = self.fields["obs.dir"].text().strip()
         data["obs"]["password"] = self.fields["obs.password"].text().strip()
         try:
@@ -444,8 +655,28 @@ class SettingsPage(QWidget):
             data["storage"]["max_size_gb"] = float(self.fields["storage.max_size_gb"].text().strip())
         except ValueError:
             pass
+        try:
+            data["polling"]["end_error_limit"] = int(self.fields["polling.end_error_limit"].text().strip())
+        except ValueError:
+            pass
+        try:
+            data["polling"]["end_poll_sec"] = float(self.fields["polling.end_poll_sec"].text().strip())
+        except ValueError:
+            pass
+        try:
+            data["polling"]["event_poll_sec"] = float(self.fields["polling.event_poll_sec"].text().strip())
+        except ValueError:
+            pass
 
-        save_config(data)
+        report = run_preflight(data, auto_fix=True, force_obs_detect=False)
+        if report.get("errors"):
+            QMessageBox.critical(self, "保存エラー", format_report_lines(report.get("errors", [])))
+            return
+
+        report["config"]["app"]["setup_completed"] = True
+        save_config(report["config"])
+        self.load_settings()
+        QMessageBox.information(self, "設定保存", "設定を保存しました。")
 
     def auto_fill_settings(self):
         data = load_config()
@@ -459,6 +690,28 @@ class SettingsPage(QWidget):
         else:
             note_text = "- 変更なし"
         QMessageBox.information(self, "自動補完", f"設定の自動補完を実行しました。\n{note_text}")
+
+    def run_preflight_fix(self):
+        data = load_config()
+        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        if report.get("changed"):
+            save_config(report["config"])
+        self.load_settings()
+
+        message = (
+            f"修正内容:\n{format_report_lines(report.get('notes', []))}\n\n"
+            f"警告:\n{format_report_lines(report.get('warnings', []))}"
+        )
+        if report.get("errors"):
+            message += f"\n\nエラー:\n{format_report_lines(report.get('errors', []))}"
+            QMessageBox.warning(self, "録画前チェック", message)
+        else:
+            QMessageBox.information(self, "録画前チェック", message)
+
+    def open_setup_wizard(self):
+        dialog = SetupWizardDialog(self, startup_mode=False)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.load_settings()
 
 
 class MainWindow(QMainWindow):
@@ -488,6 +741,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.settings_page)
 
         self.show_home()
+        self.run_startup_setup()
 
     def show_home(self):
         self.player_page.on_leave()
@@ -504,6 +758,29 @@ class MainWindow(QMainWindow):
     def show_settings(self):
         self.player_page.on_leave()
         self.stack.setCurrentWidget(self.settings_page)
+
+    def run_startup_setup(self):
+        data = load_config()
+        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        if report.get("changed"):
+            save_config(report["config"])
+            self.settings_page.load_settings()
+
+        setup_completed = bool(report["config"].get("app", {}).get("setup_completed"))
+        has_errors = bool(report.get("errors"))
+
+        if has_errors:
+            QMessageBox.warning(
+                self,
+                "初回セットアップ",
+                "設定に不足があります。初回セットアップを開きます。\n\n"
+                f"{format_report_lines(report.get('errors', []))}"
+            )
+
+        if (not setup_completed) or has_errors:
+            dialog = SetupWizardDialog(self, startup_mode=True)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                self.settings_page.load_settings()
 
 
 def main():

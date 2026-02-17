@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -14,7 +15,8 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QFormLayout,
     QLineEdit,
-    QDialogButtonBox
+    QDialogButtonBox,
+    QMessageBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon
@@ -48,6 +50,89 @@ def get_app_icon():
     return None
 
 
+def _normalize_obs_dir(path_value):
+    if not path_value:
+        return None
+    path_text = os.path.expandvars(str(path_value).strip())
+    if not path_text:
+        return None
+    return path_text
+
+
+def apply_auto_defaults(data, force_obs_detect=False):
+    changed = False
+    notes = []
+
+    if not isinstance(data, dict):
+        data = {}
+        changed = True
+
+    obs = data.setdefault("obs", {})
+    paths = data.setdefault("paths", {})
+    polling = data.setdefault("polling", {})
+    storage = data.setdefault("storage", {})
+
+    defaults_obs = {
+        "host": recordtest.DEFAULT_OBS_HOST,
+        "port": recordtest.DEFAULT_OBS_PORT,
+        "scene_name": recordtest.DEFAULT_OBS_SCENE_NAME,
+        "source_name": recordtest.DEFAULT_OBS_SOURCE_NAME,
+    }
+    for key, value in defaults_obs.items():
+        if obs.get(key) in (None, ""):
+            obs[key] = value
+            changed = True
+
+    if str(obs.get("password", "")).strip() == "your_password_here":
+        obs["password"] = ""
+        changed = True
+        notes.append("OBSパスワードのプレースホルダを空欄にしました")
+
+    current_obs_dir = _normalize_obs_dir(obs.get("dir"))
+    has_valid_dir = bool(current_obs_dir and recordtest.is_valid_obs_dir(current_obs_dir))
+    detected_obs_dir = recordtest.detect_obs_dir()
+    if force_obs_detect and detected_obs_dir:
+        if current_obs_dir != detected_obs_dir:
+            obs["dir"] = detected_obs_dir
+            changed = True
+            notes.append(f"OBSフォルダを自動検出しました: {detected_obs_dir}")
+    elif not has_valid_dir and detected_obs_dir:
+        obs["dir"] = detected_obs_dir
+        changed = True
+        notes.append(f"OBSフォルダを自動検出しました: {detected_obs_dir}")
+    elif not current_obs_dir:
+        obs["dir"] = recordtest.DEFAULT_OBS_DIR
+        changed = True
+
+    defaults_paths = {
+        "bin_dir": recordtest.DEFAULT_BIN_DIR,
+        "recordings_dir": recordtest.DEFAULT_RECORDINGS_DIR,
+        "json_dir": recordtest.DEFAULT_JSON_DIR,
+        "champion_icons_dir": recordtest.DEFAULT_CHAMPION_ICONS_DIR,
+        "champion_aliases_path": "config/champion_aliases.json",
+    }
+    for key, value in defaults_paths.items():
+        if paths.get(key) in (None, ""):
+            paths[key] = value
+            changed = True
+
+    defaults_polling = {
+        "end_error_limit": recordtest.DEFAULT_END_ERROR_LIMIT,
+        "end_poll_sec": recordtest.DEFAULT_END_POLL_SEC,
+        "event_poll_sec": recordtest.DEFAULT_EVENT_POLL_SEC,
+    }
+    for key, value in defaults_polling.items():
+        if polling.get(key) in (None, ""):
+            polling[key] = value
+            changed = True
+
+    if storage.get("max_size_gb") in (None, ""):
+        storage["max_size_gb"] = recordtest.DEFAULT_MAX_STORAGE_GB
+        changed = True
+
+    return data, changed, notes
+
+
 def load_config():
     if not CONFIG_PATH.exists():
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -55,8 +140,16 @@ def load_config():
             CONFIG_PATH.write_text(SAMPLE_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
         else:
             CONFIG_PATH.write_text(json.dumps({}, indent=4), encoding="utf-8")
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+
+    data, changed, _ = apply_auto_defaults(data, force_obs_detect=False)
+    if changed:
+        save_config(data)
+    return data
 
 
 def save_config(data):
@@ -66,6 +159,7 @@ def save_config(data):
 
 class RecorderWorker(QThread):
     status = pyqtSignal(str)
+    error = pyqtSignal(str)
     finished = pyqtSignal()
 
     def __init__(self):
@@ -98,6 +192,15 @@ class RecorderWorker(QThread):
                 if self.recorder.has_session_data():
                     self.recorder.save_json()
                 self.status.emit("✅ 試合記録完了。次の試合を待機します。")
+        except recordtest.RecorderError as e:
+            message = str(e).strip() or "録画処理でエラーが発生しました。"
+            first_line = message.splitlines()[0]
+            self.status.emit(f"❌ {first_line}")
+            self.error.emit(message)
+        except BaseException as e:
+            message = f"{type(e).__name__}: {e}"
+            self.status.emit(f"❌ {message}")
+            self.error.emit(message)
         finally:
             if self.recorder:
                 self.recorder.request_stop()
@@ -190,6 +293,7 @@ class RecorderPage(QWidget):
             return
         self.worker = RecorderWorker()
         self.worker.status.connect(self.append_log)
+        self.worker.error.connect(self.on_worker_error)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
         self.start_btn.setEnabled(False)
@@ -205,6 +309,13 @@ class RecorderPage(QWidget):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.append_log("録画待機を終了しました。")
+
+    def on_worker_error(self, message):
+        detail = (
+            f"{message}\n\n"
+            "設定画面で OBSフォルダ・ポート・パスワードを確認してください。"
+        )
+        QMessageBox.critical(self, "録画エラー", detail)
 
 
 class PlayerPage(QWidget):
@@ -284,6 +395,10 @@ class SettingsPage(QWidget):
         self.form.addRow("アイコンディレクトリ", self.fields["paths.champion_icons_dir"])
         self.form.addRow("最大容量(GB)", self.fields["storage.max_size_gb"])
 
+        self.auto_fill_btn = QPushButton("設定を自動補完")
+        self.auto_fill_btn.clicked.connect(self.auto_fill_settings)
+        self.form.addRow(self.auto_fill_btn)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Reset)
         buttons.accepted.connect(self.save_settings)
         buttons.rejected.connect(self.load_settings)
@@ -331,6 +446,19 @@ class SettingsPage(QWidget):
             pass
 
         save_config(data)
+
+    def auto_fill_settings(self):
+        data = load_config()
+        data, changed, notes = apply_auto_defaults(data, force_obs_detect=True)
+        if changed:
+            save_config(data)
+        self.load_settings()
+
+        if notes:
+            note_text = "\n".join(f"- {line}" for line in notes)
+        else:
+            note_text = "- 変更なし"
+        QMessageBox.information(self, "自動補完", f"設定の自動補完を実行しました。\n{note_text}")
 
 
 class MainWindow(QMainWindow):

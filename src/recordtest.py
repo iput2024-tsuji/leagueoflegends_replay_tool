@@ -29,7 +29,7 @@ ALL_GAME_URL = f"{LIVECLIENT_BASE}/allgamedata"
 DEFAULT_OBS_PASSWORD = "password"
 DEFAULT_OBS_SCENE_NAME = "lol_seen"
 DEFAULT_OBS_SOURCE_NAME = "color"
-DEFAULT_OBS_DIR = "C:/Program Files/obs-studio"
+DEFAULT_OBS_DIR = "bin/OBS-Studio"
 DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
 DEFAULT_JSON_DIR = "recordings/json"
@@ -55,6 +55,44 @@ END_ERROR_LIMIT = DEFAULT_END_ERROR_LIMIT
 END_POLL_SEC = DEFAULT_END_POLL_SEC
 EVENT_POLL_SEC = DEFAULT_EVENT_POLL_SEC
 MAX_STORAGE_BYTES = None
+
+
+class RecorderError(RuntimeError):
+    pass
+
+
+def obs_executable_path(base_dir):
+    if not base_dir:
+        return None
+    return Path(base_dir) / "bin" / "64bit" / "obs64.exe"
+
+
+def is_valid_obs_dir(base_dir):
+    obs_exe = obs_executable_path(base_dir)
+    return bool(obs_exe and obs_exe.exists())
+
+
+def detect_obs_dir():
+    candidates = []
+
+    # Prefer portable OBS bundled next to the app.
+    candidates.append(ROOT_DIR / "bin" / "OBS-Studio")
+
+    program_files = os.environ.get("ProgramFiles")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+    if program_files:
+        candidates.append(Path(program_files) / "obs-studio")
+        candidates.append(Path(program_files) / "OBS Studio")
+    if program_files_x86:
+        candidates.append(Path(program_files_x86) / "obs-studio")
+        candidates.append(Path(program_files_x86) / "OBS Studio")
+
+    candidates.append(Path(DEFAULT_OBS_DIR))
+
+    for candidate in candidates:
+        if is_valid_obs_dir(candidate):
+            return str(candidate)
+    return None
 
 # ▼ 全員分保存する重要なイベント（オブジェクト）
 GLOBAL_OBJECTIVES = [
@@ -85,11 +123,12 @@ def resolve_path(value, base_dir):
 
 def load_settings():
     if not CONFIG_PATH.exists():
-        print("❌ 設定ファイルが見つかりません。")
-        print(f"作成先: {CONFIG_PATH}")
-        print(f"雛形: {SAMPLE_CONFIG_PATH}")
-        print("雛形をコピーして setting.json を作成してください。")
-        sys.exit(1)
+        raise RecorderError(
+            "設定ファイルが見つかりません。\n"
+            f"作成先: {CONFIG_PATH}\n"
+            f"雛形: {SAMPLE_CONFIG_PATH}\n"
+            "雛形をコピーして setting.json を作成してください。"
+        )
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -134,8 +173,7 @@ def apply_settings(cfg):
     MAX_STORAGE_BYTES = parse_max_storage_bytes(storage_cfg)
 
     if JSON_DIR is None:
-        print("❌ json_dir の設定が無効です。")
-        sys.exit(1)
+        raise RecorderError("json_dir の設定が無効です。設定画面で JSON ディレクトリを確認してください。")
     JSON_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -276,15 +314,15 @@ def enforce_storage_limit(keep_paths=None):
 def launch_obs():
     """OBSを最小化モードで起動する"""
     if not OBS_DIR:
-        print("❌ エラー: OBSのパスが未設定です。")
-        sys.exit(1)
+        raise RecorderError("OBSのパスが未設定です。設定画面の OBSフォルダ (obs.dir) を指定してください。")
 
     obs_exe = os.path.join(OBS_DIR, "bin", "64bit", "obs64.exe")
     working_dir = os.path.join(OBS_DIR, "bin", "64bit")
 
     if not os.path.exists(obs_exe):
-        print(f"❌ エラー: OBSの実行ファイルが見つかりません。\nパス: {obs_exe}")
-        sys.exit(1)
+        detected = detect_obs_dir()
+        hint = f"\n自動検出候補: {detected}" if detected else ""
+        raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
     print("🚀 OBSを起動しています (タスクトレイに最小化)...")
     cmd = [obs_exe, "--portable", "--minimize-to-tray"]
@@ -295,8 +333,7 @@ def launch_obs():
         time.sleep(5)
         return process
     except Exception as e:
-        print(f"❌ OBS起動エラー: {e}")
-        sys.exit(1)
+        raise RecorderError(f"OBS起動エラー: {e}") from e
 
 
 def get_active_player_name():
@@ -369,6 +406,7 @@ class LoLAutoRecorder:
         self.stop_requested = False
         self.reset_session()
         self.connect_obs()
+        self.ensure_sync_setup()
 
     def log(self, message):
         print(message)
@@ -415,6 +453,7 @@ class LoLAutoRecorder:
     def connect_obs(self):
         """OBS WebSocketに接続"""
         retry_count = 0
+        last_error = None
         while retry_count < 5:
             try:
                 self.client = obs.ReqClient(
@@ -425,13 +464,18 @@ class LoLAutoRecorder:
                 version = self.client.get_version()
                 print(f"✅ OBS接続成功 (v{version.obs_version})")
                 return
-            except Exception:
+            except Exception as e:
+                last_error = e
                 retry_count += 1
                 print(f"Connection retrying... ({retry_count}/5)")
                 time.sleep(2)
 
-        print("❌ OBSへの接続に失敗しました。パスワードやポートを確認してください。")
-        sys.exit(1)
+        raise RecorderError(
+            "OBS WebSocketへの接続に失敗しました。\n"
+            f"接続先: {OBS_HOST}:{OBS_PORT}\n"
+            f"パスワード設定: {'あり' if OBS_PASSWORD else 'なし'}\n"
+            f"詳細: {last_error}"
+        )
 
     def get_source_id(self):
         """同期用ソース(赤色)のIDを取得"""
@@ -443,6 +487,88 @@ class LoLAutoRecorder:
         except Exception as e:
             print(f"⚠️ シーンアイテム取得エラー: {e}")
         return None
+
+    def ensure_sync_setup(self):
+        self.ensure_scene_exists()
+        self.ensure_sync_source_exists()
+
+    def ensure_scene_exists(self):
+        try:
+            scene_resp = self.client.get_scene_list()
+            scene_items = getattr(scene_resp, "scenes", []) or []
+            scene_names = {item.get("sceneName") for item in scene_items if isinstance(item, dict)}
+        except Exception as e:
+            raise RecorderError(f"シーン一覧の取得に失敗しました: {e}") from e
+
+        if OBS_SCENE_NAME in scene_names:
+            return
+
+        self.log(f"ℹ️ シーン '{OBS_SCENE_NAME}' が見つからないため自動作成します。")
+        try:
+            self.client.create_scene(OBS_SCENE_NAME)
+        except Exception as e:
+            raise RecorderError(f"シーン '{OBS_SCENE_NAME}' の自動作成に失敗しました: {e}") from e
+
+    def ensure_sync_source_exists(self):
+        input_exists = False
+        try:
+            input_resp = self.client.get_input_list()
+            input_items = getattr(input_resp, "inputs", []) or []
+            input_exists = any(
+                isinstance(item, dict) and item.get("inputName") == OBS_SOURCE_NAME
+                for item in input_items
+            )
+        except Exception:
+            input_exists = False
+
+        if not input_exists:
+            self.log(f"ℹ️ 色ソース '{OBS_SOURCE_NAME}' を自動作成します。")
+            settings = {"color": 4294901760, "width": 100, "height": 100}
+            last_error = None
+            for kind in ("color_source_v3", "color_source"):
+                try:
+                    self.client.create_input(
+                        OBS_SCENE_NAME,
+                        OBS_SOURCE_NAME,
+                        kind,
+                        settings,
+                        False
+                    )
+                    input_exists = True
+                    break
+                except Exception as e:
+                    last_error = e
+            if not input_exists:
+                raise RecorderError(f"色ソース '{OBS_SOURCE_NAME}' の自動作成に失敗しました: {last_error}")
+
+        scene_item_id = self.get_source_id()
+        if scene_item_id is None:
+            try:
+                self.client.create_scene_item(OBS_SCENE_NAME, OBS_SOURCE_NAME, False)
+                scene_item_id = self.get_source_id()
+            except Exception as e:
+                raise RecorderError(
+                    f"色ソース '{OBS_SOURCE_NAME}' をシーン '{OBS_SCENE_NAME}' に配置できませんでした: {e}"
+                ) from e
+
+        if scene_item_id is None:
+            raise RecorderError(
+                f"色ソース '{OBS_SOURCE_NAME}' は存在しますが、シーン '{OBS_SCENE_NAME}' で見つかりません。"
+            )
+
+        try:
+            self.client.set_scene_item_transform(
+                OBS_SCENE_NAME,
+                scene_item_id,
+                {"positionX": 0.0, "positionY": 0.0, "alignment": 5}
+            )
+        except Exception:
+            pass
+
+        try:
+            self.client.set_scene_item_enabled(OBS_SCENE_NAME, scene_item_id, False)
+        except Exception:
+            pass
 
     def try_update_player_name(self):
         name = get_active_player_name()
@@ -719,14 +845,14 @@ class LoLAutoRecorder:
 
 
 if __name__ == "__main__":
-    settings = load_settings()
-    apply_settings(settings)
-
-    setup_environment()
-    obs_process = launch_obs()
-
-    app = LoLAutoRecorder(obs_process=obs_process)
+    app = None
     try:
+        settings = load_settings()
+        apply_settings(settings)
+        setup_environment()
+        obs_process = launch_obs()
+
+        app = LoLAutoRecorder(obs_process=obs_process)
         while True:
             app.reset_session()
             app.wait_for_game_start()
@@ -737,9 +863,13 @@ if __name__ == "__main__":
             print("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
         print("\n中断を検知しました。終了処理を行います。")
+    except RecorderError as e:
+        print(f"❌ {e}")
+        sys.exit(1)
     finally:
-        app.stop_recording()
-        if app.has_session_data():
-            app.save_json()
-        app.shutdown_obs()
+        if app:
+            app.stop_recording()
+            if app.has_session_data():
+                app.save_json()
+            app.shutdown_obs()
         print("👋 全ての処理が完了しました。")

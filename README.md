@@ -73,6 +73,8 @@ pip install pyinstaller
 出力先: `dist\LoLReplayTool\`
 - 初回起動時に `config\setting.json` が自動生成されます
 - `config\setting.json` を編集して OBS パス等を設定してください
+- OBS は `bin\OBS-Studio` (ポータブル) を優先して利用します
+- シーン/同期用色ソースが不足している場合は起動時に自動作成します
 - mpv DLL は同梱せず、利用者が `bin\` に配置します
 - ビルド時に `dist\LoLReplayTool\bin\` は空フォルダとして作成されます
 - `assets\app\app.ico` が存在する場合、exeアイコンとウィンドウアイコンに反映されます

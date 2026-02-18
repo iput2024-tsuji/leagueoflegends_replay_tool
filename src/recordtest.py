@@ -29,6 +29,8 @@ ALL_GAME_URL = f"{LIVECLIENT_BASE}/allgamedata"
 DEFAULT_OBS_PASSWORD = "password"
 DEFAULT_OBS_SCENE_NAME = "lol_seen"
 DEFAULT_OBS_SOURCE_NAME = "color"
+# OBS color_source の color 値は ABGR。赤は 0xFF0000FF。
+DEFAULT_OBS_SOURCE_COLOR = 0xFF0000FF
 DEFAULT_OBS_DIR = "bin/OBS-Studio"
 DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
@@ -44,6 +46,7 @@ DEFAULT_MAX_STORAGE_GB = 50
 OBS_PASSWORD = DEFAULT_OBS_PASSWORD
 OBS_SCENE_NAME = DEFAULT_OBS_SCENE_NAME
 OBS_SOURCE_NAME = DEFAULT_OBS_SOURCE_NAME
+OBS_SOURCE_COLOR = DEFAULT_OBS_SOURCE_COLOR
 OBS_DIR = DEFAULT_OBS_DIR
 BIN_DIR = DEFAULT_BIN_DIR
 RECORDINGS_DIR = None
@@ -125,6 +128,42 @@ def _safe_float(value, default, minimum=None):
     return parsed, True
 
 
+def parse_obs_source_color(value, default=DEFAULT_OBS_SOURCE_COLOR):
+    if value is None:
+        return default, False
+    if isinstance(value, int):
+        return value & 0xFFFFFFFF, True
+
+    text = str(value).strip()
+    if not text:
+        return default, False
+
+    # #RRGGBB は ABGR に変換する
+    if text.startswith("#") and len(text) == 7:
+        try:
+            rgb = int(text[1:], 16)
+            red = (rgb >> 16) & 0xFF
+            green = (rgb >> 8) & 0xFF
+            blue = rgb & 0xFF
+            color = (0xFF << 24) | (blue << 16) | (green << 8) | red
+            return color, True
+        except Exception:
+            return default, False
+
+    try:
+        return int(text, 0) & 0xFFFFFFFF, True
+    except Exception:
+        return default, False
+
+
+def obs_color_to_hex(color_value):
+    value, _ = parse_obs_source_color(color_value, default=DEFAULT_OBS_SOURCE_COLOR)
+    red = value & 0xFF
+    green = (value >> 8) & 0xFF
+    blue = (value >> 16) & 0xFF
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
 def _has_mpv_dll(bin_path):
     names = (
         "mpv-1.dll",
@@ -167,6 +206,7 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
         "password": "",
         "scene_name": DEFAULT_OBS_SCENE_NAME,
         "source_name": DEFAULT_OBS_SOURCE_NAME,
+        "source_color": DEFAULT_OBS_SOURCE_COLOR,
         "dir": DEFAULT_OBS_DIR,
     }
     path_defaults = {
@@ -212,6 +252,13 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
             obs_cfg["port"] = port
             report["changed"] = True
         report["warnings"].append(f"OBSポートが不正だったため {port} を使用します。")
+
+    source_color, ok = parse_obs_source_color(obs_cfg.get("source_color"), default=DEFAULT_OBS_SOURCE_COLOR)
+    if not ok:
+        if auto_fix:
+            obs_cfg["source_color"] = source_color
+            report["changed"] = True
+        report["warnings"].append("source_color が不正だったため赤 (#FF0000) を使用します。")
 
     end_error_limit, ok = _safe_int(poll_cfg.get("end_error_limit"), DEFAULT_END_ERROR_LIMIT, minimum=1)
     if not ok:
@@ -307,22 +354,67 @@ def format_preflight_report(report):
 
 
 def test_obs_connection(host, port, password, timeout=2.5):
-    client = None
+    host_text = str(host or "").strip() or DEFAULT_OBS_HOST
     try:
-        client = obs.ReqClient(
-            host=host,
-            port=int(port),
-            password=password or "",
-            timeout=timeout,
+        port_num = int(port)
+    except Exception:
+        return False, f"OBSポートが不正です: {port}"
+
+    # localhost と 127.0.0.1 の差分で失敗する環境を吸収する
+    host_candidates = [host_text]
+    if host_text == "localhost":
+        host_candidates.append("127.0.0.1")
+    elif host_text == "127.0.0.1":
+        host_candidates.append("localhost")
+
+    last_error = None
+    for candidate in host_candidates:
+        client = None
+        try:
+            client = obs.ReqClient(
+                host=candidate,
+                port=port_num,
+                password=password or "",
+                timeout=timeout,
+            )
+            version = client.get_version()
+            suffix = f" (host={candidate})" if candidate != host_text else ""
+            return True, f"接続成功: OBS {version.obs_version}{suffix}"
+        except Exception as e:
+            last_error = e
+            message = f"{type(e).__name__}: {e}".lower()
+            if any(token in message for token in ("auth", "authentication", "password", "identify")):
+                return False, "OBSには到達しましたが認証に失敗しました。WebSocketパスワードを確認してください。"
+        finally:
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+
+    if last_error:
+        return (
+            False,
+            "OBS WebSocket に接続できません。OBS設定で WebSocket有効化 / ポート番号 を確認してください。\n"
+            f"詳細: {type(last_error).__name__}: {last_error}"
         )
-        version = client.get_version()
-        return True, f"接続成功: OBS {version.obs_version}"
-    except Exception as e:
-        return False, str(e)
+    return False, "OBS接続テストに失敗しました。"
+
+
+def setup_obs_sync_elements(cfg, status_cb=None):
+    apply_settings(cfg)
+    recorder = None
+    try:
+        recorder = LoLAutoRecorder(obs_process=None, status_cb=status_cb, auto_setup=True)
+        return {
+            "scene_name": OBS_SCENE_NAME,
+            "source_name": OBS_SOURCE_NAME,
+            "source_color": OBS_SOURCE_COLOR,
+        }
     finally:
-        if client:
+        if recorder and recorder.client:
             try:
-                client.disconnect()
+                recorder.client.disconnect()
             except Exception:
                 pass
 
@@ -372,7 +464,7 @@ def save_settings(cfg):
 
 
 def apply_settings(cfg):
-    global OBS_PASSWORD, OBS_SCENE_NAME, OBS_SOURCE_NAME, OBS_DIR, BIN_DIR
+    global OBS_PASSWORD, OBS_SCENE_NAME, OBS_SOURCE_NAME, OBS_SOURCE_COLOR, OBS_DIR, BIN_DIR
     global RECORDINGS_DIR, JSON_DIR, OBS_HOST, OBS_PORT, CHAMPION_ICONS_DIR
     global END_ERROR_LIMIT, END_POLL_SEC, EVENT_POLL_SEC, MAX_STORAGE_BYTES
 
@@ -384,6 +476,7 @@ def apply_settings(cfg):
     OBS_PASSWORD = obs_cfg.get("password", DEFAULT_OBS_PASSWORD)
     OBS_SCENE_NAME = obs_cfg.get("scene_name", DEFAULT_OBS_SCENE_NAME)
     OBS_SOURCE_NAME = obs_cfg.get("source_name", DEFAULT_OBS_SOURCE_NAME)
+    OBS_SOURCE_COLOR, _ = parse_obs_source_color(obs_cfg.get("source_color"), default=DEFAULT_OBS_SOURCE_COLOR)
     OBS_HOST = obs_cfg.get("host", DEFAULT_OBS_HOST)
     OBS_PORT = int(obs_cfg.get("port", DEFAULT_OBS_PORT))
 
@@ -636,7 +729,7 @@ def save_payload(path, payload):
 
 
 class LoLAutoRecorder:
-    def __init__(self, obs_process=None, status_cb=None):
+    def __init__(self, obs_process=None, status_cb=None, auto_setup=False):
         self.client = None
         self.my_name = None
         self.obs_process = obs_process
@@ -644,7 +737,8 @@ class LoLAutoRecorder:
         self.stop_requested = False
         self.reset_session()
         self.connect_obs()
-        self.ensure_sync_setup()
+        if auto_setup:
+            self.ensure_sync_setup()
 
     def log(self, message):
         print(message)
@@ -761,7 +855,7 @@ class LoLAutoRecorder:
 
         if not input_exists:
             self.log(f"ℹ️ 色ソース '{OBS_SOURCE_NAME}' を自動作成します。")
-            settings = {"color": 4294901760, "width": 100, "height": 100}
+            settings = {"color": OBS_SOURCE_COLOR, "width": 100, "height": 100}
             last_error = None
             for kind in ("color_source_v3", "color_source"):
                 try:
@@ -778,6 +872,12 @@ class LoLAutoRecorder:
                     last_error = e
             if not input_exists:
                 raise RecorderError(f"色ソース '{OBS_SOURCE_NAME}' の自動作成に失敗しました: {last_error}")
+        else:
+            # 既存色ソースも設定値で上書きして、同期色がぶれないようにする
+            try:
+                self.client.set_input_settings(OBS_SOURCE_NAME, {"color": OBS_SOURCE_COLOR}, overlay=True)
+            except Exception:
+                pass
 
         scene_item_id = self.get_source_id()
         if scene_item_id is None:
@@ -873,8 +973,10 @@ class LoLAutoRecorder:
 
         item_id = self.get_source_id()
         if not item_id:
-            self.log(f"⚠️ エラー: ソース '{OBS_SOURCE_NAME}' が見つかりません。同期なしで録画します。")
-            return
+            raise RecorderError(
+                f"同期用ソース '{OBS_SOURCE_NAME}' がシーン '{OBS_SCENE_NAME}' に見つかりません。\n"
+                "設定画面の「OBSにシーン/色ソースを作成」を実行してください。"
+            )
 
         event_time = self.wait_until_game_start_event()
         if self.should_stop():

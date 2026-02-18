@@ -28,9 +28,11 @@ copy config\setting.sample.json config\setting.json
 - OBSのパス (`obs.dir`)
 - OBS WebSocket のポート/パスワード
 - シーン名 (`scene_name`) / 同期用の赤色ソース名 (`source_name`)
+- 同期色 (`source_color`, 既定: `#FF0000`)
 - JSON保存先 (`paths.json_dir`)
 
 または、アプリ起動後に表示される「初回セットアップ」で自動検出・保存できます。
+初回セットアップ内の「OBSにシーン/色ソースを作成」で、シーンと同期用色ソースを事前作成できます。
 
 ※ `config/setting.json` は `.gitignore` 済みです。
 
@@ -78,7 +80,7 @@ pip install pyinstaller
 - `config\setting.json` を編集して OBS パス等を設定してください
 - 初回起動時はセットアップウィザードで設定できます
 - OBS は `bin\OBS-Studio` (ポータブル) を優先して利用します
-- シーン/同期用色ソースが不足している場合は起動時に自動作成します
+- 設定画面または初回セットアップで「OBSにシーン/色ソースを作成」を実行して事前作成できます
 - mpv DLL は同梱せず、利用者が `bin\` に配置します
 - ビルド時に `dist\LoLReplayTool\bin\` は空フォルダとして作成されます
 - `assets\app\app.ico` が存在する場合、exeアイコンとウィンドウアイコンに反映されます

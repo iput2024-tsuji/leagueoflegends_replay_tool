@@ -31,6 +31,7 @@ DEFAULT_OBS_SCENE_NAME = "lol_seen"
 DEFAULT_OBS_SOURCE_NAME = "color"
 # OBS color_source の color 値は ABGR。赤は 0xFF0000FF。
 DEFAULT_OBS_SOURCE_COLOR = 0xFF0000FF
+LEGACY_OBS_SOURCE_COLOR_BLUE = 0xFFFF0000
 DEFAULT_OBS_DIR = "bin/OBS-Studio"
 DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
@@ -58,6 +59,7 @@ END_ERROR_LIMIT = DEFAULT_END_ERROR_LIMIT
 END_POLL_SEC = DEFAULT_END_POLL_SEC
 EVENT_POLL_SEC = DEFAULT_EVENT_POLL_SEC
 MAX_STORAGE_BYTES = None
+MANAGED_PORTABLE_OBS_DIR = (ROOT_DIR / "bin" / "OBS-Studio").resolve()
 
 
 class RecorderError(RuntimeError):
@@ -76,26 +78,69 @@ def is_valid_obs_dir(base_dir):
 
 
 def detect_obs_dir():
-    candidates = []
-
-    # Prefer portable OBS bundled next to the app.
-    candidates.append(ROOT_DIR / "bin" / "OBS-Studio")
-
-    program_files = os.environ.get("ProgramFiles")
-    program_files_x86 = os.environ.get("ProgramFiles(x86)")
-    if program_files:
-        candidates.append(Path(program_files) / "obs-studio")
-        candidates.append(Path(program_files) / "OBS Studio")
-    if program_files_x86:
-        candidates.append(Path(program_files_x86) / "obs-studio")
-        candidates.append(Path(program_files_x86) / "OBS Studio")
-
-    candidates.append(Path(DEFAULT_OBS_DIR))
-
-    for candidate in candidates:
-        if is_valid_obs_dir(candidate):
-            return str(candidate)
+    if is_valid_obs_dir(MANAGED_PORTABLE_OBS_DIR):
+        return str(MANAGED_PORTABLE_OBS_DIR)
     return None
+
+
+def is_managed_portable_obs_dir(base_dir):
+    if not base_dir:
+        return False
+    try:
+        candidate = Path(base_dir).resolve()
+        return candidate == MANAGED_PORTABLE_OBS_DIR
+    except Exception:
+        return False
+
+
+def get_obs_websocket_config_path(base_dir):
+    return Path(base_dir) / "config" / "obs-studio" / "plugin_config" / "obs-websocket" / "config.json"
+
+
+def ensure_portable_obs_websocket_config(base_dir, port, password):
+    """
+    配布物に同梱したポータブルOBSのみを対象に、
+    WebSocket設定を固定値へ自動補完する。
+    """
+    if not is_managed_portable_obs_dir(base_dir):
+        raise RecorderError(
+            "このアプリは配布同梱のポータブルOBSのみ対応です。\n"
+            f"利用先: {MANAGED_PORTABLE_OBS_DIR}"
+        )
+
+    config_path = get_obs_websocket_config_path(base_dir)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = {}
+    if config_path.exists():
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+
+    changed = False
+
+    def set_if_diff(key, value):
+        nonlocal changed
+        if data.get(key) != value:
+            data[key] = value
+            changed = True
+
+    port_value, _ = _safe_int(port, DEFAULT_OBS_PORT, minimum=1, maximum=65535)
+    password_text = str(password or "")
+
+    set_if_diff("server_enabled", True)
+    set_if_diff("server_port", port_value)
+    set_if_diff("auth_required", bool(password_text))
+    set_if_diff("server_password", password_text)
+
+    if changed:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+    return changed, config_path
 
 
 def _ensure_section_dict(root, key):
@@ -253,12 +298,24 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
             report["changed"] = True
         report["warnings"].append(f"OBSポートが不正だったため {port} を使用します。")
 
-    source_color, ok = parse_obs_source_color(obs_cfg.get("source_color"), default=DEFAULT_OBS_SOURCE_COLOR)
+    raw_source_color = obs_cfg.get("source_color")
+    source_color, ok = parse_obs_source_color(raw_source_color, default=DEFAULT_OBS_SOURCE_COLOR)
     if not ok:
         if auto_fix:
             obs_cfg["source_color"] = source_color
             report["changed"] = True
         report["warnings"].append("source_color が不正だったため赤 (#FF0000) を使用します。")
+    elif source_color == LEGACY_OBS_SOURCE_COLOR_BLUE:
+        raw_text = str(raw_source_color).strip().lower() if raw_source_color is not None else ""
+        legacy_values = {"", "4294901760", "0xffff0000", "#0000ff"}
+        if isinstance(raw_source_color, int):
+            is_legacy = raw_source_color == LEGACY_OBS_SOURCE_COLOR_BLUE
+        else:
+            is_legacy = raw_text in legacy_values
+        if is_legacy and auto_fix:
+            obs_cfg["source_color"] = DEFAULT_OBS_SOURCE_COLOR
+            report["changed"] = True
+            report["notes"].append("旧設定の青色ソースを赤色 (#FF0000) に更新しました。")
 
     end_error_limit, ok = _safe_int(poll_cfg.get("end_error_limit"), DEFAULT_END_ERROR_LIMIT, minimum=1)
     if not ok:
@@ -322,21 +379,27 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
         )
 
     current_obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), ROOT_DIR)
+    expected_obs_dir = MANAGED_PORTABLE_OBS_DIR
+
+    if not current_obs_dir or not is_managed_portable_obs_dir(current_obs_dir):
+        if auto_fix:
+            obs_cfg["dir"] = DEFAULT_OBS_DIR
+            report["changed"] = True
+            report["notes"].append(
+                f"OBSフォルダを配布同梱用に固定しました: {DEFAULT_OBS_DIR}"
+            )
+            current_obs_dir = expected_obs_dir
+        else:
+            report["errors"].append(
+                f"OBSフォルダは配布同梱のみ対応です: {expected_obs_dir}"
+            )
+
     has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
     if not has_valid_obs:
-        detected_obs_dir = detect_obs_dir()
-        if detected_obs_dir and auto_fix:
-            obs_cfg["dir"] = detected_obs_dir
-            report["changed"] = True
-            report["notes"].append(f"OBSフォルダを自動検出しました: {detected_obs_dir}")
-            current_obs_dir = resolve_path(detected_obs_dir, ROOT_DIR)
-            has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
-
-    if not has_valid_obs:
-        current = obs_cfg.get("dir")
         report["errors"].append(
-            f"OBSフォルダが無効です: {current}\n"
-            "OBS Studio のインストール先、または bin/OBS-Studio を確認してください。"
+            "ポータブルOBSが見つかりません。\n"
+            f"配置先: {expected_obs_dir}\n"
+            "obs64.exe が存在する状態で配置してください。"
         )
 
     return report
@@ -401,15 +464,29 @@ def test_obs_connection(host, port, password, timeout=2.5):
     return False, "OBS接続テストに失敗しました。"
 
 
-def setup_obs_sync_elements(cfg, status_cb=None):
+def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
     apply_settings(cfg)
+    setup_environment()
+
+    launched_process = None
     recorder = None
     try:
-        recorder = LoLAutoRecorder(obs_process=None, status_cb=status_cb, auto_setup=True)
+        ok, _ = test_obs_connection(OBS_HOST, OBS_PORT, OBS_PASSWORD, timeout=1.5)
+        if not ok and auto_launch:
+            launched_process = launch_obs()
+
+        recorder = LoLAutoRecorder(obs_process=launched_process, status_cb=status_cb, auto_setup=True)
+        # 録画保存先も毎回明示して、配布先でOBS設定不要にする。
+        if RECORDINGS_DIR:
+            try:
+                recorder.client.set_record_directory(str(RECORDINGS_DIR))
+            except Exception:
+                pass
         return {
             "scene_name": OBS_SCENE_NAME,
             "source_name": OBS_SOURCE_NAME,
             "source_color": OBS_SOURCE_COLOR,
+            "obs_launched": bool(launched_process),
         }
     finally:
         if recorder and recorder.client:
@@ -417,6 +494,17 @@ def setup_obs_sync_elements(cfg, status_cb=None):
                 recorder.client.disconnect()
             except Exception:
                 pass
+        if launched_process:
+            if recorder:
+                try:
+                    recorder.shutdown_obs()
+                except Exception:
+                    pass
+            else:
+                try:
+                    launched_process.terminate()
+                except Exception:
+                    pass
 
 # ▼ 全員分保存する重要なイベント（オブジェクト）
 GLOBAL_OBJECTIVES = [
@@ -480,8 +568,12 @@ def apply_settings(cfg):
     OBS_HOST = obs_cfg.get("host", DEFAULT_OBS_HOST)
     OBS_PORT = int(obs_cfg.get("port", DEFAULT_OBS_PORT))
 
-    obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), ROOT_DIR)
-    OBS_DIR = str(obs_dir) if obs_dir else None
+    OBS_DIR = str(MANAGED_PORTABLE_OBS_DIR)
+    if not is_valid_obs_dir(OBS_DIR):
+        raise RecorderError(
+            "ポータブルOBSが見つかりません。\n"
+            f"配置先: {MANAGED_PORTABLE_OBS_DIR}"
+        )
 
     bin_dir = resolve_path(path_cfg.get("bin_dir", DEFAULT_BIN_DIR), ROOT_DIR)
     BIN_DIR = str(bin_dir) if bin_dir else ""
@@ -655,6 +747,13 @@ def launch_obs():
         hint = f"\n自動検出候補: {detected}" if detected else ""
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
+    try:
+        changed, ws_cfg_path = ensure_portable_obs_websocket_config(OBS_DIR, OBS_PORT, OBS_PASSWORD)
+        if changed and ws_cfg_path:
+            print(f"ℹ️ ポータブルOBSのWebSocket設定を更新しました: {ws_cfg_path}")
+    except Exception as e:
+        raise RecorderError(f"ポータブルOBSのWebSocket設定更新に失敗しました: {e}") from e
+
     print("🚀 OBSを起動しています (タスクトレイに最小化)...")
     cmd = [obs_exe, "--portable", "--minimize-to-tray"]
 
@@ -729,7 +828,7 @@ def save_payload(path, payload):
 
 
 class LoLAutoRecorder:
-    def __init__(self, obs_process=None, status_cb=None, auto_setup=False):
+    def __init__(self, obs_process=None, status_cb=None, auto_setup=True):
         self.client = None
         self.my_name = None
         self.obs_process = obs_process
@@ -737,6 +836,7 @@ class LoLAutoRecorder:
         self.stop_requested = False
         self.reset_session()
         self.connect_obs()
+        self.ensure_record_output_setup()
         if auto_setup:
             self.ensure_sync_setup()
 
@@ -819,6 +919,20 @@ class LoLAutoRecorder:
         except Exception as e:
             print(f"⚠️ シーンアイテム取得エラー: {e}")
         return None
+
+    def ensure_record_output_setup(self):
+        if not RECORDINGS_DIR:
+            return
+        try:
+            Path(RECORDINGS_DIR).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            self.client.set_record_directory(str(RECORDINGS_DIR))
+        except Exception:
+            # OBSバージョン差異や権限差分で失敗する場合は継続
+            pass
 
     def ensure_sync_setup(self):
         self.ensure_scene_exists()

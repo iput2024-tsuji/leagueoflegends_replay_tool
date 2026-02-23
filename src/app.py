@@ -1,5 +1,4 @@
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -51,15 +50,6 @@ def get_app_icon():
     return None
 
 
-def _normalize_obs_dir(path_value):
-    if not path_value:
-        return None
-    path_text = os.path.expandvars(str(path_value).strip())
-    if not path_text:
-        return None
-    return path_text
-
-
 def apply_auto_defaults(data, force_obs_detect=False):
     changed = False
     notes = []
@@ -91,23 +81,13 @@ def apply_auto_defaults(data, force_obs_detect=False):
         changed = True
         notes.append("OBSパスワードのプレースホルダを空欄にしました")
 
-    current_obs_dir = _normalize_obs_dir(obs.get("dir"))
-    has_valid_dir = bool(current_obs_dir and recordtest.is_valid_obs_dir(current_obs_dir))
-    detected_obs_dir = recordtest.detect_obs_dir()
-    if force_obs_detect and detected_obs_dir:
-        if current_obs_dir != detected_obs_dir:
-            obs["dir"] = detected_obs_dir
-            changed = True
-            notes.append(f"OBSフォルダを自動検出しました: {detected_obs_dir}")
-            has_valid_dir = True
-    elif not has_valid_dir and detected_obs_dir:
-        obs["dir"] = detected_obs_dir
-        changed = True
-        notes.append(f"OBSフォルダを自動検出しました: {detected_obs_dir}")
-        has_valid_dir = True
-    elif not current_obs_dir:
+    # OBSは配布同梱のポータブル版のみ利用する。
+    if obs.get("dir") != recordtest.DEFAULT_OBS_DIR:
         obs["dir"] = recordtest.DEFAULT_OBS_DIR
         changed = True
+        notes.append(f"OBSフォルダを固定しました: {recordtest.DEFAULT_OBS_DIR}")
+
+    has_valid_dir = bool(recordtest.detect_obs_dir())
 
     defaults_paths = {
         "bin_dir": recordtest.DEFAULT_BIN_DIR,
@@ -136,7 +116,10 @@ def apply_auto_defaults(data, force_obs_detect=False):
         changed = True
 
     if app_cfg.get("setup_completed") is None:
-        app_cfg["setup_completed"] = False
+        app_cfg["setup_completed"] = bool(has_valid_dir)
+        changed = True
+    elif not bool(app_cfg.get("setup_completed")) and has_valid_dir:
+        app_cfg["setup_completed"] = True
         changed = True
 
     return data, changed, notes
@@ -155,6 +138,25 @@ def run_preflight(config_data=None, auto_fix=True, force_obs_detect=True):
     report["changed"] = bool(changed_defaults or report.get("changed"))
     report["notes"] = list(default_notes) + list(report.get("notes", []))
     return report
+
+
+def run_guided_auto_setup(config_data=None):
+    report = run_preflight(config_data, auto_fix=True, force_obs_detect=True)
+    if report.get("errors"):
+        return report, None
+
+    try:
+        info = recordtest.setup_obs_sync_elements(report["config"])
+    except recordtest.RecorderError as e:
+        report["errors"].append(str(e))
+        return report, None
+    except Exception as e:
+        report["errors"].append(f"{type(e).__name__}: {e}")
+        return report, None
+
+    report["config"].setdefault("app", {})["setup_completed"] = True
+    save_config(report["config"])
+    return report, info
 
 
 def load_config():
@@ -263,51 +265,39 @@ class SetupWizardDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "必要な設定を自動補完します。\n"
-            "OBSフォルダ・WebSocket設定・保存先を確認して保存してください。"
+            "配布同梱のポータブルOBSを前提に、必要な設定を自動構成します。\n"
+            "保存先だけ確認して「環境を自動修復」を実行してください。"
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         form = QFormLayout()
         self.fields = {
-            "obs.host": QLineEdit(),
             "obs.dir": QLineEdit(),
-            "obs.port": QLineEdit(),
-            "obs.password": QLineEdit(),
             "obs.scene_name": QLineEdit(),
             "obs.source_name": QLineEdit(),
             "obs.source_color": QLineEdit(),
             "paths.recordings_dir": QLineEdit(),
             "paths.json_dir": QLineEdit(),
         }
-        form.addRow("OBSホスト", self.fields["obs.host"])
         form.addRow("OBSフォルダ", self.fields["obs.dir"])
-        form.addRow("OBSポート", self.fields["obs.port"])
-        form.addRow("OBSパスワード", self.fields["obs.password"])
         form.addRow("シーン名", self.fields["obs.scene_name"])
         form.addRow("色ソース名", self.fields["obs.source_name"])
         form.addRow("色ソース色", self.fields["obs.source_color"])
         form.addRow("録画ディレクトリ", self.fields["paths.recordings_dir"])
         form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
         layout.addLayout(form)
+        self.fields["obs.dir"].setReadOnly(True)
 
         action_row = QHBoxLayout()
-        self.detect_btn = QPushButton("OBSを自動検出")
-        self.detect_btn.clicked.connect(self.auto_detect_obs_dir)
-        action_row.addWidget(self.detect_btn)
+        self.quick_fix_btn = QPushButton("環境を自動修復")
+        self.quick_fix_btn.clicked.connect(self.run_quick_setup)
+        action_row.addWidget(self.quick_fix_btn)
 
         self.test_btn = QPushButton("接続テスト")
         self.test_btn.clicked.connect(self.test_obs_connection)
         action_row.addWidget(self.test_btn)
 
-        self.preflight_btn = QPushButton("自動診断")
-        self.preflight_btn.clicked.connect(self.run_diagnosis)
-        action_row.addWidget(self.preflight_btn)
-
-        self.obs_setup_btn = QPushButton("OBSにシーン/色ソースを作成")
-        self.obs_setup_btn.clicked.connect(self.setup_obs_scene)
-        action_row.addWidget(self.obs_setup_btn)
         layout.addLayout(action_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -324,10 +314,7 @@ class SetupWizardDialog(QDialog):
         data = load_config()
         obs = data.get("obs", {})
         paths = data.get("paths", {})
-        self.fields["obs.host"].setText(str(obs.get("host", "")))
-        self.fields["obs.dir"].setText(str(obs.get("dir", "")))
-        self.fields["obs.port"].setText(str(obs.get("port", "")))
-        self.fields["obs.password"].setText(str(obs.get("password", "")))
+        self.fields["obs.dir"].setText(recordtest.DEFAULT_OBS_DIR)
         self.fields["obs.scene_name"].setText(str(obs.get("scene_name", "")))
         self.fields["obs.source_name"].setText(str(obs.get("source_name", "")))
         self.fields["obs.source_color"].setText(recordtest.obs_color_to_hex(obs.get("source_color")))
@@ -340,32 +327,28 @@ class SetupWizardDialog(QDialog):
         data.setdefault("paths", {})
         data.setdefault("app", {})
 
-        data["obs"]["host"] = self.fields["obs.host"].text().strip()
-        data["obs"]["dir"] = self.fields["obs.dir"].text().strip()
-        data["obs"]["password"] = self.fields["obs.password"].text().strip()
+        data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
+        data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
+        data["obs"]["password"] = ""
+        data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
         data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
         data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
         data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
-        try:
-            data["obs"]["port"] = int(self.fields["obs.port"].text().strip())
-        except ValueError:
-            data["obs"]["port"] = self.fields["obs.port"].text().strip()
 
         data["paths"]["recordings_dir"] = self.fields["paths.recordings_dir"].text().strip()
         data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
         return data
 
-    def auto_detect_obs_dir(self):
-        detected = recordtest.detect_obs_dir()
-        if not detected:
-            QMessageBox.warning(self, "自動検出", "OBSフォルダを検出できませんでした。手動で指定してください。")
-            return
-        self.fields["obs.dir"].setText(detected)
-        QMessageBox.information(self, "自動検出", f"OBSフォルダを検出しました。\n{detected}")
-
     def test_obs_connection(self):
         data = self.collect_data()
-        report = run_preflight(data, auto_fix=True, force_obs_detect=False)
+        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        if report.get("changed"):
+            save_config(report["config"])
+            self.load_values()
+        if report.get("errors"):
+            QMessageBox.warning(self, "接続テスト", format_report_lines(report.get("errors", [])))
+            return
+
         cfg = report["config"]
         host = cfg.get("obs", {}).get("host", recordtest.DEFAULT_OBS_HOST)
         port = cfg.get("obs", {}).get("port", recordtest.DEFAULT_OBS_PORT)
@@ -383,34 +366,28 @@ class SetupWizardDialog(QDialog):
                 f"接続に失敗しました。\n{detail}"
             )
 
-    def setup_obs_scene(self):
+    def run_quick_setup(self):
         data = self.collect_data()
-        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        report, info = run_guided_auto_setup(data)
         if report.get("errors"):
-            QMessageBox.critical(self, "OBSセットアップ", format_report_lines(report.get("errors", [])))
+            QMessageBox.critical(self, "環境修復", format_report_lines(report.get("errors", [])))
             return False
 
-        cfg = report["config"]
-        try:
-            info = recordtest.setup_obs_sync_elements(cfg)
-        except recordtest.RecorderError as e:
-            QMessageBox.critical(
-                self,
-                "OBSセットアップ",
-                f"シーン/色ソース作成に失敗しました。\n{e}"
-            )
+        if info is None:
+            QMessageBox.critical(self, "環境修復", "初期化に失敗しました。")
             return False
 
-        save_config(cfg)
         self.load_values()
         color_hex = recordtest.obs_color_to_hex(info.get("source_color"))
-        QMessageBox.information(
-            self,
-            "OBSセットアップ",
-            "OBSに必要な設定を反映しました。\n"
+        launch_note = "（セットアップのためポータブルOBSを自動起動しました）" if info.get("obs_launched") else ""
+        message = (
+            "環境修復が完了しました。\n"
             f"シーン: {info.get('scene_name')}\n"
             f"色ソース: {info.get('source_name')} ({color_hex})"
         )
+        if launch_note:
+            message += f"\n{launch_note}"
+        QMessageBox.information(self, "環境修復", message)
         return True
 
     def run_diagnosis(self):
@@ -431,14 +408,7 @@ class SetupWizardDialog(QDialog):
             QMessageBox.information(self, "自動診断", message)
 
     def save_and_accept(self):
-        data = self.collect_data()
-        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
-
-        if report.get("errors"):
-            QMessageBox.critical(self, "保存できません", format_report_lines(report.get("errors", [])))
-            return
-
-        if not self.setup_obs_scene():
+        if not self.run_quick_setup():
             return
 
         config = load_config()
@@ -621,10 +591,12 @@ class SettingsPage(QWidget):
         self.fields["polling.end_error_limit"] = QLineEdit()
         self.fields["polling.end_poll_sec"] = QLineEdit()
         self.fields["polling.event_poll_sec"] = QLineEdit()
+        self.fields["obs.host"].setReadOnly(True)
+        self.fields["obs.dir"].setReadOnly(True)
+        self.fields["obs.password"].setReadOnly(True)
+        self.fields["obs.port"].setReadOnly(True)
 
-        self.form.addRow("OBSフォルダ", self.fields["obs.dir"])
-        self.form.addRow("OBSパスワード", self.fields["obs.password"])
-        self.form.addRow("OBSポート", self.fields["obs.port"])
+        self.form.addRow("OBSフォルダ(固定)", self.fields["obs.dir"])
         self.form.addRow("録画ディレクトリ", self.fields["paths.recordings_dir"])
         self.form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
         self.form.addRow("アイコンディレクトリ", self.fields["paths.champion_icons_dir"])
@@ -659,9 +631,9 @@ class SettingsPage(QWidget):
         self.preflight_btn.clicked.connect(self.run_preflight_fix)
         self.form.addRow(self.preflight_btn)
 
-        self.obs_setup_btn = QPushButton("OBSにシーン/色ソースを作成")
-        self.obs_setup_btn.clicked.connect(self.setup_obs_scene)
-        self.form.addRow(self.obs_setup_btn)
+        self.quick_fix_btn = QPushButton("環境を自動修復")
+        self.quick_fix_btn.clicked.connect(self.run_quick_setup)
+        self.form.addRow(self.quick_fix_btn)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Reset)
         buttons.accepted.connect(self.save_settings)
@@ -682,10 +654,10 @@ class SettingsPage(QWidget):
         storage = data.get("storage", {})
         polling = data.get("polling", {})
 
-        self.fields["obs.host"].setText(str(obs.get("host", "")))
-        self.fields["obs.dir"].setText(str(obs.get("dir", "")))
-        self.fields["obs.password"].setText(str(obs.get("password", "")))
-        self.fields["obs.port"].setText(str(obs.get("port", "")))
+        self.fields["obs.host"].setText(recordtest.DEFAULT_OBS_HOST)
+        self.fields["obs.dir"].setText(recordtest.DEFAULT_OBS_DIR)
+        self.fields["obs.password"].setText("")
+        self.fields["obs.port"].setText(str(recordtest.DEFAULT_OBS_PORT))
         self.fields["obs.scene_name"].setText(str(obs.get("scene_name", "")))
         self.fields["obs.source_name"].setText(str(obs.get("source_name", "")))
         self.fields["obs.source_color"].setText(recordtest.obs_color_to_hex(obs.get("source_color")))
@@ -705,13 +677,10 @@ class SettingsPage(QWidget):
         data.setdefault("polling", {})
         data.setdefault("app", {})
 
-        data["obs"]["host"] = self.fields["obs.host"].text().strip()
-        data["obs"]["dir"] = self.fields["obs.dir"].text().strip()
-        data["obs"]["password"] = self.fields["obs.password"].text().strip()
-        try:
-            data["obs"]["port"] = int(self.fields["obs.port"].text().strip())
-        except ValueError:
-            pass
+        data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
+        data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
+        data["obs"]["password"] = ""
+        data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
         data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
         data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
         data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
@@ -781,29 +750,30 @@ class SettingsPage(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.load_settings()
 
-    def setup_obs_scene(self):
+    def run_quick_setup(self):
         data = load_config()
-        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        report, info = run_guided_auto_setup(data)
         if report.get("errors"):
-            QMessageBox.critical(self, "OBSセットアップ", format_report_lines(report.get("errors", [])))
-            return
-        try:
-            info = recordtest.setup_obs_sync_elements(report["config"])
-        except recordtest.RecorderError as e:
-            QMessageBox.critical(self, "OBSセットアップ", f"シーン/色ソース作成に失敗しました。\n{e}")
+            QMessageBox.critical(self, "環境修復", format_report_lines(report.get("errors", [])))
             return
 
-        report["config"].setdefault("app", {})["setup_completed"] = True
-        save_config(report["config"])
+        if info is None:
+            QMessageBox.critical(self, "環境修復", "初期化に失敗しました。")
+            return
+
         self.load_settings()
         color_hex = recordtest.obs_color_to_hex(info.get("source_color"))
-        QMessageBox.information(
-            self,
-            "OBSセットアップ",
-            "OBSに必要な設定を反映しました。\n"
+        launch_note = "（セットアップのためポータブルOBSを自動起動しました）" if info.get("obs_launched") else ""
+        message = (
+            "環境修復が完了しました。\n"
             f"シーン: {info.get('scene_name')}\n"
             f"色ソース: {info.get('source_name')} ({color_hex})"
         )
+        if launch_note:
+            message += f"\n{launch_note}"
+        if report.get("warnings"):
+            message += f"\n\n警告:\n{format_report_lines(report.get('warnings', []))}"
+        QMessageBox.information(self, "環境修復", message)
 
 
 class MainWindow(QMainWindow):

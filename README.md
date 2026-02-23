@@ -6,12 +6,12 @@ LoLの試合録画（OBS自動制御）と、イベントログ同期再生プ�
 - 試合開始/終了の自動検知とOBS録画制御
 - 重要イベントのログ保存（自分のキル/デス + オブジェクト）
 - 録画動画とイベントの同期再生プレーヤー
-- 初回セットアップウィザード（OBS検出・接続テスト・自動診断）
+- 初回セットアップウィザード（環境を自動修復）
 
 ## 必要環境
 - Windows
 - Python 3.10+ 推奨
-- OBS Studio（WebSocket 5.x 有効、ポート/パスワード設定）
+- OBS Studio（ポータブル版を `bin/OBS-Studio` に配置）
 - mpv の DLL（`bin/` に `mpv-1.dll` / `libmpv-1.dll` / `libmpv-2.dll` のいずれか）
 
 ## セットアップ
@@ -24,15 +24,10 @@ pip install -r requirements.txt
 copy config\setting.sample.json config\setting.json
 ```
 
-`config/setting.json` を編集して以下を合わせてください。
-- OBSのパス (`obs.dir`)
-- OBS WebSocket のポート/パスワード
-- シーン名 (`scene_name`) / 同期用の赤色ソース名 (`source_name`)
-- 同期色 (`source_color`, 既定: `#FF0000`)
-- JSON保存先 (`paths.json_dir`)
-
-または、アプリ起動後に表示される「初回セットアップ」で自動検出・保存できます。
-初回セットアップ内の「OBSにシーン/色ソースを作成」で、シーンと同期用色ソースを事前作成できます。
+通常は `config/setting.json` を手動編集する必要はありません。
+- OBSは `bin/OBS-Studio` のポータブル版のみ利用します
+- WebSocket設定はアプリ側で自動補完します
+- 初回起動のセットアップで「環境を自動修復」を実行すると、シーン/色ソースを自動作成します
 
 ※ `config/setting.json` は `.gitignore` 済みです。
 
@@ -76,15 +71,13 @@ pip install pyinstaller
 ```
 
 出力先: `dist\LoLReplayTool\`
-- 初回起動時に `config\setting.json` が自動生成されます
-- `config\setting.json` を編集して OBS パス等を設定してください
-- 初回起動時はセットアップウィザードで設定できます
-- OBS は `bin\OBS-Studio` (ポータブル) を優先して利用します
-- 設定画面または初回セットアップで「OBSにシーン/色ソースを作成」を実行して事前作成できます
+- `config\setting.json` は初回起動時に自動生成されます
+- OBS は `bin\OBS-Studio` (ポータブル) のみ利用します（ユーザー環境のOBSは利用しません）
+- ポータブルOBSのWebSocket設定はアプリ側で自動補完します
+- 設定画面または初回セットアップで「環境を自動修復」を実行すると、配布先でも設定不要で動かせます
 - mpv DLL は同梱せず、利用者が `bin\` に配置します
 - ビルド時に `dist\LoLReplayTool\bin\` は空フォルダとして作成されます
 - `assets\app\app.ico` が存在する場合、exeアイコンとウィンドウアイコンに反映されます
-- OBS 本体は同梱しません（各自でインストール）
 - ビルド成果物は `LoLReplayTool.exe` と同じ階層に `config` / `assets` / `bin` が配置されます（`_internal` 非使用）
 
 ### アイコン画像の推奨仕様
@@ -101,20 +94,21 @@ pip install pyinstaller
    .\venv\Scripts\Activate.ps1
    .\scripts\build.ps1
    ```
-2. `dist\LoLReplayTool\` ディレクトリを丸ごとZIP化して配布する。
-3. ZIP化前に以下が入っているか確認する。
+2. `dist\LoLReplayTool\bin\OBS-Studio\` にポータブルOBSを配置する（同梱運用）。
+3. `dist\LoLReplayTool\` ディレクトリを丸ごとZIP化して配布する。
+4. ZIP化前に以下が入っているか確認する。
    - `LoLReplayTool.exe`
    - `config\setting.sample.json`
    - `config\champion_aliases.json`
    - `assets\champions\icons\`
-   - `bin\`（空でも可）
+   - `bin\OBS-Studio\`（ポータブルOBS）
+   - `bin\` 配下の mpv DLL（`mpv-1.dll` など）
 
 ### 2. 受け取り側の初回セットアップ
 1. ZIPを展開する。
-2. `bin\` に mpv DLL を配置する（`mpv-1.dll` / `libmpv-1.dll` / `libmpv-2.dll` のいずれか）。
-3. `LoLReplayTool.exe` を起動し、`config\setting.json` が生成されることを確認する。
-4. アプリの設定画面で `obs.dir` / WebSocketポート / パスワード / シーン名 / ソース名を設定する。
-   - 迷った場合は「設定 > 録画前チェックを実行」で自動修復できます。
+2. `LoLReplayTool.exe` を起動する。
+3. 初回セットアップで「環境を自動修復」を1回実行する。
+4. 以後は設定変更なしで録画開始できる。
 
 ## JSONの内容（例）
 ```json
@@ -134,4 +128,4 @@ pip install pyinstaller
 - イベントが表示されない  
   JSONの `events` / `events_all` を確認してください。
 - 同期が合わない  
-  OBSの赤色ソースが左上に出るように配置してください。
+  設定画面の「環境を自動修復」を再実行してください。

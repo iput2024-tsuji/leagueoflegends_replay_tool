@@ -43,6 +43,14 @@ DEFAULT_END_ERROR_LIMIT = 3
 DEFAULT_END_POLL_SEC = 5
 DEFAULT_EVENT_POLL_SEC = 1
 DEFAULT_MAX_STORAGE_GB = 50
+DEFAULT_AUDIO_DESKTOP_INPUT_NAME = "lol_desktop_audio"
+DEFAULT_AUDIO_MIC_INPUT_NAME = "lol_mic_audio"
+DEFAULT_AUDIO_DEVICE_ID = "default"
+DEFAULT_AUDIO_DEVICE_NAME = "Default"
+DEFAULT_AUDIO_DESKTOP_VOLUME_DB = 0.0
+DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
+DEFAULT_AUDIO_DESKTOP_MUTE = False
+DEFAULT_AUDIO_MIC_MUTE = False
 
 OBS_PASSWORD = DEFAULT_OBS_PASSWORD
 OBS_SCENE_NAME = DEFAULT_OBS_SCENE_NAME
@@ -60,6 +68,22 @@ END_POLL_SEC = DEFAULT_END_POLL_SEC
 EVENT_POLL_SEC = DEFAULT_EVENT_POLL_SEC
 MAX_STORAGE_BYTES = None
 MANAGED_PORTABLE_OBS_DIR = (ROOT_DIR / "bin" / "OBS-Studio").resolve()
+MANAGED_AUDIO_INPUTS = {
+    "desktop": {
+        "label": "デスクトップ音声",
+        "input_name": DEFAULT_AUDIO_DESKTOP_INPUT_NAME,
+        "input_kind": "wasapi_output_capture",
+        "default_volume_db": DEFAULT_AUDIO_DESKTOP_VOLUME_DB,
+        "default_mute": DEFAULT_AUDIO_DESKTOP_MUTE,
+    },
+    "mic": {
+        "label": "マイク入力",
+        "input_name": DEFAULT_AUDIO_MIC_INPUT_NAME,
+        "input_kind": "wasapi_input_capture",
+        "default_volume_db": DEFAULT_AUDIO_MIC_VOLUME_DB,
+        "default_mute": DEFAULT_AUDIO_MIC_MUTE,
+    },
+}
 
 
 class RecorderError(RuntimeError):
@@ -173,6 +197,96 @@ def _safe_float(value, default, minimum=None):
     return parsed, True
 
 
+def _safe_bool(value, default):
+    if isinstance(value, bool):
+        return value, True
+    if isinstance(value, (int, float)):
+        return bool(value), True
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True, True
+        if text in {"0", "false", "no", "off"}:
+            return False, True
+    return default, False
+
+
+def _ensure_audio_config_defaults(data, auto_fix=True):
+    changed = False
+    notes = []
+    warnings = []
+    errors = []
+
+    audio_cfg, replaced = _ensure_section_dict(data, "audio")
+    if replaced:
+        changed = True
+
+    for key, spec in MANAGED_AUDIO_INPUTS.items():
+        slot_cfg, replaced = _ensure_section_dict(audio_cfg, key)
+        if replaced:
+            changed = True
+
+        defaults = {
+            "input_name": spec["input_name"],
+            "device_id": DEFAULT_AUDIO_DEVICE_ID,
+            "device_name": DEFAULT_AUDIO_DEVICE_NAME,
+            "volume_db": spec["default_volume_db"],
+            "mute": spec["default_mute"],
+        }
+        for field, default_value in defaults.items():
+            if slot_cfg.get(field) in (None, ""):
+                if auto_fix:
+                    slot_cfg[field] = default_value
+                    changed = True
+                    notes.append(f"audio.{key}.{field} を既定値で補完しました。")
+                else:
+                    errors.append(f"audio.{key}.{field} が未設定です。")
+
+        input_name = str(slot_cfg.get("input_name") or "").strip()
+        if not input_name:
+            if auto_fix:
+                slot_cfg["input_name"] = spec["input_name"]
+                changed = True
+                warnings.append(f"audio.{key}.input_name が不正だったため既定値を使用します。")
+            else:
+                errors.append(f"audio.{key}.input_name が不正です。")
+
+        device_id = str(slot_cfg.get("device_id") or "").strip()
+        if not device_id:
+            if auto_fix:
+                slot_cfg["device_id"] = DEFAULT_AUDIO_DEVICE_ID
+                changed = True
+                warnings.append(f"audio.{key}.device_id が不正だったため default を使用します。")
+            else:
+                errors.append(f"audio.{key}.device_id が不正です。")
+
+        device_name = str(slot_cfg.get("device_name") or "").strip()
+        if not device_name and auto_fix:
+            slot_cfg["device_name"] = DEFAULT_AUDIO_DEVICE_NAME
+            changed = True
+
+        volume_db, ok = _safe_float(slot_cfg.get("volume_db"), spec["default_volume_db"])
+        if not ok:
+            if auto_fix:
+                slot_cfg["volume_db"] = volume_db
+                changed = True
+            warnings.append(f"audio.{key}.volume_db が不正だったため既定値を使用します。")
+
+        mute_value, ok = _safe_bool(slot_cfg.get("mute"), spec["default_mute"])
+        if not ok:
+            if auto_fix:
+                slot_cfg["mute"] = mute_value
+                changed = True
+            warnings.append(f"audio.{key}.mute が不正だったため既定値を使用します。")
+
+    return {
+        "changed": changed,
+        "notes": notes,
+        "warnings": warnings,
+        "errors": errors,
+    }
+
+
 def parse_obs_source_color(value, default=DEFAULT_OBS_SOURCE_COLOR):
     if value is None:
         return default, False
@@ -244,6 +358,12 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
     storage_cfg, replaced = _ensure_section_dict(data, "storage")
     if replaced:
         report["changed"] = True
+    audio_fix = _ensure_audio_config_defaults(data, auto_fix=auto_fix)
+    if audio_fix["changed"]:
+        report["changed"] = True
+    report["notes"].extend(audio_fix["notes"])
+    report["warnings"].extend(audio_fix["warnings"])
+    report["errors"].extend(audio_fix["errors"])
 
     obs_defaults = {
         "host": DEFAULT_OBS_HOST,
@@ -464,6 +584,256 @@ def test_obs_connection(host, port, password, timeout=2.5):
     return False, "OBS接続テストに失敗しました。"
 
 
+def connect_obs_client(host, port, password, timeout=2.5):
+    host_text = str(host or "").strip() or DEFAULT_OBS_HOST
+    port_num, ok = _safe_int(port, DEFAULT_OBS_PORT, minimum=1, maximum=65535)
+    if not ok:
+        raise RecorderError(f"OBSポートが不正です: {port}")
+
+    host_candidates = [host_text]
+    if host_text == "localhost":
+        host_candidates.append("127.0.0.1")
+    elif host_text == "127.0.0.1":
+        host_candidates.append("localhost")
+
+    last_error = None
+    for candidate in host_candidates:
+        try:
+            client = obs.ReqClient(
+                host=candidate,
+                port=port_num,
+                password=password or "",
+                timeout=timeout,
+            )
+            return client, candidate
+        except Exception as e:
+            last_error = e
+            message = f"{type(e).__name__}: {e}".lower()
+            if any(token in message for token in ("auth", "authentication", "password", "identify")):
+                raise RecorderError("OBSには到達しましたが認証に失敗しました。WebSocketパスワードを確認してください。") from e
+
+    raise RecorderError(
+        "OBS WebSocket に接続できません。\n"
+        f"接続先: {host_text}:{port_num}\n"
+        f"詳細: {last_error}"
+    ) from last_error
+
+
+def get_audio_config_defaults():
+    return {
+        "desktop": {
+            "input_name": DEFAULT_AUDIO_DESKTOP_INPUT_NAME,
+            "device_id": DEFAULT_AUDIO_DEVICE_ID,
+            "device_name": DEFAULT_AUDIO_DEVICE_NAME,
+            "volume_db": DEFAULT_AUDIO_DESKTOP_VOLUME_DB,
+            "mute": DEFAULT_AUDIO_DESKTOP_MUTE,
+        },
+        "mic": {
+            "input_name": DEFAULT_AUDIO_MIC_INPUT_NAME,
+            "device_id": DEFAULT_AUDIO_DEVICE_ID,
+            "device_name": DEFAULT_AUDIO_DEVICE_NAME,
+            "volume_db": DEFAULT_AUDIO_MIC_VOLUME_DB,
+            "mute": DEFAULT_AUDIO_MIC_MUTE,
+        },
+    }
+
+
+def normalize_audio_config(cfg, auto_fix=True):
+    container = cfg if isinstance(cfg, dict) else {}
+    fix = _ensure_audio_config_defaults(container, auto_fix=auto_fix)
+    audio_cfg = container.get("audio", {}) if isinstance(container, dict) else {}
+    return audio_cfg, fix
+
+
+def _get_audio_slot_config(cfg, key):
+    defaults = get_audio_config_defaults()
+    audio_cfg, _ = normalize_audio_config(cfg, auto_fix=True)
+    slot = audio_cfg.get(key, {}) if isinstance(audio_cfg, dict) else {}
+    merged = dict(defaults[key])
+    if isinstance(slot, dict):
+        merged.update(slot)
+
+    merged["input_name"] = str(merged.get("input_name") or defaults[key]["input_name"]).strip() or defaults[key]["input_name"]
+    merged["device_id"] = str(merged.get("device_id") or defaults[key]["device_id"]).strip() or defaults[key]["device_id"]
+    merged["device_name"] = str(merged.get("device_name") or defaults[key]["device_name"]).strip() or defaults[key]["device_name"]
+    merged["volume_db"], _ = _safe_float(merged.get("volume_db"), defaults[key]["volume_db"])
+    merged["mute"], _ = _safe_bool(merged.get("mute"), defaults[key]["mute"])
+    return merged
+
+
+def _obs_raw(client, request_type, payload=None):
+    try:
+        return client.send(request_type, payload or {}, raw=True)
+    except TypeError:
+        return client.send(request_type, payload or {})
+
+
+def ensure_obs_scene_exists(client, scene_name, status_cb=None):
+    try:
+        scene_resp = client.get_scene_list()
+        scenes = getattr(scene_resp, "scenes", []) or []
+        scene_names = {item.get("sceneName") for item in scenes if isinstance(item, dict)}
+    except Exception as e:
+        raise RecorderError(f"シーン一覧の取得に失敗しました: {e}") from e
+
+    if scene_name in scene_names:
+        return False
+
+    if status_cb:
+        try:
+            status_cb(f"ℹ️ シーン '{scene_name}' を自動作成します。")
+        except Exception:
+            pass
+    client.create_scene(scene_name)
+    return True
+
+
+def _ensure_single_audio_input(client, scene_name, key, slot_cfg):
+    spec = MANAGED_AUDIO_INPUTS[key]
+    input_name = str(slot_cfg.get("input_name") or spec["input_name"]).strip() or spec["input_name"]
+    input_kind = spec["input_kind"]
+    created = False
+
+    input_exists = False
+    input_kind_matches = False
+    try:
+        input_resp = client.get_input_list()
+        input_items = getattr(input_resp, "inputs", []) or []
+        for item in input_items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("inputName") != input_name:
+                continue
+            input_exists = True
+            input_kind_matches = (item.get("inputKind") == input_kind)
+            break
+    except Exception:
+        input_exists = False
+
+    if input_exists and not input_kind_matches:
+        try:
+            client.remove_input(input_name)
+            input_exists = False
+        except Exception:
+            # 種別違いでも削除できない場合は後続の設定更新で失敗させる。
+            pass
+
+    if not input_exists:
+        settings = {"device_id": str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)}
+        last_error = None
+        for kind_name in (input_kind,):
+            try:
+                client.create_input(scene_name, input_name, kind_name, settings, True)
+                created = True
+                input_exists = True
+                break
+            except Exception as e:
+                last_error = e
+        if not input_exists:
+            raise RecorderError(
+                f"{spec['label']}ソース '{input_name}' の作成に失敗しました: {last_error}"
+            )
+
+    # 保存されている device_id を先に適用（default でも可）
+    try:
+        client.set_input_settings(
+            input_name,
+            {"device_id": str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)},
+            overlay=True,
+        )
+    except Exception:
+        pass
+
+    return created
+
+
+def ensure_managed_audio_inputs(client, scene_name, cfg=None, status_cb=None):
+    ensure_obs_scene_exists(client, scene_name, status_cb=status_cb)
+    created_any = False
+    for key in ("desktop", "mic"):
+        slot_cfg = _get_audio_slot_config(cfg or {}, key)
+        created = _ensure_single_audio_input(client, scene_name, key, slot_cfg)
+        created_any = created_any or created
+        if created and status_cb:
+            try:
+                status_cb(
+                    f"ℹ️ {MANAGED_AUDIO_INPUTS[key]['label']}ソース '{slot_cfg['input_name']}' を作成しました。"
+                )
+            except Exception:
+                pass
+    return created_any
+
+
+def list_audio_devices_for_input(client, input_name):
+    try:
+        resp = _obs_raw(
+            client,
+            "GetInputPropertiesListPropertyItems",
+            {"inputName": input_name, "propertyName": "device_id"},
+        )
+    except Exception as e:
+        raise RecorderError(f"音声デバイス一覧の取得に失敗しました ({input_name}): {e}") from e
+
+    items = []
+    if isinstance(resp, dict):
+        items = resp.get("propertyItems") or []
+
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        device_id = str(item.get("itemValue") or "").strip()
+        device_name = str(item.get("itemName") or device_id or "").strip()
+        if not device_id:
+            continue
+        result.append({"id": device_id, "name": device_name})
+
+    if not result:
+        result.append({"id": DEFAULT_AUDIO_DEVICE_ID, "name": DEFAULT_AUDIO_DEVICE_NAME})
+    return result
+
+
+def get_audio_device_catalog(client, cfg=None, scene_name=None, status_cb=None):
+    scene_name = scene_name or OBS_SCENE_NAME
+    ensure_managed_audio_inputs(client, scene_name, cfg=cfg, status_cb=status_cb)
+    desktop_cfg = _get_audio_slot_config(cfg or {}, "desktop")
+    mic_cfg = _get_audio_slot_config(cfg or {}, "mic")
+    return {
+        "desktop": list_audio_devices_for_input(client, desktop_cfg["input_name"]),
+        "mic": list_audio_devices_for_input(client, mic_cfg["input_name"]),
+    }
+
+
+def apply_audio_input_settings(client, input_name, device_id=None, volume_db=None, mute=None):
+    if device_id not in (None, ""):
+        client.set_input_settings(input_name, {"device_id": str(device_id)}, overlay=True)
+    if volume_db is not None:
+        client.set_input_volume(input_name, vol_db=float(volume_db))
+    if mute is not None:
+        client.set_input_mute(input_name, bool(mute))
+
+
+def apply_audio_profile_from_config(client, cfg, scene_name=None, status_cb=None):
+    scene_name = scene_name or OBS_SCENE_NAME
+    ensure_managed_audio_inputs(client, scene_name, cfg=cfg, status_cb=status_cb)
+
+    for key in ("desktop", "mic"):
+        slot_cfg = _get_audio_slot_config(cfg or {}, key)
+        input_name = slot_cfg["input_name"]
+        try:
+            apply_audio_input_settings(
+                client,
+                input_name,
+                device_id=slot_cfg.get("device_id"),
+                volume_db=slot_cfg.get("volume_db"),
+                mute=slot_cfg.get("mute"),
+            )
+        except Exception as e:
+            raise RecorderError(f"{MANAGED_AUDIO_INPUTS[key]['label']}設定の適用に失敗しました: {e}") from e
+
+    return True
+
+
 def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
     apply_settings(cfg)
     setup_environment()
@@ -482,6 +852,14 @@ def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
                 recorder.client.set_record_directory(str(RECORDINGS_DIR))
             except Exception:
                 pass
+        try:
+            apply_audio_profile_from_config(recorder.client, cfg, scene_name=OBS_SCENE_NAME, status_cb=status_cb)
+        except Exception as e:
+            if status_cb:
+                try:
+                    status_cb(f"⚠️ 音声設定の初期適用に失敗しました: {e}")
+                except Exception:
+                    pass
         return {
             "scene_name": OBS_SCENE_NAME,
             "source_name": OBS_SOURCE_NAME,
@@ -888,13 +1266,14 @@ class LoLAutoRecorder:
         last_error = None
         while retry_count < 5:
             try:
-                self.client = obs.ReqClient(
-                    host=OBS_HOST,
-                    port=OBS_PORT,
-                    password=OBS_PASSWORD
+                self.client, used_host = connect_obs_client(
+                    OBS_HOST,
+                    OBS_PORT,
+                    OBS_PASSWORD,
                 )
                 version = self.client.get_version()
-                print(f"✅ OBS接続成功 (v{version.obs_version})")
+                host_note = f" host={used_host}" if used_host != OBS_HOST else ""
+                print(f"✅ OBS接続成功 (v{version.obs_version}{host_note})")
                 return
             except Exception as e:
                 last_error = e
@@ -940,18 +1319,7 @@ class LoLAutoRecorder:
 
     def ensure_scene_exists(self):
         try:
-            scene_resp = self.client.get_scene_list()
-            scene_items = getattr(scene_resp, "scenes", []) or []
-            scene_names = {item.get("sceneName") for item in scene_items if isinstance(item, dict)}
-        except Exception as e:
-            raise RecorderError(f"シーン一覧の取得に失敗しました: {e}") from e
-
-        if OBS_SCENE_NAME in scene_names:
-            return
-
-        self.log(f"ℹ️ シーン '{OBS_SCENE_NAME}' が見つからないため自動作成します。")
-        try:
-            self.client.create_scene(OBS_SCENE_NAME)
+            ensure_obs_scene_exists(self.client, OBS_SCENE_NAME, status_cb=self.log)
         except Exception as e:
             raise RecorderError(f"シーン '{OBS_SCENE_NAME}' の自動作成に失敗しました: {e}") from e
 
@@ -1317,6 +1685,11 @@ if __name__ == "__main__":
         obs_process = launch_obs()
 
         app = LoLAutoRecorder(obs_process=obs_process)
+        try:
+            apply_audio_profile_from_config(app.client, settings, scene_name=OBS_SCENE_NAME)
+            print("🔊 音声設定をOBSへ適用しました。")
+        except Exception as e:
+            print(f"⚠️ 音声設定の適用に失敗: {e}")
         while True:
             app.reset_session()
             app.wait_for_game_start()

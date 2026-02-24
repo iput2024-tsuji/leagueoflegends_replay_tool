@@ -17,8 +17,11 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QMessageBox,
+    QComboBox,
+    QCheckBox,
+    QDoubleSpinBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon
 
 try:
@@ -63,6 +66,7 @@ def apply_auto_defaults(data, force_obs_detect=False):
     polling = data.setdefault("polling", {})
     storage = data.setdefault("storage", {})
     app_cfg = data.setdefault("app", {})
+    audio_cfg = data.setdefault("audio", {})
 
     defaults_obs = {
         "host": recordtest.DEFAULT_OBS_HOST,
@@ -121,6 +125,18 @@ def apply_auto_defaults(data, force_obs_detect=False):
     elif not bool(app_cfg.get("setup_completed")) and has_valid_dir:
         app_cfg["setup_completed"] = True
         changed = True
+
+    audio_defaults = recordtest.get_audio_config_defaults()
+    for key, defaults in audio_defaults.items():
+        slot = audio_cfg.setdefault(key, {})
+        if not isinstance(slot, dict):
+            audio_cfg[key] = {}
+            slot = audio_cfg[key]
+            changed = True
+        for field, value in defaults.items():
+            if slot.get(field) in (None, ""):
+                slot[field] = value
+                changed = True
 
     return data, changed, notes
 
@@ -218,6 +234,15 @@ class RecorderWorker(QThread):
                 obs_process=obs_process,
                 status_cb=self.status.emit
             )
+            try:
+                recordtest.apply_audio_profile_from_config(
+                    self.recorder.client,
+                    settings,
+                    scene_name=recordtest.OBS_SCENE_NAME,
+                )
+                self.status.emit("🔊 音声設定をOBSへ適用しました。")
+            except Exception as e:
+                self.status.emit(f"⚠️ 音声設定の適用に失敗: {e}")
 
             while not self.stop_flag:
                 self.recorder.reset_session()
@@ -571,6 +596,11 @@ class SettingsPage(QWidget):
         self.form = QFormLayout(self)
         self.fields = {}
         self.advanced_visible = False
+        self.audio_device_cache = {"desktop": [], "mic": []}
+        self._audio_ui_loading = False
+        self._audio_apply_timer = QTimer(self)
+        self._audio_apply_timer.setSingleShot(True)
+        self._audio_apply_timer.timeout.connect(self._apply_audio_settings_auto)
 
         back_btn = QPushButton("← 戻る")
         back_btn.clicked.connect(on_back)
@@ -601,6 +631,35 @@ class SettingsPage(QWidget):
         self.form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
         self.form.addRow("アイコンディレクトリ", self.fields["paths.champion_icons_dir"])
         self.form.addRow("最大容量(GB)", self.fields["storage.max_size_gb"])
+
+        self.audio_desktop_device = QComboBox()
+        self.audio_desktop_volume = QDoubleSpinBox()
+        self.audio_desktop_volume.setRange(-60.0, 20.0)
+        self.audio_desktop_volume.setDecimals(1)
+        self.audio_desktop_volume.setSingleStep(0.5)
+        self.audio_desktop_mute = QCheckBox("ミュート")
+
+        self.audio_mic_device = QComboBox()
+        self.audio_mic_volume = QDoubleSpinBox()
+        self.audio_mic_volume.setRange(-60.0, 20.0)
+        self.audio_mic_volume.setDecimals(1)
+        self.audio_mic_volume.setSingleStep(0.5)
+        self.audio_mic_mute = QCheckBox("ミュート")
+
+        self.audio_refresh_btn = QPushButton("音声デバイス一覧を更新")
+        self.audio_refresh_btn.clicked.connect(self.refresh_audio_devices)
+        self.audio_apply_btn = QPushButton("音声設定をOBSへ反映")
+        self.audio_apply_btn.clicked.connect(self.apply_audio_settings_to_obs)
+
+        self.form.addRow(QLabel("---- 音声設定 (OBSを開かずに設定) ----"))
+        self.form.addRow("デスクトップ音声デバイス", self.audio_desktop_device)
+        self.form.addRow("デスクトップ音量 (dB)", self.audio_desktop_volume)
+        self.form.addRow("", self.audio_desktop_mute)
+        self.form.addRow("マイク入力デバイス", self.audio_mic_device)
+        self.form.addRow("マイク音量 (dB)", self.audio_mic_volume)
+        self.form.addRow("", self.audio_mic_mute)
+        self.form.addRow(self.audio_refresh_btn)
+        self.form.addRow(self.audio_apply_btn)
 
         self.advanced_toggle_btn = QPushButton("詳細設定を表示")
         self.advanced_toggle_btn.clicked.connect(self.toggle_advanced_settings)
@@ -640,6 +699,13 @@ class SettingsPage(QWidget):
         buttons.rejected.connect(self.load_settings)
         self.form.addRow(buttons)
 
+        self.audio_desktop_device.currentIndexChanged.connect(self.queue_audio_auto_apply)
+        self.audio_desktop_volume.valueChanged.connect(self.queue_audio_auto_apply)
+        self.audio_desktop_mute.stateChanged.connect(self.queue_audio_auto_apply)
+        self.audio_mic_device.currentIndexChanged.connect(self.queue_audio_auto_apply)
+        self.audio_mic_volume.valueChanged.connect(self.queue_audio_auto_apply)
+        self.audio_mic_mute.stateChanged.connect(self.queue_audio_auto_apply)
+
         self.load_settings()
 
     def toggle_advanced_settings(self):
@@ -653,7 +719,11 @@ class SettingsPage(QWidget):
         paths = data.get("paths", {})
         storage = data.get("storage", {})
         polling = data.get("polling", {})
+        audio = data.get("audio", {})
+        desktop_audio = audio.get("desktop", {})
+        mic_audio = audio.get("mic", {})
 
+        self._audio_ui_loading = True
         self.fields["obs.host"].setText(recordtest.DEFAULT_OBS_HOST)
         self.fields["obs.dir"].setText(recordtest.DEFAULT_OBS_DIR)
         self.fields["obs.password"].setText("")
@@ -668,6 +738,9 @@ class SettingsPage(QWidget):
         self.fields["polling.end_error_limit"].setText(str(polling.get("end_error_limit", "")))
         self.fields["polling.end_poll_sec"].setText(str(polling.get("end_poll_sec", "")))
         self.fields["polling.event_poll_sec"].setText(str(polling.get("event_poll_sec", "")))
+        self._set_audio_ui_from_config("desktop", desktop_audio)
+        self._set_audio_ui_from_config("mic", mic_audio)
+        self._audio_ui_loading = False
 
     def save_settings(self):
         data = load_config()
@@ -676,6 +749,7 @@ class SettingsPage(QWidget):
         data.setdefault("storage", {})
         data.setdefault("polling", {})
         data.setdefault("app", {})
+        data.setdefault("audio", {})
 
         data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
         data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
@@ -704,6 +778,7 @@ class SettingsPage(QWidget):
             data["polling"]["event_poll_sec"] = float(self.fields["polling.event_poll_sec"].text().strip())
         except ValueError:
             pass
+        self._write_audio_settings_to_config(data)
 
         report = run_preflight(data, auto_fix=True, force_obs_detect=False)
         if report.get("errors"):
@@ -714,6 +789,222 @@ class SettingsPage(QWidget):
         save_config(report["config"])
         self.load_settings()
         QMessageBox.information(self, "設定保存", "設定を保存しました。")
+
+    def _get_audio_widgets(self, key):
+        if key == "desktop":
+            return self.audio_desktop_device, self.audio_desktop_volume, self.audio_desktop_mute
+        if key == "mic":
+            return self.audio_mic_device, self.audio_mic_volume, self.audio_mic_mute
+        raise KeyError(key)
+
+    def _add_or_update_audio_combo_items(self, combo, items):
+        current_id = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        for item in items:
+            label = f"{item.get('name', '')} [{item.get('id', '')}]".strip()
+            combo.addItem(label, item.get("id"))
+        if current_id:
+            self._select_combo_by_data(combo, current_id)
+        combo.blockSignals(False)
+
+    def _select_combo_by_data(self, combo, value):
+        if value is None:
+            return False
+        value = str(value)
+        for idx in range(combo.count()):
+            if str(combo.itemData(idx)) == value:
+                combo.setCurrentIndex(idx)
+                return True
+        return False
+
+    def _set_audio_ui_from_config(self, key, slot_cfg):
+        defaults = recordtest.get_audio_config_defaults()
+        slot = dict(defaults.get(key, {}))
+        if isinstance(slot_cfg, dict):
+            slot.update(slot_cfg)
+        combo, volume, mute = self._get_audio_widgets(key)
+
+        device_id = str(slot.get("device_id") or recordtest.DEFAULT_AUDIO_DEVICE_ID)
+        device_name = str(slot.get("device_name") or recordtest.DEFAULT_AUDIO_DEVICE_NAME)
+        fallback_item = [{"id": device_id, "name": device_name}]
+        if not self.audio_device_cache.get(key):
+            self.audio_device_cache[key] = fallback_item
+        self._add_or_update_audio_combo_items(combo, self.audio_device_cache.get(key) or fallback_item)
+        if not self._select_combo_by_data(combo, device_id):
+            combo.addItem(f"{device_name} [{device_id}]", device_id)
+            self._select_combo_by_data(combo, device_id)
+
+        try:
+            volume.setValue(float(slot.get("volume_db", 0.0)))
+        except Exception:
+            volume.setValue(0.0)
+        mute.setChecked(bool(slot.get("mute", False)))
+
+    def _read_audio_slot_from_ui(self, key):
+        combo, volume, mute = self._get_audio_widgets(key)
+        defaults = recordtest.get_audio_config_defaults()[key]
+        device_id = combo.currentData()
+        if device_id in (None, ""):
+            device_id = defaults["device_id"]
+        device_name = combo.currentText().strip()
+        if " [" in device_name and device_name.endswith("]"):
+            device_name = device_name.rsplit(" [", 1)[0].strip()
+        if not device_name:
+            device_name = defaults["device_name"]
+        return {
+            "input_name": defaults["input_name"],
+            "device_id": str(device_id),
+            "device_name": device_name,
+            "volume_db": float(volume.value()),
+            "mute": bool(mute.isChecked()),
+        }
+
+    def _write_audio_settings_to_config(self, data):
+        audio = data.setdefault("audio", {})
+        audio["desktop"] = self._read_audio_slot_from_ui("desktop")
+        audio["mic"] = self._read_audio_slot_from_ui("mic")
+
+    def _collect_settings_data_from_ui(self):
+        data = load_config()
+        data.setdefault("obs", {})
+        data.setdefault("paths", {})
+        data.setdefault("storage", {})
+        data.setdefault("polling", {})
+        data.setdefault("audio", {})
+
+        data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
+        data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
+        data["obs"]["password"] = ""
+        data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
+        data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
+        data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
+        data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
+        data["paths"]["recordings_dir"] = self.fields["paths.recordings_dir"].text().strip()
+        data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
+        data["paths"]["champion_icons_dir"] = self.fields["paths.champion_icons_dir"].text().strip()
+        try:
+            data["storage"]["max_size_gb"] = float(self.fields["storage.max_size_gb"].text().strip())
+        except ValueError:
+            pass
+        try:
+            data["polling"]["end_error_limit"] = int(self.fields["polling.end_error_limit"].text().strip())
+        except ValueError:
+            pass
+        try:
+            data["polling"]["end_poll_sec"] = float(self.fields["polling.end_poll_sec"].text().strip())
+        except ValueError:
+            pass
+        try:
+            data["polling"]["event_poll_sec"] = float(self.fields["polling.event_poll_sec"].text().strip())
+        except ValueError:
+            pass
+        self._write_audio_settings_to_config(data)
+        return data
+
+    def queue_audio_auto_apply(self, *_args):
+        if self._audio_ui_loading:
+            return
+        self._audio_apply_timer.start(350)
+
+    def _apply_audio_settings_auto(self):
+        self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=False)
+
+    def _open_obs_client_for_audio(self, auto_launch=False):
+        data = self._collect_settings_data_from_ui()
+        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        if report.get("changed"):
+            save_config(report["config"])
+        if report.get("errors"):
+            raise recordtest.RecorderError("\n".join(report.get("errors", [])))
+
+        cfg = report["config"]
+        recordtest.apply_settings(cfg)
+        recordtest.setup_environment()
+
+        ok, _detail = recordtest.test_obs_connection(
+            cfg.get("obs", {}).get("host", recordtest.DEFAULT_OBS_HOST),
+            cfg.get("obs", {}).get("port", recordtest.DEFAULT_OBS_PORT),
+            cfg.get("obs", {}).get("password", ""),
+            timeout=1.5,
+        )
+
+        launched_process = None
+        if not ok and auto_launch:
+            launched_process = recordtest.launch_obs()
+
+        client, _used_host = recordtest.connect_obs_client(
+            cfg.get("obs", {}).get("host", recordtest.DEFAULT_OBS_HOST),
+            cfg.get("obs", {}).get("port", recordtest.DEFAULT_OBS_PORT),
+            cfg.get("obs", {}).get("password", ""),
+            timeout=2.5,
+        )
+        return client, launched_process, cfg
+
+    def refresh_audio_devices(self):
+        client = None
+        launched_process = None
+        try:
+            client, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=True)
+            catalog = recordtest.get_audio_device_catalog(
+                client,
+                cfg=cfg,
+                scene_name=cfg.get("obs", {}).get("scene_name", recordtest.DEFAULT_OBS_SCENE_NAME),
+            )
+            for key in ("desktop", "mic"):
+                self.audio_device_cache[key] = list(catalog.get(key, []))
+            self._audio_ui_loading = True
+            self._set_audio_ui_from_config("desktop", cfg.get("audio", {}).get("desktop", {}))
+            self._set_audio_ui_from_config("mic", cfg.get("audio", {}).get("mic", {}))
+            self._audio_ui_loading = False
+            save_config(cfg)
+            msg = "OBSが認識している音声デバイス一覧を更新しました。"
+            if launched_process:
+                msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
+            QMessageBox.information(self, "音声デバイス一覧", msg)
+        except Exception as e:
+            self._audio_ui_loading = False
+            QMessageBox.warning(self, "音声デバイス一覧", f"取得に失敗しました。\n{e}")
+        finally:
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+
+    def apply_audio_settings_to_obs(self, show_success=True, show_error=True, auto_launch=True):
+        client = None
+        launched_process = None
+        try:
+            data = self._collect_settings_data_from_ui()
+            report = run_preflight(data, auto_fix=True, force_obs_detect=False)
+            if report.get("errors"):
+                raise recordtest.RecorderError("\n".join(report.get("errors", [])))
+            cfg = report["config"]
+            save_config(cfg)
+
+            client, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=auto_launch)
+            recordtest.apply_audio_profile_from_config(
+                client,
+                cfg,
+                scene_name=cfg.get("obs", {}).get("scene_name", recordtest.DEFAULT_OBS_SCENE_NAME),
+            )
+            if show_success:
+                msg = "音声設定をOBSへ反映しました。"
+                if launched_process:
+                    msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
+                QMessageBox.information(self, "音声設定", msg)
+            return True
+        except Exception as e:
+            if show_error:
+                QMessageBox.warning(self, "音声設定", f"OBSへの反映に失敗しました。\n{e}")
+            return False
+        finally:
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
 
     def auto_fill_settings(self):
         data = load_config()
@@ -855,7 +1146,9 @@ def main():
         QLabel { color: #e0e0e0; }
         QPushButton { background-color: #2b2b2b; color: #e0e0e0; border: 1px solid #3a3a3a; padding: 6px 10px; }
         QPushButton:hover { background-color: #3a3a3a; }
-        QLineEdit, QPlainTextEdit, QListWidget { background-color: #242424; color: #e0e0e0; border: 1px solid #3a3a3a; }
+        QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QDoubleSpinBox {
+            background-color: #242424; color: #e0e0e0; border: 1px solid #3a3a3a;
+        }
         QSlider::groove:horizontal { height: 6px; background: #3a3a3a; }
         QSlider::handle:horizontal { background: #e0e0e0; width: 12px; margin: -4px 0; border-radius: 6px; }
     """)

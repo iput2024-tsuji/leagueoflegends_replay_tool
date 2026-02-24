@@ -47,11 +47,25 @@ $distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
 $distBinDir = Join-Path $distRootDir "bin"
 New-Item -ItemType Directory -Path $distBinDir -Force | Out-Null
 
+$portableObsSourceDir = Join-Path (Get-Location) "bin\\OBS-Studio"
+$portableObsExe = Join-Path $portableObsSourceDir "bin\\64bit\\obs64.exe"
+if (-not (Test-Path $portableObsExe)) {
+  throw "ポータブルOBSが見つかりません。bin\\OBS-Studio\\bin\\64bit\\obs64.exe を配置してからビルドしてください。"
+}
+
+Copy-Item -Path $portableObsSourceDir -Destination $distBinDir -Recurse -Force
+
 # Keep distribution clean: mpv DLLs must be user-provided, not bundled.
 $mpvDllPattern = '^(lib)?mpv-\d+\.dll$'
+$portableObsDistDir = Join-Path $distBinDir "OBS-Studio"
 $bundledMpvDlls = Get-ChildItem -Path $distRootDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-  $_.Name -match $mpvDllPattern
+  $_.Name -match $mpvDllPattern -and -not $_.FullName.StartsWith($portableObsDistDir, [System.StringComparison]::OrdinalIgnoreCase)
 }
 foreach ($dll in $bundledMpvDlls) {
   Remove-Item -Path $dll.FullName -Force -ErrorAction SilentlyContinue
+}
+
+$distObsExe = Join-Path $portableObsDistDir "bin\\64bit\\obs64.exe"
+if (-not (Test-Path $distObsExe)) {
+  throw "ビルド後の配布物にポータブルOBSが含まれていません: $distObsExe"
 }

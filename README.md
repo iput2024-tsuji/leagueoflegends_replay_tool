@@ -73,10 +73,10 @@ pip install pyinstaller
 出力先: `dist\LoLReplayTool\`
 - `config\setting.json` は初回起動時に自動生成されます
 - OBS は `bin\OBS-Studio` (ポータブル) のみ利用します（ユーザー環境のOBSは利用しません）
+- ビルド時に `bin\OBS-Studio` は配布物へ自動コピーされます（未配置ならビルド失敗）
 - ポータブルOBSのWebSocket設定はアプリ側で自動補完します
 - 設定画面または初回セットアップで「環境を自動修復」を実行すると、配布先でも設定不要で動かせます
 - mpv DLL は同梱せず、利用者が `bin\` に配置します
-- ビルド時に `dist\LoLReplayTool\bin\` は空フォルダとして作成されます
 - `assets\app\app.ico` が存在する場合、exeアイコンとウィンドウアイコンに反映されます
 - ビルド成果物は `LoLReplayTool.exe` と同じ階層に `config` / `assets` / `bin` が配置されます（`_internal` 非使用）
 
@@ -89,19 +89,19 @@ pip install pyinstaller
 ## 配布運用（固定手順）
 
 ### 1. 配布者の手順
-1. リポジトリ直下でビルドする。
+1. リポジトリ直下の `bin\OBS-Studio\` にポータブルOBSを配置する。
+2. リポジトリ直下でビルドする。
    ```powershell
    .\venv\Scripts\Activate.ps1
    .\scripts\build.ps1
    ```
-2. `dist\LoLReplayTool\bin\OBS-Studio\` にポータブルOBSを配置する（同梱運用）。
 3. `dist\LoLReplayTool\` ディレクトリを丸ごとZIP化して配布する。
 4. ZIP化前に以下が入っているか確認する。
    - `LoLReplayTool.exe`
    - `config\setting.sample.json`
    - `config\champion_aliases.json`
    - `assets\champions\icons\`
-   - `bin\OBS-Studio\`（ポータブルOBS）
+   - `bin\OBS-Studio\`（ビルド時に自動コピーされたポータブルOBS）
    - `bin\` 配下の mpv DLL（`mpv-1.dll` など）
 
 ### 2. 受け取り側の初回セットアップ

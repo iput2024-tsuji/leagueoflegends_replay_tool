@@ -131,11 +131,11 @@ if BIN_DIR.exists():
 
 # --- 2. MPVインポート ---
 try:
-    import mpv
-except OSError:
-    print("❌ Error: mpv DLL が見つかりません。")
-    print(f"   場所: {BIN_DIR}")
-    sys.exit(1)
+    import mpv as mpv_module
+    MPV_IMPORT_ERROR = None
+except Exception as e:
+    mpv_module = None
+    MPV_IMPORT_ERROR = e
 
 # --- 3. PyQt & その他ライブラリ ---
 import cv2
@@ -146,7 +146,32 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QDialogButtonBox, QLineEdit, QComboBox, QCheckBox,
                              QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QShortcut, QPixmap, QFont
+from PyQt6.QtGui import QKeySequence, QShortcut, QPixmap, QFont, QColor
+
+
+def show_mpv_missing_dialog_and_exit(parent=None):
+    message = (
+        "binフォルダに mpv-1.dll などのMPVコンポーネントが見つかりません。\n"
+        "配置してから起動してください。\n\n"
+        f"探した場所: {BIN_DIR}\n\n"
+        "対応DLL: mpv-1.dll / libmpv-1.dll / mpv-2.dll / libmpv-2.dll"
+    )
+    app = QApplication.instance()
+    created_app = False
+    if app is None:
+        app = QApplication(sys.argv)
+        created_app = True
+    QMessageBox.critical(parent, "MPV DLL Missing", message)
+    if created_app:
+        app.quit()
+    raise SystemExit(1)
+
+
+def ensure_mpv_available_or_exit(parent=None):
+    if mpv_module is not None:
+        return mpv_module
+    show_mpv_missing_dialog_and_exit(parent)
+
 
 class SyncWorker(QThread):
     """バックグラウンドで同期マーカーを探すスレッド"""
@@ -687,7 +712,8 @@ class PlayerWidget(QWidget):
 
     def init_mpv(self):
         try:
-            self.player = mpv.MPV(
+            mpv_runtime = ensure_mpv_available_or_exit(self)
+            self.player = mpv_runtime.MPV(
                 wid=str(int(self.video_frame.winId())),
                 input_default_bindings=False,
                 input_vo_keyboard=False,
@@ -819,12 +845,14 @@ class PlayerWidget(QWidget):
             self.on_event_clicked(self.event_list.currentItem())
 
     def open_file_dialog(self):
+        self.load_settings()
         initial_dir = str(self.json_dir if self.json_dir else ROOT_DIR)
         fname, _ = QFileDialog.getOpenFileName(self, "Open JSON Log", initial_dir, "JSON Files (*.json)")
         if fname:
             self.load_data(fname)
 
     def open_replay_selector(self):
+        self.load_settings()
         dialog = ReplaySelectDialog(
             self,
             json_dir=self.json_dir,
@@ -986,7 +1014,10 @@ class PlayerWidget(QWidget):
         item_text = f"[{m:02d}:{s:02d}] {text}"
         item = QListWidgetItem(item_text)
         item.setData(Qt.ItemDataRole.UserRole, game_time)
-        item.setForeground(Qt.GlobalColor.white)
+        color = QColor(str(color_hex))
+        if not color.isValid():
+            color = QColor("#FFFFFF")
+        item.setForeground(color)
         self.event_list.addItem(item)
 
     def on_event_clicked(self, item):

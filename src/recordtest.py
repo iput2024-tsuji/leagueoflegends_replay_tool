@@ -6,9 +6,6 @@ import subprocess
 import configparser
 from pathlib import Path
 
-import ctypes
-from ctypes import wintypes
-
 import requests
 import urllib3
 import obsws_python as obs
@@ -130,7 +127,8 @@ def get_obs_global_ini_path(base_dir):
 
 def ensure_portable_obs_global_ini(base_dir):
     """
-    ポータブルOBSのグローバル設定にトレイアイコン非表示を入れる。
+    ポータブルOBSの global.ini にトレイ無効化設定を反映する。
+    configparser を使い、キーの大文字小文字を維持して書き込む。
     """
     if not is_managed_portable_obs_dir(base_dir):
         raise RecorderError(
@@ -142,28 +140,35 @@ def ensure_portable_obs_global_ini(base_dir):
     ini_path.parent.mkdir(parents=True, exist_ok=True)
 
     parser = configparser.ConfigParser(interpolation=None)
-    parser.optionxform = str
+    parser.optionxform = str  # キーの大文字小文字を維持
+
+    parse_failed = False
     if ini_path.exists():
         try:
-            parser.read(ini_path, encoding="utf-8")
+            parser.read(ini_path, encoding="utf-8-sig")
         except Exception:
+            # 既存ファイルが壊れていても再生成で復旧する
+            parse_failed = True
             parser = configparser.ConfigParser(interpolation=None)
             parser.optionxform = str
 
+    changed = parse_failed
     if not parser.has_section("BasicWindow"):
         parser.add_section("BasicWindow")
+        changed = True
 
-    changed = False
-    for key, value in (
-        ("HideTrayIcon", "true"),
-        ("SysTrayEnabled", "false"),
-    ):
-        current = parser.get("BasicWindow", key, fallback="").strip().lower()
-        if current != value:
+    desired = {
+        "SysTrayEnabled": "false",
+        "SysTrayWhenStarted": "false",
+        "SysTrayMinimizeToTray": "false",
+    }
+    for key, value in desired.items():
+        current = parser.get("BasicWindow", key, fallback=None)
+        if current is None or str(current).strip().lower() != value:
             parser.set("BasicWindow", key, value)
             changed = True
 
-    if changed:
+    if changed or not ini_path.exists():
         with open(ini_path, "w", encoding="utf-8") as f:
             parser.write(f, space_around_delimiters=False)
 
@@ -1166,7 +1171,24 @@ def load_json_metadata(path):
             data = json.load(f)
         saved_at = parse_saved_at(data.get("saved_at"))
         video_path = data.get("obs_record_path")
-        return saved_at, Path(video_path) if video_path else None
+        if not video_path:
+            return saved_at, None
+
+        raw_path = Path(str(video_path))
+        candidates = []
+        if raw_path.is_absolute():
+            candidates.append(raw_path)
+        else:
+            candidates.append(path.parent / raw_path)
+            if RECORDINGS_DIR:
+                candidates.append(Path(RECORDINGS_DIR) / raw_path.name)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return saved_at, candidate
+        if candidates:
+            return saved_at, candidates[-1]
+        return saved_at, raw_path
     except Exception:
         return None, None
 
@@ -1223,47 +1245,95 @@ def enforce_storage_limit(keep_paths=None):
 
 
 def launch_obs():
-    """OBSを最小化モードで起動する"""
+    """OBSをバックグラウンドで起動する"""
     if not OBS_DIR:
         raise RecorderError("OBSのパスが未設定です。設定画面の OBSフォルダ (obs.dir) を指定してください。")
 
-    obs_exe = os.path.join(OBS_DIR, "bin", "64bit", "obs64.exe")
-    working_dir = os.path.join(OBS_DIR, "bin", "64bit")
+    obs_dir_abs = os.path.abspath(str(OBS_DIR))
+    obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
+    working_dir = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit"))
 
     if not os.path.exists(obs_exe):
         detected = detect_obs_dir()
         hint = f"\n自動検出候補: {detected}" if detected else ""
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
+    # 最優先: 残存OBSを先に終了して、以降の設定更新とのレースを防ぐ。
+    kill_stale_obs_processes()
+
     try:
-        changed_ini, global_ini_path = ensure_portable_obs_global_ini(OBS_DIR)
+        ensure_portable_mode_marker(obs_dir_abs)
+    except Exception as e:
+        raise RecorderError(f"portable_mode.txt の準備に失敗しました: {e}") from e
+
+    # OBSが通常版設定(AppData)を読むのを防ぐため、隔離環境を用意する。
+    isolated_root = os.path.abspath(os.path.join(obs_dir_abs, "temp_appdata"))
+    isolated_roaming = os.path.join(isolated_root, "Roaming")
+    isolated_local = os.path.join(isolated_root, "Local")
+    isolated_profile = os.path.join(isolated_root, "UserProfile")
+    for path in (isolated_root, isolated_roaming, isolated_local, isolated_profile):
+        os.makedirs(path, exist_ok=True)
+
+    try:
+        changed_ini, global_ini_path = ensure_portable_obs_global_ini(obs_dir_abs)
         if changed_ini and global_ini_path:
             print(f"ℹ️ ポータブルOBSの global.ini を更新しました: {global_ini_path}")
-        changed, ws_cfg_path = ensure_portable_obs_websocket_config(OBS_DIR, OBS_PORT, OBS_PASSWORD)
+        changed, ws_cfg_path = ensure_portable_obs_websocket_config(obs_dir_abs, OBS_PORT, OBS_PASSWORD)
         if changed and ws_cfg_path:
             print(f"ℹ️ ポータブルOBSのWebSocket設定を更新しました: {ws_cfg_path}")
     except Exception as e:
         raise RecorderError(f"ポータブルOBS起動前設定の更新に失敗しました: {e}") from e
 
     print("🚀 OBSを起動しています (バックグラウンド/非表示)...")
-    cmd = [obs_exe, "--portable"]
-
-    startupinfo = None
-    if os.name == "nt":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    cmd = [obs_exe, "--portable", "--multi", "--disable-shutdown-check", "--disable-updater"]
 
     try:
-        popen_kwargs = {"cwd": working_dir}
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+
+        custom_env = os.environ.copy()
+        custom_env["APPDATA"] = isolated_roaming
+        custom_env["LOCALAPPDATA"] = isolated_local
+        custom_env["USERPROFILE"] = isolated_profile
+
+        popen_kwargs = {"cwd": working_dir, "env": custom_env}
         if startupinfo is not None:
             popen_kwargs["startupinfo"] = startupinfo
+
         process = subprocess.Popen(cmd, **popen_kwargs)
-        print("⏳ OBSの起動を待機中...")
-        time.sleep(5)
+        # WebSocketの起動待ち
+        time.sleep(2)
         return process
     except Exception as e:
         raise RecorderError(f"OBS起動エラー: {e}") from e
+
+
+def ensure_portable_mode_marker(base_dir):
+    if not base_dir:
+        raise RecorderError("OBS_DIR が未設定です。")
+    marker = Path(base_dir) / "portable_mode.txt"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    if not marker.exists():
+        marker.write_text("", encoding="utf-8")
+    return marker
+
+
+def kill_stale_obs_processes():
+    """
+    残存している obs64.exe を起動直前に全て終了する。
+    旧プロセスがトレイ/ウィンドウを保持しているケースを排除する。
+    """
+    if os.name != "nt":
+        return
+    try:
+        os.system("taskkill /f /im obs64.exe >nul 2>&1")
+        # OS側のプロセス終了反映待ち
+        time.sleep(0.3)
+    except Exception:
+        pass
 
 
 def get_active_player_name():
@@ -1353,6 +1423,15 @@ class LoLAutoRecorder:
 
     def should_stop(self):
         return self.stop_requested
+
+    def wait_with_stop(self, seconds, step=0.5):
+        deadline = time.time() + max(0.0, float(seconds))
+        while time.time() < deadline:
+            if self.should_stop():
+                return False
+            remaining = deadline - time.time()
+            time.sleep(min(step, max(0.01, remaining)))
+        return not self.should_stop()
 
     def reset_session(self):
         self.output_file = None
@@ -1565,7 +1644,8 @@ class LoLAutoRecorder:
                     self.try_update_player_name()
                     self.session_started = True
                     return True
-            time.sleep(1)
+            if not self.wait_with_stop(1.0):
+                return False
 
     def start_recording(self):
         """録画開始 -> 同期マーカー"""
@@ -1579,7 +1659,8 @@ class LoLAutoRecorder:
         except Exception as e:
             self.log(f"⚠️ 録画開始エラー: {e}")
             return
-        time.sleep(2)
+        if not self.wait_with_stop(2.0):
+            return
 
         item_id = self.get_source_id()
         if not item_id:
@@ -1605,7 +1686,7 @@ class LoLAutoRecorder:
         self.sync_game_time = sync_time
         self.log(f"📝 同期ログ記録: {sync_time:.4f}s")
 
-        time.sleep(0.5)
+        self.wait_with_stop(0.5)
         self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, False)
         self.log("✅ シグナル消灯。録画継続中。")
 
@@ -1619,7 +1700,8 @@ class LoLAutoRecorder:
                 for event in event_data.get("Events", []):
                     if event.get("EventName") == "GameStart":
                         return event.get("EventTime", 0.0)
-            time.sleep(0.5)
+            if not self.wait_with_stop(0.5):
+                return None
         self.log("⚠️ GameStart を検知できませんでした。現在のゲーム時間で同期します。")
         return None
 
@@ -1689,7 +1771,8 @@ class LoLAutoRecorder:
                 if error_count >= END_ERROR_LIMIT:
                     self.log("🏁 試合終了検知。録画を停止します。")
                     return True
-                time.sleep(END_POLL_SEC)
+                if not self.wait_with_stop(END_POLL_SEC):
+                    return False
                 continue
 
             error_count = 0
@@ -1704,7 +1787,8 @@ class LoLAutoRecorder:
                 self.process_events(events)
                 self.update_result_from_events(events)
 
-            time.sleep(EVENT_POLL_SEC)
+            if not self.wait_with_stop(EVENT_POLL_SEC):
+                return False
         return True
 
     def stop_recording(self):
@@ -1744,17 +1828,24 @@ class LoLAutoRecorder:
         if self.obs_process.poll() is not None:
             return
 
-        def enum_windows_callback(hwnd, lparam):
-            pid = wintypes.DWORD()
-            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value == self.obs_process.pid:
-                ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
-            return True
+        try:
+            self.obs_process.terminate()
+        except Exception:
+            pass
 
-        callback = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
-        ctypes.windll.user32.EnumWindows(callback(enum_windows_callback), 0)
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if self.obs_process.poll() is not None:
+                break
+            time.sleep(0.1)
 
-        time.sleep(1)
+        if self.obs_process.poll() is None:
+            self.log("⚠️ OBSが終了しないため強制終了します。")
+            try:
+                self.obs_process.kill()
+                self.obs_process.wait(timeout=2)
+            except Exception:
+                pass
 
         if self.client:
             self.client.disconnect()
@@ -1769,6 +1860,13 @@ class LoLAutoRecorder:
                 self.game_result = game_data.get("gameResult") or game_data.get("result")
                 self.winning_team = self.winning_team or game_data.get("winningTeam") or game_data.get("winning_team")
 
+        record_path_for_json = None
+        if self.record_path:
+            try:
+                record_path_for_json = Path(self.record_path).name
+            except Exception:
+                record_path_for_json = str(self.record_path)
+
         payload = {
             "summoner_name": self.my_name,
             "champion_name": self.champion_name,
@@ -1777,7 +1875,7 @@ class LoLAutoRecorder:
             "winning_team": self.winning_team,
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "sync_game_time": self.sync_game_time,
-            "obs_record_path": self.record_path,
+            "obs_record_path": record_path_for_json,
             "paths": {
                 "recordings_dir": str(RECORDINGS_DIR) if RECORDINGS_DIR else None,
                 "json_path": str(self.output_file)

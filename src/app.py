@@ -11,7 +11,6 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QLabel,
     QStackedWidget,
-    QPlainTextEdit,
     QFormLayout,
     QLineEdit,
     QDialog,
@@ -506,71 +505,6 @@ class HomePage(QWidget):
             self.status_detail_label.setToolTip(detail_text)
 
 
-class RecorderPage(QWidget):
-    def __init__(self, on_back):
-        super().__init__()
-        self.worker = None
-
-        layout = QVBoxLayout(self)
-        header = QHBoxLayout()
-        back_btn = QPushButton("← 戻る")
-        back_btn.clicked.connect(on_back)
-        header.addWidget(back_btn)
-
-        self.status_label = QLabel("待機中")
-        header.addWidget(self.status_label)
-        header.addStretch(1)
-        layout.addLayout(header)
-
-        button_row = QHBoxLayout()
-        self.start_btn = QPushButton("録画待機開始")
-        self.stop_btn = QPushButton("停止")
-        self.stop_btn.setEnabled(False)
-        button_row.addWidget(self.start_btn)
-        button_row.addWidget(self.stop_btn)
-        layout.addLayout(button_row)
-
-        self.log_view = QPlainTextEdit()
-        self.log_view.setReadOnly(True)
-        layout.addWidget(self.log_view, stretch=1)
-
-        self.start_btn.clicked.connect(self.start_worker)
-        self.stop_btn.clicked.connect(self.stop_worker)
-
-    def append_log(self, text):
-        self.log_view.appendPlainText(text)
-        self.status_label.setText(text)
-
-    def start_worker(self):
-        if self.worker and self.worker.isRunning():
-            return
-        self.worker = RecorderWorker()
-        self.worker.status.connect(self.append_log)
-        self.worker.error.connect(self.on_worker_error)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.start()
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.append_log("録画待機を開始しました。")
-
-    def stop_worker(self):
-        if self.worker:
-            self.worker.stop()
-            self.append_log("停止リクエスト送信…")
-
-    def on_finished(self):
-        self.start_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-        self.append_log("録画待機を終了しました。")
-
-    def on_worker_error(self, message):
-        detail = (
-            f"{message}\n\n"
-            "設定画面で OBSフォルダ・ポート・パスワードを確認してください。"
-        )
-        QMessageBox.critical(self, "録画エラー", detail)
-
-
 class PlayerPage(QWidget):
     def __init__(self, on_back):
         super().__init__()
@@ -687,8 +621,26 @@ class SettingsPage(QWidget):
         self.recordings_dir_browse_btn.clicked.connect(self.browse_recordings_dir)
         recordings_dir_layout.addWidget(self.recordings_dir_browse_btn)
         general_form.addRow("録画保存ディレクトリ", self.recordings_dir_row)
-        general_form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
-        general_form.addRow("アイコンディレクトリ", self.fields["paths.champion_icons_dir"])
+
+        self.json_dir_row = QWidget()
+        json_dir_layout = QHBoxLayout(self.json_dir_row)
+        json_dir_layout.setContentsMargins(0, 0, 0, 0)
+        json_dir_layout.setSpacing(8)
+        json_dir_layout.addWidget(self.fields["paths.json_dir"], stretch=1)
+        self.json_dir_browse_btn = QPushButton("参照...")
+        self.json_dir_browse_btn.clicked.connect(self.browse_json_dir)
+        json_dir_layout.addWidget(self.json_dir_browse_btn)
+        general_form.addRow("JSONディレクトリ", self.json_dir_row)
+
+        self.icons_dir_row = QWidget()
+        icons_dir_layout = QHBoxLayout(self.icons_dir_row)
+        icons_dir_layout.setContentsMargins(0, 0, 0, 0)
+        icons_dir_layout.setSpacing(8)
+        icons_dir_layout.addWidget(self.fields["paths.champion_icons_dir"], stretch=1)
+        self.icons_dir_browse_btn = QPushButton("参照...")
+        self.icons_dir_browse_btn.clicked.connect(self.browse_icons_dir)
+        icons_dir_layout.addWidget(self.icons_dir_browse_btn)
+        general_form.addRow("アイコンディレクトリ", self.icons_dir_row)
         general_form.addRow("最大容量(GB)", self.fields["storage.max_size_gb"])
         self.obs_fps_combo = QComboBox()
         self.obs_fps_combo.addItems(["30", "60", "120"])
@@ -793,6 +745,20 @@ class SettingsPage(QWidget):
         selected = QFileDialog.getExistingDirectory(self, "録画保存ディレクトリを選択", start_dir)
         if selected:
             self.fields["paths.recordings_dir"].setText(selected)
+
+    def browse_json_dir(self):
+        current = self.fields["paths.json_dir"].text().strip()
+        start_dir = current or str(ROOT_DIR)
+        selected = QFileDialog.getExistingDirectory(self, "JSONディレクトリを選択", start_dir)
+        if selected:
+            self.fields["paths.json_dir"].setText(selected)
+
+    def browse_icons_dir(self):
+        current = self.fields["paths.champion_icons_dir"].text().strip()
+        start_dir = current or str(ROOT_DIR)
+        selected = QFileDialog.getExistingDirectory(self, "アイコンディレクトリを選択", start_dir)
+        if selected:
+            self.fields["paths.champion_icons_dir"].setText(selected)
 
     def load_settings(self):
         data = load_config()

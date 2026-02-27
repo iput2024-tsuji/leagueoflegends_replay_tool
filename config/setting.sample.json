@@ -2,6 +2,7 @@
     "obs": {
         "host": "localhost",
         "port": 4455,
+        "fps": 60,
         "password": "",
         "scene_name": "lol_seen",
         "source_name": "color",
@@ -40,6 +41,7 @@
         }
     },
     "app": {
-        "setup_completed": false
+        "setup_completed": false,
+        "minimize_to_tray": true
     }
 }

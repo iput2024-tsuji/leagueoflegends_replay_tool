@@ -19,6 +19,72 @@ BIN_DIR = ROOT_DIR / "bin"
 ICON_DIR = ROOT_DIR / "assets" / "champions" / "icons"
 ICON_INDEX = None
 ICON_ALIASES = None
+DEFAULT_RECORDINGS_DIR = ROOT_DIR / "recordings"
+DEFAULT_JSON_DIR = ROOT_DIR / "recordings" / "json"
+
+
+def load_app_config():
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def resolve_config_path(value, fallback):
+    path = fallback
+    if value not in (None, ""):
+        path = Path(str(value))
+    if not path.is_absolute():
+        path = (ROOT_DIR / path).resolve()
+    return path
+
+
+def get_config_media_paths(config_data=None):
+    data = config_data if isinstance(config_data, dict) else load_app_config()
+    paths = data.get("paths", {}) if isinstance(data, dict) else {}
+    recordings_dir = resolve_config_path(paths.get("recordings_dir"), DEFAULT_RECORDINGS_DIR)
+    json_dir = resolve_config_path(paths.get("json_dir"), DEFAULT_JSON_DIR)
+    return data, recordings_dir, json_dir
+
+
+def resolve_video_path(json_path: Path, payload: dict, recordings_dir: Path):
+    value = payload.get("obs_record_path")
+    if not value:
+        return None
+
+    raw = Path(str(value))
+    candidates = []
+
+    if raw.is_absolute():
+        candidates.append(raw)
+        candidates.append(json_path.parent / raw.name)
+        if recordings_dir:
+            candidates.append(recordings_dir / raw.name)
+    else:
+        candidates.append(json_path.parent / raw)
+        if recordings_dir:
+            candidates.append(recordings_dir / raw)
+            candidates.append(recordings_dir / raw.name)
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if resolved.exists():
+            return resolved
+    return None
 
 def ensure_mpv_dll(bin_dir: Path, root_dir: Path):
     candidates = []
@@ -279,12 +345,16 @@ def find_champion_icon(champion_name):
 
 
 class ReplaySelectDialog(QDialog):
-    def __init__(self, parent=None, json_dir=None):
+    def __init__(self, parent=None, json_dir=None, recordings_dir=None):
         super().__init__(parent)
         self.setWindowTitle("Replay Select")
         self.resize(820, 560)
         self.selected_path = None
-        self.json_dir = json_dir or (ROOT_DIR / "recordings" / "json")
+        _cfg_data, cfg_recordings_dir, cfg_json_dir = get_config_media_paths()
+        self.json_dir = resolve_config_path(json_dir, cfg_json_dir) if json_dir else cfg_json_dir
+        self.recordings_dir = (
+            resolve_config_path(recordings_dir, cfg_recordings_dir) if recordings_dir else cfg_recordings_dir
+        )
         self.meta_cache = []
 
         layout = QVBoxLayout(self)
@@ -354,7 +424,8 @@ class ReplaySelectDialog(QDialog):
             "result": "Unknown",
             "summoner": "Unknown",
             "saved_at": path.stem,
-            "video_exists": True
+            "video_exists": True,
+            "video_path": None,
         }
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -366,21 +437,9 @@ class ReplaySelectDialog(QDialog):
             team = data.get("player_team")
             winning = data.get("winning_team")
             meta["result"] = normalize_result(result, team_value=team, winning_team=winning)
-
-            video_path = data.get("obs_record_path")
-            if video_path:
-                video_path = Path(video_path)
-                if not video_path.exists():
-                    fallback = path.parent / video_path.name
-                    if fallback.exists():
-                        video_path = fallback
-                        meta["video_exists"] = True
-                    else:
-                        meta["video_exists"] = False
-                else:
-                    meta["video_exists"] = True
-            else:
-                meta["video_exists"] = False
+            resolved_video = resolve_video_path(path, data, self.recordings_dir)
+            meta["video_path"] = str(resolved_video) if resolved_video else None
+            meta["video_exists"] = resolved_video is not None
         except Exception:
             pass
         return meta
@@ -478,7 +537,12 @@ class ReplaySelectDialog(QDialog):
         self.accept()
 
     def open_file_dialog(self):
-        fname, _ = QFileDialog.getOpenFileName(self, "Open JSON Log", str(ROOT_DIR), "JSON Files (*.json)")
+        fname, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open JSON Log",
+            str(self.json_dir if self.json_dir else ROOT_DIR),
+            "JSON Files (*.json)"
+        )
         if fname:
             self.selected_path = fname
             self.accept()
@@ -639,25 +703,24 @@ class PlayerWidget(QWidget):
 
     def load_settings(self):
         global ICON_DIR, ICON_INDEX, ICON_ALIASES, ALIASES_PATH
+        self.recordings_dir = DEFAULT_RECORDINGS_DIR
+        self.json_dir = DEFAULT_JSON_DIR
         if not CONFIG_PATH.exists():
             return
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            paths = data.get("paths", {})
+            data = load_app_config()
+            paths = data.get("paths", {}) if isinstance(data, dict) else {}
+
+            self.recordings_dir = resolve_config_path(paths.get("recordings_dir"), DEFAULT_RECORDINGS_DIR)
+            self.json_dir = resolve_config_path(paths.get("json_dir"), DEFAULT_JSON_DIR)
+
             icons = paths.get("champion_icons_dir")
             if icons:
-                path = Path(icons)
-                if not path.is_absolute():
-                    path = (ROOT_DIR / path).resolve()
-                ICON_DIR = path
+                ICON_DIR = resolve_config_path(icons, ICON_DIR)
                 ICON_INDEX = None
             aliases_path = paths.get("champion_aliases_path")
             if aliases_path:
-                alias_path = Path(aliases_path)
-                if not alias_path.is_absolute():
-                    alias_path = (ROOT_DIR / alias_path).resolve()
-                ALIASES_PATH = alias_path
+                ALIASES_PATH = resolve_config_path(aliases_path, ALIASES_PATH)
                 ICON_ALIASES = None
         except Exception:
             pass
@@ -756,13 +819,17 @@ class PlayerWidget(QWidget):
             self.on_event_clicked(self.event_list.currentItem())
 
     def open_file_dialog(self):
-        initial_dir = str(ROOT_DIR)
+        initial_dir = str(self.json_dir if self.json_dir else ROOT_DIR)
         fname, _ = QFileDialog.getOpenFileName(self, "Open JSON Log", initial_dir, "JSON Files (*.json)")
         if fname:
             self.load_data(fname)
 
     def open_replay_selector(self):
-        dialog = ReplaySelectDialog(self, json_dir=ROOT_DIR / "recordings" / "json")
+        dialog = ReplaySelectDialog(
+            self,
+            json_dir=self.json_dir,
+            recordings_dir=self.recordings_dir,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_path:
             self.load_data(dialog.selected_path)
 
@@ -771,18 +838,11 @@ class PlayerWidget(QWidget):
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            
-            video_path_str = data.get("obs_record_path")
-            if not video_path_str:
-                self.info_label.setText("Error: Path not found in JSON")
+
+            video_path = resolve_video_path(json_path, data, self.recordings_dir)
+            if video_path is None:
+                self.info_label.setText("Error: Video file missing")
                 return
-            
-            video_path = Path(video_path_str)
-            if not video_path.exists():
-                video_path = json_path.parent / video_path.name
-                if not video_path.exists():
-                    self.info_label.setText("Error: Video file missing")
-                    return
 
             self.current_video_path = video_path
             self.sync_game_time = data.get("sync_game_time", 0.0)

@@ -19,10 +19,15 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QComboBox,
     QCheckBox,
-    QDoubleSpinBox,
+    QTabWidget,
+    QSlider,
+    QSystemTrayIcon,
+    QMenu,
+    QStyle,
+    QFileDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QAction
 
 try:
     from . import recordtest
@@ -71,6 +76,7 @@ def apply_auto_defaults(data, force_obs_detect=False):
     defaults_obs = {
         "host": recordtest.DEFAULT_OBS_HOST,
         "port": recordtest.DEFAULT_OBS_PORT,
+        "fps": recordtest.DEFAULT_OBS_FPS,
         "scene_name": recordtest.DEFAULT_OBS_SCENE_NAME,
         "source_name": recordtest.DEFAULT_OBS_SOURCE_NAME,
         "source_color": recordtest.DEFAULT_OBS_SOURCE_COLOR,
@@ -124,6 +130,9 @@ def apply_auto_defaults(data, force_obs_detect=False):
         changed = True
     elif not bool(app_cfg.get("setup_completed")) and has_valid_dir:
         app_cfg["setup_completed"] = True
+        changed = True
+    if app_cfg.get("minimize_to_tray") is None:
+        app_cfg["minimize_to_tray"] = True
         changed = True
 
     audio_defaults = recordtest.get_audio_config_defaults()
@@ -443,28 +452,35 @@ class SetupWizardDialog(QDialog):
 
 
 class HomePage(QWidget):
-    def __init__(self, on_record, on_play, on_settings):
+    def __init__(self, on_play, on_settings):
         super().__init__()
         layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
 
         title = QLabel("LoL Replay Tool")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("font-size: 22px; font-weight: bold;")
         layout.addWidget(title)
 
-        exit_btn = QPushButton("アプリを終了")
-        exit_btn.setFixedHeight(38)
-        exit_btn.clicked.connect(QApplication.instance().quit)
-        layout.addWidget(exit_btn)
+        self.status_label = QLabel("⚪ 停止")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setStyleSheet(
+            "padding: 10px 14px; border-radius: 8px; "
+            "background-color: #2d2d2d; color: #cfcfcf; border: 1px solid #3a3a3a;"
+        )
+        layout.addWidget(self.status_label)
+
+        self.status_detail_label = QLabel("バックグラウンド監視を開始していません。")
+        self.status_detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_detail_label.setWordWrap(True)
+        self.status_detail_label.setStyleSheet("color: #9a9a9a;")
+        layout.addWidget(self.status_detail_label)
+
+        layout.addStretch(1)
 
         btn_layout = QVBoxLayout()
         btn_layout.setSpacing(12)
-
-        record_btn = QPushButton("録画を開始")
-        record_btn.setFixedHeight(50)
-        record_btn.clicked.connect(on_record)
-        btn_layout.addWidget(record_btn)
 
         play_btn = QPushButton("リプレイを再生")
         play_btn.setFixedHeight(50)
@@ -477,6 +493,17 @@ class HomePage(QWidget):
         btn_layout.addWidget(settings_btn)
 
         layout.addLayout(btn_layout)
+        layout.addStretch(1)
+
+    def set_recorder_status(self, badge_text, color_hex="#cfcfcf", detail_text=None):
+        self.status_label.setText(badge_text)
+        self.status_label.setStyleSheet(
+            "padding: 10px 14px; border-radius: 8px; "
+            f"background-color: #2d2d2d; color: {color_hex}; border: 1px solid #3a3a3a;"
+        )
+        if detail_text is not None:
+            self.status_detail_label.setText(detail_text)
+            self.status_detail_label.setToolTip(detail_text)
 
 
 class RecorderPage(QWidget):
@@ -593,18 +620,42 @@ class PlayerPage(QWidget):
 class SettingsPage(QWidget):
     def __init__(self, on_back):
         super().__init__()
-        self.form = QFormLayout(self)
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(10)
         self.fields = {}
-        self.advanced_visible = False
         self.audio_device_cache = {"desktop": [], "mic": []}
         self._audio_ui_loading = False
+        self._audio_refresh_in_progress = False
+        self._audio_auto_refreshed_once = False
         self._audio_apply_timer = QTimer(self)
         self._audio_apply_timer.setSingleShot(True)
         self._audio_apply_timer.timeout.connect(self._apply_audio_settings_auto)
 
         back_btn = QPushButton("← 戻る")
         back_btn.clicked.connect(on_back)
-        self.form.addRow(back_btn)
+        root_layout.addWidget(back_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.tabs = QTabWidget()
+        root_layout.addWidget(self.tabs, stretch=1)
+
+        general_tab = QWidget()
+        general_form = QFormLayout(general_tab)
+        general_form.setContentsMargins(8, 8, 8, 8)
+        general_form.setSpacing(10)
+        self.tabs.addTab(general_tab, "一般")
+
+        audio_tab = QWidget()
+        audio_form = QFormLayout(audio_tab)
+        audio_form.setContentsMargins(8, 8, 8, 8)
+        audio_form.setSpacing(10)
+        self.tabs.addTab(audio_tab, "オーディオ")
+
+        advanced_tab = QWidget()
+        advanced_form = QFormLayout(advanced_tab)
+        advanced_form.setContentsMargins(8, 8, 8, 8)
+        advanced_form.setSpacing(10)
+        self.tabs.addTab(advanced_tab, "高度な設定")
 
         self.fields["obs.host"] = QLineEdit()
         self.fields["obs.dir"] = QLineEdit()
@@ -626,78 +677,71 @@ class SettingsPage(QWidget):
         self.fields["obs.password"].setReadOnly(True)
         self.fields["obs.port"].setReadOnly(True)
 
-        self.form.addRow("OBSフォルダ(固定)", self.fields["obs.dir"])
-        self.form.addRow("録画ディレクトリ", self.fields["paths.recordings_dir"])
-        self.form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
-        self.form.addRow("アイコンディレクトリ", self.fields["paths.champion_icons_dir"])
-        self.form.addRow("最大容量(GB)", self.fields["storage.max_size_gb"])
+        general_form.addRow("OBSフォルダ(固定)", self.fields["obs.dir"])
+        self.recordings_dir_row = QWidget()
+        recordings_dir_layout = QHBoxLayout(self.recordings_dir_row)
+        recordings_dir_layout.setContentsMargins(0, 0, 0, 0)
+        recordings_dir_layout.setSpacing(8)
+        recordings_dir_layout.addWidget(self.fields["paths.recordings_dir"], stretch=1)
+        self.recordings_dir_browse_btn = QPushButton("参照...")
+        self.recordings_dir_browse_btn.clicked.connect(self.browse_recordings_dir)
+        recordings_dir_layout.addWidget(self.recordings_dir_browse_btn)
+        general_form.addRow("録画保存ディレクトリ", self.recordings_dir_row)
+        general_form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
+        general_form.addRow("アイコンディレクトリ", self.fields["paths.champion_icons_dir"])
+        general_form.addRow("最大容量(GB)", self.fields["storage.max_size_gb"])
+        self.obs_fps_combo = QComboBox()
+        self.obs_fps_combo.addItems(["30", "60", "120"])
+        general_form.addRow("録画FPS", self.obs_fps_combo)
+        self.minimize_to_tray_check = QCheckBox("ウィンドウを閉じた時にタスクトレイに格納する")
+        general_form.addRow("", self.minimize_to_tray_check)
 
         self.audio_desktop_device = QComboBox()
-        self.audio_desktop_volume = QDoubleSpinBox()
-        self.audio_desktop_volume.setRange(-60.0, 20.0)
-        self.audio_desktop_volume.setDecimals(1)
-        self.audio_desktop_volume.setSingleStep(0.5)
+        self.audio_desktop_volume_row, self.audio_desktop_volume, self.audio_desktop_volume_label = self._create_db_slider()
         self.audio_desktop_mute = QCheckBox("ミュート")
 
         self.audio_mic_device = QComboBox()
-        self.audio_mic_volume = QDoubleSpinBox()
-        self.audio_mic_volume.setRange(-60.0, 20.0)
-        self.audio_mic_volume.setDecimals(1)
-        self.audio_mic_volume.setSingleStep(0.5)
+        self.audio_mic_volume_row, self.audio_mic_volume, self.audio_mic_volume_label = self._create_db_slider()
         self.audio_mic_mute = QCheckBox("ミュート")
 
-        self.audio_refresh_btn = QPushButton("音声デバイス一覧を更新")
-        self.audio_refresh_btn.clicked.connect(self.refresh_audio_devices)
-        self.audio_apply_btn = QPushButton("音声設定をOBSへ反映")
-        self.audio_apply_btn.clicked.connect(self.apply_audio_settings_to_obs)
+        audio_form.addRow(QLabel("OBSを開かずに、デスクトップ音声/マイクをこの画面で設定します。"))
+        audio_form.addRow("デスクトップ音声デバイス", self.audio_desktop_device)
+        audio_form.addRow("デスクトップ音量 (dB)", self.audio_desktop_volume_row)
+        audio_form.addRow("", self.audio_desktop_mute)
+        audio_form.addRow("マイク入力デバイス", self.audio_mic_device)
+        audio_form.addRow("マイク音量 (dB)", self.audio_mic_volume_row)
+        audio_form.addRow("", self.audio_mic_mute)
 
-        self.form.addRow(QLabel("---- 音声設定 (OBSを開かずに設定) ----"))
-        self.form.addRow("デスクトップ音声デバイス", self.audio_desktop_device)
-        self.form.addRow("デスクトップ音量 (dB)", self.audio_desktop_volume)
-        self.form.addRow("", self.audio_desktop_mute)
-        self.form.addRow("マイク入力デバイス", self.audio_mic_device)
-        self.form.addRow("マイク音量 (dB)", self.audio_mic_volume)
-        self.form.addRow("", self.audio_mic_mute)
-        self.form.addRow(self.audio_refresh_btn)
-        self.form.addRow(self.audio_apply_btn)
-
-        self.advanced_toggle_btn = QPushButton("詳細設定を表示")
-        self.advanced_toggle_btn.clicked.connect(self.toggle_advanced_settings)
-        self.form.addRow(self.advanced_toggle_btn)
-
-        self.advanced_widget = QWidget()
-        advanced_form = QFormLayout(self.advanced_widget)
-        advanced_form.setContentsMargins(0, 0, 0, 0)
         advanced_form.addRow("OBSホスト", self.fields["obs.host"])
+        advanced_form.addRow("OBSポート", self.fields["obs.port"])
+        advanced_form.addRow("OBSパスワード", self.fields["obs.password"])
         advanced_form.addRow("シーン名", self.fields["obs.scene_name"])
         advanced_form.addRow("ソース名", self.fields["obs.source_name"])
         advanced_form.addRow("ソース色", self.fields["obs.source_color"])
         advanced_form.addRow("終了検知エラー閾値", self.fields["polling.end_error_limit"])
         advanced_form.addRow("終了監視間隔(秒)", self.fields["polling.end_poll_sec"])
         advanced_form.addRow("イベント監視間隔(秒)", self.fields["polling.event_poll_sec"])
-        self.advanced_widget.setVisible(False)
-        self.form.addRow(self.advanced_widget)
 
         self.setup_btn = QPushButton("初回セットアップを開く")
         self.setup_btn.clicked.connect(self.open_setup_wizard)
-        self.form.addRow(self.setup_btn)
+        advanced_form.addRow(self.setup_btn)
 
         self.auto_fill_btn = QPushButton("設定を自動補完")
         self.auto_fill_btn.clicked.connect(self.auto_fill_settings)
-        self.form.addRow(self.auto_fill_btn)
+        advanced_form.addRow(self.auto_fill_btn)
 
         self.preflight_btn = QPushButton("録画前チェックを実行")
         self.preflight_btn.clicked.connect(self.run_preflight_fix)
-        self.form.addRow(self.preflight_btn)
+        advanced_form.addRow(self.preflight_btn)
 
         self.quick_fix_btn = QPushButton("環境を自動修復")
         self.quick_fix_btn.clicked.connect(self.run_quick_setup)
-        self.form.addRow(self.quick_fix_btn)
+        advanced_form.addRow(self.quick_fix_btn)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Reset)
         buttons.accepted.connect(self.save_settings)
         buttons.rejected.connect(self.load_settings)
-        self.form.addRow(buttons)
+        root_layout.addWidget(buttons)
 
         self.audio_desktop_device.currentIndexChanged.connect(self.queue_audio_auto_apply)
         self.audio_desktop_volume.valueChanged.connect(self.queue_audio_auto_apply)
@@ -707,11 +751,48 @@ class SettingsPage(QWidget):
         self.audio_mic_mute.stateChanged.connect(self.queue_audio_auto_apply)
 
         self.load_settings()
+        QTimer.singleShot(0, lambda: self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False))
 
-    def toggle_advanced_settings(self):
-        self.advanced_visible = not self.advanced_visible
-        self.advanced_widget.setVisible(self.advanced_visible)
-        self.advanced_toggle_btn.setText("詳細設定を隠す" if self.advanced_visible else "詳細設定を表示")
+    def _create_db_slider(self):
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(-600, 200)  # -60.0dB ～ +20.0dB (0.1dB刻み)
+        slider.setSingleStep(5)     # 0.5dB
+        slider.setPageStep(10)
+        value_label = QLabel("0.0 dB")
+        value_label.setFixedWidth(64)
+        value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        slider.valueChanged.connect(lambda v, label=value_label: label.setText(f"{v / 10.0:.1f} dB"))
+        layout.addWidget(slider, stretch=1)
+        layout.addWidget(value_label)
+        return row, slider, value_label
+
+    def _set_db_slider_value(self, slider, value):
+        try:
+            db_value = float(value)
+        except Exception:
+            db_value = 0.0
+        slider.setValue(int(round(db_value * 10)))
+
+    def _get_db_slider_value(self, slider):
+        return float(slider.value()) / 10.0
+
+    def on_page_shown(self):
+        if not self._audio_auto_refreshed_once:
+            self._audio_auto_refreshed_once = True
+            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
+            return
+        self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
+
+    def browse_recordings_dir(self):
+        current = self.fields["paths.recordings_dir"].text().strip()
+        start_dir = current or str(ROOT_DIR)
+        selected = QFileDialog.getExistingDirectory(self, "録画保存ディレクトリを選択", start_dir)
+        if selected:
+            self.fields["paths.recordings_dir"].setText(selected)
 
     def load_settings(self):
         data = load_config()
@@ -720,6 +801,7 @@ class SettingsPage(QWidget):
         storage = data.get("storage", {})
         polling = data.get("polling", {})
         audio = data.get("audio", {})
+        app_cfg = data.get("app", {})
         desktop_audio = audio.get("desktop", {})
         mic_audio = audio.get("mic", {})
 
@@ -728,6 +810,10 @@ class SettingsPage(QWidget):
         self.fields["obs.dir"].setText(recordtest.DEFAULT_OBS_DIR)
         self.fields["obs.password"].setText("")
         self.fields["obs.port"].setText(str(recordtest.DEFAULT_OBS_PORT))
+        fps_text = str(obs.get("fps", recordtest.DEFAULT_OBS_FPS))
+        if self.obs_fps_combo.findText(fps_text) < 0:
+            self.obs_fps_combo.addItem(fps_text)
+        self.obs_fps_combo.setCurrentText(fps_text)
         self.fields["obs.scene_name"].setText(str(obs.get("scene_name", "")))
         self.fields["obs.source_name"].setText(str(obs.get("source_name", "")))
         self.fields["obs.source_color"].setText(recordtest.obs_color_to_hex(obs.get("source_color")))
@@ -740,6 +826,7 @@ class SettingsPage(QWidget):
         self.fields["polling.event_poll_sec"].setText(str(polling.get("event_poll_sec", "")))
         self._set_audio_ui_from_config("desktop", desktop_audio)
         self._set_audio_ui_from_config("mic", mic_audio)
+        self.minimize_to_tray_check.setChecked(bool(app_cfg.get("minimize_to_tray", True)))
         self._audio_ui_loading = False
 
     def save_settings(self):
@@ -755,6 +842,10 @@ class SettingsPage(QWidget):
         data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
         data["obs"]["password"] = ""
         data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
+        try:
+            data["obs"]["fps"] = int(self.obs_fps_combo.currentText())
+        except Exception:
+            data["obs"]["fps"] = recordtest.DEFAULT_OBS_FPS
         data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
         data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
         data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
@@ -778,6 +869,7 @@ class SettingsPage(QWidget):
             data["polling"]["event_poll_sec"] = float(self.fields["polling.event_poll_sec"].text().strip())
         except ValueError:
             pass
+        data["app"]["minimize_to_tray"] = bool(self.minimize_to_tray_check.isChecked())
         self._write_audio_settings_to_config(data)
 
         report = run_preflight(data, auto_fix=True, force_obs_detect=False)
@@ -787,6 +879,7 @@ class SettingsPage(QWidget):
 
         report["config"]["app"]["setup_completed"] = True
         save_config(report["config"])
+        self.apply_runtime_output_settings_to_obs(report["config"], show_error=False)
         self.load_settings()
         QMessageBox.information(self, "設定保存", "設定を保存しました。")
 
@@ -835,10 +928,7 @@ class SettingsPage(QWidget):
             combo.addItem(f"{device_name} [{device_id}]", device_id)
             self._select_combo_by_data(combo, device_id)
 
-        try:
-            volume.setValue(float(slot.get("volume_db", 0.0)))
-        except Exception:
-            volume.setValue(0.0)
+        self._set_db_slider_value(volume, slot.get("volume_db", 0.0))
         mute.setChecked(bool(slot.get("mute", False)))
 
     def _read_audio_slot_from_ui(self, key):
@@ -856,7 +946,7 @@ class SettingsPage(QWidget):
             "input_name": defaults["input_name"],
             "device_id": str(device_id),
             "device_name": device_name,
-            "volume_db": float(volume.value()),
+            "volume_db": self._get_db_slider_value(volume),
             "mute": bool(mute.isChecked()),
         }
 
@@ -871,12 +961,17 @@ class SettingsPage(QWidget):
         data.setdefault("paths", {})
         data.setdefault("storage", {})
         data.setdefault("polling", {})
+        data.setdefault("app", {})
         data.setdefault("audio", {})
 
         data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
         data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
         data["obs"]["password"] = ""
         data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
+        try:
+            data["obs"]["fps"] = int(self.obs_fps_combo.currentText())
+        except Exception:
+            data["obs"]["fps"] = recordtest.DEFAULT_OBS_FPS
         data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
         data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
         data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
@@ -899,6 +994,7 @@ class SettingsPage(QWidget):
             data["polling"]["event_poll_sec"] = float(self.fields["polling.event_poll_sec"].text().strip())
         except ValueError:
             pass
+        data["app"]["minimize_to_tray"] = bool(self.minimize_to_tray_check.isChecked())
         self._write_audio_settings_to_config(data)
         return data
 
@@ -941,11 +1037,14 @@ class SettingsPage(QWidget):
         )
         return client, launched_process, cfg
 
-    def refresh_audio_devices(self):
+    def refresh_audio_devices(self, show_message=True, show_error=True, auto_launch=True):
+        if self._audio_refresh_in_progress:
+            return False
         client = None
         launched_process = None
+        self._audio_refresh_in_progress = True
         try:
-            client, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=True)
+            client, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=auto_launch)
             catalog = recordtest.get_audio_device_catalog(
                 client,
                 cfg=cfg,
@@ -958,14 +1057,19 @@ class SettingsPage(QWidget):
             self._set_audio_ui_from_config("mic", cfg.get("audio", {}).get("mic", {}))
             self._audio_ui_loading = False
             save_config(cfg)
-            msg = "OBSが認識している音声デバイス一覧を更新しました。"
-            if launched_process:
-                msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
-            QMessageBox.information(self, "音声デバイス一覧", msg)
+            if show_message:
+                msg = "OBSが認識している音声デバイス一覧を更新しました。"
+                if launched_process:
+                    msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
+                QMessageBox.information(self, "音声デバイス一覧", msg)
+            return True
         except Exception as e:
             self._audio_ui_loading = False
-            QMessageBox.warning(self, "音声デバイス一覧", f"取得に失敗しました。\n{e}")
+            if show_error:
+                QMessageBox.warning(self, "音声デバイス一覧", f"取得に失敗しました。\n{e}")
+            return False
         finally:
+            self._audio_refresh_in_progress = False
             if client:
                 try:
                     client.disconnect()
@@ -998,6 +1102,54 @@ class SettingsPage(QWidget):
         except Exception as e:
             if show_error:
                 QMessageBox.warning(self, "音声設定", f"OBSへの反映に失敗しました。\n{e}")
+            return False
+        finally:
+            if client:
+                try:
+                    client.disconnect()
+                except Exception:
+                    pass
+
+    def apply_runtime_output_settings_to_obs(self, cfg=None, show_error=False):
+        """
+        一般タブの録画出力関連（録画保存先/FPS）を、OBS起動中のみ即時反映する。
+        設定保存でOBSを自動起動はしない。
+        """
+        client = None
+        try:
+            if cfg is None:
+                cfg = load_config()
+
+            recordtest.apply_settings(cfg)
+            recordtest.setup_environment()
+
+            obs_cfg = cfg.get("obs", {})
+            ok, _detail = recordtest.test_obs_connection(
+                obs_cfg.get("host", recordtest.DEFAULT_OBS_HOST),
+                obs_cfg.get("port", recordtest.DEFAULT_OBS_PORT),
+                obs_cfg.get("password", ""),
+                timeout=1.0,
+            )
+            if not ok:
+                return False
+
+            client, _used_host = recordtest.connect_obs_client(
+                obs_cfg.get("host", recordtest.DEFAULT_OBS_HOST),
+                obs_cfg.get("port", recordtest.DEFAULT_OBS_PORT),
+                obs_cfg.get("password", ""),
+                timeout=2.0,
+            )
+
+            if recordtest.RECORDINGS_DIR:
+                recordtest.apply_record_directory_to_obs(client, recordtest.RECORDINGS_DIR)
+            try:
+                recordtest.apply_obs_video_settings(client, recordtest.OBS_FPS)
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            if show_error:
+                QMessageBox.warning(self, "設定反映", f"録画設定のOBS反映に失敗しました。\n{e}")
             return False
         finally:
             if client:
@@ -1040,6 +1192,7 @@ class SettingsPage(QWidget):
         dialog = SetupWizardDialog(self, startup_mode=False)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.load_settings()
+            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
 
     def run_quick_setup(self):
         data = load_config()
@@ -1053,6 +1206,7 @@ class SettingsPage(QWidget):
             return
 
         self.load_settings()
+        self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
         color_hex = recordtest.obs_color_to_hex(info.get("source_color"))
         launch_note = "（セットアップのためポータブルOBSを自動起動しました）" if info.get("obs_launched") else ""
         message = (
@@ -1070,39 +1224,94 @@ class SettingsPage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self.bg_recorder_worker = None
+        self._closing = False
+        self._is_quitting = False
+        self._tray_icon = None
+        self._tray_notice_shown = False
         self.setWindowTitle("LoL Replay Tool")
         self.resize(1200, 720)
         icon = get_app_icon()
         if icon:
             self.setWindowIcon(icon)
+        self.init_tray_icon()
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
         self.home_page = HomePage(
-            on_record=self.show_recorder,
             on_play=self.show_player,
             on_settings=self.show_settings
         )
-        self.recorder_page = RecorderPage(on_back=self.show_home)
         self.player_page = PlayerPage(on_back=self.show_home)
         self.settings_page = SettingsPage(on_back=self.show_home)
 
         self.stack.addWidget(self.home_page)
-        self.stack.addWidget(self.recorder_page)
         self.stack.addWidget(self.player_page)
         self.stack.addWidget(self.settings_page)
 
         self.show_home()
         self.run_startup_setup()
+        self.start_background_recorder()
+
+    def init_tray_icon(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        tray_icon = self.windowIcon()
+        if tray_icon.isNull():
+            tray_icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+
+        self._tray_icon = QSystemTrayIcon(tray_icon, self)
+        self._tray_icon.setToolTip("LoL Replay Tool")
+
+        tray_menu = QMenu(self)
+        show_action = QAction("アプリを表示", self)
+        show_action.triggered.connect(self.restore_from_tray)
+        quit_action = QAction("終了", self)
+        quit_action.triggered.connect(self.exit_from_tray)
+        tray_menu.addAction(show_action)
+        tray_menu.addSeparator()
+        tray_menu.addAction(quit_action)
+
+        self._tray_icon.setContextMenu(tray_menu)
+        self._tray_icon.activated.connect(self.on_tray_activated)
+        self._tray_icon.show()
+
+    def on_tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.restore_from_tray()
+
+    def restore_from_tray(self):
+        self.show()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        self.show_home()
+
+    def exit_from_tray(self):
+        self._is_quitting = True
+        self.close()
+
+    def should_minimize_to_tray(self):
+        if self._is_quitting:
+            return False
+        if not self._tray_icon or not self._tray_icon.isVisible():
+            return False
+        try:
+            data = load_config()
+            return bool(data.get("app", {}).get("minimize_to_tray", True))
+        except Exception:
+            return True
 
     def show_home(self):
         self.player_page.on_leave()
         self.stack.setCurrentWidget(self.home_page)
-
-    def show_recorder(self):
-        self.player_page.on_leave()
-        self.stack.setCurrentWidget(self.recorder_page)
+        if not self._closing:
+            self.start_background_recorder()
 
     def show_player(self):
         self.stack.setCurrentWidget(self.player_page)
@@ -1111,6 +1320,7 @@ class MainWindow(QMainWindow):
     def show_settings(self):
         self.player_page.on_leave()
         self.stack.setCurrentWidget(self.settings_page)
+        self.settings_page.on_page_shown()
 
     def run_startup_setup(self):
         data = load_config()
@@ -1134,6 +1344,109 @@ class MainWindow(QMainWindow):
             dialog = SetupWizardDialog(self, startup_mode=True)
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.settings_page.load_settings()
+
+    def _derive_recorder_home_status(self, raw_message):
+        text = str(raw_message or "").strip()
+        if not text:
+            return "⚪ 停止", "#cfcfcf", "状態情報なし"
+
+        lowered = text.lower()
+
+        if text.startswith("❌"):
+            return "⚠️ 録画監視エラー", "#ffb74d", text
+        if "録画を開始します" in text or "試合終了を監視中" in text or "録画継続中" in text:
+            return "🔴 録画中", "#ff6b6b", text
+        if "試合開始を待機中" in text or "次の試合を待機" in text:
+            return "🟢 LoLの起動を待機中...", "#7bd88f", text
+        if "停止リクエスト" in text or "終了しました" in text:
+            return "⚪ 停止", "#cfcfcf", text
+        if text.startswith("⚠️") or "warning" in lowered:
+            return "🟡 監視中（警告あり）", "#ffd166", text
+        if text.startswith("🛠️"):
+            return "🟢 起動準備中...", "#7bd88f", text
+        return "🟢 監視中", "#7bd88f", text
+
+    def _set_home_status_from_worker_message(self, raw_message):
+        badge, color, detail = self._derive_recorder_home_status(raw_message)
+        self.home_page.set_recorder_status(badge, color_hex=color, detail_text=detail)
+
+    def start_background_recorder(self):
+        if self.bg_recorder_worker and self.bg_recorder_worker.isRunning():
+            return
+
+        self.bg_recorder_worker = RecorderWorker()
+        self.bg_recorder_worker.status.connect(self.on_bg_recorder_status)
+        self.bg_recorder_worker.error.connect(self.on_bg_recorder_error)
+        self.bg_recorder_worker.finished.connect(self.on_bg_recorder_finished)
+        self.home_page.set_recorder_status(
+            "🟢 起動準備中...",
+            color_hex="#7bd88f",
+            detail_text="バックグラウンド録画監視を起動しています。"
+        )
+        self.bg_recorder_worker.start()
+
+    def stop_background_recorder(self, wait_ms=5000):
+        worker = self.bg_recorder_worker
+        if not worker:
+            return
+        if worker.isRunning():
+            worker.stop()
+            worker.wait(wait_ms)
+
+    def on_bg_recorder_status(self, message):
+        self._set_home_status_from_worker_message(message)
+
+    def on_bg_recorder_error(self, message):
+        self.home_page.set_recorder_status(
+            "⚠️ 録画監視エラー",
+            color_hex="#ffb74d",
+            detail_text=str(message),
+        )
+
+    def on_bg_recorder_finished(self):
+        if self._closing:
+            self.home_page.set_recorder_status("⚪ 停止", color_hex="#cfcfcf", detail_text="アプリ終了中")
+            return
+        self.home_page.set_recorder_status(
+            "⚪ 停止",
+            color_hex="#cfcfcf",
+            detail_text="バックグラウンド録画監視が停止しました。",
+        )
+
+    def closeEvent(self, event):
+        if (not self._is_quitting) and self.should_minimize_to_tray():
+            event.ignore()
+            self.hide()
+            if self._tray_icon and not self._tray_notice_shown:
+                self._tray_notice_shown = True
+                try:
+                    self._tray_icon.showMessage(
+                        "LoL Replay Tool",
+                        "バックグラウンドで録画監視を継続しています。",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        3000,
+                    )
+                except Exception:
+                    pass
+            return
+
+        self._is_quitting = True
+        self._closing = True
+        try:
+            self.player_page.on_leave()
+        except Exception:
+            pass
+        self.stop_background_recorder(wait_ms=6000)
+        if self._tray_icon:
+            try:
+                self._tray_icon.hide()
+            except Exception:
+                pass
+        event.accept()
+        super().closeEvent(event)
+        app = QApplication.instance()
+        if app:
+            app.quit()
 
 
 def main():

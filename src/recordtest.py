@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import subprocess
+import configparser
 from pathlib import Path
 
 import ctypes
@@ -39,6 +40,7 @@ DEFAULT_JSON_DIR = "recordings/json"
 DEFAULT_CHAMPION_ICONS_DIR = "assets/champions/icons"
 DEFAULT_OBS_HOST = "localhost"
 DEFAULT_OBS_PORT = 4455
+DEFAULT_OBS_FPS = 60
 DEFAULT_END_ERROR_LIMIT = 3
 DEFAULT_END_POLL_SEC = 5
 DEFAULT_EVENT_POLL_SEC = 1
@@ -63,6 +65,7 @@ JSON_DIR = None
 CHAMPION_ICONS_DIR = None
 OBS_HOST = DEFAULT_OBS_HOST
 OBS_PORT = DEFAULT_OBS_PORT
+OBS_FPS = DEFAULT_OBS_FPS
 END_ERROR_LIMIT = DEFAULT_END_ERROR_LIMIT
 END_POLL_SEC = DEFAULT_END_POLL_SEC
 EVENT_POLL_SEC = DEFAULT_EVENT_POLL_SEC
@@ -119,6 +122,52 @@ def is_managed_portable_obs_dir(base_dir):
 
 def get_obs_websocket_config_path(base_dir):
     return Path(base_dir) / "config" / "obs-studio" / "plugin_config" / "obs-websocket" / "config.json"
+
+
+def get_obs_global_ini_path(base_dir):
+    return Path(base_dir) / "config" / "obs-studio" / "global.ini"
+
+
+def ensure_portable_obs_global_ini(base_dir):
+    """
+    ポータブルOBSのグローバル設定にトレイアイコン非表示を入れる。
+    """
+    if not is_managed_portable_obs_dir(base_dir):
+        raise RecorderError(
+            "このアプリは配布同梱のポータブルOBSのみ対応です。\n"
+            f"利用先: {MANAGED_PORTABLE_OBS_DIR}"
+        )
+
+    ini_path = get_obs_global_ini_path(base_dir)
+    ini_path.parent.mkdir(parents=True, exist_ok=True)
+
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    if ini_path.exists():
+        try:
+            parser.read(ini_path, encoding="utf-8")
+        except Exception:
+            parser = configparser.ConfigParser(interpolation=None)
+            parser.optionxform = str
+
+    if not parser.has_section("BasicWindow"):
+        parser.add_section("BasicWindow")
+
+    changed = False
+    for key, value in (
+        ("HideTrayIcon", "true"),
+        ("SysTrayEnabled", "false"),
+    ):
+        current = parser.get("BasicWindow", key, fallback="").strip().lower()
+        if current != value:
+            parser.set("BasicWindow", key, value)
+            changed = True
+
+    if changed:
+        with open(ini_path, "w", encoding="utf-8") as f:
+            parser.write(f, space_around_delimiters=False)
+
+    return changed, ini_path
 
 
 def ensure_portable_obs_websocket_config(base_dir, port, password):
@@ -368,6 +417,7 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
     obs_defaults = {
         "host": DEFAULT_OBS_HOST,
         "port": DEFAULT_OBS_PORT,
+        "fps": DEFAULT_OBS_FPS,
         "password": "",
         "scene_name": DEFAULT_OBS_SCENE_NAME,
         "source_name": DEFAULT_OBS_SOURCE_NAME,
@@ -417,6 +467,13 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
             obs_cfg["port"] = port
             report["changed"] = True
         report["warnings"].append(f"OBSポートが不正だったため {port} を使用します。")
+
+    fps_value, ok = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
+    if not ok:
+        if auto_fix:
+            obs_cfg["fps"] = fps_value
+            report["changed"] = True
+        report["warnings"].append(f"OBS FPS が不正だったため {fps_value} を使用します。")
 
     raw_source_color = obs_cfg.get("source_color")
     source_color, ok = parse_obs_source_color(raw_source_color, default=DEFAULT_OBS_SOURCE_COLOR)
@@ -521,6 +578,16 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
             f"配置先: {expected_obs_dir}\n"
             "obs64.exe が存在する状態で配置してください。"
         )
+    elif auto_fix:
+        try:
+            changed, global_ini_path = ensure_portable_obs_global_ini(current_obs_dir)
+            if changed:
+                report["changed"] = True
+                report["notes"].append(
+                    f"ポータブルOBSのトレイアイコン非表示を設定しました: {global_ini_path}"
+                )
+        except Exception as e:
+            report["warnings"].append(f"OBS global.ini の更新に失敗しました: {e}")
 
     return report
 
@@ -666,6 +733,48 @@ def _obs_raw(client, request_type, payload=None):
         return client.send(request_type, payload or {}, raw=True)
     except TypeError:
         return client.send(request_type, payload or {})
+
+
+def apply_obs_video_settings(client, fps_value=None):
+    fps_num, _ = _safe_int(fps_value, DEFAULT_OBS_FPS, minimum=1, maximum=240)
+    return _obs_raw(
+        client,
+        "SetVideoSettings",
+        {
+            "fpsNumerator": int(fps_num),
+            "fpsDenominator": 1,
+        },
+    )
+
+
+def apply_record_directory_to_obs(client, record_dir):
+    """
+    OBSの録画保存先をWebSocket経由で反映する。
+    wrapper -> raw request の順で試し、環境差分を吸収する。
+    """
+    if not record_dir:
+        return False
+
+    record_path = str(Path(record_dir))
+    errors = []
+
+    try:
+        client.set_record_directory(record_path)
+        return True
+    except Exception as e:
+        errors.append(f"wrapper: {type(e).__name__}: {e}")
+
+    try:
+        _obs_raw(client, "SetRecordDirectory", {"recordDirectory": record_path})
+        return True
+    except Exception as e:
+        errors.append(f"raw: {type(e).__name__}: {e}")
+
+    raise RecorderError(
+        "録画保存ディレクトリをOBSに反映できませんでした。\n"
+        f"対象: {record_path}\n"
+        + "\n".join(errors)
+    )
 
 
 def ensure_obs_scene_exists(client, scene_name, status_cb=None):
@@ -849,7 +958,7 @@ def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
         # 録画保存先も毎回明示して、配布先でOBS設定不要にする。
         if RECORDINGS_DIR:
             try:
-                recorder.client.set_record_directory(str(RECORDINGS_DIR))
+                apply_record_directory_to_obs(recorder.client, RECORDINGS_DIR)
             except Exception:
                 pass
         try:
@@ -932,7 +1041,7 @@ def save_settings(cfg):
 def apply_settings(cfg):
     global OBS_PASSWORD, OBS_SCENE_NAME, OBS_SOURCE_NAME, OBS_SOURCE_COLOR, OBS_DIR, BIN_DIR
     global RECORDINGS_DIR, JSON_DIR, OBS_HOST, OBS_PORT, CHAMPION_ICONS_DIR
-    global END_ERROR_LIMIT, END_POLL_SEC, EVENT_POLL_SEC, MAX_STORAGE_BYTES
+    global END_ERROR_LIMIT, END_POLL_SEC, EVENT_POLL_SEC, MAX_STORAGE_BYTES, OBS_FPS
 
     obs_cfg = cfg.get("obs", {})
     path_cfg = cfg.get("paths", {})
@@ -945,6 +1054,7 @@ def apply_settings(cfg):
     OBS_SOURCE_COLOR, _ = parse_obs_source_color(obs_cfg.get("source_color"), default=DEFAULT_OBS_SOURCE_COLOR)
     OBS_HOST = obs_cfg.get("host", DEFAULT_OBS_HOST)
     OBS_PORT = int(obs_cfg.get("port", DEFAULT_OBS_PORT))
+    OBS_FPS, _ = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
 
     OBS_DIR = str(MANAGED_PORTABLE_OBS_DIR)
     if not is_valid_obs_dir(OBS_DIR):
@@ -1126,17 +1236,29 @@ def launch_obs():
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
     try:
+        changed_ini, global_ini_path = ensure_portable_obs_global_ini(OBS_DIR)
+        if changed_ini and global_ini_path:
+            print(f"ℹ️ ポータブルOBSの global.ini を更新しました: {global_ini_path}")
         changed, ws_cfg_path = ensure_portable_obs_websocket_config(OBS_DIR, OBS_PORT, OBS_PASSWORD)
         if changed and ws_cfg_path:
             print(f"ℹ️ ポータブルOBSのWebSocket設定を更新しました: {ws_cfg_path}")
     except Exception as e:
-        raise RecorderError(f"ポータブルOBSのWebSocket設定更新に失敗しました: {e}") from e
+        raise RecorderError(f"ポータブルOBS起動前設定の更新に失敗しました: {e}") from e
 
-    print("🚀 OBSを起動しています (タスクトレイに最小化)...")
-    cmd = [obs_exe, "--portable", "--minimize-to-tray"]
+    print("🚀 OBSを起動しています (バックグラウンド/非表示)...")
+    cmd = [obs_exe, "--portable"]
+
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
 
     try:
-        process = subprocess.Popen(cmd, cwd=working_dir)
+        popen_kwargs = {"cwd": working_dir}
+        if startupinfo is not None:
+            popen_kwargs["startupinfo"] = startupinfo
+        process = subprocess.Popen(cmd, **popen_kwargs)
         print("⏳ OBSの起動を待機中...")
         time.sleep(5)
         return process
@@ -1300,18 +1422,24 @@ class LoLAutoRecorder:
         return None
 
     def ensure_record_output_setup(self):
-        if not RECORDINGS_DIR:
-            return
-        try:
-            Path(RECORDINGS_DIR).mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
+        if RECORDINGS_DIR:
+            try:
+                Path(RECORDINGS_DIR).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            try:
+                apply_record_directory_to_obs(self.client, RECORDINGS_DIR)
+            except Exception:
+                # OBSバージョン差異や権限差分で失敗する場合は継続
+                pass
 
         try:
-            self.client.set_record_directory(str(RECORDINGS_DIR))
-        except Exception:
-            # OBSバージョン差異や権限差分で失敗する場合は継続
-            pass
+            apply_obs_video_settings(self.client, OBS_FPS)
+            self.log(f"🎞️ OBS録画FPSを {OBS_FPS} に設定しました。")
+        except Exception as e:
+            # 録画は続行可能なので警告のみ
+            self.log(f"⚠️ OBS録画FPS設定の適用に失敗: {e}")
 
     def ensure_sync_setup(self):
         self.ensure_scene_exists()

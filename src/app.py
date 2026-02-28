@@ -1313,8 +1313,11 @@ class MainWindow(QMainWindow):
             self.start_background_recorder()
 
     def show_player(self):
-        if self.player_page.open_selector():
-            self.stack.setCurrentWidget(self.player_page)
+        # MPV native window focus issues are avoided by showing player page first.
+        self.stack.setCurrentWidget(self.player_page)
+        success = self.player_page.open_selector()
+        if not success:
+            self.show_home()
 
     def show_settings(self):
         self.player_page.on_leave()

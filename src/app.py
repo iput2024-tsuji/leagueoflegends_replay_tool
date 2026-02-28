@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QMenu,
     QStyle,
     QFileDialog,
+    QProgressBar,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QAction
@@ -528,7 +529,7 @@ class PlayerPage(QWidget):
         layout.addWidget(self.player_widget, stretch=1)
 
     def open_selector(self):
-        self.player_widget.open_replay_selector()
+        return self.player_widget.open_replay_selector()
 
     def handle_fullscreen(self, enabled):
         window = self.window()
@@ -642,6 +643,12 @@ class SettingsPage(QWidget):
         icons_dir_layout.addWidget(self.icons_dir_browse_btn)
         general_form.addRow("アイコンディレクトリ", self.icons_dir_row)
         general_form.addRow("最大容量(GB)", self.fields["storage.max_size_gb"])
+        self.storage_progress = QProgressBar()
+        self.storage_progress.setRange(0, 100)
+        self.storage_progress.setValue(0)
+        self.storage_progress.setTextVisible(True)
+        self.storage_progress.setFormat("0.0 GB / 0.0 GB (0%)")
+        general_form.addRow("ストレージ使用量", self.storage_progress)
         self.obs_fps_combo = QComboBox()
         self.obs_fps_combo.addItems(["30", "60", "120"])
         general_form.addRow("録画FPS", self.obs_fps_combo)
@@ -760,6 +767,31 @@ class SettingsPage(QWidget):
         if selected:
             self.fields["paths.champion_icons_dir"].setText(selected)
 
+    def update_storage_progress(self, data=None):
+        cfg = data if isinstance(data, dict) else load_config()
+        storage_cfg = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
+        max_bytes = recordtest.parse_max_storage_bytes(storage_cfg) or 0
+        used_bytes = 0
+
+        try:
+            recordtest.apply_settings(cfg)
+            used_bytes = recordtest.total_storage_size()
+        except Exception:
+            used_bytes = 0
+
+        used_gb = used_bytes / (1024 ** 3)
+        if max_bytes > 0:
+            max_gb = max_bytes / (1024 ** 3)
+            ratio = int(max(0, min(100, round((used_bytes / max_bytes) * 100))))
+            text = f"{used_gb:.1f} GB / {max_gb:.1f} GB ({ratio}%)"
+            self.storage_progress.setValue(ratio)
+        else:
+            text = f"{used_gb:.1f} GB / -- GB (0%)"
+            self.storage_progress.setValue(0)
+
+        self.storage_progress.setFormat(text)
+        self.storage_progress.setToolTip(text)
+
     def load_settings(self):
         data = load_config()
         obs = data.get("obs", {})
@@ -793,6 +825,7 @@ class SettingsPage(QWidget):
         self._set_audio_ui_from_config("desktop", desktop_audio)
         self._set_audio_ui_from_config("mic", mic_audio)
         self.minimize_to_tray_check.setChecked(bool(app_cfg.get("minimize_to_tray", True)))
+        self.update_storage_progress(data)
         self._audio_ui_loading = False
 
     def save_settings(self):
@@ -1280,8 +1313,8 @@ class MainWindow(QMainWindow):
             self.start_background_recorder()
 
     def show_player(self):
-        self.stack.setCurrentWidget(self.player_page)
-        self.player_page.open_selector()
+        if self.player_page.open_selector():
+            self.stack.setCurrentWidget(self.player_page)
 
     def show_settings(self):
         self.player_page.on_leave()
@@ -1425,6 +1458,22 @@ def main():
         QLabel { color: #e0e0e0; }
         QPushButton { background-color: #2b2b2b; color: #e0e0e0; border: 1px solid #3a3a3a; padding: 6px 10px; }
         QPushButton:hover { background-color: #3a3a3a; }
+        QTabWidget::pane { border: 1px solid #3a3a3a; background-color: #1f1f1f; top: -1px; }
+        QTabBar::tab {
+            background-color: #262626;
+            color: #bdbdbd;
+            border: 1px solid #3a3a3a;
+            border-bottom: 1px solid #3a3a3a;
+            padding: 7px 12px;
+            margin-right: 2px;
+        }
+        QTabBar::tab:hover { background-color: #333333; color: #f0f0f0; }
+        QTabBar::tab:selected {
+            background-color: #2f2f2f;
+            color: #ffffff;
+            font-weight: 700;
+            border-bottom: 2px solid #d32f2f;
+        }
         QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QDoubleSpinBox {
             background-color: #242424; color: #e0e0e0; border: 1px solid #3a3a3a;
         }

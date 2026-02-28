@@ -853,13 +853,15 @@ class PlayerWidget(QWidget):
 
     def open_replay_selector(self):
         self.load_settings()
+        dialog_parent = self.window() if self.window() else self
         dialog = ReplaySelectDialog(
-            self,
+            dialog_parent,
             json_dir=self.json_dir,
             recordings_dir=self.recordings_dir,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_path:
-            self.load_data(dialog.selected_path)
+            return bool(self.load_data(dialog.selected_path))
+        return False
 
     def load_data(self, json_path):
         json_path = Path(json_path)
@@ -870,7 +872,7 @@ class PlayerWidget(QWidget):
             video_path = resolve_video_path(json_path, data, self.recordings_dir)
             if video_path is None:
                 self.info_label.setText("Error: Video file missing")
-                return
+                return False
 
             self.current_video_path = video_path
             self.sync_game_time = data.get("sync_game_time", 0.0)
@@ -890,9 +892,11 @@ class PlayerWidget(QWidget):
             
             self.update_video_fps()
             self.start_sync_worker()
+            return True
 
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
+            return False
 
     def start_sync_worker(self):
         self.worker = SyncWorker(self.current_video_path, max_seconds=180)

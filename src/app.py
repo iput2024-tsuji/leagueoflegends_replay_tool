@@ -91,7 +91,7 @@ def apply_auto_defaults(data, force_obs_detect=False):
         changed = True
         notes.append("OBSパスワードのプレースホルダを空欄にしました")
 
-    # OBSは配布同梱のポータブル版のみ利用する。
+    # OBSはユーザーが bin/OBS-Studio に配置したポータブル版のみ利用する。
     if obs.get("dir") != recordtest.DEFAULT_OBS_DIR:
         obs["dir"] = recordtest.DEFAULT_OBS_DIR
         changed = True
@@ -299,7 +299,7 @@ class SetupWizardDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "配布同梱のポータブルOBSを前提に、必要な設定を自動構成します。\n"
+            "bin/OBS-Studio に配置されたポータブルOBSを前提に、必要な設定を自動構成します。\n"
             "保存先だけ確認して「環境を自動修復」を実行してください。"
         )
         intro.setWordWrap(True)

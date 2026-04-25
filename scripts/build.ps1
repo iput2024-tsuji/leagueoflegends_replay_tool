@@ -11,8 +11,7 @@ $pyArgs = @(
   "--name", "LoLReplayTool",
   "--clean",
   "--add-data", "config\\setting.sample.json;config",
-  "--add-data", "config\\champion_aliases.json;config",
-  "--add-data", "assets\\champions\\icons;assets\\champions\\icons"
+  "--add-data", "config\\champion_aliases.json;config"
 )
 
 $iconPath = "assets\\app\\app.ico"
@@ -46,26 +45,16 @@ if ($buildExitCode -ne 0) {
 $distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
 $distBinDir = Join-Path $distRootDir "bin"
 New-Item -ItemType Directory -Path $distBinDir -Force | Out-Null
+New-Item -ItemType Directory -Path (Join-Path $distRootDir "assets\\champions\\icons") -Force | Out-Null
 
-$portableObsSourceDir = Join-Path (Get-Location) "bin\\OBS-Studio"
-$portableObsExe = Join-Path $portableObsSourceDir "bin\\64bit\\obs64.exe"
-if (-not (Test-Path $portableObsExe)) {
-  throw "ポータブルOBSが見つかりません。bin\\OBS-Studio\\bin\\64bit\\obs64.exe を配置してからビルドしてください。"
-}
-
-Copy-Item -Path $portableObsSourceDir -Destination $distBinDir -Recurse -Force
-
-# Keep distribution clean: mpv DLLs must be user-provided, not bundled.
+# Keep distribution clean: OBS, mpv DLLs, and third-party game assets must be user-provided.
 $mpvDllPattern = '^(lib)?mpv-\d+\.dll$'
-$portableObsDistDir = Join-Path $distBinDir "OBS-Studio"
 $bundledMpvDlls = Get-ChildItem -Path $distRootDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-  $_.Name -match $mpvDllPattern -and -not $_.FullName.StartsWith($portableObsDistDir, [System.StringComparison]::OrdinalIgnoreCase)
+  $_.Name -match $mpvDllPattern
 }
 foreach ($dll in $bundledMpvDlls) {
   Remove-Item -Path $dll.FullName -Force -ErrorAction SilentlyContinue
 }
 
-$distObsExe = Join-Path $portableObsDistDir "bin\\64bit\\obs64.exe"
-if (-not (Test-Path $distObsExe)) {
-  throw "ビルド後の配布物にポータブルOBSが含まれていません: $distObsExe"
-}
+Write-Host "Build complete. Portable OBS, mpv DLLs, and game assets are not bundled."
+Write-Host "Place OBS under dist\\LoLReplayTool\\bin\\OBS-Studio and mpv DLLs under dist\\LoLReplayTool\\bin manually."

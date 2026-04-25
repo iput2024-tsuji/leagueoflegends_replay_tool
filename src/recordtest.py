@@ -132,7 +132,7 @@ def ensure_portable_obs_global_ini(base_dir):
     """
     if not is_managed_portable_obs_dir(base_dir):
         raise RecorderError(
-            "このアプリは配布同梱のポータブルOBSのみ対応です。\n"
+            "このアプリは bin/OBS-Studio に配置されたポータブルOBSのみ対応です。\n"
             f"利用先: {MANAGED_PORTABLE_OBS_DIR}"
         )
 
@@ -177,12 +177,12 @@ def ensure_portable_obs_global_ini(base_dir):
 
 def ensure_portable_obs_websocket_config(base_dir, port, password):
     """
-    配布物に同梱したポータブルOBSのみを対象に、
+    bin/OBS-Studio に配置されたポータブルOBSのみを対象に、
     WebSocket設定を固定値へ自動補完する。
     """
     if not is_managed_portable_obs_dir(base_dir):
         raise RecorderError(
-            "このアプリは配布同梱のポータブルOBSのみ対応です。\n"
+            "このアプリは bin/OBS-Studio に配置されたポータブルOBSのみ対応です。\n"
             f"利用先: {MANAGED_PORTABLE_OBS_DIR}"
         )
 
@@ -568,12 +568,12 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
             obs_cfg["dir"] = DEFAULT_OBS_DIR
             report["changed"] = True
             report["notes"].append(
-                f"OBSフォルダを配布同梱用に固定しました: {DEFAULT_OBS_DIR}"
+                f"OBSフォルダをアプリ管理用に固定しました: {DEFAULT_OBS_DIR}"
             )
             current_obs_dir = expected_obs_dir
         else:
             report["errors"].append(
-                f"OBSフォルダは配布同梱のみ対応です: {expected_obs_dir}"
+                f"OBSフォルダは bin/OBS-Studio のポータブルOBSのみ対応です: {expected_obs_dir}"
             )
 
     has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))

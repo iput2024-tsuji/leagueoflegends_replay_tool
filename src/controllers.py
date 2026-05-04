@@ -3,9 +3,11 @@ from pathlib import Path
 
 try:
     from . import recordtest
+    from .analytics import GameDataAnalyzer
     from .app_paths import get_app_root
 except ImportError:
     import recordtest
+    from analytics import GameDataAnalyzer
     from app_paths import get_app_root
 
 
@@ -304,3 +306,59 @@ class RecordingController:
             obs_process=obs_process,
             status_cb=status_cb,
         )
+
+
+class AnalyticsController:
+    """録画JSON分析をUIから分離して提供する。"""
+
+    def __init__(self, config_controller=None):
+        self.config_controller = config_controller or ConfigController()
+
+    def load_summary(self):
+        config_data = self.config_controller.load_config()
+        config = recordtest.AppConfig.from_dict(config_data)
+        analyzer = GameDataAnalyzer(config=config)
+        df = analyzer.load_dataframe()
+        horde_result = analyzer.horde_kill_15min_winrate_correlation(df)
+
+        if df.empty:
+            return {
+                "total_matches": 0,
+                "win_rate": None,
+                "horde": horde_result,
+                "horde_rows": [],
+            }
+
+        matches = df.drop_duplicates("match_id").copy()
+        known_results = matches.dropna(subset=["is_win"])
+        total_matches = int(matches["match_id"].nunique())
+        win_rate = None
+        if not known_results.empty:
+            win_rate = float(known_results["is_win"].mean())
+
+        event_counts = horde_result.get("winrate_by_event_count", {})
+        count_sizes = {}
+        if "event_name" in df.columns and "event_time" in df.columns:
+            horde_rows = df[
+                (df["event_name"] == "HordeKill")
+                & (df["event_time"].fillna(float("inf")) <= 15 * 60)
+            ]
+            counts = horde_rows.groupby("match_id").size()
+            match_counts = counts.reindex(matches["match_id"], fill_value=0).astype(int)
+            count_sizes = match_counts.value_counts().sort_index().to_dict()
+
+        horde_rows = [
+            {
+                "count": int(count),
+                "win_rate": float(rate),
+                "matches": int(count_sizes.get(count, 0)),
+            }
+            for count, rate in sorted(event_counts.items(), key=lambda item: int(item[0]))
+        ]
+
+        return {
+            "total_matches": total_matches,
+            "win_rate": win_rate,
+            "horde": horde_result,
+            "horde_rows": horde_rows,
+        }

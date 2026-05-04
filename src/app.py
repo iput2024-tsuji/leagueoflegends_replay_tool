@@ -25,13 +25,16 @@ from PyQt6.QtWidgets import (
     QStyle,
     QFileDialog,
     QProgressBar,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QAction
 
 try:
     from . import recordtest
-    from .controllers import AudioSettingsController, ConfigController, RecordingController
+    from .controllers import AnalyticsController, AudioSettingsController, ConfigController, RecordingController
     from .player import PlayerWidget
     from .app_paths import get_app_root
 except ImportError:
@@ -39,7 +42,7 @@ except ImportError:
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
     import recordtest
-    from controllers import AudioSettingsController, ConfigController, RecordingController
+    from controllers import AnalyticsController, AudioSettingsController, ConfigController, RecordingController
     from player import PlayerWidget
     from app_paths import get_app_root
 
@@ -61,6 +64,7 @@ def get_app_icon():
 CONFIG_CONTROLLER = ConfigController()
 AUDIO_CONTROLLER = AudioSettingsController(CONFIG_CONTROLLER)
 RECORDING_CONTROLLER = RecordingController()
+ANALYTICS_CONTROLLER = AnalyticsController(CONFIG_CONTROLLER)
 
 
 def apply_auto_defaults(data, force_obs_detect=False):
@@ -190,6 +194,17 @@ class RecorderWorker(QThread):
             self.stop_event.set()
         if self.recorder:
             self.recorder.request_stop()
+
+
+class AnalyticsWorker(QThread):
+    loaded = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def run(self):
+        try:
+            self.loaded.emit(ANALYTICS_CONTROLLER.load_summary())
+        except Exception as e:
+            self.error.emit(f"{type(e).__name__}: {e}")
 
 
 class SetupWizardDialog(QDialog):
@@ -346,7 +361,7 @@ class SetupWizardDialog(QDialog):
 
 
 class HomePage(QWidget):
-    def __init__(self, on_play, on_settings):
+    def __init__(self, on_play, on_settings, on_analytics):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -385,6 +400,11 @@ class HomePage(QWidget):
         settings_btn.setFixedHeight(40)
         settings_btn.clicked.connect(on_settings)
         btn_layout.addWidget(settings_btn)
+
+        analytics_btn = QPushButton("データ分析")
+        analytics_btn.setFixedHeight(40)
+        analytics_btn.clicked.connect(on_analytics)
+        btn_layout.addWidget(analytics_btn)
 
         layout.addLayout(btn_layout)
         layout.addStretch(1)
@@ -444,6 +464,122 @@ class PlayerPage(QWidget):
 
     def on_leave(self):
         self.player_widget.stop_playback()
+
+
+class AnalyticsPage(QWidget):
+    def __init__(self, on_back):
+        super().__init__()
+        self.worker = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        self.back_btn = QPushButton("← 戻る")
+        self.back_btn.clicked.connect(on_back)
+        header.addWidget(self.back_btn)
+
+        title = QLabel("データ分析")
+        title.setStyleSheet("font-size: 20px; font-weight: bold;")
+        header.addWidget(title)
+        header.addStretch(1)
+
+        self.refresh_btn = QPushButton("再読み込み")
+        self.refresh_btn.clicked.connect(self.reload)
+        header.addWidget(self.refresh_btn)
+        layout.addLayout(header)
+
+        self.status_label = QLabel("録画データを読み込みます。")
+        self.status_label.setStyleSheet("color: #a8a8a8;")
+        layout.addWidget(self.status_label)
+
+        self.summary_label = QLabel("総録画試合数: -- / 勝率: --")
+        self.summary_label.setStyleSheet(
+            "padding: 12px; border: 1px solid #3a3a3a; border-radius: 8px; "
+            "background-color: #252525; font-size: 15px;"
+        )
+        layout.addWidget(self.summary_label)
+
+        horde_title = QLabel("15分以内のヴォイドグラブ取得数ごとの勝率")
+        horde_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(horde_title)
+
+        self.horde_table = QTableWidget(0, 4)
+        self.horde_table.setHorizontalHeaderLabels(["取得数", "試合数", "勝率", "グラフ"])
+        self.horde_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.horde_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.horde_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.horde_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.horde_table.verticalHeader().setVisible(False)
+        self.horde_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.horde_table, stretch=1)
+
+    def on_page_shown(self):
+        self.reload()
+
+    def reload(self):
+        if self.worker and self.worker.isRunning():
+            return
+        self.status_label.setText("分析中...")
+        self.refresh_btn.setEnabled(False)
+        self.horde_table.setRowCount(0)
+
+        self.worker = AnalyticsWorker()
+        self.worker.loaded.connect(self.apply_result)
+        self.worker.error.connect(self.apply_error)
+        self.worker.finished.connect(self.on_worker_finished)
+        self.worker.start()
+
+    def apply_result(self, result):
+        total_matches = result.get("total_matches", 0)
+        win_rate = result.get("win_rate")
+        win_rate_text = "--" if win_rate is None else f"{win_rate * 100:.1f}%"
+        self.summary_label.setText(f"総録画試合数: {total_matches} / 勝率: {win_rate_text}")
+
+        horde = result.get("horde", {})
+        correlation = horde.get("correlation")
+        corr_text = "--" if correlation is None else f"{correlation:.3f}"
+        self.status_label.setText(f"分析完了。HordeKillと勝敗の相関: {corr_text}")
+        self.populate_horde_table(result.get("horde_rows", []))
+
+    def apply_error(self, message):
+        self.status_label.setText(f"分析に失敗しました: {message}")
+        self.summary_label.setText("総録画試合数: -- / 勝率: --")
+        self.horde_table.setRowCount(0)
+
+    def on_worker_finished(self):
+        self.refresh_btn.setEnabled(True)
+
+    def populate_horde_table(self, rows):
+        self.horde_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            count = int(row.get("count", 0))
+            matches = int(row.get("matches", 0))
+            win_rate = float(row.get("win_rate", 0.0))
+            percent = int(round(win_rate * 100))
+
+            self.horde_table.setItem(row_index, 0, QTableWidgetItem(str(count)))
+            self.horde_table.setItem(row_index, 1, QTableWidgetItem(str(matches)))
+            self.horde_table.setItem(row_index, 2, QTableWidgetItem(f"{percent}%"))
+
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            bar.setValue(percent)
+            bar.setFormat(f"{percent}%")
+            bar.setStyleSheet(
+                "QProgressBar { background-color: #202020; border: 1px solid #3a3a3a; "
+                "border-radius: 5px; color: #ffffff; text-align: center; }"
+                "QProgressBar::chunk { background-color: #d32f2f; border-radius: 4px; }"
+            )
+            self.horde_table.setCellWidget(row_index, 3, bar)
+
+        if not rows:
+            self.horde_table.setRowCount(1)
+            self.horde_table.setItem(0, 0, QTableWidgetItem("-"))
+            self.horde_table.setItem(0, 1, QTableWidgetItem("0"))
+            self.horde_table.setItem(0, 2, QTableWidgetItem("--"))
+            self.horde_table.setItem(0, 3, QTableWidgetItem("分析できる試合結果がありません。"))
 
 
 class SettingsPage(QWidget):
@@ -1035,13 +1171,16 @@ class MainWindow(QMainWindow):
 
         self.home_page = HomePage(
             on_play=self.show_player,
-            on_settings=self.show_settings
+            on_settings=self.show_settings,
+            on_analytics=self.show_analytics,
         )
         self.player_page = PlayerPage(on_back=self.show_home)
+        self.analytics_page = AnalyticsPage(on_back=self.show_home)
         self.settings_page = SettingsPage(on_back=self.show_home)
 
         self.stack.addWidget(self.home_page)
         self.stack.addWidget(self.player_page)
+        self.stack.addWidget(self.analytics_page)
         self.stack.addWidget(self.settings_page)
 
         self.show_home()
@@ -1118,6 +1257,11 @@ class MainWindow(QMainWindow):
         self.player_page.on_leave()
         self.stack.setCurrentWidget(self.settings_page)
         self.settings_page.on_page_shown()
+
+    def show_analytics(self):
+        self.player_page.on_leave()
+        self.stack.setCurrentWidget(self.analytics_page)
+        self.analytics_page.on_page_shown()
 
     def run_startup_setup(self):
         data = load_config()

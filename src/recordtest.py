@@ -4,6 +4,7 @@ import time
 import json
 import subprocess
 import configparser
+from abc import ABC, abstractmethod
 from pathlib import Path
 
 import requests
@@ -88,6 +89,111 @@ MANAGED_AUDIO_INPUTS = {
 
 class RecorderError(RuntimeError):
     pass
+
+
+class OBSClient(ABC):
+    """OBS制御だけを担当する抽象インターフェース。"""
+
+    @property
+    @abstractmethod
+    def raw_client(self):
+        pass
+
+    @abstractmethod
+    def connect(self):
+        pass
+
+    @abstractmethod
+    def disconnect(self):
+        pass
+
+    @abstractmethod
+    def setup_record_output(self):
+        pass
+
+    @abstractmethod
+    def setup_sync_elements(self):
+        pass
+
+    @abstractmethod
+    def get_sync_source_id(self):
+        pass
+
+    @abstractmethod
+    def set_sync_marker_enabled(self, enabled, source_id=None):
+        pass
+
+    @abstractmethod
+    def start_recording(self):
+        pass
+
+    @abstractmethod
+    def stop_recording(self):
+        pass
+
+    @abstractmethod
+    def is_recording_active(self):
+        pass
+
+    @abstractmethod
+    def shutdown(self):
+        pass
+
+
+class RiotAPIClient(ABC):
+    """LoL Live Client APIの取得とパースだけを担当する抽象インターフェース。"""
+
+    @abstractmethod
+    def get_active_player_name(self):
+        pass
+
+    @abstractmethod
+    def get_event_data(self):
+        pass
+
+    @abstractmethod
+    def get_all_game_data(self):
+        pass
+
+
+class RecordingSessionManager(ABC):
+    """OBSClientとRiotAPIClientを注入され、録画ワークフローを管理する抽象インターフェース。"""
+
+    @abstractmethod
+    def reset_session(self):
+        pass
+
+    @abstractmethod
+    def request_stop(self):
+        pass
+
+    @abstractmethod
+    def has_session_data(self):
+        pass
+
+    @abstractmethod
+    def wait_for_game_start(self):
+        pass
+
+    @abstractmethod
+    def start_recording(self):
+        pass
+
+    @abstractmethod
+    def record_until_end(self):
+        pass
+
+    @abstractmethod
+    def stop_recording(self):
+        pass
+
+    @abstractmethod
+    def save_json(self):
+        pass
+
+    @abstractmethod
+    def shutdown_obs(self):
+        pass
 
 
 def obs_executable_path(base_dir):
@@ -960,7 +1066,7 @@ def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
             launched_process = launch_obs()
 
         recorder = LoLAutoRecorder(obs_process=launched_process, status_cb=status_cb, auto_setup=True)
-        # 録画保存先も毎回明示して、配布先でOBS設定不要にする。
+        # 録画保存先も毎回明示して、環境差分でOBS設定がぶれないようにする。
         if RECORDINGS_DIR:
             try:
                 apply_record_directory_to_obs(recorder.client, RECORDINGS_DIR)
@@ -981,11 +1087,6 @@ def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
             "obs_launched": bool(launched_process),
         }
     finally:
-        if recorder and recorder.client:
-            try:
-                recorder.client.disconnect()
-            except Exception:
-                pass
         if launched_process:
             if recorder:
                 try:
@@ -997,6 +1098,12 @@ def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
                     launched_process.terminate()
                 except Exception:
                     pass
+        elif recorder:
+            try:
+                recorder.obs_client.disconnect()
+                recorder.client = recorder.obs_client.raw_client
+            except Exception:
+                pass
 
 # ▼ 全員分保存する重要なイベント（オブジェクト）
 GLOBAL_OBJECTIVES = [
@@ -1397,13 +1504,234 @@ def save_payload(path, payload):
         json.dump(payload, f, indent=4, ensure_ascii=False)
 
 
-class LoLAutoRecorder:
-    def __init__(self, obs_process=None, status_cb=None, auto_setup=True):
+class LiveClientRiotAPIClient(RiotAPIClient):
+    """Riot Live Client APIを使う本番用クライアント。"""
+
+    def get_active_player_name(self):
+        return get_active_player_name()
+
+    def get_event_data(self):
+        return get_event_data()
+
+    def get_all_game_data(self):
+        return get_all_game_data()
+
+
+class ObsWebSocketClient(OBSClient):
+    """obs-websocketを使う本番用OBSクライアント。"""
+
+    def __init__(self, obs_process=None, status_cb=None):
         self.client = None
-        self.my_name = None
         self.obs_process = obs_process
         self.status_cb = status_cb
+
+    @property
+    def raw_client(self):
+        return self.client
+
+    def log(self, message):
+        print(message)
+        if self.status_cb:
+            try:
+                self.status_cb(message)
+            except Exception:
+                pass
+
+    def connect(self):
+        retry_count = 0
+        last_error = None
+        while retry_count < 5:
+            try:
+                self.client, used_host = connect_obs_client(
+                    OBS_HOST,
+                    OBS_PORT,
+                    OBS_PASSWORD,
+                )
+                version = self.client.get_version()
+                host_note = f" host={used_host}" if used_host != OBS_HOST else ""
+                print(f"✅ OBS接続成功 (v{version.obs_version}{host_note})")
+                return
+            except Exception as e:
+                last_error = e
+                retry_count += 1
+                print(f"Connection retrying... ({retry_count}/5)")
+                time.sleep(2)
+
+        raise RecorderError(
+            "OBS WebSocketへの接続に失敗しました。\n"
+            f"接続先: {OBS_HOST}:{OBS_PORT}\n"
+            f"パスワード設定: {'あり' if OBS_PASSWORD else 'なし'}\n"
+            f"詳細: {last_error}"
+        )
+
+    def disconnect(self):
+        if self.client:
+            try:
+                self.client.disconnect()
+            finally:
+                self.client = None
+
+    def setup_record_output(self):
+        if RECORDINGS_DIR:
+            try:
+                Path(RECORDINGS_DIR).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            try:
+                apply_record_directory_to_obs(self.client, RECORDINGS_DIR)
+            except Exception:
+                # OBSバージョン差異や権限差分で失敗する場合は継続
+                pass
+
+        try:
+            apply_obs_video_settings(self.client, OBS_FPS)
+            self.log(f"🎞️ OBS録画FPSを {OBS_FPS} に設定しました。")
+        except Exception as e:
+            # 録画は続行可能なので警告のみ
+            self.log(f"⚠️ OBS録画FPS設定の適用に失敗: {e}")
+
+    def setup_sync_elements(self):
+        self._ensure_scene_exists()
+        self._ensure_sync_source_exists()
+
+    def _ensure_scene_exists(self):
+        try:
+            ensure_obs_scene_exists(self.client, OBS_SCENE_NAME, status_cb=self.log)
+        except Exception as e:
+            raise RecorderError(f"シーン '{OBS_SCENE_NAME}' の自動作成に失敗しました: {e}") from e
+
+    def _ensure_sync_source_exists(self):
+        input_exists = False
+        try:
+            input_resp = self.client.get_input_list()
+            input_items = getattr(input_resp, "inputs", []) or []
+            input_exists = any(
+                isinstance(item, dict) and item.get("inputName") == OBS_SOURCE_NAME
+                for item in input_items
+            )
+        except Exception:
+            input_exists = False
+
+        if not input_exists:
+            self.log(f"ℹ️ 色ソース '{OBS_SOURCE_NAME}' を自動作成します。")
+            settings = {"color": OBS_SOURCE_COLOR, "width": 100, "height": 100}
+            last_error = None
+            for kind in ("color_source_v3", "color_source"):
+                try:
+                    self.client.create_input(
+                        OBS_SCENE_NAME,
+                        OBS_SOURCE_NAME,
+                        kind,
+                        settings,
+                        False
+                    )
+                    input_exists = True
+                    break
+                except Exception as e:
+                    last_error = e
+            if not input_exists:
+                raise RecorderError(f"色ソース '{OBS_SOURCE_NAME}' の自動作成に失敗しました: {last_error}")
+        else:
+            try:
+                self.client.set_input_settings(OBS_SOURCE_NAME, {"color": OBS_SOURCE_COLOR}, overlay=True)
+            except Exception:
+                pass
+
+        scene_item_id = self.get_sync_source_id()
+        if scene_item_id is None:
+            try:
+                self.client.create_scene_item(OBS_SCENE_NAME, OBS_SOURCE_NAME, False)
+                scene_item_id = self.get_sync_source_id()
+            except Exception as e:
+                raise RecorderError(
+                    f"色ソース '{OBS_SOURCE_NAME}' をシーン '{OBS_SCENE_NAME}' に配置できませんでした: {e}"
+                ) from e
+
+        if scene_item_id is None:
+            raise RecorderError(
+                f"色ソース '{OBS_SOURCE_NAME}' は存在しますが、シーン '{OBS_SCENE_NAME}' で見つかりません。"
+            )
+
+        try:
+            self.client.set_scene_item_transform(
+                OBS_SCENE_NAME,
+                scene_item_id,
+                {"positionX": 0.0, "positionY": 0.0, "alignment": 5}
+            )
+        except Exception:
+            pass
+
+        try:
+            self.set_sync_marker_enabled(False, scene_item_id)
+        except Exception:
+            pass
+
+    def get_sync_source_id(self):
+        try:
+            items = self.client.get_scene_item_list(OBS_SCENE_NAME).scene_items
+            for item in items:
+                if item['sourceName'] == OBS_SOURCE_NAME:
+                    return item['sceneItemId']
+        except Exception as e:
+            print(f"⚠️ シーンアイテム取得エラー: {e}")
+        return None
+
+    def set_sync_marker_enabled(self, enabled, source_id=None):
+        item_id = source_id if source_id is not None else self.get_sync_source_id()
+        if item_id is None:
+            raise RecorderError(
+                f"同期用ソース '{OBS_SOURCE_NAME}' がシーン '{OBS_SCENE_NAME}' に見つかりません。"
+            )
+        self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, bool(enabled))
+
+    def start_recording(self):
+        self.client.start_record()
+
+    def stop_recording(self):
+        res = self.client.stop_record()
+        return getattr(res, "output_path", None)
+
+    def is_recording_active(self):
+        status = self.client.get_record_status()
+        return getattr(status, "output_active", None)
+
+    def shutdown(self):
+        if self.obs_process:
+            self.log("🧹 OBSを終了しています...")
+
+            if self.obs_process.poll() is None:
+                try:
+                    self.obs_process.terminate()
+                except Exception:
+                    pass
+
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if self.obs_process.poll() is not None:
+                        break
+                    time.sleep(0.1)
+
+                if self.obs_process.poll() is None:
+                    self.log("⚠️ OBSが終了しないため強制終了します。")
+                    try:
+                        self.obs_process.kill()
+                        self.obs_process.wait(timeout=2)
+                    except Exception:
+                        pass
+
+        self.disconnect()
+
+
+class LoLAutoRecorder(RecordingSessionManager):
+    def __init__(self, obs_process=None, status_cb=None, auto_setup=True, obs_client=None, riot_api_client=None):
+        self.client = None
+        self.my_name = None
+        self.status_cb = status_cb
         self.stop_requested = False
+        self.obs_client = obs_client or ObsWebSocketClient(obs_process=obs_process, status_cb=status_cb)
+        self.riot_api_client = riot_api_client or LiveClientRiotAPIClient()
+        self.obs_process = getattr(self.obs_client, "obs_process", obs_process)
         self.reset_session()
         self.connect_obs()
         self.ensure_record_output_setup()
@@ -1462,143 +1790,26 @@ class LoLAutoRecorder:
         )
 
     def connect_obs(self):
-        """OBS WebSocketに接続"""
-        retry_count = 0
-        last_error = None
-        while retry_count < 5:
-            try:
-                self.client, used_host = connect_obs_client(
-                    OBS_HOST,
-                    OBS_PORT,
-                    OBS_PASSWORD,
-                )
-                version = self.client.get_version()
-                host_note = f" host={used_host}" if used_host != OBS_HOST else ""
-                print(f"✅ OBS接続成功 (v{version.obs_version}{host_note})")
-                return
-            except Exception as e:
-                last_error = e
-                retry_count += 1
-                print(f"Connection retrying... ({retry_count}/5)")
-                time.sleep(2)
-
-        raise RecorderError(
-            "OBS WebSocketへの接続に失敗しました。\n"
-            f"接続先: {OBS_HOST}:{OBS_PORT}\n"
-            f"パスワード設定: {'あり' if OBS_PASSWORD else 'なし'}\n"
-            f"詳細: {last_error}"
-        )
+        self.obs_client.connect()
+        self.client = self.obs_client.raw_client
 
     def get_source_id(self):
-        """同期用ソース(赤色)のIDを取得"""
-        try:
-            items = self.client.get_scene_item_list(OBS_SCENE_NAME).scene_items
-            for item in items:
-                if item['sourceName'] == OBS_SOURCE_NAME:
-                    return item['sceneItemId']
-        except Exception as e:
-            print(f"⚠️ シーンアイテム取得エラー: {e}")
-        return None
+        return self.obs_client.get_sync_source_id()
 
     def ensure_record_output_setup(self):
-        if RECORDINGS_DIR:
-            try:
-                Path(RECORDINGS_DIR).mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-
-            try:
-                apply_record_directory_to_obs(self.client, RECORDINGS_DIR)
-            except Exception:
-                # OBSバージョン差異や権限差分で失敗する場合は継続
-                pass
-
-        try:
-            apply_obs_video_settings(self.client, OBS_FPS)
-            self.log(f"🎞️ OBS録画FPSを {OBS_FPS} に設定しました。")
-        except Exception as e:
-            # 録画は続行可能なので警告のみ
-            self.log(f"⚠️ OBS録画FPS設定の適用に失敗: {e}")
+        self.obs_client.setup_record_output()
 
     def ensure_sync_setup(self):
-        self.ensure_scene_exists()
-        self.ensure_sync_source_exists()
+        self.obs_client.setup_sync_elements()
 
     def ensure_scene_exists(self):
-        try:
-            ensure_obs_scene_exists(self.client, OBS_SCENE_NAME, status_cb=self.log)
-        except Exception as e:
-            raise RecorderError(f"シーン '{OBS_SCENE_NAME}' の自動作成に失敗しました: {e}") from e
+        self.obs_client.setup_sync_elements()
 
     def ensure_sync_source_exists(self):
-        input_exists = False
-        try:
-            input_resp = self.client.get_input_list()
-            input_items = getattr(input_resp, "inputs", []) or []
-            input_exists = any(
-                isinstance(item, dict) and item.get("inputName") == OBS_SOURCE_NAME
-                for item in input_items
-            )
-        except Exception:
-            input_exists = False
-
-        if not input_exists:
-            self.log(f"ℹ️ 色ソース '{OBS_SOURCE_NAME}' を自動作成します。")
-            settings = {"color": OBS_SOURCE_COLOR, "width": 100, "height": 100}
-            last_error = None
-            for kind in ("color_source_v3", "color_source"):
-                try:
-                    self.client.create_input(
-                        OBS_SCENE_NAME,
-                        OBS_SOURCE_NAME,
-                        kind,
-                        settings,
-                        False
-                    )
-                    input_exists = True
-                    break
-                except Exception as e:
-                    last_error = e
-            if not input_exists:
-                raise RecorderError(f"色ソース '{OBS_SOURCE_NAME}' の自動作成に失敗しました: {last_error}")
-        else:
-            # 既存色ソースも設定値で上書きして、同期色がぶれないようにする
-            try:
-                self.client.set_input_settings(OBS_SOURCE_NAME, {"color": OBS_SOURCE_COLOR}, overlay=True)
-            except Exception:
-                pass
-
-        scene_item_id = self.get_source_id()
-        if scene_item_id is None:
-            try:
-                self.client.create_scene_item(OBS_SCENE_NAME, OBS_SOURCE_NAME, False)
-                scene_item_id = self.get_source_id()
-            except Exception as e:
-                raise RecorderError(
-                    f"色ソース '{OBS_SOURCE_NAME}' をシーン '{OBS_SCENE_NAME}' に配置できませんでした: {e}"
-                ) from e
-
-        if scene_item_id is None:
-            raise RecorderError(
-                f"色ソース '{OBS_SOURCE_NAME}' は存在しますが、シーン '{OBS_SCENE_NAME}' で見つかりません。"
-            )
-
-        try:
-            self.client.set_scene_item_transform(
-                OBS_SCENE_NAME,
-                scene_item_id,
-                {"positionX": 0.0, "positionY": 0.0, "alignment": 5}
-            )
-        except Exception:
-            pass
-
-        try:
-            self.client.set_scene_item_enabled(OBS_SCENE_NAME, scene_item_id, False)
-        except Exception:
-            pass
+        self.obs_client.setup_sync_elements()
 
     def try_update_player_name(self):
-        name = get_active_player_name()
+        name = self.riot_api_client.get_active_player_name()
         if name and name != self.my_name:
             self.my_name = name
             self.my_name_short = normalize_summoner_name(name)
@@ -1635,7 +1846,7 @@ class LoLAutoRecorder:
         while True:
             if self.should_stop():
                 return False
-            data = get_all_game_data()
+            data = self.riot_api_client.get_all_game_data()
             if data:
                 game_time = data.get('gameData', {}).get('gameTime', 0)
                 if game_time > 0:
@@ -1651,7 +1862,7 @@ class LoLAutoRecorder:
         """録画開始 -> 同期マーカー"""
         self.log("🎥 録画を開始します...")
         try:
-            self.client.start_record()
+            self.obs_client.start_recording()
             self.recording_started = True
         except OBSSDKRequestError as e:
             self.log(f"⚠️ 録画開始エラー: {e}")
@@ -1674,10 +1885,10 @@ class LoLAutoRecorder:
             return
 
         self.log("⚡ 同期シグナル送信 (Marker ON)")
-        self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, True)
+        self.obs_client.set_sync_marker_enabled(True, item_id)
 
         sync_time = 0.0
-        data = get_all_game_data()
+        data = self.riot_api_client.get_all_game_data()
         if data:
             sync_time = data.get('gameData', {}).get('gameTime', 0.0)
         if (not sync_time or sync_time <= 0) and event_time is not None:
@@ -1687,7 +1898,7 @@ class LoLAutoRecorder:
         self.log(f"📝 同期ログ記録: {sync_time:.4f}s")
 
         self.wait_with_stop(0.5)
-        self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, False)
+        self.obs_client.set_sync_marker_enabled(False, item_id)
         self.log("✅ シグナル消灯。録画継続中。")
 
     def wait_until_game_start_event(self, timeout_sec=180):
@@ -1695,7 +1906,7 @@ class LoLAutoRecorder:
         while time.time() - start < timeout_sec:
             if self.should_stop():
                 return None
-            event_data = get_event_data()
+            event_data = self.riot_api_client.get_event_data()
             if event_data:
                 for event in event_data.get("Events", []):
                     if event.get("EventName") == "GameStart":
@@ -1765,7 +1976,7 @@ class LoLAutoRecorder:
         while True:
             if self.should_stop():
                 return False
-            data = get_all_game_data()
+            data = self.riot_api_client.get_all_game_data()
             if not data:
                 error_count += 1
                 if error_count >= END_ERROR_LIMIT:
@@ -1781,7 +1992,7 @@ class LoLAutoRecorder:
                 self.try_update_player_name()
             self.update_player_info_from_game_data(data)
 
-            event_data = get_event_data()
+            event_data = self.riot_api_client.get_event_data()
             if event_data:
                 events = event_data.get("Events", [])
                 self.process_events(events)
@@ -1798,8 +2009,7 @@ class LoLAutoRecorder:
             return
 
         try:
-            status = self.client.get_record_status()
-            is_active = getattr(status, "output_active", None)
+            is_active = self.obs_client.is_recording_active()
             if is_active is False:
                 self.recording_started = False
                 return
@@ -1807,8 +2017,7 @@ class LoLAutoRecorder:
             pass
 
         try:
-            res = self.client.stop_record()
-            self.record_path = getattr(res, "output_path", None)
+            self.record_path = self.obs_client.stop_recording()
             if self.record_path:
                 self.log(f"💾 保存完了: {self.record_path}")
             self.recording_started = False
@@ -1821,34 +2030,8 @@ class LoLAutoRecorder:
             self.log(f"⚠️ 録画停止エラー: {e}")
 
     def shutdown_obs(self):
-        if not self.obs_process:
-            return
-        self.log("🧹 OBSを終了しています...")
-
-        if self.obs_process.poll() is not None:
-            return
-
-        try:
-            self.obs_process.terminate()
-        except Exception:
-            pass
-
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            if self.obs_process.poll() is not None:
-                break
-            time.sleep(0.1)
-
-        if self.obs_process.poll() is None:
-            self.log("⚠️ OBSが終了しないため強制終了します。")
-            try:
-                self.obs_process.kill()
-                self.obs_process.wait(timeout=2)
-            except Exception:
-                pass
-
-        if self.client:
-            self.client.disconnect()
+        self.obs_client.shutdown()
+        self.client = self.obs_client.raw_client
 
     def save_json(self):
         if self.output_file is None:

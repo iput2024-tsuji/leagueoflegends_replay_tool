@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+from sklearn.tree import DecisionTreeClassifier, export_text
 
 try:
     from . import recordtest
@@ -140,6 +141,57 @@ class GameDataAnalyzer:
         y = matches["is_win"].astype(int).rename("is_win")
         return x, y
 
+    def extract_tactical_insights(self):
+        x, y = self.build_feature_matrix()
+        feature_labels = {
+            "horde_kill_15m": "15分以内HordeKill",
+            "own_building_kill_15m": "15分以内タワー破壊",
+            "first_blood": "ファーストブラッド取得",
+        }
+        if x.empty or y.empty:
+            return {
+                "sample_size": 0,
+                "best_rule": None,
+                "worst_rule": None,
+                "tree_text": "",
+                "reason": "分析可能な試合データがありません。",
+            }
+        if len(y) < 3 or y.nunique() < 2:
+            return {
+                "sample_size": int(len(y)),
+                "best_rule": None,
+                "worst_rule": None,
+                "tree_text": "",
+                "reason": "決定木分析には勝敗両方を含む3試合以上のデータが必要です。",
+            }
+
+        model = DecisionTreeClassifier(
+            max_depth=3,
+            min_samples_leaf=3,
+            random_state=42,
+        )
+        model.fit(x, y)
+
+        leaves = self._decision_tree_leaf_rules(model, x.columns.tolist(), feature_labels)
+        if not leaves:
+            return {
+                "sample_size": int(len(y)),
+                "best_rule": None,
+                "worst_rule": None,
+                "tree_text": export_text(model, feature_names=list(feature_labels.values())),
+                "reason": "決定木からルールを抽出できませんでした。",
+            }
+
+        best = max(leaves, key=lambda item: (item["win_rate"], item["samples"]))
+        worst = min(leaves, key=lambda item: (item["win_rate"], -item["samples"]))
+        return {
+            "sample_size": int(len(y)),
+            "best_rule": self._format_leaf_rule(best),
+            "worst_rule": self._format_leaf_rule(worst),
+            "tree_text": export_text(model, feature_names=[feature_labels[name] for name in x.columns]),
+            "reason": None,
+        }
+
     def _read_payload(self, path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -229,6 +281,58 @@ class GameDataAnalyzer:
         else:
             own_by_team = pd.Series(False, index=df.index)
         return own_by_relation | own_by_team
+
+    def _decision_tree_leaf_rules(self, model, feature_names, feature_labels):
+        tree = model.tree_
+        class_index = {int(label): index for index, label in enumerate(model.classes_)}
+        win_index = class_index.get(1)
+        leaves = []
+
+        def walk(node_id, conditions):
+            left = tree.children_left[node_id]
+            right = tree.children_right[node_id]
+            if left == right:
+                values = tree.value[node_id][0]
+                samples = int(tree.n_node_samples[node_id])
+                if win_index is None or samples <= 0:
+                    win_rate = 0.0
+                elif abs(float(values.sum()) - 1.0) < 1e-9:
+                    win_rate = float(values[win_index])
+                else:
+                    win_rate = float(values[win_index]) / float(values.sum())
+                leaves.append(
+                    {
+                        "conditions": conditions or ["全試合"],
+                        "samples": samples,
+                        "win_rate": win_rate,
+                    }
+                )
+                return
+
+            feature_name = feature_names[tree.feature[node_id]]
+            label = feature_labels.get(feature_name, feature_name)
+            threshold = float(tree.threshold[node_id])
+            walk(left, conditions + [self._format_tree_condition(label, feature_name, threshold, "left")])
+            walk(right, conditions + [self._format_tree_condition(label, feature_name, threshold, "right")])
+
+        walk(0, [])
+        return leaves
+
+    def _format_tree_condition(self, label, feature_name, threshold, side):
+        if feature_name == "first_blood":
+            return f"{label}なし" if side == "left" else f"{label}あり"
+
+        if side == "left":
+            value = int(threshold // 1)
+            return f"{label} <= {value}"
+
+        value = int(threshold // 1) + 1
+        return f"{label} >= {value}"
+
+    def _format_leaf_rule(self, leaf):
+        rule_text = " AND ".join(leaf["conditions"])
+        win_rate = round(leaf["win_rate"] * 100)
+        return f"{rule_text} -> WinRate {win_rate}% (n={leaf['samples']})"
 
     def _is_win(self, game_result, player_team, winning_team):
         if isinstance(game_result, bool):

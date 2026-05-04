@@ -72,3 +72,40 @@ def test_analyzer_flattens_events_and_correlates_horde_kill():
     assert x.loc["loss", "first_blood"] == 0
     assert y.loc["win"] == 1
     assert y.loc["loss"] == 0
+
+
+def test_extract_tactical_insights_returns_best_and_worst_rules():
+    tmp_path = runtime_dir("insights")
+    for index in range(4):
+        write_match(
+            tmp_path / f"win_{index}.json",
+            "Win",
+            "Malphite",
+            [
+                {"EventID": 100 + index, "EventName": "HordeKill", "EventTime": 500.0},
+                {"EventID": 200 + index, "EventName": "HordeKill", "EventTime": 650.0},
+                {"EventID": 300 + index, "EventName": "BuildingKill", "EventTime": 700.0, "KillerTeam": "ORDER"},
+                {"EventID": 400 + index, "EventName": "FirstBlood", "EventTime": 120.0, "KillerTeam": "ORDER"},
+            ],
+        )
+
+    for index in range(4):
+        write_match(
+            tmp_path / f"loss_{index}.json",
+            "Loss",
+            "Ahri",
+            [
+                {"EventID": 500 + index, "EventName": "BuildingKill", "EventTime": 700.0, "KillerTeam": "CHAOS"},
+                {"EventID": 600 + index, "EventName": "FirstBlood", "EventTime": 120.0, "KillerTeam": "CHAOS"},
+            ],
+        )
+
+    insights = GameDataAnalyzer(json_dir=tmp_path).extract_tactical_insights()
+
+    assert insights["sample_size"] == 8
+    assert insights["reason"] is None
+    assert "WinRate 100%" in insights["best_rule"]
+    assert "WinRate 0%" in insights["worst_rule"]
+    assert "n=4" in insights["best_rule"]
+    assert "15分以内" in insights["best_rule"]
+    assert "15分以内" in insights["tree_text"]

@@ -4,3 +4,4 @@ python-mpv
 aiohttp
 PyQt6
 pandas
+scikit-learn

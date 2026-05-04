@@ -320,6 +320,7 @@ class AnalyticsController:
         analyzer = GameDataAnalyzer(config=config)
         df = analyzer.load_dataframe()
         horde_result = analyzer.horde_kill_15min_winrate_correlation(df)
+        tactical_insights = analyzer.extract_tactical_insights()
 
         if df.empty:
             return {
@@ -327,6 +328,7 @@ class AnalyticsController:
                 "win_rate": None,
                 "horde": horde_result,
                 "horde_rows": [],
+                "tactical_insights": tactical_insights,
             }
 
         matches = df.drop_duplicates("match_id").copy()
@@ -361,4 +363,5 @@ class AnalyticsController:
             "win_rate": win_rate,
             "horde": horde_result,
             "horde_rows": horde_rows,
+            "tactical_insights": tactical_insights,
         }

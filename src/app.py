@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHeaderView,
+    QFrame,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QAction
@@ -515,6 +516,26 @@ class AnalyticsPage(QWidget):
         self.horde_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         layout.addWidget(self.horde_table, stretch=1)
 
+        insight_title = QLabel("戦術インサイト (AI分析)")
+        insight_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(insight_title)
+
+        self.insight_frame = QFrame()
+        self.insight_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.insight_frame.setStyleSheet(
+            "QFrame { background-color: #252525; border: 1px solid #3a3a3a; "
+            "border-radius: 8px; }"
+        )
+        insight_layout = QVBoxLayout(self.insight_frame)
+        insight_layout.setContentsMargins(12, 10, 12, 10)
+        insight_layout.setSpacing(8)
+
+        self.insight_label = QLabel("分析結果はここに表示されます。")
+        self.insight_label.setWordWrap(True)
+        self.insight_label.setStyleSheet("color: #e6e6e6; line-height: 1.4;")
+        insight_layout.addWidget(self.insight_label)
+        layout.addWidget(self.insight_frame)
+
     def on_page_shown(self):
         self.reload()
 
@@ -524,6 +545,7 @@ class AnalyticsPage(QWidget):
         self.status_label.setText("分析中...")
         self.refresh_btn.setEnabled(False)
         self.horde_table.setRowCount(0)
+        self.insight_label.setText("戦術インサイトを分析中...")
 
         self.worker = AnalyticsWorker()
         self.worker.loaded.connect(self.apply_result)
@@ -542,11 +564,13 @@ class AnalyticsPage(QWidget):
         corr_text = "--" if correlation is None else f"{correlation:.3f}"
         self.status_label.setText(f"分析完了。HordeKillと勝敗の相関: {corr_text}")
         self.populate_horde_table(result.get("horde_rows", []))
+        self.populate_tactical_insights(result.get("tactical_insights", {}))
 
     def apply_error(self, message):
         self.status_label.setText(f"分析に失敗しました: {message}")
         self.summary_label.setText("総録画試合数: -- / 勝率: --")
         self.horde_table.setRowCount(0)
+        self.insight_label.setText("データ不足のため分析できません。")
 
     def on_worker_finished(self):
         self.refresh_btn.setEnabled(True)
@@ -580,6 +604,27 @@ class AnalyticsPage(QWidget):
             self.horde_table.setItem(0, 1, QTableWidgetItem("0"))
             self.horde_table.setItem(0, 2, QTableWidgetItem("--"))
             self.horde_table.setItem(0, 3, QTableWidgetItem("分析できる試合結果がありません。"))
+
+    def populate_tactical_insights(self, insights):
+        if not insights:
+            self.insight_label.setText("データ不足のため分析できません。")
+            return
+
+        reason = insights.get("reason")
+        best_rule = insights.get("best_rule")
+        worst_rule = insights.get("worst_rule")
+        sample_size = int(insights.get("sample_size") or 0)
+
+        if reason or not best_rule or not worst_rule:
+            detail = f"\n理由: {reason}" if reason else ""
+            self.insight_label.setText(f"データ不足のため分析できません。{detail}")
+            return
+
+        self.insight_label.setText(
+            f"対象試合数: {sample_size}\n"
+            f"・勝利の方程式: {best_rule}\n"
+            f"・敗北のパターン: {worst_rule}"
+        )
 
 
 class SettingsPage(QWidget):

@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from pathlib import Path
 
@@ -99,8 +100,38 @@ class RecorderWorker(QThread):
         super().__init__()
         self.stop_flag = False
         self.recorder = None
+        self.loop = None
+        self.stop_event = None
 
     def run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.stop_event = asyncio.Event()
+        try:
+            self.loop.run_until_complete(self.run_async())
+        except recordtest.RecorderError as e:
+            message = str(e).strip() or "録画処理でエラーが発生しました。"
+            first_line = message.splitlines()[0]
+            self.status.emit(f"❌ {first_line}")
+            self.error.emit(message)
+        except BaseException as e:
+            message = f"{type(e).__name__}: {e}"
+            self.status.emit(f"❌ {message}")
+            self.error.emit(message)
+        finally:
+            try:
+                pending = asyncio.all_tasks(self.loop)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            finally:
+                self.loop.close()
+                self.loop = None
+                self.stop_event = None
+            self.finished.emit()
+
+    async def run_async(self):
         try:
             settings = load_config()
             report = run_preflight(settings, auto_fix=True, force_obs_detect=True)
@@ -118,34 +149,26 @@ class RecorderWorker(QThread):
 
             settings = report["config"]
             self.recorder = RECORDING_CONTROLLER.create_recorder(settings, status_cb=self.status.emit)
+            self.recorder.set_stop_event(self.stop_event)
             try:
                 self.recorder.apply_audio_profile(self.recorder.config)
                 self.status.emit("🔊 音声設定をOBSへ適用しました。")
             except Exception as e:
                 self.status.emit(f"⚠️ 音声設定の適用に失敗: {e}")
 
-            while not self.stop_flag:
+            while not self.stop_event.is_set():
                 self.recorder.reset_session()
-                started = self.recorder.wait_for_game_start()
-                if not started or self.stop_flag:
+                started = await self.recorder.wait_for_game_start_async()
+                if not started or self.stop_event.is_set():
                     break
-                self.recorder.start_recording()
-                if self.stop_flag:
+                await self.recorder.start_recording_async()
+                if self.stop_event.is_set():
                     break
-                self.recorder.record_until_end()
+                await self.recorder.record_until_end_async()
                 self.recorder.stop_recording()
                 if self.recorder.has_session_data():
                     self.recorder.save_json()
                 self.status.emit("✅ 試合記録完了。次の試合を待機します。")
-        except recordtest.RecorderError as e:
-            message = str(e).strip() or "録画処理でエラーが発生しました。"
-            first_line = message.splitlines()[0]
-            self.status.emit(f"❌ {first_line}")
-            self.error.emit(message)
-        except BaseException as e:
-            message = f"{type(e).__name__}: {e}"
-            self.status.emit(f"❌ {message}")
-            self.error.emit(message)
         finally:
             if self.recorder:
                 self.recorder.request_stop()
@@ -153,10 +176,18 @@ class RecorderWorker(QThread):
                 if self.recorder.has_session_data():
                     self.recorder.save_json()
                 self.recorder.shutdown_obs()
-            self.finished.emit()
 
     def stop(self):
         self.stop_flag = True
+        loop = self.loop
+        if loop and loop.is_running():
+            loop.call_soon_threadsafe(self._request_stop_on_loop)
+        else:
+            self._request_stop_on_loop()
+
+    def _request_stop_on_loop(self):
+        if self.stop_event:
+            self.stop_event.set()
         if self.recorder:
             self.recorder.request_stop()
 

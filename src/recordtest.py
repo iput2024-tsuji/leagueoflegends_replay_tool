@@ -392,15 +392,15 @@ class RecordingSessionManager(ABC):
         pass
 
     @abstractmethod
-    def wait_for_game_start(self):
+    async def wait_for_game_start_async(self):
         pass
 
     @abstractmethod
-    def start_recording(self):
+    async def start_recording_async(self):
         pass
 
     @abstractmethod
-    def record_until_end(self):
+    async def record_until_end_async(self):
         pass
 
     @abstractmethod
@@ -1686,15 +1686,6 @@ def save_payload(path, payload):
         json.dump(payload, f, indent=4, ensure_ascii=False)
 
 
-def _run_async(coro):
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-    coro.close()
-    raise RecorderError("この同期APIは実行中のasyncioイベントループ内からは呼び出せません。")
-
-
 class LiveClientRiotAPIClient(RiotAPIClient):
     """aiohttpでRiot Live Client APIを取得する本番用クライアント。"""
 
@@ -1731,22 +1722,6 @@ class LiveClientRiotAPIClient(RiotAPIClient):
     async def get_all_game_data(self):
         data = await self._fetch(ALL_GAME_URL, timeout_sec=1)
         return data if isinstance(data, dict) else None
-
-
-def get_active_player_name():
-    """互換用の同期ラッパー。録画ループ内では非同期APIを使う。"""
-    return _run_async(LiveClientRiotAPIClient().get_active_player_name())
-
-
-def get_event_data():
-    """互換用の同期ラッパー。録画ループ内では非同期APIを使う。"""
-    return _run_async(LiveClientRiotAPIClient().get_event_data())
-
-
-def get_all_game_data():
-    """互換用の同期ラッパー。録画ループ内では非同期APIを使う。"""
-    return _run_async(LiveClientRiotAPIClient().get_all_game_data())
-
 
 class ObsWebSocketClient(OBSClient):
     """obs-websocketを使う本番用OBSクライアント。"""
@@ -1989,11 +1964,21 @@ class ObsWebSocketClient(OBSClient):
 
 
 class LoLAutoRecorder(RecordingSessionManager):
-    def __init__(self, config=None, obs_process=None, status_cb=None, auto_setup=True, obs_client=None, riot_api_client=None):
+    def __init__(
+        self,
+        config=None,
+        obs_process=None,
+        status_cb=None,
+        auto_setup=True,
+        obs_client=None,
+        riot_api_client=None,
+        stop_event=None,
+    ):
         self.config = config or load_app_config()
         self.my_name = None
         self.status_cb = status_cb
         self.stop_requested = False
+        self.stop_event = stop_event
         self.logger = logging.getLogger(f"lol_replay.recorder.{id(self)}")
         self._status_handler = StatusCallbackLogHandler(status_cb) if status_cb else None
         if self._status_handler:
@@ -2015,13 +2000,30 @@ class LoLAutoRecorder(RecordingSessionManager):
     def log(self, message):
         self.logger.info(message)
 
+    def set_stop_event(self, stop_event):
+        self.stop_event = stop_event
+
     def request_stop(self):
         self.stop_requested = True
+        if self.stop_event is not None:
+            try:
+                self.stop_event.set()
+            except Exception:
+                pass
 
     def should_stop(self):
-        return self.stop_requested
+        return self.stop_requested or bool(self.stop_event and self.stop_event.is_set())
 
     async def wait_with_stop_async(self, seconds, step=0.5):
+        if self.should_stop():
+            return False
+        if self.stop_event is not None:
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=max(0.0, float(seconds)))
+                return False
+            except asyncio.TimeoutError:
+                return not self.should_stop()
+
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(0.0, float(seconds))
         while loop.time() < deadline:
@@ -2030,9 +2032,6 @@ class LoLAutoRecorder(RecordingSessionManager):
             remaining = deadline - loop.time()
             await asyncio.sleep(min(step, max(0.01, remaining)))
         return not self.should_stop()
-
-    def wait_with_stop(self, seconds, step=0.5):
-        return _run_async(self.wait_with_stop_async(seconds, step=step))
 
     def reset_session(self):
         self.output_file = None
@@ -2099,9 +2098,6 @@ class LoLAutoRecorder(RecordingSessionManager):
             self.my_name_short = normalize_summoner_name(name)
             self.log(f"プレイヤー名を特定: {self.my_name}")
 
-    def try_update_player_name(self):
-        return _run_async(self.try_update_player_name_async())
-
     def update_player_info_from_game_data(self, data):
         if not data or not self.my_name:
             return
@@ -2116,16 +2112,19 @@ class LoLAutoRecorder(RecordingSessionManager):
     def update_result_from_events(self, events):
         if not events:
             return
-        end_names = {"GameEnd", "EndGame", "GameEnded", "GameComplete"}
         for event in events:
             name = event.get("EventName")
-            if name not in end_names:
+            if not self.is_game_end_event(event):
                 continue
             result_value = event.get("Result") or event.get("result") or event.get("GameResult") or event.get("gameResult")
             winning_team = event.get("WinningTeam") or event.get("winningTeam") or event.get("Team") or event.get("team")
             self.game_result = result_value
             self.winning_team = winning_team
             return
+
+    @staticmethod
+    def is_game_end_event(event):
+        return bool(event and event.get("EventName") in {"GameEnd", "EndGame", "GameEnded", "GameComplete"})
 
     async def wait_for_game_start_async(self):
         """LoLの試合開始を監視"""
@@ -2144,9 +2143,6 @@ class LoLAutoRecorder(RecordingSessionManager):
                     return True
             if not await self.wait_with_stop_async(1.0):
                 return False
-
-    def wait_for_game_start(self):
-        return _run_async(self.wait_for_game_start_async())
 
     async def start_recording_async(self):
         """録画開始 -> 同期マーカー"""
@@ -2191,9 +2187,6 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.obs_client.set_sync_marker_enabled(False, item_id)
         self.log("✅ シグナル消灯。録画継続中。")
 
-    def start_recording(self):
-        return _run_async(self.start_recording_async())
-
     async def wait_until_game_start_event_async(self, timeout_sec=180):
         loop = asyncio.get_running_loop()
         start = loop.time()
@@ -2209,9 +2202,6 @@ class LoLAutoRecorder(RecordingSessionManager):
                 return None
         self.log("⚠️ GameStart を検知できませんでした。現在のゲーム時間で同期します。")
         return None
-
-    def wait_until_game_start_event(self, timeout_sec=180):
-        return _run_async(self.wait_until_game_start_event_async(timeout_sec=timeout_sec))
 
     def process_events(self, events):
         for event in events:
@@ -2294,13 +2284,13 @@ class LoLAutoRecorder(RecordingSessionManager):
                 events = event_data.get("Events", [])
                 self.process_events(events)
                 self.update_result_from_events(events)
+                if any(self.is_game_end_event(event) for event in events):
+                    self.log("🏁 GameEndイベントを検知。録画を停止します。")
+                    return True
 
             if not await self.wait_with_stop_async(self.config.polling.event_poll_sec):
                 return False
         return True
-
-    def record_until_end(self):
-        return _run_async(self.record_until_end_async())
 
     def stop_recording(self):
         if not self.obs_client.raw_client or self.record_path is not None:
@@ -2389,7 +2379,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         enforce_storage_limit(self.config, keep_paths=[self.output_file, self.record_path])
 
 
-if __name__ == "__main__":
+async def run_cli_recorder():
     app = None
     try:
         settings = load_settings()
@@ -2415,9 +2405,11 @@ if __name__ == "__main__":
             LOGGER.warning("⚠️ 音声設定の適用に失敗: %s", e)
         while True:
             app.reset_session()
-            app.wait_for_game_start()
-            app.start_recording()
-            app.record_until_end()
+            started = await app.wait_for_game_start_async()
+            if not started:
+                break
+            await app.start_recording_async()
+            await app.record_until_end_async()
             app.stop_recording()
             app.save_json()
             LOGGER.info("✅ 試合記録完了。次の試合を待機します。")
@@ -2433,3 +2425,7 @@ if __name__ == "__main__":
                 app.save_json()
             app.shutdown_obs()
         LOGGER.info("👋 全ての処理が完了しました。")
+
+
+if __name__ == "__main__":
+    asyncio.run(run_cli_recorder())

@@ -1,0 +1,306 @@
+import json
+from pathlib import Path
+
+try:
+    from . import recordtest
+    from .app_paths import get_app_root
+except ImportError:
+    import recordtest
+    from app_paths import get_app_root
+
+
+ROOT_DIR = get_app_root()
+CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
+SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
+
+
+class ConfigController:
+    """設定ファイル、補完、プレフライトをUIから分離して扱う。"""
+
+    def apply_auto_defaults(self, data, force_obs_detect=False):
+        changed = False
+        notes = []
+
+        if not isinstance(data, dict):
+            data = {}
+            changed = True
+
+        obs = data.setdefault("obs", {})
+        paths = data.setdefault("paths", {})
+        polling = data.setdefault("polling", {})
+        storage = data.setdefault("storage", {})
+        app_cfg = data.setdefault("app", {})
+        audio_cfg = data.setdefault("audio", {})
+
+        defaults_obs = {
+            "host": recordtest.DEFAULT_OBS_HOST,
+            "port": recordtest.DEFAULT_OBS_PORT,
+            "fps": recordtest.DEFAULT_OBS_FPS,
+            "scene_name": recordtest.DEFAULT_OBS_SCENE_NAME,
+            "source_name": recordtest.DEFAULT_OBS_SOURCE_NAME,
+            "source_color": recordtest.DEFAULT_OBS_SOURCE_COLOR,
+        }
+        for key, value in defaults_obs.items():
+            if obs.get(key) in (None, ""):
+                obs[key] = value
+                changed = True
+
+        if str(obs.get("password", "")).strip() == "your_password_here":
+            obs["password"] = ""
+            changed = True
+            notes.append("OBSパスワードのプレースホルダを空欄にしました")
+
+        if obs.get("dir") != recordtest.DEFAULT_OBS_DIR:
+            obs["dir"] = recordtest.DEFAULT_OBS_DIR
+            changed = True
+            notes.append(f"OBSフォルダを固定しました: {recordtest.DEFAULT_OBS_DIR}")
+
+        has_valid_dir = bool(recordtest.detect_obs_dir())
+
+        defaults_paths = {
+            "bin_dir": recordtest.DEFAULT_BIN_DIR,
+            "recordings_dir": recordtest.DEFAULT_RECORDINGS_DIR,
+            "json_dir": recordtest.DEFAULT_JSON_DIR,
+            "champion_icons_dir": recordtest.DEFAULT_CHAMPION_ICONS_DIR,
+            "champion_aliases_path": "config/champion_aliases.json",
+        }
+        for key, value in defaults_paths.items():
+            if paths.get(key) in (None, ""):
+                paths[key] = value
+                changed = True
+
+        defaults_polling = {
+            "end_error_limit": recordtest.DEFAULT_END_ERROR_LIMIT,
+            "end_poll_sec": recordtest.DEFAULT_END_POLL_SEC,
+            "event_poll_sec": recordtest.DEFAULT_EVENT_POLL_SEC,
+        }
+        for key, value in defaults_polling.items():
+            if polling.get(key) in (None, ""):
+                polling[key] = value
+                changed = True
+
+        if storage.get("max_size_gb") in (None, ""):
+            storage["max_size_gb"] = recordtest.DEFAULT_MAX_STORAGE_GB
+            changed = True
+
+        if app_cfg.get("setup_completed") is None:
+            app_cfg["setup_completed"] = bool(has_valid_dir)
+            changed = True
+        elif not bool(app_cfg.get("setup_completed")) and has_valid_dir:
+            app_cfg["setup_completed"] = True
+            changed = True
+        if app_cfg.get("minimize_to_tray") is None:
+            app_cfg["minimize_to_tray"] = True
+            changed = True
+
+        audio_defaults = recordtest.get_audio_config_defaults()
+        for key, defaults in audio_defaults.items():
+            slot = audio_cfg.setdefault(key, {})
+            if not isinstance(slot, dict):
+                audio_cfg[key] = {}
+                slot = audio_cfg[key]
+                changed = True
+            for field, value in defaults.items():
+                if slot.get(field) in (None, ""):
+                    slot[field] = value
+                    changed = True
+
+        return data, changed, notes
+
+    def format_report_lines(self, lines):
+        if not lines:
+            return "- なし"
+        return "\n".join(f"- {line}" for line in lines)
+
+    def load_config(self):
+        if not CONFIG_PATH.exists():
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            if SAMPLE_CONFIG_PATH.exists():
+                CONFIG_PATH.write_text(SAMPLE_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
+            else:
+                CONFIG_PATH.write_text(json.dumps({}, indent=4), encoding="utf-8")
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
+        data, changed, _ = self.apply_auto_defaults(data, force_obs_detect=False)
+        if changed:
+            self.save_config(data)
+        return data
+
+    def save_config(self, data):
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+
+    def run_preflight(self, config_data=None, auto_fix=True, force_obs_detect=True):
+        data = config_data if config_data is not None else self.load_config()
+        data, changed_defaults, default_notes = self.apply_auto_defaults(
+            data,
+            force_obs_detect=force_obs_detect,
+        )
+        report = recordtest.run_preflight_checks(data, auto_fix=auto_fix, ensure_dirs=True)
+        report["changed"] = bool(changed_defaults or report.get("changed"))
+        report["notes"] = list(default_notes) + list(report.get("notes", []))
+        return report
+
+    def run_guided_auto_setup(self, config_data=None):
+        report = self.run_preflight(config_data, auto_fix=True, force_obs_detect=True)
+        if report.get("errors"):
+            return report, None
+
+        try:
+            info = recordtest.setup_obs_sync_elements(report["config"])
+        except recordtest.RecorderError as e:
+            report["errors"].append(str(e))
+            return report, None
+        except Exception as e:
+            report["errors"].append(f"{type(e).__name__}: {e}")
+            return report, None
+
+        report["config"].setdefault("app", {})["setup_completed"] = True
+        self.save_config(report["config"])
+        return report, info
+
+    def test_obs_connection(self, config_data=None):
+        report = self.run_preflight(config_data, auto_fix=True, force_obs_detect=True)
+        if report.get("changed"):
+            self.save_config(report["config"])
+        if report.get("errors"):
+            return report, False, self.format_report_lines(report.get("errors", []))
+
+        config = recordtest.AppConfig.from_dict(report["config"])
+        ok, detail = recordtest.test_obs_connection(
+            config.obs.host,
+            config.obs.port,
+            config.obs.password,
+        )
+        return report, ok, detail
+
+    def total_storage_size(self, config_data=None):
+        config = recordtest.AppConfig.from_dict(config_data or self.load_config())
+        return recordtest.total_storage_size(config)
+
+
+class AudioSettingsController:
+    """OBS音声・録画出力のインフラ操作をUIから分離する。"""
+
+    def __init__(self, config_controller=None):
+        self.config_controller = config_controller or ConfigController()
+
+    def _prepare_config(self, data, auto_fix=True, force_obs_detect=True):
+        report = self.config_controller.run_preflight(
+            data,
+            auto_fix=auto_fix,
+            force_obs_detect=force_obs_detect,
+        )
+        if report.get("changed"):
+            self.config_controller.save_config(report["config"])
+        if report.get("errors"):
+            raise recordtest.RecorderError("\n".join(report.get("errors", [])))
+        config = recordtest.AppConfig.from_dict(report["config"])
+        recordtest.setup_environment(config)
+        return report, config
+
+    def _open_recorder(self, config, auto_launch=False, max_retries=2, retry_delay=0.5):
+        ok, _detail = recordtest.test_obs_connection(
+            config.obs.host,
+            config.obs.port,
+            config.obs.password,
+            timeout=1.5,
+        )
+
+        launched_process = None
+        if not ok and auto_launch:
+            launched_process = recordtest.launch_obs(config)
+
+        obs_client = recordtest.ObsWebSocketClient(
+            config=config,
+            obs_process=launched_process,
+            status_cb=None,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
+        )
+        recorder = recordtest.LoLAutoRecorder(
+            config=config,
+            obs_process=launched_process,
+            status_cb=None,
+            auto_setup=False,
+            obs_client=obs_client,
+        )
+        return recorder, launched_process
+
+    def refresh_audio_devices(self, data, auto_launch=True):
+        report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=True)
+        recorder = None
+        launched_process = None
+        try:
+            recorder, launched_process = self._open_recorder(config, auto_launch=auto_launch)
+            catalog = recorder.get_audio_device_catalog(cfg=config)
+            return {
+                "catalog": catalog,
+                "config": report["config"],
+                "obs_launched": bool(launched_process),
+            }
+        finally:
+            if recorder:
+                recorder.disconnect_obs()
+
+
+    def apply_audio_settings(self, data, auto_launch=True):
+        report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
+        recorder = None
+        launched_process = None
+        try:
+            recorder, launched_process = self._open_recorder(config, auto_launch=auto_launch)
+            recorder.apply_audio_profile(config)
+            self.config_controller.save_config(report["config"])
+            return {"config": report["config"], "obs_launched": bool(launched_process)}
+        finally:
+            if recorder:
+                recorder.disconnect_obs()
+
+    def apply_runtime_output_settings(self, data):
+        report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
+        ok, _detail = recordtest.test_obs_connection(
+            config.obs.host,
+            config.obs.port,
+            config.obs.password,
+            timeout=1.0,
+        )
+        if not ok:
+            return False
+
+        recorder = None
+        try:
+            obs_client = recordtest.ObsWebSocketClient(
+                config=config,
+                status_cb=None,
+                max_retries=1,
+                retry_delay=0.0,
+            )
+            recorder = recordtest.LoLAutoRecorder(
+                config=config,
+                status_cb=None,
+                auto_setup=False,
+                obs_client=obs_client,
+            )
+            recorder.apply_record_output_settings()
+            return True
+        finally:
+            if recorder:
+                recorder.disconnect_obs()
+
+class RecordingController:
+    """録画監視ワーカーが使う録画ランタイム生成を担当する。"""
+
+    def create_recorder(self, config_data, status_cb=None):
+        config = recordtest.AppConfig.from_dict(config_data)
+        recordtest.setup_environment(config)
+        obs_process = recordtest.launch_obs(config)
+        return recordtest.LoLAutoRecorder(
+            config=config,
+            obs_process=obs_process,
+            status_cb=status_cb,
+        )

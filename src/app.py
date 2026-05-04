@@ -1,4 +1,3 @@
-import json
 import sys
 from pathlib import Path
 
@@ -31,6 +30,7 @@ from PyQt6.QtGui import QIcon, QAction
 
 try:
     from . import recordtest
+    from .controllers import AudioSettingsController, ConfigController, RecordingController
     from .player import PlayerWidget
     from .app_paths import get_app_root
 except ImportError:
@@ -38,13 +38,12 @@ except ImportError:
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
     import recordtest
+    from controllers import AudioSettingsController, ConfigController, RecordingController
     from player import PlayerWidget
     from app_paths import get_app_root
 
 
 ROOT_DIR = get_app_root()
-CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
-SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
 APP_ICON_CANDIDATES = [
     ROOT_DIR / "assets" / "app" / "app.ico",
     ROOT_DIR / "assets" / "app" / "app.png",
@@ -58,154 +57,37 @@ def get_app_icon():
     return None
 
 
+CONFIG_CONTROLLER = ConfigController()
+AUDIO_CONTROLLER = AudioSettingsController(CONFIG_CONTROLLER)
+RECORDING_CONTROLLER = RecordingController()
+
+
 def apply_auto_defaults(data, force_obs_detect=False):
-    changed = False
-    notes = []
-
-    if not isinstance(data, dict):
-        data = {}
-        changed = True
-
-    obs = data.setdefault("obs", {})
-    paths = data.setdefault("paths", {})
-    polling = data.setdefault("polling", {})
-    storage = data.setdefault("storage", {})
-    app_cfg = data.setdefault("app", {})
-    audio_cfg = data.setdefault("audio", {})
-
-    defaults_obs = {
-        "host": recordtest.DEFAULT_OBS_HOST,
-        "port": recordtest.DEFAULT_OBS_PORT,
-        "fps": recordtest.DEFAULT_OBS_FPS,
-        "scene_name": recordtest.DEFAULT_OBS_SCENE_NAME,
-        "source_name": recordtest.DEFAULT_OBS_SOURCE_NAME,
-        "source_color": recordtest.DEFAULT_OBS_SOURCE_COLOR,
-    }
-    for key, value in defaults_obs.items():
-        if obs.get(key) in (None, ""):
-            obs[key] = value
-            changed = True
-
-    if str(obs.get("password", "")).strip() == "your_password_here":
-        obs["password"] = ""
-        changed = True
-        notes.append("OBSパスワードのプレースホルダを空欄にしました")
-
-    # OBSはユーザーが bin/OBS-Studio に配置したポータブル版のみ利用する。
-    if obs.get("dir") != recordtest.DEFAULT_OBS_DIR:
-        obs["dir"] = recordtest.DEFAULT_OBS_DIR
-        changed = True
-        notes.append(f"OBSフォルダを固定しました: {recordtest.DEFAULT_OBS_DIR}")
-
-    has_valid_dir = bool(recordtest.detect_obs_dir())
-
-    defaults_paths = {
-        "bin_dir": recordtest.DEFAULT_BIN_DIR,
-        "recordings_dir": recordtest.DEFAULT_RECORDINGS_DIR,
-        "json_dir": recordtest.DEFAULT_JSON_DIR,
-        "champion_icons_dir": recordtest.DEFAULT_CHAMPION_ICONS_DIR,
-        "champion_aliases_path": "config/champion_aliases.json",
-    }
-    for key, value in defaults_paths.items():
-        if paths.get(key) in (None, ""):
-            paths[key] = value
-            changed = True
-
-    defaults_polling = {
-        "end_error_limit": recordtest.DEFAULT_END_ERROR_LIMIT,
-        "end_poll_sec": recordtest.DEFAULT_END_POLL_SEC,
-        "event_poll_sec": recordtest.DEFAULT_EVENT_POLL_SEC,
-    }
-    for key, value in defaults_polling.items():
-        if polling.get(key) in (None, ""):
-            polling[key] = value
-            changed = True
-
-    if storage.get("max_size_gb") in (None, ""):
-        storage["max_size_gb"] = recordtest.DEFAULT_MAX_STORAGE_GB
-        changed = True
-
-    if app_cfg.get("setup_completed") is None:
-        app_cfg["setup_completed"] = bool(has_valid_dir)
-        changed = True
-    elif not bool(app_cfg.get("setup_completed")) and has_valid_dir:
-        app_cfg["setup_completed"] = True
-        changed = True
-    if app_cfg.get("minimize_to_tray") is None:
-        app_cfg["minimize_to_tray"] = True
-        changed = True
-
-    audio_defaults = recordtest.get_audio_config_defaults()
-    for key, defaults in audio_defaults.items():
-        slot = audio_cfg.setdefault(key, {})
-        if not isinstance(slot, dict):
-            audio_cfg[key] = {}
-            slot = audio_cfg[key]
-            changed = True
-        for field, value in defaults.items():
-            if slot.get(field) in (None, ""):
-                slot[field] = value
-                changed = True
-
-    return data, changed, notes
+    return CONFIG_CONTROLLER.apply_auto_defaults(data, force_obs_detect=force_obs_detect)
 
 
 def format_report_lines(lines):
-    if not lines:
-        return "- なし"
-    return "\n".join(f"- {line}" for line in lines)
+    return CONFIG_CONTROLLER.format_report_lines(lines)
 
 
 def run_preflight(config_data=None, auto_fix=True, force_obs_detect=True):
-    data = config_data if config_data is not None else load_config()
-    data, changed_defaults, default_notes = apply_auto_defaults(data, force_obs_detect=force_obs_detect)
-    report = recordtest.run_preflight_checks(data, auto_fix=auto_fix, ensure_dirs=True)
-    report["changed"] = bool(changed_defaults or report.get("changed"))
-    report["notes"] = list(default_notes) + list(report.get("notes", []))
-    return report
+    return CONFIG_CONTROLLER.run_preflight(
+        config_data,
+        auto_fix=auto_fix,
+        force_obs_detect=force_obs_detect,
+    )
 
 
 def run_guided_auto_setup(config_data=None):
-    report = run_preflight(config_data, auto_fix=True, force_obs_detect=True)
-    if report.get("errors"):
-        return report, None
-
-    try:
-        info = recordtest.setup_obs_sync_elements(report["config"])
-    except recordtest.RecorderError as e:
-        report["errors"].append(str(e))
-        return report, None
-    except Exception as e:
-        report["errors"].append(f"{type(e).__name__}: {e}")
-        return report, None
-
-    report["config"].setdefault("app", {})["setup_completed"] = True
-    save_config(report["config"])
-    return report, info
+    return CONFIG_CONTROLLER.run_guided_auto_setup(config_data)
 
 
 def load_config():
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if SAMPLE_CONFIG_PATH.exists():
-            CONFIG_PATH.write_text(SAMPLE_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
-        else:
-            CONFIG_PATH.write_text(json.dumps({}, indent=4), encoding="utf-8")
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {}
-
-    data, changed, _ = apply_auto_defaults(data, force_obs_detect=False)
-    if changed:
-        save_config(data)
-    return data
+    return CONFIG_CONTROLLER.load_config()
 
 
 def save_config(data):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    CONFIG_CONTROLLER.save_config(data)
 
 
 class RecorderWorker(QThread):
@@ -235,16 +117,9 @@ class RecorderWorker(QThread):
                 raise recordtest.RecorderError("\n".join(errors))
 
             settings = report["config"]
-            recordtest.apply_settings(settings)
-            recordtest.setup_environment()
-            obs_process = recordtest.launch_obs()
-
-            self.recorder = recordtest.LoLAutoRecorder(
-                obs_process=obs_process,
-                status_cb=self.status.emit
-            )
+            self.recorder = RECORDING_CONTROLLER.create_recorder(settings, status_cb=self.status.emit)
             try:
-                self.recorder.apply_audio_profile(settings)
+                self.recorder.apply_audio_profile(self.recorder.config)
                 self.status.emit("🔊 音声設定をOBSへ適用しました。")
             except Exception as e:
                 self.status.emit(f"⚠️ 音声設定の適用に失敗: {e}")
@@ -371,7 +246,7 @@ class SetupWizardDialog(QDialog):
 
     def test_obs_connection(self):
         data = self.collect_data()
-        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
+        report, ok, detail = CONFIG_CONTROLLER.test_obs_connection(data)
         if report.get("changed"):
             save_config(report["config"])
             self.load_values()
@@ -379,15 +254,7 @@ class SetupWizardDialog(QDialog):
             QMessageBox.warning(self, "接続テスト", format_report_lines(report.get("errors", [])))
             return
 
-        cfg = report["config"]
-        host = cfg.get("obs", {}).get("host", recordtest.DEFAULT_OBS_HOST)
-        port = cfg.get("obs", {}).get("port", recordtest.DEFAULT_OBS_PORT)
-        password = cfg.get("obs", {}).get("password", "")
-        ok, detail = recordtest.test_obs_connection(host, port, password)
         if ok:
-            if report.get("changed"):
-                save_config(cfg)
-                self.load_values()
             QMessageBox.information(self, "接続テスト", detail)
         else:
             QMessageBox.warning(
@@ -770,8 +637,7 @@ class SettingsPage(QWidget):
         used_bytes = 0
 
         try:
-            recordtest.apply_settings(cfg)
-            used_bytes = recordtest.total_storage_size()
+            used_bytes = CONFIG_CONTROLLER.total_storage_size(cfg)
         except Exception:
             used_bytes = 0
 
@@ -1001,52 +867,15 @@ class SettingsPage(QWidget):
     def _apply_audio_settings_auto(self):
         self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=False)
 
-    def _open_obs_client_for_audio(self, auto_launch=False):
-        data = self._collect_settings_data_from_ui()
-        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
-        if report.get("changed"):
-            save_config(report["config"])
-        if report.get("errors"):
-            raise recordtest.RecorderError("\n".join(report.get("errors", [])))
-
-        cfg = report["config"]
-        recordtest.apply_settings(cfg)
-        recordtest.setup_environment()
-
-        ok, _detail = recordtest.test_obs_connection(
-            cfg.get("obs", {}).get("host", recordtest.DEFAULT_OBS_HOST),
-            cfg.get("obs", {}).get("port", recordtest.DEFAULT_OBS_PORT),
-            cfg.get("obs", {}).get("password", ""),
-            timeout=1.5,
-        )
-
-        launched_process = None
-        if not ok and auto_launch:
-            launched_process = recordtest.launch_obs()
-
-        obs_client = recordtest.ObsWebSocketClient(
-            obs_process=launched_process,
-            status_cb=None,
-            max_retries=2,
-            retry_delay=0.5,
-        )
-        recorder = recordtest.LoLAutoRecorder(
-            obs_process=launched_process,
-            status_cb=None,
-            auto_setup=False,
-            obs_client=obs_client,
-        )
-        return recorder, launched_process, cfg
-
     def refresh_audio_devices(self, show_message=True, show_error=True, auto_launch=True):
         if self._audio_refresh_in_progress:
             return False
-        recorder = None
-        launched_process = None
         self._audio_refresh_in_progress = True
         try:
-            recorder, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=auto_launch)
-            catalog = recorder.get_audio_device_catalog(cfg=cfg)
+            data = self._collect_settings_data_from_ui()
+            result = AUDIO_CONTROLLER.refresh_audio_devices(data, auto_launch=auto_launch)
+            cfg = result["config"]
+            catalog = result["catalog"]
             for key in ("desktop", "mic"):
                 self.audio_device_cache[key] = list(catalog.get(key, []))
             self._audio_ui_loading = True
@@ -1056,7 +885,7 @@ class SettingsPage(QWidget):
             save_config(cfg)
             if show_message:
                 msg = "OBSが認識している音声デバイス一覧を更新しました。"
-                if launched_process:
+                if result.get("obs_launched"):
                     msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
                 QMessageBox.information(self, "音声デバイス一覧", msg)
             return True
@@ -1067,28 +896,14 @@ class SettingsPage(QWidget):
             return False
         finally:
             self._audio_refresh_in_progress = False
-            if recorder:
-                try:
-                    recorder.disconnect_obs()
-                except Exception:
-                    pass
 
     def apply_audio_settings_to_obs(self, show_success=True, show_error=True, auto_launch=True):
-        recorder = None
-        launched_process = None
         try:
             data = self._collect_settings_data_from_ui()
-            report = run_preflight(data, auto_fix=True, force_obs_detect=False)
-            if report.get("errors"):
-                raise recordtest.RecorderError("\n".join(report.get("errors", [])))
-            cfg = report["config"]
-            save_config(cfg)
-
-            recorder, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=auto_launch)
-            recorder.apply_audio_profile(cfg)
+            result = AUDIO_CONTROLLER.apply_audio_settings(data, auto_launch=auto_launch)
             if show_success:
                 msg = "音声設定をOBSへ反映しました。"
-                if launched_process:
+                if result.get("obs_launched"):
                     msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
                 QMessageBox.information(self, "音声設定", msg)
             return True
@@ -1096,58 +911,15 @@ class SettingsPage(QWidget):
             if show_error:
                 QMessageBox.warning(self, "音声設定", f"OBSへの反映に失敗しました。\n{e}")
             return False
-        finally:
-            if recorder:
-                try:
-                    recorder.disconnect_obs()
-                except Exception:
-                    pass
 
     def apply_runtime_output_settings_to_obs(self, cfg=None, show_error=False):
-        """
-        一般タブの録画出力関連（録画保存先/FPS）を、OBS起動中のみ即時反映する。
-        設定保存でOBSを自動起動はしない。
-        """
-        recorder = None
         try:
-            if cfg is None:
-                cfg = load_config()
-
-            recordtest.apply_settings(cfg)
-            recordtest.setup_environment()
-
-            obs_cfg = cfg.get("obs", {})
-            ok, _detail = recordtest.test_obs_connection(
-                obs_cfg.get("host", recordtest.DEFAULT_OBS_HOST),
-                obs_cfg.get("port", recordtest.DEFAULT_OBS_PORT),
-                obs_cfg.get("password", ""),
-                timeout=1.0,
-            )
-            if not ok:
-                return False
-
-            obs_client = recordtest.ObsWebSocketClient(
-                status_cb=None,
-                max_retries=1,
-                retry_delay=0.0,
-            )
-            recorder = recordtest.LoLAutoRecorder(
-                status_cb=None,
-                auto_setup=False,
-                obs_client=obs_client,
-            )
-            recorder.apply_record_output_settings()
-            return True
+            data = cfg if cfg is not None else load_config()
+            return AUDIO_CONTROLLER.apply_runtime_output_settings(data)
         except Exception as e:
             if show_error:
                 QMessageBox.warning(self, "設定反映", f"録画設定のOBS反映に失敗しました。\n{e}")
             return False
-        finally:
-            if recorder:
-                try:
-                    recorder.disconnect_obs()
-                except Exception:
-                    pass
 
     def auto_fill_settings(self):
         data = load_config()

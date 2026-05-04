@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
 import aiohttp
@@ -63,6 +64,17 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def app_config():
+    return recordtest.AppConfig.from_dict({})
+
+
+def test_app_config_is_immutable():
+    config = app_config()
+
+    with pytest.raises(FrozenInstanceError):
+        config.obs.port = 1234
+
+
 def test_riot_api_fetches_and_parses_live_client_payloads():
     routes = {
         recordtest.ACTIVE_PLAYER_URL: "Summoner#JP1",
@@ -87,7 +99,7 @@ def test_riot_api_returns_none_when_lcu_server_is_down():
 
 
 def test_obs_websocket_timeout_is_wrapped_as_recorder_error():
-    client = recordtest.ObsWebSocketClient(max_retries=2, retry_delay=0)
+    client = recordtest.ObsWebSocketClient(config=app_config(), max_retries=2, retry_delay=0)
 
     with patch("src.recordtest.connect_obs_client", side_effect=TimeoutError("timed out")):
         with pytest.raises(recordtest.RecorderError) as exc:
@@ -102,7 +114,7 @@ def test_obs_disconnect_clears_raw_client_even_when_socket_errors():
         def disconnect(self):
             raise TimeoutError("socket already closed")
 
-    client = recordtest.ObsWebSocketClient()
+    client = recordtest.ObsWebSocketClient(config=app_config())
     client.client = BrokenRawClient()
 
     with pytest.raises(TimeoutError):

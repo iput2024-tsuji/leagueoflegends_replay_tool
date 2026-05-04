@@ -6,6 +6,9 @@ import subprocess
 import configparser
 import asyncio
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+import logging
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 import aiohttp
@@ -53,22 +56,6 @@ DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
 DEFAULT_AUDIO_DESKTOP_MUTE = False
 DEFAULT_AUDIO_MIC_MUTE = False
 
-OBS_PASSWORD = DEFAULT_OBS_PASSWORD
-OBS_SCENE_NAME = DEFAULT_OBS_SCENE_NAME
-OBS_SOURCE_NAME = DEFAULT_OBS_SOURCE_NAME
-OBS_SOURCE_COLOR = DEFAULT_OBS_SOURCE_COLOR
-OBS_DIR = DEFAULT_OBS_DIR
-BIN_DIR = DEFAULT_BIN_DIR
-RECORDINGS_DIR = None
-JSON_DIR = None
-CHAMPION_ICONS_DIR = None
-OBS_HOST = DEFAULT_OBS_HOST
-OBS_PORT = DEFAULT_OBS_PORT
-OBS_FPS = DEFAULT_OBS_FPS
-END_ERROR_LIMIT = DEFAULT_END_ERROR_LIMIT
-END_POLL_SEC = DEFAULT_END_POLL_SEC
-EVENT_POLL_SEC = DEFAULT_EVENT_POLL_SEC
-MAX_STORAGE_BYTES = None
 MANAGED_PORTABLE_OBS_DIR = (ROOT_DIR / "bin" / "OBS-Studio").resolve()
 MANAGED_AUDIO_INPUTS = {
     "desktop": {
@@ -87,9 +74,217 @@ MANAGED_AUDIO_INPUTS = {
     },
 }
 
+LOG_DIR = ROOT_DIR / "logs"
+LOGGER = logging.getLogger("lol_replay")
+
+
+class StatusCallbackLogHandler(logging.Handler):
+    """UIへログメッセージを転送する軽量ハンドラ。"""
+
+    def __init__(self, callback):
+        super().__init__(level=logging.INFO)
+        self.callback = callback
+
+    def emit(self, record):
+        if not self.callback:
+            return
+        try:
+            self.callback(record.getMessage())
+        except Exception:
+            self.handleError(record)
+
+
+def configure_logging():
+    if getattr(configure_logging, "_configured", False):
+        return
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    file_handler = TimedRotatingFileHandler(
+        LOG_DIR / "app.log",
+        when="midnight",
+        backupCount=14,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(logging.Formatter("%(message)s"))
+    LOGGER.addHandler(stream_handler)
+
+    configure_logging._configured = True
+
+
+configure_logging()
+
 
 class RecorderError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class OBSSettings:
+    host: str
+    port: int
+    password: str
+    scene_name: str
+    source_name: str
+    source_color: int
+    fps: int
+    obs_dir: Path
+
+
+@dataclass(frozen=True)
+class PathsSettings:
+    bin_dir: Path
+    recordings_dir: Path
+    json_dir: Path
+    champion_icons_dir: Path
+
+
+@dataclass(frozen=True)
+class PollingSettings:
+    end_error_limit: int
+    end_poll_sec: float
+    event_poll_sec: float
+
+
+@dataclass(frozen=True)
+class StorageSettings:
+    max_size_gb: float
+    max_size_bytes: int | None
+
+
+@dataclass(frozen=True)
+class AudioSlotSettings:
+    input_name: str
+    device_id: str
+    device_name: str
+    volume_db: float
+    mute: bool
+
+    def to_dict(self):
+        return {
+            "input_name": self.input_name,
+            "device_id": self.device_id,
+            "device_name": self.device_name,
+            "volume_db": self.volume_db,
+            "mute": self.mute,
+        }
+
+
+@dataclass(frozen=True)
+class AudioSettings:
+    desktop: AudioSlotSettings
+    mic: AudioSlotSettings
+
+    def to_dict(self):
+        return {
+            "desktop": self.desktop.to_dict(),
+            "mic": self.mic.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    obs: OBSSettings
+    paths: PathsSettings
+    polling: PollingSettings
+    storage: StorageSettings
+    audio: AudioSettings
+
+    @classmethod
+    def from_dict(cls, data):
+        source = data if isinstance(data, dict) else {}
+        obs_cfg = source.get("obs", {}) if isinstance(source.get("obs", {}), dict) else {}
+        paths_cfg = source.get("paths", {}) if isinstance(source.get("paths", {}), dict) else {}
+        polling_cfg = source.get("polling", {}) if isinstance(source.get("polling", {}), dict) else {}
+        storage_cfg = source.get("storage", {}) if isinstance(source.get("storage", {}), dict) else {}
+
+        source_color, _ = parse_obs_source_color(
+            obs_cfg.get("source_color"),
+            default=DEFAULT_OBS_SOURCE_COLOR,
+        )
+        fps, _ = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
+        port, _ = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
+        end_limit, _ = _safe_int(
+            polling_cfg.get("end_error_limit"),
+            DEFAULT_END_ERROR_LIMIT,
+            minimum=1,
+        )
+        end_poll, _ = _safe_float(
+            polling_cfg.get("end_poll_sec"),
+            DEFAULT_END_POLL_SEC,
+            minimum=0.1,
+        )
+        event_poll, _ = _safe_float(
+            polling_cfg.get("event_poll_sec"),
+            DEFAULT_EVENT_POLL_SEC,
+            minimum=0.1,
+        )
+        max_size_gb, _ = _safe_float(
+            storage_cfg.get("max_size_gb"),
+            DEFAULT_MAX_STORAGE_GB,
+            minimum=0.1,
+        )
+
+        recordings_dir = resolve_path(paths_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), ROOT_DIR)
+        json_dir = resolve_path(paths_cfg.get("json_dir", DEFAULT_JSON_DIR), ROOT_DIR)
+        if json_dir is None and recordings_dir is not None:
+            json_dir = recordings_dir / "json"
+        bin_dir = resolve_path(paths_cfg.get("bin_dir", DEFAULT_BIN_DIR), ROOT_DIR)
+        icons_dir = resolve_path(paths_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), ROOT_DIR)
+
+        if recordings_dir is None:
+            recordings_dir = (ROOT_DIR / DEFAULT_RECORDINGS_DIR).resolve()
+        if json_dir is None:
+            json_dir = (recordings_dir / "json").resolve()
+        if bin_dir is None:
+            bin_dir = (ROOT_DIR / DEFAULT_BIN_DIR).resolve()
+        if icons_dir is None:
+            icons_dir = (ROOT_DIR / DEFAULT_CHAMPION_ICONS_DIR).resolve()
+
+        return cls(
+            obs=OBSSettings(
+                host=str(obs_cfg.get("host") or DEFAULT_OBS_HOST),
+                port=port,
+                password=str(obs_cfg.get("password") or ""),
+                scene_name=str(obs_cfg.get("scene_name") or DEFAULT_OBS_SCENE_NAME),
+                source_name=str(obs_cfg.get("source_name") or DEFAULT_OBS_SOURCE_NAME),
+                source_color=source_color,
+                fps=fps,
+                obs_dir=MANAGED_PORTABLE_OBS_DIR,
+            ),
+            paths=PathsSettings(
+                bin_dir=bin_dir,
+                recordings_dir=recordings_dir,
+                json_dir=json_dir,
+                champion_icons_dir=icons_dir,
+            ),
+            polling=PollingSettings(
+                end_error_limit=end_limit,
+                end_poll_sec=end_poll,
+                event_poll_sec=event_poll,
+            ),
+            storage=StorageSettings(
+                max_size_gb=max_size_gb,
+                max_size_bytes=parse_max_storage_bytes({"max_size_gb": max_size_gb}),
+            ),
+            audio=AudioSettings(
+                desktop=_audio_slot_from_config(source, "desktop"),
+                mic=_audio_slot_from_config(source, "mic"),
+            ),
+        )
+
+    @classmethod
+    def load(cls):
+        return cls.from_dict(load_settings())
+
+    def audio_to_dict(self):
+        return {"audio": self.audio.to_dict()}
 
 
 class OBSClient(ABC):
@@ -846,6 +1041,13 @@ def get_audio_config_defaults():
 
 
 def normalize_audio_config(cfg, auto_fix=True):
+    if isinstance(cfg, AppConfig):
+        return cfg.audio.to_dict(), {
+            "changed": False,
+            "notes": [],
+            "warnings": [],
+            "errors": [],
+        }
     container = cfg if isinstance(cfg, dict) else {}
     fix = _ensure_audio_config_defaults(container, auto_fix=auto_fix)
     audio_cfg = container.get("audio", {}) if isinstance(container, dict) else {}
@@ -853,6 +1055,10 @@ def normalize_audio_config(cfg, auto_fix=True):
 
 
 def _get_audio_slot_config(cfg, key):
+    if isinstance(cfg, AppConfig):
+        slot = cfg.audio.desktop if key == "desktop" else cfg.audio.mic
+        return slot.to_dict()
+
     defaults = get_audio_config_defaults()
     audio_cfg, _ = normalize_audio_config(cfg, auto_fix=True)
     slot = audio_cfg.get(key, {}) if isinstance(audio_cfg, dict) else {}
@@ -866,6 +1072,17 @@ def _get_audio_slot_config(cfg, key):
     merged["volume_db"], _ = _safe_float(merged.get("volume_db"), defaults[key]["volume_db"])
     merged["mute"], _ = _safe_bool(merged.get("mute"), defaults[key]["mute"])
     return merged
+
+
+def _audio_slot_from_config(cfg, key):
+    slot = _get_audio_slot_config(cfg if isinstance(cfg, dict) else {}, key)
+    return AudioSlotSettings(
+        input_name=slot["input_name"],
+        device_id=slot["device_id"],
+        device_name=slot["device_name"],
+        volume_db=slot["volume_db"],
+        mute=slot["mute"],
+    )
 
 
 def _obs_raw(client, request_type, payload=None):
@@ -1043,7 +1260,7 @@ def list_audio_devices_for_input(client, input_name):
 
 
 def get_audio_device_catalog(client, cfg=None, scene_name=None, status_cb=None):
-    scene_name = scene_name or OBS_SCENE_NAME
+    scene_name = scene_name or (cfg.obs.scene_name if isinstance(cfg, AppConfig) else DEFAULT_OBS_SCENE_NAME)
     ensure_managed_audio_inputs(client, scene_name, cfg=cfg, status_cb=status_cb)
     desktop_cfg = _get_audio_slot_config(cfg or {}, "desktop")
     mic_cfg = _get_audio_slot_config(cfg or {}, "mic")
@@ -1063,7 +1280,7 @@ def apply_audio_input_settings(client, input_name, device_id=None, volume_db=Non
 
 
 def apply_audio_profile_from_config(client, cfg, scene_name=None, status_cb=None):
-    scene_name = scene_name or OBS_SCENE_NAME
+    scene_name = scene_name or (cfg.obs.scene_name if isinstance(cfg, AppConfig) else DEFAULT_OBS_SCENE_NAME)
     ensure_managed_audio_inputs(client, scene_name, cfg=cfg, status_cb=status_cb)
 
     for key in ("desktop", "mic"):
@@ -1084,17 +1301,27 @@ def apply_audio_profile_from_config(client, cfg, scene_name=None, status_cb=None
 
 
 def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
-    apply_settings(cfg)
-    setup_environment()
+    config = AppConfig.from_dict(cfg)
+    setup_environment(config)
 
     launched_process = None
     recorder = None
     try:
-        ok, _ = test_obs_connection(OBS_HOST, OBS_PORT, OBS_PASSWORD, timeout=1.5)
+        ok, _ = test_obs_connection(
+            config.obs.host,
+            config.obs.port,
+            config.obs.password,
+            timeout=1.5,
+        )
         if not ok and auto_launch:
-            launched_process = launch_obs()
+            launched_process = launch_obs(config)
 
-        recorder = LoLAutoRecorder(obs_process=launched_process, status_cb=status_cb, auto_setup=True)
+        recorder = LoLAutoRecorder(
+            config=config,
+            obs_process=launched_process,
+            status_cb=status_cb,
+            auto_setup=True,
+        )
         # 録画保存先も毎回明示して、環境差分でOBS設定がぶれないようにする。
         try:
             recorder.apply_record_output_settings()
@@ -1109,9 +1336,9 @@ def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
                 except Exception:
                     pass
         return {
-            "scene_name": OBS_SCENE_NAME,
-            "source_name": OBS_SOURCE_NAME,
-            "source_color": OBS_SOURCE_COLOR,
+            "scene_name": config.obs.scene_name,
+            "source_name": config.obs.source_name,
+            "source_color": config.obs.source_color,
             "obs_launched": bool(launched_process),
         }
     finally:
@@ -1171,77 +1398,34 @@ def load_settings():
         return json.load(f)
 
 
+def load_app_config():
+    return AppConfig.from_dict(load_settings())
+
+
 def save_settings(cfg):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4, ensure_ascii=False)
 
 
-def apply_settings(cfg):
-    global OBS_PASSWORD, OBS_SCENE_NAME, OBS_SOURCE_NAME, OBS_SOURCE_COLOR, OBS_DIR, BIN_DIR
-    global RECORDINGS_DIR, JSON_DIR, OBS_HOST, OBS_PORT, CHAMPION_ICONS_DIR
-    global END_ERROR_LIMIT, END_POLL_SEC, EVENT_POLL_SEC, MAX_STORAGE_BYTES, OBS_FPS
-
-    obs_cfg = cfg.get("obs", {})
-    path_cfg = cfg.get("paths", {})
-    poll_cfg = cfg.get("polling", {})
-    storage_cfg = cfg.get("storage", {})
-
-    OBS_PASSWORD = obs_cfg.get("password", DEFAULT_OBS_PASSWORD)
-    OBS_SCENE_NAME = obs_cfg.get("scene_name", DEFAULT_OBS_SCENE_NAME)
-    OBS_SOURCE_NAME = obs_cfg.get("source_name", DEFAULT_OBS_SOURCE_NAME)
-    OBS_SOURCE_COLOR, _ = parse_obs_source_color(obs_cfg.get("source_color"), default=DEFAULT_OBS_SOURCE_COLOR)
-    OBS_HOST = obs_cfg.get("host", DEFAULT_OBS_HOST)
-    OBS_PORT = int(obs_cfg.get("port", DEFAULT_OBS_PORT))
-    OBS_FPS, _ = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
-
-    OBS_DIR = str(MANAGED_PORTABLE_OBS_DIR)
-    if not is_valid_obs_dir(OBS_DIR):
-        raise RecorderError(
-            "ポータブルOBSが見つかりません。\n"
-            f"配置先: {MANAGED_PORTABLE_OBS_DIR}"
-        )
-
-    bin_dir = resolve_path(path_cfg.get("bin_dir", DEFAULT_BIN_DIR), ROOT_DIR)
-    BIN_DIR = str(bin_dir) if bin_dir else ""
-
-    recordings_dir = resolve_path(path_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), ROOT_DIR)
-    json_dir_value = path_cfg.get("json_dir", DEFAULT_JSON_DIR)
-    json_dir = resolve_path(json_dir_value, ROOT_DIR)
-    champion_icons_dir = resolve_path(path_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), ROOT_DIR)
-    if not json_dir and recordings_dir:
-        json_dir = recordings_dir / "json"
-
-    RECORDINGS_DIR = recordings_dir
-    JSON_DIR = json_dir
-    CHAMPION_ICONS_DIR = champion_icons_dir
-
-    END_ERROR_LIMIT = int(poll_cfg.get("end_error_limit", DEFAULT_END_ERROR_LIMIT))
-    END_POLL_SEC = float(poll_cfg.get("end_poll_sec", DEFAULT_END_POLL_SEC))
-    EVENT_POLL_SEC = float(poll_cfg.get("event_poll_sec", DEFAULT_EVENT_POLL_SEC))
-
-    MAX_STORAGE_BYTES = parse_max_storage_bytes(storage_cfg)
-
-    if JSON_DIR is None:
-        raise RecorderError("json_dir の設定が無効です。設定画面で JSON ディレクトリを確認してください。")
-    JSON_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def setup_environment():
+def setup_environment(config):
     """環境変数の設定 (MPVのDLLを読み込めるようにする)"""
-    if BIN_DIR:
-        os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ["PATH"]
+    bin_dir = str(config.paths.bin_dir)
+    if bin_dir:
+        os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
 
         if not (
-            os.path.exists(os.path.join(BIN_DIR, "mpv-1.dll")) or
-            os.path.exists(os.path.join(BIN_DIR, "libmpv-1.dll")) or
-            os.path.exists(os.path.join(BIN_DIR, "mpv-2.dll")) or
-            os.path.exists(os.path.join(BIN_DIR, "libmpv-2.dll"))
+            os.path.exists(os.path.join(bin_dir, "mpv-1.dll")) or
+            os.path.exists(os.path.join(bin_dir, "libmpv-1.dll")) or
+            os.path.exists(os.path.join(bin_dir, "mpv-2.dll")) or
+            os.path.exists(os.path.join(bin_dir, "libmpv-2.dll"))
         ):
-            print("⚠️ 警告: 'bin' フォルダ内に mpv-1.dll / mpv-2.dll (または libmpv-1.dll / libmpv-2.dll) が見つかりません。")
-            print(f"探した場所: {BIN_DIR}")
+            LOGGER.warning("⚠️ 警告: 'bin' フォルダ内に mpv-1.dll / mpv-2.dll (または libmpv-1.dll / libmpv-2.dll) が見つかりません。")
+            LOGGER.warning("探した場所: %s", bin_dir)
     else:
-        print("⚠️ 警告: bin_dir が未設定です。")
+        LOGGER.warning("⚠️ 警告: bin_dir が未設定です。")
+
+    config.paths.json_dir.mkdir(parents=True, exist_ok=True)
 
 
 def parse_max_storage_bytes(storage_cfg):
@@ -1279,14 +1463,13 @@ def get_dir_size(path):
     return total
 
 
-def total_storage_size():
+def total_storage_size(config=None):
+    config = config or load_app_config()
     roots = []
-    if RECORDINGS_DIR:
-        roots.append(Path(RECORDINGS_DIR))
-    if JSON_DIR:
-        json_path = Path(JSON_DIR)
-        if not roots or not is_within(json_path, roots[0]):
-            roots.append(json_path)
+    roots.append(Path(config.paths.recordings_dir))
+    json_path = Path(config.paths.json_dir)
+    if not roots or not is_within(json_path, roots[0]):
+        roots.append(json_path)
     return sum(get_dir_size(root) for root in roots if root.exists())
 
 
@@ -1299,7 +1482,8 @@ def parse_saved_at(value):
         return None
 
 
-def load_json_metadata(path):
+def load_json_metadata(path, config=None):
+    config = config or load_app_config()
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1314,8 +1498,7 @@ def load_json_metadata(path):
             candidates.append(raw_path)
         else:
             candidates.append(path.parent / raw_path)
-            if RECORDINGS_DIR:
-                candidates.append(Path(RECORDINGS_DIR) / raw_path.name)
+            candidates.append(Path(config.paths.recordings_dir) / raw_path.name)
 
         for candidate in candidates:
             if candidate.exists():
@@ -1327,19 +1510,20 @@ def load_json_metadata(path):
         return None, None
 
 
-def enforce_storage_limit(keep_paths=None):
-    if not MAX_STORAGE_BYTES:
+def enforce_storage_limit(config=None, keep_paths=None):
+    config = config or load_app_config()
+    if not config.storage.max_size_bytes:
         return
 
     keep_paths = {Path(p).resolve() for p in keep_paths or [] if p}
-    total = total_storage_size()
-    if total <= MAX_STORAGE_BYTES:
+    total = total_storage_size(config)
+    if total <= config.storage.max_size_bytes:
         return
 
-    if JSON_DIR and Path(JSON_DIR).exists():
+    if Path(config.paths.json_dir).exists():
         entries = []
-        for json_path in Path(JSON_DIR).glob("*.json"):
-            saved_at, video_path = load_json_metadata(json_path)
+        for json_path in Path(config.paths.json_dir).glob("*.json"):
+            saved_at, video_path = load_json_metadata(json_path, config)
             ts = saved_at if saved_at else json_path.stat().st_mtime
             entries.append((ts, json_path, video_path))
         entries.sort(key=lambda item: item[0])
@@ -1356,14 +1540,14 @@ def enforce_storage_limit(keep_paths=None):
                 json_path.unlink(missing_ok=True)
             except Exception:
                 pass
-            total = total_storage_size()
-            if total <= MAX_STORAGE_BYTES:
+            total = total_storage_size(config)
+            if total <= config.storage.max_size_bytes:
                 return
 
-    if RECORDINGS_DIR and Path(RECORDINGS_DIR).exists():
+    if Path(config.paths.recordings_dir).exists():
         video_exts = {".mp4", ".mkv", ".flv", ".mov", ".avi"}
         video_files = sorted(
-            [p for p in Path(RECORDINGS_DIR).rglob("*") if p.is_file() and p.suffix.lower() in video_exts],
+            [p for p in Path(config.paths.recordings_dir).rglob("*") if p.is_file() and p.suffix.lower() in video_exts],
             key=lambda p: p.stat().st_mtime
         )
         for video_path in video_files:
@@ -1373,17 +1557,17 @@ def enforce_storage_limit(keep_paths=None):
                 video_path.unlink(missing_ok=True)
             except Exception:
                 pass
-            total = total_storage_size()
-            if total <= MAX_STORAGE_BYTES:
+            total = total_storage_size(config)
+            if total <= config.storage.max_size_bytes:
                 return
 
 
-def launch_obs():
+def launch_obs(config):
     """OBSをバックグラウンドで起動する"""
-    if not OBS_DIR:
+    if not config.obs.obs_dir:
         raise RecorderError("OBSのパスが未設定です。設定画面の OBSフォルダ (obs.dir) を指定してください。")
 
-    obs_dir_abs = os.path.abspath(str(OBS_DIR))
+    obs_dir_abs = os.path.abspath(str(config.obs.obs_dir))
     obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
     working_dir = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit"))
 
@@ -1411,14 +1595,18 @@ def launch_obs():
     try:
         changed_ini, global_ini_path = ensure_portable_obs_global_ini(obs_dir_abs)
         if changed_ini and global_ini_path:
-            print(f"ℹ️ ポータブルOBSの global.ini を更新しました: {global_ini_path}")
-        changed, ws_cfg_path = ensure_portable_obs_websocket_config(obs_dir_abs, OBS_PORT, OBS_PASSWORD)
+            LOGGER.info("ℹ️ ポータブルOBSの global.ini を更新しました: %s", global_ini_path)
+        changed, ws_cfg_path = ensure_portable_obs_websocket_config(
+            obs_dir_abs,
+            config.obs.port,
+            config.obs.password,
+        )
         if changed and ws_cfg_path:
-            print(f"ℹ️ ポータブルOBSのWebSocket設定を更新しました: {ws_cfg_path}")
+            LOGGER.info("ℹ️ ポータブルOBSのWebSocket設定を更新しました: %s", ws_cfg_path)
     except Exception as e:
         raise RecorderError(f"ポータブルOBS起動前設定の更新に失敗しました: {e}") from e
 
-    print("🚀 OBSを起動しています (バックグラウンド/非表示)...")
+    LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
     cmd = [obs_exe, "--portable", "--multi", "--disable-shutdown-check", "--disable-updater"]
 
     try:
@@ -1447,7 +1635,7 @@ def launch_obs():
 
 def ensure_portable_mode_marker(base_dir):
     if not base_dir:
-        raise RecorderError("OBS_DIR が未設定です。")
+        raise RecorderError("OBSディレクトリが未設定です。")
     marker = Path(base_dir) / "portable_mode.txt"
     marker.parent.mkdir(parents=True, exist_ok=True)
     if not marker.exists():
@@ -1479,18 +1667,18 @@ def normalize_summoner_name(value):
     return name.strip()
 
 
-def build_output_path():
+def build_output_path(config):
     """重複回避のため、存在しないファイル名を返す"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    candidate = JSON_DIR / f"lol_{timestamp}.json"
+    candidate = config.paths.json_dir / f"lol_{timestamp}.json"
     if not candidate.exists():
         return candidate
     for i in range(1, 100):
-        candidate = JSON_DIR / f"lol_{timestamp}_{i:02d}.json"
+        candidate = config.paths.json_dir / f"lol_{timestamp}_{i:02d}.json"
         if not candidate.exists():
             return candidate
     time.sleep(1)
-    return build_output_path()
+    return build_output_path(config)
 
 
 def save_payload(path, payload):
@@ -1563,24 +1751,25 @@ def get_all_game_data():
 class ObsWebSocketClient(OBSClient):
     """obs-websocketを使う本番用OBSクライアント。"""
 
-    def __init__(self, obs_process=None, status_cb=None, max_retries=5, retry_delay=2.0):
+    def __init__(self, config=None, obs_process=None, status_cb=None, max_retries=5, retry_delay=2.0):
+        self.config = config or load_app_config()
         self.client = None
         self.obs_process = obs_process
         self.status_cb = status_cb
         self.max_retries = int(max_retries)
         self.retry_delay = float(retry_delay)
+        self.logger = logging.getLogger(f"lol_replay.obs.{id(self)}")
+        self._status_handler = StatusCallbackLogHandler(status_cb) if status_cb else None
+        if self._status_handler:
+            self.logger.addHandler(self._status_handler)
+        self.logger.propagate = True
 
     @property
     def raw_client(self):
         return self.client
 
     def log(self, message):
-        print(message)
-        if self.status_cb:
-            try:
-                self.status_cb(message)
-            except Exception:
-                pass
+        self.logger.info(message)
 
     def connect(self):
         retry_count = 0
@@ -1589,25 +1778,25 @@ class ObsWebSocketClient(OBSClient):
         while retry_count < max_retries:
             try:
                 self.client, used_host = connect_obs_client(
-                    OBS_HOST,
-                    OBS_PORT,
-                    OBS_PASSWORD,
+                    self.config.obs.host,
+                    self.config.obs.port,
+                    self.config.obs.password,
                 )
                 version = self.client.get_version()
-                host_note = f" host={used_host}" if used_host != OBS_HOST else ""
-                print(f"✅ OBS接続成功 (v{version.obs_version}{host_note})")
+                host_note = f" host={used_host}" if used_host != self.config.obs.host else ""
+                self.log(f"✅ OBS接続成功 (v{version.obs_version}{host_note})")
                 return
             except Exception as e:
                 last_error = e
                 retry_count += 1
-                print(f"Connection retrying... ({retry_count}/{max_retries})")
+                self.logger.info("Connection retrying... (%s/%s)", retry_count, max_retries)
                 if retry_count < max_retries and self.retry_delay > 0:
                     time.sleep(self.retry_delay)
 
         raise RecorderError(
             "OBS WebSocketへの接続に失敗しました。\n"
-            f"接続先: {OBS_HOST}:{OBS_PORT}\n"
-            f"パスワード設定: {'あり' if OBS_PASSWORD else 'なし'}\n"
+            f"接続先: {self.config.obs.host}:{self.config.obs.port}\n"
+            f"パスワード設定: {'あり' if self.config.obs.password else 'なし'}\n"
             f"詳細: {last_error}"
         )
 
@@ -1617,23 +1806,29 @@ class ObsWebSocketClient(OBSClient):
                 self.client.disconnect()
             finally:
                 self.client = None
+        if self._status_handler:
+            try:
+                self.logger.removeHandler(self._status_handler)
+            except Exception:
+                pass
+            self._status_handler = None
 
     def setup_record_output(self):
-        if RECORDINGS_DIR:
+        if self.config.paths.recordings_dir:
             try:
-                Path(RECORDINGS_DIR).mkdir(parents=True, exist_ok=True)
+                Path(self.config.paths.recordings_dir).mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
 
             try:
-                apply_record_directory_to_obs(self.client, RECORDINGS_DIR)
+                apply_record_directory_to_obs(self.client, self.config.paths.recordings_dir)
             except Exception:
                 # OBSバージョン差異や権限差分で失敗する場合は継続
                 pass
 
         try:
-            apply_obs_video_settings(self.client, OBS_FPS)
-            self.log(f"🎞️ OBS録画FPSを {OBS_FPS} に設定しました。")
+            apply_obs_video_settings(self.client, self.config.obs.fps)
+            self.log(f"🎞️ OBS録画FPSを {self.config.obs.fps} に設定しました。")
         except Exception as e:
             # 録画は続行可能なので警告のみ
             self.log(f"⚠️ OBS録画FPS設定の適用に失敗: {e}")
@@ -1646,7 +1841,7 @@ class ObsWebSocketClient(OBSClient):
         return apply_audio_profile_from_config(
             self.client,
             cfg,
-            scene_name=scene_name or OBS_SCENE_NAME,
+            scene_name=scene_name or self.config.obs.scene_name,
             status_cb=self.log,
         )
 
@@ -1654,7 +1849,7 @@ class ObsWebSocketClient(OBSClient):
         return get_audio_device_catalog(
             self.client,
             cfg=cfg,
-            scene_name=scene_name or OBS_SCENE_NAME,
+            scene_name=scene_name or self.config.obs.scene_name,
             status_cb=self.log,
         )
 
@@ -1663,32 +1858,35 @@ class ObsWebSocketClient(OBSClient):
         self._ensure_sync_source_exists()
 
     def _ensure_scene_exists(self):
+        scene_name = self.config.obs.scene_name
         try:
-            ensure_obs_scene_exists(self.client, OBS_SCENE_NAME, status_cb=self.log)
+            ensure_obs_scene_exists(self.client, scene_name, status_cb=self.log)
         except Exception as e:
-            raise RecorderError(f"シーン '{OBS_SCENE_NAME}' の自動作成に失敗しました: {e}") from e
+            raise RecorderError(f"シーン '{scene_name}' の自動作成に失敗しました: {e}") from e
 
     def _ensure_sync_source_exists(self):
+        scene_name = self.config.obs.scene_name
+        source_name = self.config.obs.source_name
         input_exists = False
         try:
             input_resp = self.client.get_input_list()
             input_items = getattr(input_resp, "inputs", []) or []
             input_exists = any(
-                isinstance(item, dict) and item.get("inputName") == OBS_SOURCE_NAME
+                isinstance(item, dict) and item.get("inputName") == source_name
                 for item in input_items
             )
         except Exception:
             input_exists = False
 
         if not input_exists:
-            self.log(f"ℹ️ 色ソース '{OBS_SOURCE_NAME}' を自動作成します。")
-            settings = {"color": OBS_SOURCE_COLOR, "width": 100, "height": 100}
+            self.log(f"ℹ️ 色ソース '{source_name}' を自動作成します。")
+            settings = {"color": self.config.obs.source_color, "width": 100, "height": 100}
             last_error = None
             for kind in ("color_source_v3", "color_source"):
                 try:
                     self.client.create_input(
-                        OBS_SCENE_NAME,
-                        OBS_SOURCE_NAME,
+                        scene_name,
+                        source_name,
                         kind,
                         settings,
                         False
@@ -1698,31 +1896,31 @@ class ObsWebSocketClient(OBSClient):
                 except Exception as e:
                     last_error = e
             if not input_exists:
-                raise RecorderError(f"色ソース '{OBS_SOURCE_NAME}' の自動作成に失敗しました: {last_error}")
+                raise RecorderError(f"色ソース '{source_name}' の自動作成に失敗しました: {last_error}")
         else:
             try:
-                self.client.set_input_settings(OBS_SOURCE_NAME, {"color": OBS_SOURCE_COLOR}, overlay=True)
+                self.client.set_input_settings(source_name, {"color": self.config.obs.source_color}, overlay=True)
             except Exception:
                 pass
 
         scene_item_id = self.get_sync_source_id()
         if scene_item_id is None:
             try:
-                self.client.create_scene_item(OBS_SCENE_NAME, OBS_SOURCE_NAME, False)
+                self.client.create_scene_item(scene_name, source_name, False)
                 scene_item_id = self.get_sync_source_id()
             except Exception as e:
                 raise RecorderError(
-                    f"色ソース '{OBS_SOURCE_NAME}' をシーン '{OBS_SCENE_NAME}' に配置できませんでした: {e}"
+                    f"色ソース '{source_name}' をシーン '{scene_name}' に配置できませんでした: {e}"
                 ) from e
 
         if scene_item_id is None:
             raise RecorderError(
-                f"色ソース '{OBS_SOURCE_NAME}' は存在しますが、シーン '{OBS_SCENE_NAME}' で見つかりません。"
+                f"色ソース '{source_name}' は存在しますが、シーン '{scene_name}' で見つかりません。"
             )
 
         try:
             self.client.set_scene_item_transform(
-                OBS_SCENE_NAME,
+                scene_name,
                 scene_item_id,
                 {"positionX": 0.0, "positionY": 0.0, "alignment": 5}
             )
@@ -1736,21 +1934,21 @@ class ObsWebSocketClient(OBSClient):
 
     def get_sync_source_id(self):
         try:
-            items = self.client.get_scene_item_list(OBS_SCENE_NAME).scene_items
+            items = self.client.get_scene_item_list(self.config.obs.scene_name).scene_items
             for item in items:
-                if item['sourceName'] == OBS_SOURCE_NAME:
+                if item['sourceName'] == self.config.obs.source_name:
                     return item['sceneItemId']
         except Exception as e:
-            print(f"⚠️ シーンアイテム取得エラー: {e}")
+            self.logger.warning("⚠️ シーンアイテム取得エラー: %s", e)
         return None
 
     def set_sync_marker_enabled(self, enabled, source_id=None):
         item_id = source_id if source_id is not None else self.get_sync_source_id()
         if item_id is None:
             raise RecorderError(
-                f"同期用ソース '{OBS_SOURCE_NAME}' がシーン '{OBS_SCENE_NAME}' に見つかりません。"
+                f"同期用ソース '{self.config.obs.source_name}' がシーン '{self.config.obs.scene_name}' に見つかりません。"
             )
-        self.client.set_scene_item_enabled(OBS_SCENE_NAME, item_id, bool(enabled))
+        self.client.set_scene_item_enabled(self.config.obs.scene_name, item_id, bool(enabled))
 
     def start_recording(self):
         self.client.start_record()
@@ -1791,11 +1989,21 @@ class ObsWebSocketClient(OBSClient):
 
 
 class LoLAutoRecorder(RecordingSessionManager):
-    def __init__(self, obs_process=None, status_cb=None, auto_setup=True, obs_client=None, riot_api_client=None):
+    def __init__(self, config=None, obs_process=None, status_cb=None, auto_setup=True, obs_client=None, riot_api_client=None):
+        self.config = config or load_app_config()
         self.my_name = None
         self.status_cb = status_cb
         self.stop_requested = False
-        self.obs_client = obs_client or ObsWebSocketClient(obs_process=obs_process, status_cb=status_cb)
+        self.logger = logging.getLogger(f"lol_replay.recorder.{id(self)}")
+        self._status_handler = StatusCallbackLogHandler(status_cb) if status_cb else None
+        if self._status_handler:
+            self.logger.addHandler(self._status_handler)
+        self.logger.propagate = True
+        self.obs_client = obs_client or ObsWebSocketClient(
+            config=self.config,
+            obs_process=obs_process,
+            status_cb=status_cb,
+        )
         self.riot_api_client = riot_api_client or LiveClientRiotAPIClient()
         self.obs_process = getattr(self.obs_client, "obs_process", obs_process)
         self.reset_session()
@@ -1805,12 +2013,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             self.ensure_sync_setup()
 
     def log(self, message):
-        print(message)
-        if self.status_cb:
-            try:
-                self.status_cb(message)
-            except Exception:
-                pass
+        self.logger.info(message)
 
     def request_stop(self):
         self.stop_requested = True
@@ -1866,10 +2069,13 @@ class LoLAutoRecorder(RecordingSessionManager):
         return self.obs_client.apply_record_output_settings()
 
     def apply_audio_profile(self, cfg):
-        return self.obs_client.apply_audio_profile(cfg, scene_name=OBS_SCENE_NAME)
+        return self.obs_client.apply_audio_profile(cfg, scene_name=self.config.obs.scene_name)
 
     def get_audio_device_catalog(self, cfg=None):
-        return self.obs_client.get_audio_device_catalog(cfg=cfg, scene_name=OBS_SCENE_NAME)
+        return self.obs_client.get_audio_device_catalog(
+            cfg=cfg or self.config,
+            scene_name=self.config.obs.scene_name,
+        )
 
     def get_source_id(self):
         return self.obs_client.get_sync_source_id()
@@ -1932,7 +2138,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 game_time = data.get('gameData', {}).get('gameTime', 0)
                 if game_time > 0:
                     self.log(f"🔥 試合開始検知！ GameTime: {game_time:.2f}s")
-                    self.output_file = build_output_path()
+                    self.output_file = build_output_path(self.config)
                     await self.try_update_player_name_async()
                     self.session_started = True
                     return True
@@ -1960,7 +2166,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         item_id = self.get_source_id()
         if not item_id:
             raise RecorderError(
-                f"同期用ソース '{OBS_SOURCE_NAME}' がシーン '{OBS_SCENE_NAME}' に見つかりません。\n"
+                f"同期用ソース '{self.config.obs.source_name}' がシーン '{self.config.obs.scene_name}' に見つかりません。\n"
                 "設定画面の「OBSにシーン/色ソースを作成」を実行してください。"
             )
 
@@ -2055,7 +2261,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                     time_text = f"{float(event_time):.1f}"
                 except Exception:
                     time_text = "?"
-                print(f"{log_message} (Time: {time_text})")
+                self.logger.info("%s (Time: %s)", log_message, time_text)
                 self.saved_events.append(event)
 
             self.processed_event_keys.add(event_key)
@@ -2070,10 +2276,10 @@ class LoLAutoRecorder(RecordingSessionManager):
             data = await self.riot_api_client.get_all_game_data()
             if not data:
                 error_count += 1
-                if error_count >= END_ERROR_LIMIT:
+                if error_count >= self.config.polling.end_error_limit:
                     self.log("🏁 試合終了検知。録画を停止します。")
                     return True
-                if not await self.wait_with_stop_async(END_POLL_SEC):
+                if not await self.wait_with_stop_async(self.config.polling.end_poll_sec):
                     return False
                 continue
 
@@ -2089,7 +2295,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 self.process_events(events)
                 self.update_result_from_events(events)
 
-            if not await self.wait_with_stop_async(EVENT_POLL_SEC):
+            if not await self.wait_with_stop_async(self.config.polling.event_poll_sec):
                 return False
         return True
 
@@ -2125,13 +2331,25 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     def shutdown_obs(self):
         self.obs_client.shutdown()
+        if self._status_handler:
+            try:
+                self.logger.removeHandler(self._status_handler)
+            except Exception:
+                pass
+            self._status_handler = None
 
     def disconnect_obs(self):
         self.obs_client.disconnect()
+        if self._status_handler:
+            try:
+                self.logger.removeHandler(self._status_handler)
+            except Exception:
+                pass
+            self._status_handler = None
 
     def save_json(self):
         if self.output_file is None:
-            self.output_file = build_output_path()
+            self.output_file = build_output_path(self.config)
 
         if self.last_game_data and self.game_result is None:
             game_data = self.last_game_data.get("gameData", {})
@@ -2156,7 +2374,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             "sync_game_time": self.sync_game_time,
             "obs_record_path": record_path_for_json,
             "paths": {
-                "recordings_dir": str(RECORDINGS_DIR) if RECORDINGS_DIR else None,
+                "recordings_dir": str(self.config.paths.recordings_dir),
                 "json_path": str(self.output_file)
             },
             "events": self.saved_events,
@@ -2168,7 +2386,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         }
         save_payload(self.output_file, payload)
         self.log(f"ログ保存完了: {self.output_file}")
-        enforce_storage_limit(keep_paths=[self.output_file, self.record_path])
+        enforce_storage_limit(self.config, keep_paths=[self.output_file, self.record_path])
 
 
 if __name__ == "__main__":
@@ -2178,23 +2396,23 @@ if __name__ == "__main__":
         preflight = run_preflight_checks(settings, auto_fix=True, ensure_dirs=True)
         if preflight.get("changed"):
             save_settings(preflight["config"])
-            print("🛠️ 設定を自動補完しました。")
+            LOGGER.info("🛠️ 設定を自動補完しました。")
         for warning in preflight.get("warnings", []):
-            print(f"⚠️ {warning}")
+            LOGGER.warning("⚠️ %s", warning)
         if preflight.get("errors"):
             raise RecorderError("\n".join(preflight["errors"]))
         settings = preflight["config"]
+        config = AppConfig.from_dict(settings)
 
-        apply_settings(settings)
-        setup_environment()
-        obs_process = launch_obs()
+        setup_environment(config)
+        obs_process = launch_obs(config)
 
-        app = LoLAutoRecorder(obs_process=obs_process)
+        app = LoLAutoRecorder(config=config, obs_process=obs_process)
         try:
-            app.apply_audio_profile(settings)
-            print("🔊 音声設定をOBSへ適用しました。")
+            app.apply_audio_profile(config)
+            LOGGER.info("🔊 音声設定をOBSへ適用しました。")
         except Exception as e:
-            print(f"⚠️ 音声設定の適用に失敗: {e}")
+            LOGGER.warning("⚠️ 音声設定の適用に失敗: %s", e)
         while True:
             app.reset_session()
             app.wait_for_game_start()
@@ -2202,11 +2420,11 @@ if __name__ == "__main__":
             app.record_until_end()
             app.stop_recording()
             app.save_json()
-            print("✅ 試合記録完了。次の試合を待機します。")
+            LOGGER.info("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
-        print("\n中断を検知しました。終了処理を行います。")
+        LOGGER.info("中断を検知しました。終了処理を行います。")
     except RecorderError as e:
-        print(f"❌ {e}")
+        LOGGER.error("❌ %s", e)
         sys.exit(1)
     finally:
         if app:
@@ -2214,4 +2432,4 @@ if __name__ == "__main__":
             if app.has_session_data():
                 app.save_json()
             app.shutdown_obs()
-        print("👋 全ての処理が完了しました。")
+        LOGGER.info("👋 全ての処理が完了しました。")

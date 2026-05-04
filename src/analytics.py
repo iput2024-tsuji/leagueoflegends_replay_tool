@@ -92,6 +92,54 @@ class GameDataAnalyzer:
         source = df if df is not None else self.load_dataframe()
         return self.correlate_event_with_winrate(source, "HordeKill", within_seconds=15 * 60)
 
+    def build_feature_matrix(self, df=None):
+        source = df if df is not None else self.load_dataframe()
+        feature_names = [
+            "horde_kill_15m",
+            "own_building_kill_15m",
+            "first_blood",
+        ]
+        if source is None or source.empty:
+            return pd.DataFrame(columns=feature_names), pd.Series(dtype="int64", name="is_win")
+
+        matches = (
+            source.drop_duplicates("match_id")
+            .set_index("match_id")[["is_win", "player_team"]]
+            .dropna(subset=["is_win"])
+            .copy()
+        )
+        if matches.empty:
+            return pd.DataFrame(columns=feature_names), pd.Series(dtype="int64", name="is_win")
+
+        timed = source[source["event_time"].fillna(float("inf")) <= 15 * 60].copy()
+
+        horde_counts = (
+            timed[timed["event_name"] == "HordeKill"]
+            .groupby("match_id")
+            .size()
+        )
+
+        building_rows = timed[timed["event_name"] == "BuildingKill"].copy()
+        own_building_counts = (
+            building_rows[self._own_team_event_mask(building_rows)]
+            .groupby("match_id")
+            .size()
+        )
+
+        first_blood_rows = source[source["is_first_blood"].fillna(False)].copy()
+        first_blood_owned = (
+            first_blood_rows[self._own_team_event_mask(first_blood_rows)]
+            .groupby("match_id")
+            .size()
+        )
+
+        x = pd.DataFrame(index=matches.index)
+        x["horde_kill_15m"] = horde_counts.reindex(matches.index, fill_value=0).astype(int)
+        x["own_building_kill_15m"] = own_building_counts.reindex(matches.index, fill_value=0).astype(int)
+        x["first_blood"] = (first_blood_owned.reindex(matches.index, fill_value=0) > 0).astype(int)
+        y = matches["is_win"].astype(int).rename("is_win")
+        return x, y
+
     def _read_payload(self, path):
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -111,6 +159,7 @@ class GameDataAnalyzer:
             "saved_at": payload.get("saved_at"),
             "summoner_name": payload.get("summoner_name"),
             "champion_name": payload.get("champion_name"),
+            "enemy_champions": payload.get("enemy_champions") or [],
             "player_team": player_team,
             "game_result": game_result,
             "winning_team": winning_team,
@@ -130,9 +179,13 @@ class GameDataAnalyzer:
             "victim_name": event.get("VictimName"),
             "assisters": event.get("Assisters"),
             "dragon_type": event.get("DragonType") or event.get("dragonType"),
+            "building_type": event.get("BuildingType") or event.get("buildingType"),
+            "killer_team": event.get("KillerTeam") or event.get("killer_team"),
+            "team_relation": event.get("team_relation"),
             "is_dragon": event_name == "DragonKill",
             "is_baron": event_name == "BaronKill",
             "is_horde": event_name == "HordeKill",
+            "is_building": event_name == "BuildingKill",
             "is_first_blood": event_name == "FirstBlood" or bool(event.get("FirstBlood")),
             "raw_event": event,
         }
@@ -146,12 +199,36 @@ class GameDataAnalyzer:
             "victim_name": None,
             "assisters": None,
             "dragon_type": None,
+            "building_type": None,
+            "killer_team": None,
+            "team_relation": None,
             "is_dragon": False,
             "is_baron": False,
             "is_horde": False,
+            "is_building": False,
             "is_first_blood": False,
             "raw_event": None,
         }
+
+    def _own_team_event_mask(self, df):
+        if df.empty:
+            return pd.Series(False, index=df.index)
+        relation = df.get("team_relation")
+        if relation is not None:
+            own_by_relation = relation.fillna("").astype(str).str.lower().eq("own")
+        else:
+            own_by_relation = pd.Series(False, index=df.index)
+
+        killer_team = df.get("killer_team")
+        player_team = df.get("player_team")
+        if killer_team is not None and player_team is not None:
+            own_by_team = (
+                killer_team.fillna("").astype(str).str.lower()
+                == player_team.fillna("").astype(str).str.lower()
+            )
+        else:
+            own_by_team = pd.Series(False, index=df.index)
+        return own_by_relation | own_by_team
 
     def _is_win(self, game_result, player_team, winning_team):
         if isinstance(game_result, bool):

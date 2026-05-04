@@ -92,13 +92,22 @@ def test_game_end_event_flow_stops_recording_without_real_sleep():
     riot_client.get_all_game_data = AsyncMock(
         return_value={
             "gameData": {"gameTime": 1200.0},
-            "allPlayers": [{"summonerName": "Tester#JP1", "championName": "Malphite", "team": "ORDER"}],
+            "allPlayers": [
+                {"summonerName": "Tester#JP1", "championName": "Malphite", "team": "ORDER"},
+                {"summonerName": "Enemy#JP1", "championName": "Darius", "team": "CHAOS"},
+            ],
         }
     )
     riot_client.get_active_player_name = AsyncMock(return_value="Tester#JP1")
     riot_client.get_event_data = AsyncMock(
         return_value={
             "Events": [
+                {
+                    "EventID": 50,
+                    "EventName": "BuildingKill",
+                    "EventTime": 850.0,
+                    "KillerName": "Tester#JP1",
+                },
                 {
                     "EventID": 99,
                     "EventName": "GameEnd",
@@ -127,5 +136,10 @@ def test_game_end_event_flow_stops_recording_without_real_sleep():
     assert ended is True
     assert recorder.game_result == "Win"
     assert recorder.winning_team == "ORDER"
+    assert recorder.enemy_champions == ["Darius"]
+    assert any(event.get("EventName") == "BuildingKill" for event in recorder.saved_events)
+    building_event = next(event for event in recorder.all_events if event.get("EventName") == "BuildingKill")
+    assert building_event["KillerTeam"] == "ORDER"
+    assert building_event["team_relation"] == "own"
     obs_client.stop_recording.assert_called_once()
     recorder.wait_with_stop_async.assert_not_awaited()

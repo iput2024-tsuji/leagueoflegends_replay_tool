@@ -1364,7 +1364,8 @@ GLOBAL_OBJECTIVES = [
     "DragonKill",   # ドラゴン
     "BaronKill",    # バロン
     "HeraldKill",   # ヘラルド
-    "HordeKill"     # ヴォイドグラブ（内部名称）
+    "HordeKill",    # ヴォイドグラブ（内部名称）
+    "BuildingKill"  # タワー / インヒビターなどの建造物破壊
 ]
 
 # ▼ 自分が関与しているかチェックするイベント
@@ -2048,6 +2049,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.last_game_data = None
         self.champion_name = None
         self.player_team = None
+        self.enemy_champions = []
         self.game_result = None
         self.winning_team = None
 
@@ -2107,7 +2109,44 @@ class LoLAutoRecorder(RecordingSessionManager):
             if summoner == self.my_name or summoner == self.my_name_short:
                 self.champion_name = player.get("championName") or player.get("champion_name")
                 self.player_team = player.get("team")
-                return
+                break
+
+        if self.player_team:
+            enemy_champions = []
+            for player in players:
+                if player.get("team") == self.player_team:
+                    continue
+                champion = player.get("championName") or player.get("champion_name")
+                if champion:
+                    enemy_champions.append(champion)
+            self.enemy_champions = enemy_champions
+
+    def get_player_team_by_name(self, name):
+        if not name or not self.last_game_data:
+            return None
+        lookup_name = normalize_summoner_name(name)
+        for player in self.last_game_data.get("allPlayers", []):
+            summoner = player.get("summonerName") or player.get("summoner_name")
+            if not summoner:
+                continue
+            if summoner == name or normalize_summoner_name(summoner) == lookup_name:
+                return player.get("team")
+        return None
+
+    def enrich_event(self, event):
+        enriched = dict(event or {})
+        killer = enriched.get("KillerName") or enriched.get("killerName")
+        killer_team = (
+            enriched.get("KillerTeam")
+            or enriched.get("killerTeam")
+            or self.get_player_team_by_name(killer)
+        )
+        if killer_team:
+            enriched["KillerTeam"] = killer_team
+            enriched["killer_team"] = killer_team
+            if self.player_team:
+                enriched["team_relation"] = "own" if killer_team == self.player_team else "enemy"
+        return enriched
 
     def update_result_from_events(self, events):
         if not events:
@@ -2204,7 +2243,8 @@ class LoLAutoRecorder(RecordingSessionManager):
         return None
 
     def process_events(self, events):
-        for event in events:
+        for raw_event in events:
+            event = self.enrich_event(raw_event)
             event_id = event.get("EventID")
             event_name = event.get("EventName")
             event_time = event.get("EventTime", 0.0)
@@ -2357,6 +2397,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         payload = {
             "summoner_name": self.my_name,
             "champion_name": self.champion_name,
+            "enemy_champions": self.enemy_champions,
             "player_team": self.player_team,
             "game_result": self.game_result,
             "winning_team": self.winning_team,

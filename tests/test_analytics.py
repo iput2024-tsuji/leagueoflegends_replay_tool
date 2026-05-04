@@ -12,13 +12,13 @@ def runtime_dir(name):
     return path
 
 
-def write_match(path, result, champion, events):
+def write_match(path, result, champion, events, enemy_champions=None):
     path.write_text(
         json.dumps(
             {
                 "summoner_name": "Tester",
                 "champion_name": champion,
-                "enemy_champions": ["Darius", "Lux"],
+                "enemy_champions": enemy_champions or ["Darius", "Lux"],
                 "player_team": "ORDER",
                 "game_result": result,
                 "saved_at": "2026-01-01 00:00:00",
@@ -64,10 +64,18 @@ def test_analyzer_flattens_events_and_correlates_horde_kill():
     assert result["winrate_by_event_count"][0] == 0.0
 
     x, y = analyzer.build_feature_matrix(df)
-    assert list(x.columns) == ["horde_kill_15m", "own_building_kill_15m", "first_blood"]
+    assert list(x.columns) == [
+        "horde_kill_15m",
+        "own_building_kill_15m",
+        "first_blood",
+        "enemy_Darius",
+        "enemy_Lux",
+    ]
     assert x.loc["win", "horde_kill_15m"] == 1
     assert x.loc["win", "own_building_kill_15m"] == 1
     assert x.loc["win", "first_blood"] == 1
+    assert x.loc["win", "enemy_Darius"] == 1
+    assert x.loc["win", "enemy_Lux"] == 1
     assert x.loc["loss", "own_building_kill_15m"] == 0
     assert x.loc["loss", "first_blood"] == 0
     assert y.loc["win"] == 1
@@ -107,5 +115,39 @@ def test_extract_tactical_insights_returns_best_and_worst_rules():
     assert "WinRate 100%" in insights["best_rule"]
     assert "WinRate 0%" in insights["worst_rule"]
     assert "n=4" in insights["best_rule"]
-    assert "15分以内" in insights["best_rule"]
-    assert "15分以内" in insights["tree_text"]
+    assert any(label in insights["best_rule"] for label in ["15分以内", "ファーストブラッド"])
+    assert any(label in insights["tree_text"] for label in ["15分以内", "ファーストブラッド"])
+
+
+def test_enemy_champions_are_used_as_readable_decision_tree_features():
+    tmp_path = runtime_dir("enemy_insights")
+    for index in range(4):
+        write_match(
+            tmp_path / f"win_{index}.json",
+            "Win",
+            "Malphite",
+            [],
+            enemy_champions=["Darius"],
+        )
+
+    for index in range(4):
+        write_match(
+            tmp_path / f"loss_{index}.json",
+            "Loss",
+            "Malphite",
+            [],
+            enemy_champions=["Aatrox"],
+        )
+
+    analyzer = GameDataAnalyzer(json_dir=tmp_path)
+    x, _ = analyzer.build_feature_matrix()
+    insights = analyzer.extract_tactical_insights()
+
+    assert "enemy_Aatrox" in x.columns
+    assert "enemy_Darius" in x.columns
+    assert insights["reason"] is None
+    assert "敵に" in insights["best_rule"]
+    assert "敵に" in insights["worst_rule"]
+    assert "enemy_" not in insights["best_rule"]
+    assert "enemy_" not in insights["worst_rule"]
+    assert "がいる" in insights["best_rule"] or "がいない" in insights["best_rule"]

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pandas as pd
+from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.tree import DecisionTreeClassifier, export_text
 
 try:
@@ -103,12 +104,17 @@ class GameDataAnalyzer:
         if source is None or source.empty:
             return pd.DataFrame(columns=feature_names), pd.Series(dtype="int64", name="is_win")
 
+        match_columns = ["is_win", "player_team"]
+        if "enemy_champions" in source.columns:
+            match_columns.append("enemy_champions")
         matches = (
             source.drop_duplicates("match_id")
-            .set_index("match_id")[["is_win", "player_team"]]
+            .set_index("match_id")[match_columns]
             .dropna(subset=["is_win"])
             .copy()
         )
+        if "enemy_champions" not in matches.columns:
+            matches["enemy_champions"] = [[] for _ in range(len(matches))]
         if matches.empty:
             return pd.DataFrame(columns=feature_names), pd.Series(dtype="int64", name="is_win")
 
@@ -138,16 +144,28 @@ class GameDataAnalyzer:
         x["horde_kill_15m"] = horde_counts.reindex(matches.index, fill_value=0).astype(int)
         x["own_building_kill_15m"] = own_building_counts.reindex(matches.index, fill_value=0).astype(int)
         x["first_blood"] = (first_blood_owned.reindex(matches.index, fill_value=0) > 0).astype(int)
+
+        enemy_lists = matches["enemy_champions"].apply(self._normalize_champion_list).tolist()
+        enemy_binarizer = MultiLabelBinarizer()
+        enemy_matrix = enemy_binarizer.fit_transform(enemy_lists)
+        if len(enemy_binarizer.classes_) > 0:
+            used_names = set(x.columns)
+            enemy_feature_labels = {}
+            enemy_columns = []
+            for champion in enemy_binarizer.classes_:
+                feature_name = self._enemy_feature_name(champion, used_names)
+                enemy_columns.append(feature_name)
+                enemy_feature_labels[feature_name] = str(champion)
+            enemy_df = pd.DataFrame(enemy_matrix, index=matches.index, columns=enemy_columns).astype(int)
+            x = pd.concat([x, enemy_df], axis=1)
+            x.attrs["enemy_feature_labels"] = enemy_feature_labels
+
         y = matches["is_win"].astype(int).rename("is_win")
         return x, y
 
     def extract_tactical_insights(self):
         x, y = self.build_feature_matrix()
-        feature_labels = {
-            "horde_kill_15m": "15分以内HordeKill",
-            "own_building_kill_15m": "15分以内タワー破壊",
-            "first_blood": "ファーストブラッド取得",
-        }
+        feature_labels = self._feature_labels(x)
         if x.empty or y.empty:
             return {
                 "sample_size": 0,
@@ -166,8 +184,9 @@ class GameDataAnalyzer:
             }
 
         model = DecisionTreeClassifier(
-            max_depth=3,
-            min_samples_leaf=3,
+            max_depth=5,
+            min_samples_leaf=2,
+            min_samples_split=4,
             random_state=42,
         )
         model.fit(x, y)
@@ -178,7 +197,7 @@ class GameDataAnalyzer:
                 "sample_size": int(len(y)),
                 "best_rule": None,
                 "worst_rule": None,
-                "tree_text": export_text(model, feature_names=list(feature_labels.values())),
+                "tree_text": export_text(model, feature_names=[feature_labels[name] for name in x.columns]),
                 "reason": "決定木からルールを抽出できませんでした。",
             }
 
@@ -282,6 +301,52 @@ class GameDataAnalyzer:
             own_by_team = pd.Series(False, index=df.index)
         return own_by_relation | own_by_team
 
+    def _normalize_champion_list(self, champions):
+        if champions is None:
+            return []
+        if isinstance(champions, str):
+            source = champions.split(",")
+        elif isinstance(champions, (list, tuple, set)):
+            source = champions
+        else:
+            return []
+
+        normalized = []
+        for champion in source:
+            name = str(champion or "").strip()
+            if name:
+                normalized.append(name)
+        return sorted(set(normalized))
+
+    def _enemy_feature_name(self, champion, used_names):
+        safe_name = "".join(char if char.isalnum() else "_" for char in str(champion).strip())
+        while "__" in safe_name:
+            safe_name = safe_name.replace("__", "_")
+        safe_name = safe_name.strip("_") or "Unknown"
+
+        base_name = f"enemy_{safe_name}"
+        feature_name = base_name
+        suffix = 2
+        while feature_name in used_names:
+            feature_name = f"{base_name}_{suffix}"
+            suffix += 1
+        used_names.add(feature_name)
+        return feature_name
+
+    def _feature_labels(self, x):
+        labels = {
+            "horde_kill_15m": "15分以内HordeKill",
+            "own_building_kill_15m": "15分以内タワー破壊",
+            "first_blood": "ファーストブラッド取得",
+        }
+        enemy_feature_labels = x.attrs.get("enemy_feature_labels", {})
+        for feature_name, champion in enemy_feature_labels.items():
+            labels[feature_name] = f"敵に{champion}"
+        for feature_name in x.columns:
+            if feature_name.startswith("enemy_") and feature_name not in labels:
+                labels[feature_name] = f"敵に{feature_name.removeprefix('enemy_')}"
+        return labels
+
     def _decision_tree_leaf_rules(self, model, feature_names, feature_labels):
         tree = model.tree_
         class_index = {int(label): index for index, label in enumerate(model.classes_)}
@@ -321,6 +386,8 @@ class GameDataAnalyzer:
     def _format_tree_condition(self, label, feature_name, threshold, side):
         if feature_name == "first_blood":
             return f"{label}なし" if side == "left" else f"{label}あり"
+        if feature_name.startswith("enemy_"):
+            return f"{label}がいない" if side == "left" else f"{label}がいる"
 
         if side == "left":
             value = int(threshold // 1)

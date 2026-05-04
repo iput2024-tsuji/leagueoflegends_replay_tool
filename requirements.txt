@@ -1,5 +1,5 @@
 obsws-python
 opencv-python
 python-mpv
-requests
+aiohttp
 PyQt6

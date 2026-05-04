@@ -244,11 +244,7 @@ class RecorderWorker(QThread):
                 status_cb=self.status.emit
             )
             try:
-                recordtest.apply_audio_profile_from_config(
-                    self.recorder.client,
-                    settings,
-                    scene_name=recordtest.OBS_SCENE_NAME,
-                )
+                self.recorder.apply_audio_profile(settings)
                 self.status.emit("🔊 音声設定をOBSへ適用しました。")
             except Exception as e:
                 self.status.emit(f"⚠️ 音声設定の適用に失敗: {e}")
@@ -1028,27 +1024,29 @@ class SettingsPage(QWidget):
         if not ok and auto_launch:
             launched_process = recordtest.launch_obs()
 
-        client, _used_host = recordtest.connect_obs_client(
-            cfg.get("obs", {}).get("host", recordtest.DEFAULT_OBS_HOST),
-            cfg.get("obs", {}).get("port", recordtest.DEFAULT_OBS_PORT),
-            cfg.get("obs", {}).get("password", ""),
-            timeout=2.5,
+        obs_client = recordtest.ObsWebSocketClient(
+            obs_process=launched_process,
+            status_cb=None,
+            max_retries=2,
+            retry_delay=0.5,
         )
-        return client, launched_process, cfg
+        recorder = recordtest.LoLAutoRecorder(
+            obs_process=launched_process,
+            status_cb=None,
+            auto_setup=False,
+            obs_client=obs_client,
+        )
+        return recorder, launched_process, cfg
 
     def refresh_audio_devices(self, show_message=True, show_error=True, auto_launch=True):
         if self._audio_refresh_in_progress:
             return False
-        client = None
+        recorder = None
         launched_process = None
         self._audio_refresh_in_progress = True
         try:
-            client, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=auto_launch)
-            catalog = recordtest.get_audio_device_catalog(
-                client,
-                cfg=cfg,
-                scene_name=cfg.get("obs", {}).get("scene_name", recordtest.DEFAULT_OBS_SCENE_NAME),
-            )
+            recorder, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=auto_launch)
+            catalog = recorder.get_audio_device_catalog(cfg=cfg)
             for key in ("desktop", "mic"):
                 self.audio_device_cache[key] = list(catalog.get(key, []))
             self._audio_ui_loading = True
@@ -1069,14 +1067,14 @@ class SettingsPage(QWidget):
             return False
         finally:
             self._audio_refresh_in_progress = False
-            if client:
+            if recorder:
                 try:
-                    client.disconnect()
+                    recorder.disconnect_obs()
                 except Exception:
                     pass
 
     def apply_audio_settings_to_obs(self, show_success=True, show_error=True, auto_launch=True):
-        client = None
+        recorder = None
         launched_process = None
         try:
             data = self._collect_settings_data_from_ui()
@@ -1086,12 +1084,8 @@ class SettingsPage(QWidget):
             cfg = report["config"]
             save_config(cfg)
 
-            client, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=auto_launch)
-            recordtest.apply_audio_profile_from_config(
-                client,
-                cfg,
-                scene_name=cfg.get("obs", {}).get("scene_name", recordtest.DEFAULT_OBS_SCENE_NAME),
-            )
+            recorder, launched_process, cfg = self._open_obs_client_for_audio(auto_launch=auto_launch)
+            recorder.apply_audio_profile(cfg)
             if show_success:
                 msg = "音声設定をOBSへ反映しました。"
                 if launched_process:
@@ -1103,9 +1097,9 @@ class SettingsPage(QWidget):
                 QMessageBox.warning(self, "音声設定", f"OBSへの反映に失敗しました。\n{e}")
             return False
         finally:
-            if client:
+            if recorder:
                 try:
-                    client.disconnect()
+                    recorder.disconnect_obs()
                 except Exception:
                     pass
 
@@ -1114,7 +1108,7 @@ class SettingsPage(QWidget):
         一般タブの録画出力関連（録画保存先/FPS）を、OBS起動中のみ即時反映する。
         設定保存でOBSを自動起動はしない。
         """
-        client = None
+        recorder = None
         try:
             if cfg is None:
                 cfg = load_config()
@@ -1132,28 +1126,26 @@ class SettingsPage(QWidget):
             if not ok:
                 return False
 
-            client, _used_host = recordtest.connect_obs_client(
-                obs_cfg.get("host", recordtest.DEFAULT_OBS_HOST),
-                obs_cfg.get("port", recordtest.DEFAULT_OBS_PORT),
-                obs_cfg.get("password", ""),
-                timeout=2.0,
+            obs_client = recordtest.ObsWebSocketClient(
+                status_cb=None,
+                max_retries=1,
+                retry_delay=0.0,
             )
-
-            if recordtest.RECORDINGS_DIR:
-                recordtest.apply_record_directory_to_obs(client, recordtest.RECORDINGS_DIR)
-            try:
-                recordtest.apply_obs_video_settings(client, recordtest.OBS_FPS)
-            except Exception:
-                pass
+            recorder = recordtest.LoLAutoRecorder(
+                status_cb=None,
+                auto_setup=False,
+                obs_client=obs_client,
+            )
+            recorder.apply_record_output_settings()
             return True
         except Exception as e:
             if show_error:
                 QMessageBox.warning(self, "設定反映", f"録画設定のOBS反映に失敗しました。\n{e}")
             return False
         finally:
-            if client:
+            if recorder:
                 try:
-                    client.disconnect()
+                    recorder.disconnect_obs()
                 except Exception:
                     pass
 

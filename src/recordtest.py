@@ -4,10 +4,11 @@ import time
 import json
 import subprocess
 import configparser
+import asyncio
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-import requests
+import aiohttp
 import urllib3
 import obsws_python as obs
 from obsws_python.error import OBSSDKRequestError
@@ -116,6 +117,18 @@ class OBSClient(ABC):
         pass
 
     @abstractmethod
+    def apply_record_output_settings(self):
+        pass
+
+    @abstractmethod
+    def apply_audio_profile(self, cfg, scene_name=None):
+        pass
+
+    @abstractmethod
+    def get_audio_device_catalog(self, cfg=None, scene_name=None):
+        pass
+
+    @abstractmethod
     def get_sync_source_id(self):
         pass
 
@@ -144,15 +157,15 @@ class RiotAPIClient(ABC):
     """LoL Live Client APIの取得とパースだけを担当する抽象インターフェース。"""
 
     @abstractmethod
-    def get_active_player_name(self):
+    async def get_active_player_name(self):
         pass
 
     @abstractmethod
-    def get_event_data(self):
+    async def get_event_data(self):
         pass
 
     @abstractmethod
-    def get_all_game_data(self):
+    async def get_all_game_data(self):
         pass
 
 
@@ -169,6 +182,18 @@ class RecordingSessionManager(ABC):
 
     @abstractmethod
     def has_session_data(self):
+        pass
+
+    @abstractmethod
+    def apply_record_output_settings(self):
+        pass
+
+    @abstractmethod
+    def apply_audio_profile(self, cfg):
+        pass
+
+    @abstractmethod
+    def get_audio_device_catalog(self, cfg=None):
         pass
 
     @abstractmethod
@@ -193,6 +218,10 @@ class RecordingSessionManager(ABC):
 
     @abstractmethod
     def shutdown_obs(self):
+        pass
+
+    @abstractmethod
+    def disconnect_obs(self):
         pass
 
 
@@ -1067,13 +1096,12 @@ def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
 
         recorder = LoLAutoRecorder(obs_process=launched_process, status_cb=status_cb, auto_setup=True)
         # 録画保存先も毎回明示して、環境差分でOBS設定がぶれないようにする。
-        if RECORDINGS_DIR:
-            try:
-                apply_record_directory_to_obs(recorder.client, RECORDINGS_DIR)
-            except Exception:
-                pass
         try:
-            apply_audio_profile_from_config(recorder.client, cfg, scene_name=OBS_SCENE_NAME, status_cb=status_cb)
+            recorder.apply_record_output_settings()
+        except Exception:
+            pass
+        try:
+            recorder.apply_audio_profile(cfg)
         except Exception as e:
             if status_cb:
                 try:
@@ -1100,8 +1128,7 @@ def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
                     pass
         elif recorder:
             try:
-                recorder.obs_client.disconnect()
-                recorder.client = recorder.obs_client.raw_client
+                recorder.disconnect_obs()
             except Exception:
                 pass
 
@@ -1443,19 +1470,6 @@ def kill_stale_obs_processes():
         pass
 
 
-def get_active_player_name():
-    """自分のサモナーネームを取得する"""
-    try:
-        response = requests.get(ACTIVE_PLAYER_URL, verify=False, timeout=5)
-        response.raise_for_status()
-        try:
-            return response.json()
-        except Exception:
-            return response.text.strip().replace('"', '')
-    except Exception:
-        return None
-
-
 def normalize_summoner_name(value):
     if not value:
         return None
@@ -1463,26 +1477,6 @@ def normalize_summoner_name(value):
     if "#" in name:
         name = name.split("#", 1)[0]
     return name.strip()
-
-
-def get_event_data():
-    """イベントデータを取得する"""
-    try:
-        response = requests.get(EVENT_URL, verify=False, timeout=5)
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        return None
-
-
-def get_all_game_data():
-    """ゲーム全体データを取得する"""
-    try:
-        response = requests.get(ALL_GAME_URL, verify=False, timeout=1)
-        response.raise_for_status()
-        return response.json()
-    except Exception:
-        return None
 
 
 def build_output_path():
@@ -1504,26 +1498,77 @@ def save_payload(path, payload):
         json.dump(payload, f, indent=4, ensure_ascii=False)
 
 
+def _run_async(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    coro.close()
+    raise RecorderError("この同期APIは実行中のasyncioイベントループ内からは呼び出せません。")
+
+
 class LiveClientRiotAPIClient(RiotAPIClient):
-    """Riot Live Client APIを使う本番用クライアント。"""
+    """aiohttpでRiot Live Client APIを取得する本番用クライアント。"""
 
-    def get_active_player_name(self):
-        return get_active_player_name()
+    def __init__(self, session_factory=None):
+        self.session_factory = session_factory or aiohttp.ClientSession
 
-    def get_event_data(self):
-        return get_event_data()
+    async def _fetch(self, url, timeout_sec):
+        timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
+        try:
+            async with self.session_factory(timeout=timeout) as session:
+                async with session.get(url, ssl=False) as response:
+                    response.raise_for_status()
+                    try:
+                        return await response.json(content_type=None)
+                    except Exception:
+                        text = await response.text()
+                        return text.strip().replace('"', '')
+        except (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientResponseError,
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OSError,
+        ):
+            return None
 
-    def get_all_game_data(self):
-        return get_all_game_data()
+    async def get_active_player_name(self):
+        return await self._fetch(ACTIVE_PLAYER_URL, timeout_sec=5)
+
+    async def get_event_data(self):
+        data = await self._fetch(EVENT_URL, timeout_sec=5)
+        return data if isinstance(data, dict) else None
+
+    async def get_all_game_data(self):
+        data = await self._fetch(ALL_GAME_URL, timeout_sec=1)
+        return data if isinstance(data, dict) else None
+
+
+def get_active_player_name():
+    """互換用の同期ラッパー。録画ループ内では非同期APIを使う。"""
+    return _run_async(LiveClientRiotAPIClient().get_active_player_name())
+
+
+def get_event_data():
+    """互換用の同期ラッパー。録画ループ内では非同期APIを使う。"""
+    return _run_async(LiveClientRiotAPIClient().get_event_data())
+
+
+def get_all_game_data():
+    """互換用の同期ラッパー。録画ループ内では非同期APIを使う。"""
+    return _run_async(LiveClientRiotAPIClient().get_all_game_data())
 
 
 class ObsWebSocketClient(OBSClient):
     """obs-websocketを使う本番用OBSクライアント。"""
 
-    def __init__(self, obs_process=None, status_cb=None):
+    def __init__(self, obs_process=None, status_cb=None, max_retries=5, retry_delay=2.0):
         self.client = None
         self.obs_process = obs_process
         self.status_cb = status_cb
+        self.max_retries = int(max_retries)
+        self.retry_delay = float(retry_delay)
 
     @property
     def raw_client(self):
@@ -1540,7 +1585,8 @@ class ObsWebSocketClient(OBSClient):
     def connect(self):
         retry_count = 0
         last_error = None
-        while retry_count < 5:
+        max_retries = max(1, self.max_retries)
+        while retry_count < max_retries:
             try:
                 self.client, used_host = connect_obs_client(
                     OBS_HOST,
@@ -1554,8 +1600,9 @@ class ObsWebSocketClient(OBSClient):
             except Exception as e:
                 last_error = e
                 retry_count += 1
-                print(f"Connection retrying... ({retry_count}/5)")
-                time.sleep(2)
+                print(f"Connection retrying... ({retry_count}/{max_retries})")
+                if retry_count < max_retries and self.retry_delay > 0:
+                    time.sleep(self.retry_delay)
 
         raise RecorderError(
             "OBS WebSocketへの接続に失敗しました。\n"
@@ -1590,6 +1637,26 @@ class ObsWebSocketClient(OBSClient):
         except Exception as e:
             # 録画は続行可能なので警告のみ
             self.log(f"⚠️ OBS録画FPS設定の適用に失敗: {e}")
+
+    def apply_record_output_settings(self):
+        self.setup_record_output()
+        return True
+
+    def apply_audio_profile(self, cfg, scene_name=None):
+        return apply_audio_profile_from_config(
+            self.client,
+            cfg,
+            scene_name=scene_name or OBS_SCENE_NAME,
+            status_cb=self.log,
+        )
+
+    def get_audio_device_catalog(self, cfg=None, scene_name=None):
+        return get_audio_device_catalog(
+            self.client,
+            cfg=cfg,
+            scene_name=scene_name or OBS_SCENE_NAME,
+            status_cb=self.log,
+        )
 
     def setup_sync_elements(self):
         self._ensure_scene_exists()
@@ -1725,7 +1792,6 @@ class ObsWebSocketClient(OBSClient):
 
 class LoLAutoRecorder(RecordingSessionManager):
     def __init__(self, obs_process=None, status_cb=None, auto_setup=True, obs_client=None, riot_api_client=None):
-        self.client = None
         self.my_name = None
         self.status_cb = status_cb
         self.stop_requested = False
@@ -1752,14 +1818,18 @@ class LoLAutoRecorder(RecordingSessionManager):
     def should_stop(self):
         return self.stop_requested
 
-    def wait_with_stop(self, seconds, step=0.5):
-        deadline = time.time() + max(0.0, float(seconds))
-        while time.time() < deadline:
+    async def wait_with_stop_async(self, seconds, step=0.5):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, float(seconds))
+        while loop.time() < deadline:
             if self.should_stop():
                 return False
-            remaining = deadline - time.time()
-            time.sleep(min(step, max(0.01, remaining)))
+            remaining = deadline - loop.time()
+            await asyncio.sleep(min(step, max(0.01, remaining)))
         return not self.should_stop()
+
+    def wait_with_stop(self, seconds, step=0.5):
+        return _run_async(self.wait_with_stop_async(seconds, step=step))
 
     def reset_session(self):
         self.output_file = None
@@ -1791,7 +1861,15 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     def connect_obs(self):
         self.obs_client.connect()
-        self.client = self.obs_client.raw_client
+
+    def apply_record_output_settings(self):
+        return self.obs_client.apply_record_output_settings()
+
+    def apply_audio_profile(self, cfg):
+        return self.obs_client.apply_audio_profile(cfg, scene_name=OBS_SCENE_NAME)
+
+    def get_audio_device_catalog(self, cfg=None):
+        return self.obs_client.get_audio_device_catalog(cfg=cfg, scene_name=OBS_SCENE_NAME)
 
     def get_source_id(self):
         return self.obs_client.get_sync_source_id()
@@ -1808,12 +1886,15 @@ class LoLAutoRecorder(RecordingSessionManager):
     def ensure_sync_source_exists(self):
         self.obs_client.setup_sync_elements()
 
-    def try_update_player_name(self):
-        name = self.riot_api_client.get_active_player_name()
+    async def try_update_player_name_async(self):
+        name = await self.riot_api_client.get_active_player_name()
         if name and name != self.my_name:
             self.my_name = name
             self.my_name_short = normalize_summoner_name(name)
             self.log(f"プレイヤー名を特定: {self.my_name}")
+
+    def try_update_player_name(self):
+        return _run_async(self.try_update_player_name_async())
 
     def update_player_info_from_game_data(self, data):
         if not data or not self.my_name:
@@ -1840,25 +1921,28 @@ class LoLAutoRecorder(RecordingSessionManager):
             self.winning_team = winning_team
             return
 
-    def wait_for_game_start(self):
+    async def wait_for_game_start_async(self):
         """LoLの試合開始を監視"""
         self.log("⚔️  LoLの試合開始を待機中 (API監視)...")
         while True:
             if self.should_stop():
                 return False
-            data = self.riot_api_client.get_all_game_data()
+            data = await self.riot_api_client.get_all_game_data()
             if data:
                 game_time = data.get('gameData', {}).get('gameTime', 0)
                 if game_time > 0:
                     self.log(f"🔥 試合開始検知！ GameTime: {game_time:.2f}s")
                     self.output_file = build_output_path()
-                    self.try_update_player_name()
+                    await self.try_update_player_name_async()
                     self.session_started = True
                     return True
-            if not self.wait_with_stop(1.0):
+            if not await self.wait_with_stop_async(1.0):
                 return False
 
-    def start_recording(self):
+    def wait_for_game_start(self):
+        return _run_async(self.wait_for_game_start_async())
+
+    async def start_recording_async(self):
         """録画開始 -> 同期マーカー"""
         self.log("🎥 録画を開始します...")
         try:
@@ -1870,7 +1954,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         except Exception as e:
             self.log(f"⚠️ 録画開始エラー: {e}")
             return
-        if not self.wait_with_stop(2.0):
+        if not await self.wait_with_stop_async(2.0):
             return
 
         item_id = self.get_source_id()
@@ -1880,7 +1964,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 "設定画面の「OBSにシーン/色ソースを作成」を実行してください。"
             )
 
-        event_time = self.wait_until_game_start_event()
+        event_time = await self.wait_until_game_start_event_async()
         if self.should_stop():
             return
 
@@ -1888,7 +1972,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.obs_client.set_sync_marker_enabled(True, item_id)
 
         sync_time = 0.0
-        data = self.riot_api_client.get_all_game_data()
+        data = await self.riot_api_client.get_all_game_data()
         if data:
             sync_time = data.get('gameData', {}).get('gameTime', 0.0)
         if (not sync_time or sync_time <= 0) and event_time is not None:
@@ -1897,24 +1981,31 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.sync_game_time = sync_time
         self.log(f"📝 同期ログ記録: {sync_time:.4f}s")
 
-        self.wait_with_stop(0.5)
+        await self.wait_with_stop_async(0.5)
         self.obs_client.set_sync_marker_enabled(False, item_id)
         self.log("✅ シグナル消灯。録画継続中。")
 
-    def wait_until_game_start_event(self, timeout_sec=180):
-        start = time.time()
-        while time.time() - start < timeout_sec:
+    def start_recording(self):
+        return _run_async(self.start_recording_async())
+
+    async def wait_until_game_start_event_async(self, timeout_sec=180):
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        while loop.time() - start < timeout_sec:
             if self.should_stop():
                 return None
-            event_data = self.riot_api_client.get_event_data()
+            event_data = await self.riot_api_client.get_event_data()
             if event_data:
                 for event in event_data.get("Events", []):
                     if event.get("EventName") == "GameStart":
                         return event.get("EventTime", 0.0)
-            if not self.wait_with_stop(0.5):
+            if not await self.wait_with_stop_async(0.5):
                 return None
         self.log("⚠️ GameStart を検知できませんでした。現在のゲーム時間で同期します。")
         return None
+
+    def wait_until_game_start_event(self, timeout_sec=180):
+        return _run_async(self.wait_until_game_start_event_async(timeout_sec=timeout_sec))
 
     def process_events(self, events):
         for event in events:
@@ -1969,41 +2060,44 @@ class LoLAutoRecorder(RecordingSessionManager):
 
             self.processed_event_keys.add(event_key)
 
-    def record_until_end(self):
+    async def record_until_end_async(self):
         """試合終了まで待機して録画停止"""
         self.log("🛡️  試合終了を監視中...")
         error_count = 0
         while True:
             if self.should_stop():
                 return False
-            data = self.riot_api_client.get_all_game_data()
+            data = await self.riot_api_client.get_all_game_data()
             if not data:
                 error_count += 1
                 if error_count >= END_ERROR_LIMIT:
                     self.log("🏁 試合終了検知。録画を停止します。")
                     return True
-                if not self.wait_with_stop(END_POLL_SEC):
+                if not await self.wait_with_stop_async(END_POLL_SEC):
                     return False
                 continue
 
             error_count = 0
             self.last_game_data = data
             if not self.my_name:
-                self.try_update_player_name()
+                await self.try_update_player_name_async()
             self.update_player_info_from_game_data(data)
 
-            event_data = self.riot_api_client.get_event_data()
+            event_data = await self.riot_api_client.get_event_data()
             if event_data:
                 events = event_data.get("Events", [])
                 self.process_events(events)
                 self.update_result_from_events(events)
 
-            if not self.wait_with_stop(EVENT_POLL_SEC):
+            if not await self.wait_with_stop_async(EVENT_POLL_SEC):
                 return False
         return True
 
+    def record_until_end(self):
+        return _run_async(self.record_until_end_async())
+
     def stop_recording(self):
-        if not self.client or self.record_path is not None:
+        if not self.obs_client.raw_client or self.record_path is not None:
             return
         if not self.recording_started:
             return
@@ -2031,7 +2125,9 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     def shutdown_obs(self):
         self.obs_client.shutdown()
-        self.client = self.obs_client.raw_client
+
+    def disconnect_obs(self):
+        self.obs_client.disconnect()
 
     def save_json(self):
         if self.output_file is None:
@@ -2095,7 +2191,7 @@ if __name__ == "__main__":
 
         app = LoLAutoRecorder(obs_process=obs_process)
         try:
-            apply_audio_profile_from_config(app.client, settings, scene_name=OBS_SCENE_NAME)
+            app.apply_audio_profile(settings)
             print("🔊 音声設定をOBSへ適用しました。")
         except Exception as e:
             print(f"⚠️ 音声設定の適用に失敗: {e}")

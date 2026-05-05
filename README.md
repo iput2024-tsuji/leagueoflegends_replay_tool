@@ -146,8 +146,9 @@ assets/
   app/               # アプリアイコン
   champions/icons/   # チャンピオンアイコン
 bin/
-  OBS-Studio/        # 利用者が配置するポータブル OBS
   *.dll              # 利用者が配置する mpv DLL
+obs-portable/
+  bin/64bit/obs64.exe # 利用者が配置するポータブル OBS
 tests/
   test_analytics.py
   test_recorder_async.py
@@ -163,7 +164,7 @@ tests/
 
 このリポジトリおよびビルド成果物には、OBS Studio 本体、mpv DLL、Riot Games の画像アセットを同梱しません。
 
-- OBS Studio は利用者が公式配布元から取得し、`bin/OBS-Studio` に配置してください。
+- OBS Studio は利用者が公式配布元から取得し、`obs-portable` に配置してください。
 - mpv DLL は利用者が正規の配布元から取得し、`bin/` に配置してください。
 - チャンピオンアイコンを使う場合は、利用者が `assets/champions/icons` に配置してください。Riot Games のアセットを利用する場合は、Riot Games の規約・ポリシーに従ってください。
 
@@ -177,8 +178,9 @@ python main.py
 
 通常は `config/setting.json` を手動編集する必要はありません。
 
-- OBS は `bin/OBS-Studio` に配置されたポータブル版のみ利用します
+- OBS は `obs-portable` に配置されたポータブル版のみ利用します
 - ユーザー環境にインストール済みの OBS は利用しません
+- 起動時に `obs-portable/obs_portable_mode.txt` と OBS の `global.ini` を自動生成・補正します
 - 初回セットアップで「環境を自動修復」を実行すると、WebSocket、シーン、同期用色ソースを自動構成します
 - 音声デバイス、録画保存先、FPS、容量制限はアプリの設定画面から変更できます
 
@@ -234,7 +236,7 @@ dist\LoLReplayTool\
 ## トラブルシュート
 
 - `ポータブルOBSが見つかりません`
-  - `bin/OBS-Studio/bin/64bit/obs64.exe` が存在するように配置してください。
+  - `obs-portable/bin/64bit/obs64.exe` が存在するように配置してください。
 - `mpv DLL が見つかりません`
   - `bin/` に `mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll` のいずれかを配置してください。
 - イベントが表示されない
@@ -244,3 +246,4 @@ dist\LoLReplayTool\
   - 決定木分析には勝敗両方を含むデータが必要です。
 - 同期が合わない
   - 設定画面から同期補正を行うか、「環境を自動修復」を再実行してください。
+

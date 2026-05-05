@@ -217,7 +217,7 @@ class SetupWizardDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "bin/OBS-Studio に配置されたポータブルOBSを前提に、必要な設定を自動構成します。\n"
+            "obs-portable に配置されたポータブルOBSを前提に、必要な設定を自動構成します。\n"
             "保存先だけ確認して「環境を自動修復」を実行してください。"
         )
         intro.setWordWrap(True)
@@ -1474,3 +1474,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

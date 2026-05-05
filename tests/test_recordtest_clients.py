@@ -1,5 +1,7 @@
 import asyncio
+import shutil
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 from unittest.mock import patch
 
 import aiohttp
@@ -121,3 +123,22 @@ def test_obs_disconnect_clears_raw_client_even_when_socket_errors():
         client.disconnect()
 
     assert client.raw_client is None
+
+
+def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(monkeypatch):
+    obs_dir = Path("tests") / "_tmp" / "obs_bootstrapper" / "obs-portable"
+    shutil.rmtree(obs_dir.parent, ignore_errors=True)
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
+
+    result = recordtest.OBSBootstrapper(obs_dir).bootstrap()
+    global_ini = result["global_ini_path"]
+
+    assert (obs_dir / "obs_portable_mode.txt").exists()
+    assert (obs_dir / "portable_mode.txt").exists()
+    assert global_ini.exists()
+
+    text = global_ini.read_text(encoding="utf-8")
+    assert "SysTrayEnabled=false" in text
+    assert "SysTrayWhenStarted=false" in text
+    assert "SysTrayMinimizeToTray=false" in text
+    assert "HideTrayIcon=true" in text

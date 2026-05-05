@@ -35,7 +35,7 @@ DEFAULT_OBS_SOURCE_NAME = "color"
 # OBS color_source の color 値は ABGR。赤は 0xFF0000FF。
 DEFAULT_OBS_SOURCE_COLOR = 0xFF0000FF
 LEGACY_OBS_SOURCE_COLOR_BLUE = 0xFFFF0000
-DEFAULT_OBS_DIR = "bin/OBS-Studio"
+DEFAULT_OBS_DIR = "obs-portable"
 DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
 DEFAULT_JSON_DIR = "recordings/json"
@@ -56,7 +56,9 @@ DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
 DEFAULT_AUDIO_DESKTOP_MUTE = False
 DEFAULT_AUDIO_MIC_MUTE = False
 
-MANAGED_PORTABLE_OBS_DIR = (ROOT_DIR / "bin" / "OBS-Studio").resolve()
+MANAGED_PORTABLE_OBS_DIR = (ROOT_DIR / DEFAULT_OBS_DIR).resolve()
+PORTABLE_OBS_MARKER_NAME = "obs_portable_mode.txt"
+LEGACY_PORTABLE_OBS_MARKER_NAME = "portable_mode.txt"
 MANAGED_AUDIO_INPUTS = {
     "desktop": {
         "label": "デスクトップ音声",
@@ -455,6 +457,39 @@ def get_obs_global_ini_path(base_dir):
     return Path(base_dir) / "config" / "obs-studio" / "global.ini"
 
 
+def get_obs_portable_marker_path(base_dir):
+    return Path(base_dir) / PORTABLE_OBS_MARKER_NAME
+
+
+class OBSBootstrapper:
+    """アプリ管理のポータブルOBSを初期化するBootstrapper。"""
+
+    def __init__(self, base_dir):
+        self.base_dir = Path(base_dir).resolve()
+
+    def ensure_portable_mode_marker(self):
+        return ensure_portable_mode_marker(self.base_dir)
+
+    def ensure_global_ini(self):
+        return ensure_portable_obs_global_ini(self.base_dir)
+
+    def ensure_websocket_config(self, port, password):
+        return ensure_portable_obs_websocket_config(self.base_dir, port, password)
+
+    def bootstrap(self, port=None, password=""):
+        marker = self.ensure_portable_mode_marker()
+        changed_ini, global_ini_path = self.ensure_global_ini()
+        websocket_result = None
+        if port is not None:
+            websocket_result = self.ensure_websocket_config(port, password)
+        return {
+            "marker": marker,
+            "global_ini_changed": changed_ini,
+            "global_ini_path": global_ini_path,
+            "websocket": websocket_result,
+        }
+
+
 def ensure_portable_obs_global_ini(base_dir):
     """
     ポータブルOBSの global.ini にトレイ無効化設定を反映する。
@@ -462,7 +497,7 @@ def ensure_portable_obs_global_ini(base_dir):
     """
     if not is_managed_portable_obs_dir(base_dir):
         raise RecorderError(
-            "このアプリは bin/OBS-Studio に配置されたポータブルOBSのみ対応です。\n"
+            "このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n"
             f"利用先: {MANAGED_PORTABLE_OBS_DIR}"
         )
 
@@ -491,7 +526,14 @@ def ensure_portable_obs_global_ini(base_dir):
         "SysTrayEnabled": "false",
         "SysTrayWhenStarted": "false",
         "SysTrayMinimizeToTray": "false",
+        "HideTrayIcon": "true",
     }
+    for key in list(parser.options("BasicWindow")):
+        lower_key = key.lower()
+        if ("systray" in lower_key or "hidetray" in lower_key) and key not in desired:
+            parser.remove_option("BasicWindow", key)
+            changed = True
+
     for key, value in desired.items():
         current = parser.get("BasicWindow", key, fallback=None)
         if current is None or str(current).strip().lower() != value:
@@ -507,12 +549,12 @@ def ensure_portable_obs_global_ini(base_dir):
 
 def ensure_portable_obs_websocket_config(base_dir, port, password):
     """
-    bin/OBS-Studio に配置されたポータブルOBSのみを対象に、
+    obs-portable に配置されたポータブルOBSのみを対象に、
     WebSocket設定を固定値へ自動補完する。
     """
     if not is_managed_portable_obs_dir(base_dir):
         raise RecorderError(
-            "このアプリは bin/OBS-Studio に配置されたポータブルOBSのみ対応です。\n"
+            "このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n"
             f"利用先: {MANAGED_PORTABLE_OBS_DIR}"
         )
 
@@ -903,8 +945,27 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
             current_obs_dir = expected_obs_dir
         else:
             report["errors"].append(
-                f"OBSフォルダは bin/OBS-Studio のポータブルOBSのみ対応です: {expected_obs_dir}"
+                f"OBSフォルダは obs-portable のポータブルOBSのみ対応です: {expected_obs_dir}"
             )
+
+    if auto_fix and current_obs_dir and is_managed_portable_obs_dir(current_obs_dir):
+        try:
+            marker_path = get_obs_portable_marker_path(current_obs_dir)
+            marker_existed = marker_path.exists()
+            bootstrapper = OBSBootstrapper(current_obs_dir)
+            marker = bootstrapper.ensure_portable_mode_marker()
+            if not marker_existed:
+                report["changed"] = True
+                report["notes"].append(f"OBSポータブルモードマーカーを作成しました: {marker}")
+
+            changed, global_ini_path = bootstrapper.ensure_global_ini()
+            if changed:
+                report["changed"] = True
+                report["notes"].append(
+                    f"ポータブルOBSのトレイアイコン非表示を設定しました: {global_ini_path}"
+                )
+        except Exception as e:
+            report["warnings"].append(f"OBS Bootstrapper の実行に失敗しました: {e}")
 
     has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
     if not has_valid_obs:
@@ -913,16 +974,6 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
             f"配置先: {expected_obs_dir}\n"
             "obs64.exe が存在する状態で配置してください。"
         )
-    elif auto_fix:
-        try:
-            changed, global_ini_path = ensure_portable_obs_global_ini(current_obs_dir)
-            if changed:
-                report["changed"] = True
-                report["notes"].append(
-                    f"ポータブルOBSのトレイアイコン非表示を設定しました: {global_ini_path}"
-                )
-        except Exception as e:
-            report["warnings"].append(f"OBS global.ini の更新に失敗しました: {e}")
 
     return report
 
@@ -1580,10 +1631,11 @@ def launch_obs(config):
     # 最優先: 残存OBSを先に終了して、以降の設定更新とのレースを防ぐ。
     kill_stale_obs_processes()
 
+    bootstrapper = OBSBootstrapper(obs_dir_abs)
     try:
-        ensure_portable_mode_marker(obs_dir_abs)
+        bootstrapper.ensure_portable_mode_marker()
     except Exception as e:
-        raise RecorderError(f"portable_mode.txt の準備に失敗しました: {e}") from e
+        raise RecorderError(f"{PORTABLE_OBS_MARKER_NAME} の準備に失敗しました: {e}") from e
 
     # OBSが通常版設定(AppData)を読むのを防ぐため、隔離環境を用意する。
     isolated_root = os.path.abspath(os.path.join(obs_dir_abs, "temp_appdata"))
@@ -1594,11 +1646,10 @@ def launch_obs(config):
         os.makedirs(path, exist_ok=True)
 
     try:
-        changed_ini, global_ini_path = ensure_portable_obs_global_ini(obs_dir_abs)
+        changed_ini, global_ini_path = bootstrapper.ensure_global_ini()
         if changed_ini and global_ini_path:
             LOGGER.info("ℹ️ ポータブルOBSの global.ini を更新しました: %s", global_ini_path)
-        changed, ws_cfg_path = ensure_portable_obs_websocket_config(
-            obs_dir_abs,
+        changed, ws_cfg_path = bootstrapper.ensure_websocket_config(
             config.obs.port,
             config.obs.password,
         )
@@ -1637,11 +1688,19 @@ def launch_obs(config):
 def ensure_portable_mode_marker(base_dir):
     if not base_dir:
         raise RecorderError("OBSディレクトリが未設定です。")
-    marker = Path(base_dir) / "portable_mode.txt"
-    marker.parent.mkdir(parents=True, exist_ok=True)
-    if not marker.exists():
-        marker.write_text("", encoding="utf-8")
-    return marker
+    base_path = Path(base_dir)
+    base_path.mkdir(parents=True, exist_ok=True)
+
+    primary_marker = base_path / PORTABLE_OBS_MARKER_NAME
+    if not primary_marker.exists():
+        primary_marker.write_text("", encoding="utf-8")
+
+    # OBS本体のバージョン差異に備え、従来名のマーカーも同時に維持する。
+    legacy_marker = base_path / LEGACY_PORTABLE_OBS_MARKER_NAME
+    if not legacy_marker.exists():
+        legacy_marker.write_text("", encoding="utf-8")
+
+    return primary_marker
 
 
 def kill_stale_obs_processes():

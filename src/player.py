@@ -5,6 +5,7 @@ import time
 import re
 import shutil
 import subprocess
+import logging
 from pathlib import Path
 
 # --- 1. MPVのパス設定 ---
@@ -22,6 +23,7 @@ ICON_INDEX = None
 ICON_ALIASES = None
 DEFAULT_RECORDINGS_DIR = ROOT_DIR / "recordings"
 DEFAULT_JSON_DIR = ROOT_DIR / "recordings" / "json"
+LOGGER = logging.getLogger("lol_replay.player")
 
 
 def load_app_config():
@@ -283,9 +285,7 @@ class ClipExportWorker(QThread):
 
     ENCODER_PROFILES = [
         ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "fast", "-cq", "23"]),
-        ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "fast", "-global_quality", "23"]),
-        ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", "23", "-qp_p", "23"]),
-        ("libx264", ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]),
+        ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]),
     ]
 
     def cancel(self):
@@ -328,8 +328,10 @@ class ClipExportWorker(QThread):
                 return
 
             failures.append(f"[{encoder_name}] {detail}")
+            if encoder_name == "h264_nvenc":
+                LOGGER.warning("H.264 NVENC clip export failed. Falling back to libx264 CPU encode. %s", detail)
             if encoder_name != self.ENCODER_PROFILES[-1][0]:
-                self.progress.emit(0, f"{encoder_name} が使えないため次のエンコーダを試します...")
+                self.progress.emit(0, f"{encoder_name} が使えないためCPUエンコードへ切り替えます...")
 
         self.export_failed.emit("FFmpegの実行に失敗しました。\n" + "\n\n".join(failures[-3:]))
 

@@ -211,6 +211,7 @@ __marimo__/
 
 # 追加
 bin/
+obs-portable/
 recordings/
 logs/
 config/setting.json

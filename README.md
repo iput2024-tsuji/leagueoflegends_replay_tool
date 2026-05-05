@@ -175,6 +175,7 @@ tests/
 
 ```powershell
 pip install -r requirements.txt
+python scripts\setup_env.py
 copy config\setting.sample.json config\setting.json
 python main.py
 ```
@@ -184,6 +185,7 @@ python main.py
 - OBS は `obs-portable` に配置されたポータブル版のみ利用します
 - ユーザー環境にインストール済みの OBS は利用しません
 - 起動時に `obs-portable/obs_portable_mode.txt` と OBS の `global.ini` を自動生成・補正します
+- `scripts/setup_env.py` は `bin/ffmpeg.exe` が無い場合に gyan.dev の Windows essentials ZIP から自動取得します
 - 初回セットアップで「環境を自動修復」を実行すると、WebSocket、シーン、同期用色ソースを自動構成します
 - 音声デバイス、録画保存先、FPS、容量制限はアプリの設定画面から変更できます
 

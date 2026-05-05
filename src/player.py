@@ -4,6 +4,7 @@ import json
 import time
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 # --- 1. MPVのパス設定 ---
@@ -86,6 +87,32 @@ def resolve_video_path(json_path: Path, payload: dict, recordings_dir: Path):
             return resolved
     return None
 
+
+def find_ffmpeg_executable():
+    candidates = [
+        BIN_DIR / "ffmpeg.exe",
+        ROOT_DIR / "ffmpeg.exe",
+        shutil.which("ffmpeg"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists() or str(candidate).lower() == "ffmpeg":
+            return str(path if path.exists() else candidate)
+    return None
+
+
+def format_seconds(value):
+    try:
+        total = max(0.0, float(value))
+    except Exception:
+        total = 0.0
+    minutes, seconds = divmod(int(total), 60)
+    millis = int(round((total - int(total)) * 1000))
+    return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
+
+
 def ensure_mpv_dll(bin_dir: Path, root_dir: Path):
     candidates = []
     for base in (bin_dir, root_dir):
@@ -144,7 +171,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidget, QListWidgetItem, QPushButton,
                              QFileDialog, QLabel, QSlider, QMessageBox, QDialog,
                              QDialogButtonBox, QLineEdit, QComboBox, QCheckBox,
-                             QSizePolicy)
+                             QSizePolicy, QProgressBar)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut, QPixmap, QFont, QColor
 
@@ -246,6 +273,147 @@ class SyncWorker(QThread):
 
         cap.release()
         self.finished.emit(found_time)
+
+
+class ClipExportWorker(QThread):
+    progress = pyqtSignal(int, str)
+    export_finished = pyqtSignal(str)
+    export_failed = pyqtSignal(str)
+
+    def __init__(self, ffmpeg_path, input_path, output_path, start_sec, end_sec):
+        super().__init__()
+        self.ffmpeg_path = str(ffmpeg_path)
+        self.input_path = str(input_path)
+        self.output_path = str(output_path)
+        self.start_sec = float(start_sec)
+        self.end_sec = float(end_sec)
+        self.duration_sec = max(0.0, self.end_sec - self.start_sec)
+        self.process = None
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
+        process = self.process
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    def run(self):
+        if self.duration_sec <= 0:
+            self.export_failed.emit("クリップ範囲が不正です。終了時間は開始時間より後にしてください。")
+            return
+
+        output_parent = Path(self.output_path).parent
+        try:
+            output_parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            self.export_failed.emit(f"出力先ディレクトリを作成できません: {e}")
+            return
+
+        cmd = [
+            self.ffmpeg_path,
+            "-hide_banner",
+            "-y",
+            "-ss",
+            f"{self.start_sec:.3f}",
+            "-i",
+            self.input_path,
+            "-t",
+            f"{self.duration_sec:.3f}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-vf",
+            "fps=60",
+            "-r",
+            "60",
+            "-vsync",
+            "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            "-progress",
+            "pipe:1",
+            "-nostats",
+            self.output_path,
+        ]
+
+        self.progress.emit(0, "FFmpegでクリップを書き出しています...")
+        tail = []
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            self.process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+            )
+            if self.process.stdout:
+                for line in self.process.stdout:
+                    if self._cancel_requested:
+                        self.cancel()
+                        break
+                    line = line.strip()
+                    if line:
+                        tail.append(line)
+                        tail = tail[-12:]
+                    self._handle_progress_line(line)
+
+            return_code = self.process.wait()
+            if self._cancel_requested:
+                self.export_failed.emit("クリップ出力をキャンセルしました。")
+            elif return_code == 0:
+                self.progress.emit(100, "クリップ出力が完了しました。")
+                self.export_finished.emit(self.output_path)
+            else:
+                detail = "\n".join(tail) if tail else f"exit code: {return_code}"
+                self.export_failed.emit(f"FFmpegの実行に失敗しました。\n{detail}")
+        except FileNotFoundError:
+            self.export_failed.emit("FFmpegが見つかりません。bin/ffmpeg.exe またはPATHにffmpegを配置してください。")
+        except Exception as e:
+            self.export_failed.emit(f"クリップ出力に失敗しました: {e}")
+
+    def _handle_progress_line(self, line):
+        if not line or "=" not in line:
+            return
+        key, value = line.split("=", 1)
+        out_sec = None
+        if key in {"out_time_ms", "out_time_us"}:
+            try:
+                out_sec = float(value) / 1_000_000.0
+            except Exception:
+                out_sec = None
+        elif key == "out_time":
+            out_sec = self._parse_ffmpeg_time(value)
+
+        if out_sec is None:
+            return
+        percent = int(max(0, min(100, (out_sec / self.duration_sec) * 100)))
+        self.progress.emit(percent, f"出力中... {percent}%")
+
+    def _parse_ffmpeg_time(self, value):
+        try:
+            hours, minutes, seconds = str(value).split(":")
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        except Exception:
+            return None
 
 
 def normalize_result(result_value, team_value=None, winning_team=None):
@@ -588,6 +756,9 @@ class PlayerWidget(QWidget):
         self.events_all = []
         self.my_name = None
         self.my_name_short = None
+        self.clip_start = None
+        self.clip_end = None
+        self.clip_worker = None
 
         self.load_settings()
 
@@ -694,6 +865,44 @@ class PlayerWidget(QWidget):
         sync_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         sync_btn.clicked.connect(self.sync_to_current_position)
         right_layout.addWidget(sync_btn)
+
+        clip_title = QLabel("クリップ出力")
+        clip_title.setStyleSheet("padding: 8px 10px 0 10px; font-weight: bold; color: #ddd;")
+        right_layout.addWidget(clip_title)
+
+        clip_mark_row = QHBoxLayout()
+        clip_mark_row.setContentsMargins(8, 0, 8, 0)
+        self.clip_start_btn = QPushButton("開始時間")
+        self.clip_start_btn.setFixedHeight(28)
+        self.clip_start_btn.clicked.connect(self.mark_clip_start)
+        self.clip_end_btn = QPushButton("終了時間")
+        self.clip_end_btn.setFixedHeight(28)
+        self.clip_end_btn.clicked.connect(self.mark_clip_end)
+        clip_mark_row.addWidget(self.clip_start_btn)
+        clip_mark_row.addWidget(self.clip_end_btn)
+        right_layout.addLayout(clip_mark_row)
+
+        self.clip_label = QLabel("Start: -- / End: --")
+        self.clip_label.setWordWrap(True)
+        self.clip_label.setStyleSheet("padding: 0 10px; color: #ccc;")
+        right_layout.addWidget(self.clip_label)
+
+        self.clip_export_btn = QPushButton("クリップ出力")
+        self.clip_export_btn.setFixedHeight(30)
+        self.clip_export_btn.clicked.connect(self.export_clip)
+        right_layout.addWidget(self.clip_export_btn)
+
+        self.clip_progress = QProgressBar()
+        self.clip_progress.setRange(0, 100)
+        self.clip_progress.setValue(0)
+        self.clip_progress.setFormat("待機中")
+        self.clip_progress.setStyleSheet(
+            "QProgressBar { background-color: #202020; border: 1px solid #444; "
+            "border-radius: 4px; color: #fff; text-align: center; }"
+            "QProgressBar::chunk { background-color: #d32f2f; border-radius: 3px; }"
+        )
+        right_layout.addWidget(self.clip_progress)
+
         right_layout.addWidget(self.event_list)
 
         # レイアウト統合
@@ -881,6 +1090,11 @@ class PlayerWidget(QWidget):
             self.my_name = data.get("summoner_name", "Unknown")
             self.my_name_short = normalize_summoner_name(self.my_name)
             self.offset = None
+            self.clip_start = None
+            self.clip_end = None
+            self.update_clip_label()
+            self.clip_progress.setValue(0)
+            self.clip_progress.setFormat("待機中")
             self.event_list.setEnabled(False)
 
             self.info_label.setText(f"Player: {self.my_name}\nSyncing...")
@@ -1013,6 +1227,125 @@ class PlayerWidget(QWidget):
         self.offset = current - float(game_time)
         self.update_offset_label()
 
+    def get_current_position(self):
+        if not hasattr(self, "player"):
+            return None
+        try:
+            return float(self.player.time_pos or 0.0)
+        except Exception:
+            return None
+
+    def mark_clip_start(self):
+        current = self.get_current_position()
+        if current is None:
+            QMessageBox.warning(self, "Clip", "現在の再生位置を取得できません。")
+            return
+        self.clip_start = current
+        if self.clip_end is not None and self.clip_end <= self.clip_start:
+            self.clip_end = None
+        self.update_clip_label()
+
+    def mark_clip_end(self):
+        current = self.get_current_position()
+        if current is None:
+            QMessageBox.warning(self, "Clip", "現在の再生位置を取得できません。")
+            return
+        self.clip_end = current
+        self.update_clip_label()
+
+    def update_clip_label(self):
+        start_text = "--" if self.clip_start is None else format_seconds(self.clip_start)
+        end_text = "--" if self.clip_end is None else format_seconds(self.clip_end)
+        if self.clip_start is not None and self.clip_end is not None:
+            duration = self.clip_end - self.clip_start
+            duration_text = f" / 長さ: {format_seconds(duration)}" if duration > 0 else " / 範囲が不正"
+        else:
+            duration_text = ""
+        self.clip_label.setText(f"Start: {start_text} / End: {end_text}{duration_text}")
+
+    def export_clip(self):
+        if self.clip_worker and self.clip_worker.isRunning():
+            QMessageBox.information(self, "Clip", "クリップ出力中です。完了まで待ってください。")
+            return
+        if not self.current_video_path:
+            QMessageBox.warning(self, "Clip", "動画が読み込まれていません。")
+            return
+        if self.clip_start is None or self.clip_end is None:
+            QMessageBox.warning(self, "Clip", "開始時間と終了時間をマークしてください。")
+            return
+        if self.clip_end <= self.clip_start:
+            QMessageBox.warning(self, "Clip", "終了時間は開始時間より後にしてください。")
+            return
+
+        ffmpeg_path = find_ffmpeg_executable()
+        if not ffmpeg_path:
+            QMessageBox.critical(
+                self,
+                "FFmpeg Missing",
+                "FFmpegが見つかりません。\n"
+                "bin/ffmpeg.exe に配置するか、PATHから ffmpeg を実行できるようにしてください。",
+            )
+            return
+
+        clips_dir = Path(self.recordings_dir) / "clips"
+        clips_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(self.current_video_path).stem
+        default_name = f"{stem}_clip_{int(self.clip_start * 1000)}_{int(self.clip_end * 1000)}.mp4"
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "クリップ出力先",
+            str(clips_dir / default_name),
+            "MP4 Video (*.mp4)",
+        )
+        if not output_path:
+            return
+        output = Path(output_path)
+        if output.suffix.lower() != ".mp4":
+            output = output.with_suffix(".mp4")
+        try:
+            if output.resolve() == Path(self.current_video_path).resolve():
+                QMessageBox.warning(self, "Clip", "元動画と同じファイルには出力できません。")
+                return
+        except Exception:
+            pass
+
+        self.clip_export_btn.setEnabled(False)
+        self.clip_start_btn.setEnabled(False)
+        self.clip_end_btn.setEnabled(False)
+        self.clip_progress.setValue(0)
+        self.clip_progress.setFormat("出力準備中...")
+
+        self.clip_worker = ClipExportWorker(
+            ffmpeg_path,
+            self.current_video_path,
+            output,
+            self.clip_start,
+            self.clip_end,
+        )
+        self.clip_worker.progress.connect(self.on_clip_progress)
+        self.clip_worker.export_finished.connect(self.on_clip_export_finished)
+        self.clip_worker.export_failed.connect(self.on_clip_export_failed)
+        self.clip_worker.finished.connect(self.on_clip_worker_finished)
+        self.clip_worker.start()
+
+    def on_clip_progress(self, percent, message):
+        self.clip_progress.setValue(int(percent))
+        self.clip_progress.setFormat(message)
+
+    def on_clip_export_finished(self, output_path):
+        self.clip_progress.setValue(100)
+        self.clip_progress.setFormat("完了")
+        QMessageBox.information(self, "Clip", f"クリップを書き出しました。\n{output_path}")
+
+    def on_clip_export_failed(self, message):
+        self.clip_progress.setFormat("失敗")
+        QMessageBox.critical(self, "Clip Export Error", message)
+
+    def on_clip_worker_finished(self):
+        self.clip_export_btn.setEnabled(True)
+        self.clip_start_btn.setEnabled(True)
+        self.clip_end_btn.setEnabled(True)
+
     def add_event_item(self, text, game_time, color_hex):
         m, s = divmod(int(game_time), 60)
         item_text = f"[{m:02d}:{s:02d}] {text}"
@@ -1104,6 +1437,9 @@ class PlayerWidget(QWidget):
             self.player.seek(target, reference='absolute', precision='exact')
 
     def closeEvent(self, event):
+        if self.clip_worker and self.clip_worker.isRunning():
+            self.clip_worker.cancel()
+            self.clip_worker.wait(1000)
         if hasattr(self, 'player'):
             self.player.terminate()
         event.accept()

@@ -453,8 +453,12 @@ def get_obs_websocket_config_path(base_dir):
     return Path(base_dir) / "config" / "obs-studio" / "plugin_config" / "obs-websocket" / "config.json"
 
 
+def get_obs_config_dir(base_dir):
+    return Path(base_dir) / "config" / "obs-studio"
+
+
 def get_obs_global_ini_path(base_dir):
-    return Path(base_dir) / "config" / "obs-studio" / "global.ini"
+    return get_obs_config_dir(base_dir) / "global.ini"
 
 
 def get_obs_portable_marker_path(base_dir):
@@ -470,7 +474,13 @@ class OBSBootstrapper:
     def ensure_portable_mode_marker(self):
         return ensure_portable_mode_marker(self.base_dir)
 
+    def ensure_config_dir(self):
+        config_dir = get_obs_config_dir(self.base_dir)
+        config_dir.mkdir(parents=True, exist_ok=True)
+        return config_dir
+
     def ensure_global_ini(self):
+        self.ensure_config_dir()
         return ensure_portable_obs_global_ini(self.base_dir)
 
     def ensure_websocket_config(self, port, password):
@@ -478,12 +488,14 @@ class OBSBootstrapper:
 
     def bootstrap(self, port=None, password=""):
         marker = self.ensure_portable_mode_marker()
+        config_dir = self.ensure_config_dir()
         changed_ini, global_ini_path = self.ensure_global_ini()
         websocket_result = None
         if port is not None:
             websocket_result = self.ensure_websocket_config(port, password)
         return {
             "marker": marker,
+            "config_dir": config_dir,
             "global_ini_changed": changed_ini,
             "global_ini_path": global_ini_path,
             "websocket": websocket_result,

@@ -58,6 +58,6 @@ foreach ($dll in $bundledMpvDlls) {
   Remove-Item -Path $dll.FullName -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Build complete. Portable OBS, mpv DLLs, and game assets are not bundled."
-Write-Host "Place OBS under dist\\LoLReplayTool\\obs-portable and mpv DLLs under dist\\LoLReplayTool\\bin manually."
+Write-Host "Build complete. Portable OBS, mpv DLLs, FFmpeg, and game assets are not bundled."
+Write-Host "Place OBS under dist\\LoLReplayTool\\obs-portable, then place mpv DLLs and ffmpeg.exe under dist\\LoLReplayTool\\bin manually."
 

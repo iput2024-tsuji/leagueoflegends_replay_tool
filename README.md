@@ -147,6 +147,7 @@ assets/
   champions/icons/   # チャンピオンアイコン
 bin/
   *.dll              # 利用者が配置する mpv DLL
+  ffmpeg.exe         # 利用者が配置するクリップ出力用FFmpeg
 obs-portable/
   bin/64bit/obs64.exe # 利用者が配置するポータブル OBS
 tests/
@@ -161,11 +162,13 @@ tests/
 - Python 3.10+ 推奨
 - OBS Studio ポータブル版
 - mpv DLL
+- FFmpeg (`bin/ffmpeg.exe`)
 
 このリポジトリおよびビルド成果物には、OBS Studio 本体、mpv DLL、Riot Games の画像アセットを同梱しません。
 
 - OBS Studio は利用者が公式配布元から取得し、`obs-portable` に配置してください。
 - mpv DLL は利用者が正規の配布元から取得し、`bin/` に配置してください。
+- FFmpeg は利用者が正規の配布元から取得し、`bin/ffmpeg.exe` に配置してください。システム PATH 上の FFmpeg には依存しません。
 - チャンピオンアイコンを使う場合は、利用者が `assets/champions/icons` に配置してください。Riot Games のアセットを利用する場合は、Riot Games の規約・ポリシーに従ってください。
 
 ## セットアップ
@@ -230,6 +233,7 @@ dist\LoLReplayTool\
 - `config/setting.json` は初回起動時に自動生成されます
 - OBS Studio 本体はビルド成果物へコピーされません
 - mpv DLL はビルド成果物へコピーされません
+- FFmpeg はビルド成果物へコピーされません
 - チャンピオンアイコンはビルド成果物へコピーされません
 - `assets/app/app.ico` が存在する場合、exe アイコンとウィンドウアイコンに反映されます
 
@@ -239,6 +243,8 @@ dist\LoLReplayTool\
   - `obs-portable/bin/64bit/obs64.exe` が存在するように配置してください。
 - `mpv DLL が見つかりません`
   - `bin/` に `mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll` のいずれかを配置してください。
+- `FFmpegが見つかりません`
+  - `bin/ffmpeg.exe` を配置してください。クリップ出力はシステム PATH の FFmpeg を使用しません。
 - イベントが表示されない
   - JSON の `events` / `events_all` を確認してください。
 - 分析結果が表示されない

@@ -132,9 +132,12 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
 
     result = recordtest.OBSBootstrapper(obs_dir).bootstrap()
     global_ini = result["global_ini_path"]
+    config_dir = result["config_dir"]
 
     assert (obs_dir / "obs_portable_mode.txt").exists()
     assert (obs_dir / "portable_mode.txt").exists()
+    assert config_dir == (obs_dir / "config" / "obs-studio").resolve()
+    assert config_dir.exists()
     assert global_ini.exists()
 
     text = global_ini.read_text(encoding="utf-8")

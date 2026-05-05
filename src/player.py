@@ -89,18 +89,8 @@ def resolve_video_path(json_path: Path, payload: dict, recordings_dir: Path):
 
 
 def find_ffmpeg_executable():
-    candidates = [
-        BIN_DIR / "ffmpeg.exe",
-        ROOT_DIR / "ffmpeg.exe",
-        shutil.which("ffmpeg"),
-    ]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        path = Path(candidate)
-        if path.exists() or str(candidate).lower() == "ffmpeg":
-            return str(path if path.exists() else candidate)
-    return None
+    ffmpeg_path = BIN_DIR / "ffmpeg.exe"
+    return str(ffmpeg_path) if ffmpeg_path.exists() else None
 
 
 def format_seconds(value):
@@ -291,6 +281,13 @@ class ClipExportWorker(QThread):
         self.process = None
         self._cancel_requested = False
 
+    ENCODER_PROFILES = [
+        ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "fast", "-cq", "23"]),
+        ("h264_qsv", ["-c:v", "h264_qsv", "-preset", "fast", "-global_quality", "23"]),
+        ("h264_amf", ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", "23", "-qp_p", "23"]),
+        ("libx264", ["-c:v", "libx264", "-preset", "fast", "-crf", "20"]),
+    ]
+
     def cancel(self):
         self._cancel_requested = True
         process = self.process
@@ -312,7 +309,32 @@ class ClipExportWorker(QThread):
             self.export_failed.emit(f"出力先ディレクトリを作成できません: {e}")
             return
 
-        cmd = [
+        failures = []
+        for encoder_name, encoder_args in self.ENCODER_PROFILES:
+            if self._cancel_requested:
+                self.export_failed.emit("クリップ出力をキャンセルしました。")
+                return
+
+            try:
+                Path(self.output_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            self.progress.emit(0, f"{encoder_name} でクリップを書き出しています...")
+            ok, detail = self._run_ffmpeg_with_encoder(encoder_name, encoder_args)
+            if ok:
+                self.progress.emit(100, "クリップ出力が完了しました。")
+                self.export_finished.emit(self.output_path)
+                return
+
+            failures.append(f"[{encoder_name}] {detail}")
+            if encoder_name != self.ENCODER_PROFILES[-1][0]:
+                self.progress.emit(0, f"{encoder_name} が使えないため次のエンコーダを試します...")
+
+        self.export_failed.emit("FFmpegの実行に失敗しました。\n" + "\n\n".join(failures[-3:]))
+
+    def _build_ffmpeg_command(self, encoder_args):
+        return [
             self.ffmpeg_path,
             "-hide_banner",
             "-y",
@@ -330,18 +352,15 @@ class ClipExportWorker(QThread):
             "fps=60",
             "-r",
             "60",
-            "-vsync",
-            "1",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "fast",
-            "-crf",
-            "20",
+            "-fps_mode",
+            "cfr",
+            *encoder_args,
             "-pix_fmt",
             "yuv420p",
             "-c:a",
             "aac",
+            "-ar",
+            "48000",
             "-b:a",
             "192k",
             "-movflags",
@@ -352,7 +371,8 @@ class ClipExportWorker(QThread):
             self.output_path,
         ]
 
-        self.progress.emit(0, "FFmpegでクリップを書き出しています...")
+    def _run_ffmpeg_with_encoder(self, encoder_name, encoder_args):
+        cmd = self._build_ffmpeg_command(encoder_args)
         tail = []
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -374,23 +394,20 @@ class ClipExportWorker(QThread):
                     if line:
                         tail.append(line)
                         tail = tail[-12:]
-                    self._handle_progress_line(line)
+                    self._handle_progress_line(line, encoder_name)
 
             return_code = self.process.wait()
             if self._cancel_requested:
-                self.export_failed.emit("クリップ出力をキャンセルしました。")
-            elif return_code == 0:
-                self.progress.emit(100, "クリップ出力が完了しました。")
-                self.export_finished.emit(self.output_path)
-            else:
-                detail = "\n".join(tail) if tail else f"exit code: {return_code}"
-                self.export_failed.emit(f"FFmpegの実行に失敗しました。\n{detail}")
+                return False, "キャンセルされました。"
+            if return_code == 0:
+                return True, ""
+            return False, "\n".join(tail) if tail else f"exit code: {return_code}"
         except FileNotFoundError:
-            self.export_failed.emit("FFmpegが見つかりません。bin/ffmpeg.exe またはPATHにffmpegを配置してください。")
+            return False, "FFmpegが見つかりません。bin/ffmpeg.exe を配置してください。"
         except Exception as e:
-            self.export_failed.emit(f"クリップ出力に失敗しました: {e}")
+            return False, str(e)
 
-    def _handle_progress_line(self, line):
+    def _handle_progress_line(self, line, encoder_name):
         if not line or "=" not in line:
             return
         key, value = line.split("=", 1)
@@ -406,7 +423,7 @@ class ClipExportWorker(QThread):
         if out_sec is None:
             return
         percent = int(max(0, min(100, (out_sec / self.duration_sec) * 100)))
-        self.progress.emit(percent, f"出力中... {percent}%")
+        self.progress.emit(percent, f"出力中... {percent}% ({encoder_name})")
 
     def _parse_ffmpeg_time(self, value):
         try:
@@ -1283,7 +1300,8 @@ class PlayerWidget(QWidget):
                 self,
                 "FFmpeg Missing",
                 "FFmpegが見つかりません。\n"
-                "bin/ffmpeg.exe に配置するか、PATHから ffmpeg を実行できるようにしてください。",
+                f"{BIN_DIR / 'ffmpeg.exe'} に配置してください。\n"
+                "システムPATH上のffmpegは使用しません。",
             )
             return
 

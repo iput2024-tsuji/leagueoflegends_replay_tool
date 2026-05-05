@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QHeaderView,
     QFrame,
+    QProgressDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QIcon, QAction
@@ -206,6 +207,76 @@ class AnalyticsWorker(QThread):
             self.loaded.emit(ANALYTICS_CONTROLLER.load_summary())
         except Exception as e:
             self.error.emit(f"{type(e).__name__}: {e}")
+
+
+class EnvironmentSetupWorker(QThread):
+    progress = pyqtSignal(int, str)
+    completed = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def run(self):
+        try:
+            from scripts import setup_env
+
+            setup_env.run_setup(lambda percent, message: self.progress.emit(percent, message))
+            self.completed.emit()
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+def run_environment_bootstrap(parent=None):
+    try:
+        from scripts import setup_env
+    except Exception as e:
+        QMessageBox.critical(parent, "環境構築エラー", f"セットアップモジュールを読み込めません。\n{e}")
+        return False
+
+    if setup_env.is_environment_ready():
+        return True
+
+    dialog = QProgressDialog("初回環境を構築しています...", None, 0, 100, parent)
+    dialog.setWindowTitle("初回セットアップ")
+    dialog.setCancelButton(None)
+    dialog.setAutoClose(False)
+    dialog.setAutoReset(False)
+    dialog.setMinimumDuration(0)
+    dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+    dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+    dialog.setValue(0)
+
+    worker = EnvironmentSetupWorker()
+    result = {"ok": False, "error": None}
+
+    def on_progress(percent, message):
+        dialog.setValue(int(percent))
+        dialog.setLabelText(str(message))
+
+    def on_completed():
+        result["ok"] = True
+        dialog.setValue(100)
+        dialog.close()
+
+    def on_failed(message):
+        result["error"] = message
+        dialog.close()
+
+    worker.progress.connect(on_progress)
+    worker.completed.connect(on_completed)
+    worker.failed.connect(on_failed)
+    worker.start()
+    dialog.exec()
+    worker.wait()
+
+    if result["ok"]:
+        return True
+
+    QMessageBox.critical(
+        parent,
+        "環境構築エラー",
+        "必要な実行ファイルの自動セットアップに失敗しました。\n\n"
+        f"{result.get('error') or 'unknown error'}",
+    )
+    return False
 
 
 class SetupWizardDialog(QDialog):
@@ -1440,6 +1511,8 @@ def main():
     icon = get_app_icon()
     if icon:
         app.setWindowIcon(icon)
+    if not run_environment_bootstrap():
+        return
     app.setStyleSheet("""
         QWidget { background-color: #1e1e1e; color: #e0e0e0; }
         QLabel { color: #e0e0e0; }

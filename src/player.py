@@ -269,6 +269,7 @@ class SyncWorker(QThread):
 
 class ClipExportWorker(QThread):
     progress = pyqtSignal(int, str)
+    warning = pyqtSignal(str)
     export_finished = pyqtSignal(str)
     export_failed = pyqtSignal(str)
 
@@ -329,7 +330,9 @@ class ClipExportWorker(QThread):
 
             failures.append(f"[{encoder_name}] {detail}")
             if encoder_name == "h264_nvenc":
-                LOGGER.warning("H.264 NVENC clip export failed. Falling back to libx264 CPU encode. %s", detail)
+                message = "H.264 NVENC が使えないため、CPUエンコード(libx264)へ切り替えます。"
+                LOGGER.warning("%s %s", message, detail)
+                self.warning.emit(message)
             if encoder_name != self.ENCODER_PROFILES[-1][0]:
                 self.progress.emit(0, f"{encoder_name} が使えないためCPUエンコードへ切り替えます...")
 
@@ -1343,6 +1346,7 @@ class PlayerWidget(QWidget):
             self.clip_end,
         )
         self.clip_worker.progress.connect(self.on_clip_progress)
+        self.clip_worker.warning.connect(self.on_clip_warning)
         self.clip_worker.export_finished.connect(self.on_clip_export_finished)
         self.clip_worker.export_failed.connect(self.on_clip_export_failed)
         self.clip_worker.finished.connect(self.on_clip_worker_finished)
@@ -1351,6 +1355,10 @@ class PlayerWidget(QWidget):
     def on_clip_progress(self, percent, message):
         self.clip_progress.setValue(int(percent))
         self.clip_progress.setFormat(message)
+
+    def on_clip_warning(self, message):
+        self.clip_progress.setFormat(message)
+        self.info_label.setText(message)
 
     def on_clip_export_finished(self, output_path):
         self.clip_progress.setValue(100)

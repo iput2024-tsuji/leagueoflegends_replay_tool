@@ -59,6 +59,6 @@ foreach ($dll in $bundledMpvDlls) {
 }
 
 Write-Host "Build complete. Portable OBS, mpv DLLs, FFmpeg, and game assets are not bundled."
-Write-Host "Place OBS under dist\\LoLReplayTool\\obs-portable, then place mpv DLLs and ffmpeg.exe under dist\\LoLReplayTool\\bin manually."
-Write-Host "For local development, run: python scripts\\setup_env.py"
+Write-Host "OBS and FFmpeg are downloaded automatically on first launch with pinned SHA256 verification."
+Write-Host "Place mpv DLLs under dist\\LoLReplayTool\\bin manually."
 

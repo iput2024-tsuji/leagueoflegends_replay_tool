@@ -166,16 +166,15 @@ tests/
 
 このリポジトリおよびビルド成果物には、OBS Studio 本体、mpv DLL、Riot Games の画像アセットを同梱しません。
 
-- OBS Studio は利用者が公式配布元から取得し、`obs-portable` に配置してください。
+- OBS Studio は初回起動時に固定バージョンを自動取得し、`obs-portable` に配置します。
 - mpv DLL は利用者が正規の配布元から取得し、`bin/` に配置してください。
-- FFmpeg は利用者が正規の配布元から取得し、`bin/ffmpeg.exe` に配置してください。システム PATH 上の FFmpeg には依存しません。
+- FFmpeg は初回起動時に固定バージョンを自動取得し、`bin/ffmpeg.exe` に配置します。システム PATH 上の FFmpeg には依存しません。
 - チャンピオンアイコンを使う場合は、利用者が `assets/champions/icons` に配置してください。Riot Games のアセットを利用する場合は、Riot Games の規約・ポリシーに従ってください。
 
 ## セットアップ
 
 ```powershell
 pip install -r requirements.txt
-python scripts\setup_env.py
 copy config\setting.sample.json config\setting.json
 python main.py
 ```
@@ -184,8 +183,9 @@ python main.py
 
 - OBS は `obs-portable` に配置されたポータブル版のみ利用します
 - ユーザー環境にインストール済みの OBS は利用しません
+- 初回起動時、メインウィンドウ表示前にGUIブートストラッパーがFFmpeg/OBSを自動取得します
+- ダウンロード対象は固定バージョンで、SHA256ハッシュ検証に失敗したファイルは展開しません
 - 起動時に `obs-portable/obs_portable_mode.txt` と OBS の `global.ini` を自動生成・補正します
-- `scripts/setup_env.py` は `bin/ffmpeg.exe` が無い場合に gyan.dev の Windows essentials ZIP から自動取得します
 - 初回セットアップで「環境を自動修復」を実行すると、WebSocket、シーン、同期用色ソースを自動構成します
 - 音声デバイス、録画保存先、FPS、容量制限はアプリの設定画面から変更できます
 

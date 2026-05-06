@@ -2,54 +2,55 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QPushButton,
-    QLabel,
-    QStackedWidget,
-    QFormLayout,
-    QLineEdit,
+    QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
-    QMessageBox,
-    QComboBox,
-    QCheckBox,
-    QTabWidget,
-    QSlider,
-    QSystemTrayIcon,
-    QMenu,
-    QStyle,
     QFileDialog,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
     QProgressBar,
+    QProgressDialog,
+    QPushButton,
+    QSlider,
+    QStackedWidget,
+    QStyle,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
-    QHeaderView,
-    QFrame,
-    QProgressDialog,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QIcon, QAction
 
 try:
     from . import recordtest
+    from .app_paths import get_app_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController, RecordingController
     from .player import PlayerWidget
-    from .app_paths import get_app_root
 except ImportError:
     SRC_DIR = Path(__file__).resolve().parent
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
     import recordtest
+    from app_paths import get_app_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController, RecordingController
     from player import PlayerWidget
-    from app_paths import get_app_root
 
 
 ROOT_DIR = get_app_root()

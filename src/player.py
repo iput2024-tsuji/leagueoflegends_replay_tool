@@ -1,15 +1,41 @@
 from __future__ import annotations
 
-import sys
-import os
 import json
-import time
+import logging
+import os
 import re
 import shutil
 import subprocess
-import logging
+import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+import cv2
+import numpy as np
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QSizePolicy,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
 
 # --- 1. MPVのパス設定 ---
 try:
@@ -33,7 +59,7 @@ def load_app_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         return {}
     try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             return data
@@ -158,17 +184,6 @@ try:
 except Exception as e:
     mpv_module = None
     MPV_IMPORT_ERROR = e
-
-# --- 3. PyQt & その他ライブラリ ---
-import cv2
-import numpy as np
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                             QHBoxLayout, QListWidget, QListWidgetItem, QPushButton,
-                             QFileDialog, QLabel, QSlider, QMessageBox, QDialog,
-                             QDialogButtonBox, QLineEdit, QComboBox, QCheckBox,
-                             QSizePolicy, QProgressBar)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QShortcut, QPixmap, QFont, QColor
 
 
 def show_mpv_missing_dialog_and_exit(parent: QWidget | None = None) -> None:
@@ -502,7 +517,7 @@ def load_icon_aliases() -> None:
     if not ALIASES_PATH.exists():
         return
     try:
-        with open(ALIASES_PATH, "r", encoding="utf-8") as f:
+        with open(ALIASES_PATH, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             ICON_ALIASES = data
@@ -646,7 +661,7 @@ class ReplaySelectDialog(QDialog):
             "video_path": None,
         }
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             meta["champion_name"] = data.get("champion_name") or data.get("player_champion") or "Unknown"
             meta["summoner"] = data.get("summoner_name") or "Unknown"
@@ -1100,7 +1115,7 @@ class PlayerWidget(QWidget):
     def load_data(self, json_path: str | Path) -> bool:
         json_path = Path(json_path)
         try:
-            with open(json_path, 'r', encoding='utf-8') as f:
+            with open(json_path, encoding='utf-8') as f:
                 data = json.load(f)
 
             video_path = resolve_video_path(json_path, data, self.recordings_dir)
@@ -1444,7 +1459,8 @@ class PlayerWidget(QWidget):
         self.play_btn.setText("Play")
 
     def on_time_update(self, name: str, time_pos: float | None) -> None:
-        if time_pos is None: return
+        if time_pos is None:
+            return
         if not self.is_slider_pressed and self.duration > 0:
             val = int((time_pos / self.duration) * 1000)
             self.slider.setValue(val)
@@ -1454,7 +1470,8 @@ class PlayerWidget(QWidget):
         self.time_label.setText(f"{cm:02d}:{cs:02d} / {dm:02d}:{ds:02d}")
 
     def on_duration_update(self, name: str, duration: float | None) -> None:
-        if duration: self.duration = duration
+        if duration:
+            self.duration = duration
 
     def on_slider_pressed(self) -> None:
         self.is_slider_pressed = True

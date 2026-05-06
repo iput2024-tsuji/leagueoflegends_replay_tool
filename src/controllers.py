@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 try:
     from . import recordtest
@@ -125,7 +125,7 @@ class ConfigController:
             else:
                 CONFIG_PATH.write_text(json.dumps({}, indent=4), encoding="utf-8")
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            with open(CONFIG_PATH, encoding="utf-8") as f:
                 data = json.load(f)
         except Exception:
             data = {}

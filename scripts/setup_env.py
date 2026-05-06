@@ -13,10 +13,9 @@ import sys
 import tempfile
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
-
 
 ProgressCallback = Callable[[int, str], None]
 

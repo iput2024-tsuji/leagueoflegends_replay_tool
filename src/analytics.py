@@ -222,7 +222,7 @@ class GameDataAnalyzer:
 
     def _read_payload(self, path: Path) -> dict[str, Any] | None:
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else None
         except Exception:

@@ -1,23 +1,25 @@
 from __future__ import annotations
 
+import asyncio
+import configparser
+import json
+import logging
 import os
+import subprocess
 import sys
 import time
-import json
-import subprocess
-import configparser
-import asyncio
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
-import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import aiohttp
-import urllib3
 import obsws_python as obs
+import urllib3
 from obsws_python.error import OBSSDKRequestError
+
 try:
     from .app_paths import get_app_root
 except ImportError:
@@ -579,7 +581,7 @@ def ensure_portable_obs_websocket_config(base_dir: str | Path, port: int, passwo
     data = {}
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
+            with open(config_path, encoding="utf-8") as f:
                 loaded = json.load(f)
             if isinstance(loaded, dict):
                 data = loaded
@@ -1482,7 +1484,7 @@ def load_settings() -> dict[str, Any]:
             f"雛形: {SAMPLE_CONFIG_PATH}\n"
             "雛形をコピーして setting.json を作成してください。"
         )
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    with open(CONFIG_PATH, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -1574,7 +1576,7 @@ def load_json_metadata(path: str | Path, config: AppConfig | None = None) -> tup
     path = Path(path)
     config = config or load_app_config()
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         saved_at = parse_saved_at(data.get("saved_at"))
         video_path = data.get("obs_record_path")
@@ -2255,7 +2257,6 @@ class LoLAutoRecorder(RecordingSessionManager):
         if not events:
             return
         for event in events:
-            name = event.get("EventName")
             if not self.is_game_end_event(event):
                 continue
             result_value = event.get("Result") or event.get("result") or event.get("GameResult") or event.get("gameResult")
@@ -2371,7 +2372,6 @@ class LoLAutoRecorder(RecordingSessionManager):
             elif event_name in COMBAT_EVENTS and self.my_name:
                 killer = event.get("KillerName")
                 victim = event.get("VictimName")
-                assisters = event.get("Assisters", [])
 
                 # 自分が関与したキル or デスのみ
                 is_involved = (

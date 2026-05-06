@@ -3,6 +3,17 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location (Join-Path $scriptDir "..")
 
+$venvPython = Join-Path (Get-Location) "venv\Scripts\python.exe"
+$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+$pythonExe = if (Test-Path $venvPython) { $venvPython } elseif ($pythonCmd) { $pythonCmd.Source } else { $null }
+$makeIconScript = "scripts\make_icon.py"
+if ($pythonExe -and (Test-Path $makeIconScript)) {
+  & $pythonExe $makeIconScript
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
+}
+
 $pyArgs = @(
   "-y",
   "--noconsole",
@@ -14,12 +25,13 @@ $pyArgs = @(
   "--add-data", "config\\champion_aliases.json;config"
 )
 
-$iconPath = "assets\\app\\app.ico"
-if (Test-Path $iconPath) {
-  $pyArgs += "--icon"
-  $pyArgs += $iconPath
+$iconCandidates = @("assets\\icon.ico", "assets\\app\\app.ico")
+$iconPath = $iconCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($iconPath -and (Test-Path $iconPath)) {
+  $pyArgs += "--icon=$iconPath"
+  $iconDest = if ($iconPath -eq "assets\\icon.ico") { "assets" } else { "assets\\app" }
   $pyArgs += "--add-data"
-  $pyArgs += "$iconPath;assets\\app"
+  $pyArgs += "$iconPath;$iconDest"
 }
 
 $pyArgs += "main.py"

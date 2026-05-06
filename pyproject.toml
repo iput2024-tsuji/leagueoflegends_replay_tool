@@ -32,3 +32,7 @@ skip-magic-trailing-comma = false
 [tool.ruff.lint.isort]
 combine-as-imports = true
 known-first-party = ["src", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = ["_tmp", ".git", ".ruff_cache", ".pytest_cache", "build", "dist"]

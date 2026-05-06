@@ -1,0 +1,44 @@
+import shutil
+import zipfile
+from pathlib import Path
+
+from scripts import setup_env
+
+
+def runtime_dir(name):
+    path = Path("tests") / "_tmp" / name
+    shutil.rmtree(path, ignore_errors=True)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_extract_obs_flattens_top_level_zip_directory():
+    tmp_path = runtime_dir("setup_env_obs_extract")
+    zip_path = tmp_path / "obs.zip"
+    dest = tmp_path / "obs-portable"
+
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("OBS-Studio-Portable/bin/64bit/obs64.exe", "fake")
+        archive.writestr("OBS-Studio-Portable/data/obs-plugins/plugin.txt", "plugin")
+
+    setup_env._extract_obs(zip_path, dest)
+
+    assert (dest / "bin" / "64bit" / "obs64.exe").exists()
+    assert (dest / "data" / "obs-plugins" / "plugin.txt").exists()
+    assert not (dest / "OBS-Studio-Portable" / "bin" / "64bit" / "obs64.exe").exists()
+
+
+def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings():
+    obs_dir = runtime_dir("setup_env_obs_bootstrap") / "obs-portable"
+
+    setup_env.bootstrap_obs_portable_config(obs_dir)
+
+    global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
+    text = global_ini.read_text(encoding="utf-8")
+
+    assert (obs_dir / "obs_portable_mode.txt").exists()
+    assert "[General]" in text
+    assert "[BasicWindow]" in text
+    assert "SysTrayEnabled=false" in text
+    assert "SysTrayWhenStarted=false" in text
+    assert "SysTrayMinimizeToTray=false" in text

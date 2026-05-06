@@ -55,6 +55,7 @@ except ImportError:
 
 ROOT_DIR = get_app_root()
 APP_ICON_CANDIDATES = [
+    ROOT_DIR / "assets" / "icon.ico",
     ROOT_DIR / "assets" / "app" / "app.ico",
     ROOT_DIR / "assets" / "app" / "app.png",
 ]
@@ -228,6 +229,22 @@ class EnvironmentSetupWorker(QThread):
 
             setup_env.run_setup(lambda percent, message: self.progress.emit(percent, message))
             self.completed.emit()
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class AudioDeviceRefreshWorker(QThread):
+    loaded = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, data: dict[str, Any], auto_launch: bool) -> None:
+        super().__init__()
+        self.data = data
+        self.auto_launch = auto_launch
+
+    def run(self) -> None:
+        try:
+            self.loaded.emit(AUDIO_CONTROLLER.refresh_audio_devices(self.data, auto_launch=self.auto_launch))
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
@@ -710,6 +727,9 @@ class SettingsPage(QWidget):
         self._audio_ui_loading = False
         self._audio_refresh_in_progress = False
         self._audio_auto_refreshed_once = False
+        self._audio_refresh_worker = None
+        self._audio_refresh_show_message = False
+        self._audio_refresh_show_error = True
         self._audio_apply_timer = QTimer(self)
         self._audio_apply_timer.setSingleShot(True)
         self._audio_apply_timer.timeout.connect(self._apply_audio_settings_auto)
@@ -813,6 +833,10 @@ class SettingsPage(QWidget):
         self.audio_mic_mute = QCheckBox("ミュート")
 
         audio_form.addRow(QLabel("OBSを開かずに、デスクトップ音声/マイクをこの画面で設定します。"))
+        self.audio_status_label = QLabel("音声デバイスは設定画面表示後にバックグラウンドで取得します。")
+        self.audio_status_label.setWordWrap(True)
+        self.audio_status_label.setStyleSheet("color: #a8a8a8;")
+        audio_form.addRow(self.audio_status_label)
         audio_form.addRow("デスクトップ音声デバイス", self.audio_desktop_device)
         audio_form.addRow("デスクトップ音量 (dB)", self.audio_desktop_volume_row)
         audio_form.addRow("", self.audio_desktop_mute)
@@ -859,9 +883,6 @@ class SettingsPage(QWidget):
         self.audio_mic_mute.stateChanged.connect(self.queue_audio_auto_apply)
 
         self.load_settings()
-        QTimer.singleShot(
-            0, lambda: self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
-        )
 
     def _create_db_slider(self) -> tuple[QWidget, QSlider, QLabel]:
         row = QWidget()
@@ -1155,37 +1176,73 @@ class SettingsPage(QWidget):
     def _apply_audio_settings_auto(self) -> None:
         self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=False)
 
+    def _set_audio_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.audio_desktop_device,
+            self.audio_desktop_volume,
+            self.audio_desktop_mute,
+            self.audio_mic_device,
+            self.audio_mic_volume,
+            self.audio_mic_mute,
+        ):
+            widget.setEnabled(enabled)
+
     def refresh_audio_devices(
         self, show_message: bool = True, show_error: bool = True, auto_launch: bool = True
     ) -> bool:
         if self._audio_refresh_in_progress:
             return False
-        self._audio_refresh_in_progress = True
         try:
             data = self._collect_settings_data_from_ui()
-            result = AUDIO_CONTROLLER.refresh_audio_devices(data, auto_launch=auto_launch)
-            cfg = result["config"]
-            catalog = result["catalog"]
-            for key in ("desktop", "mic"):
-                self.audio_device_cache[key] = list(catalog.get(key, []))
-            self._audio_ui_loading = True
-            self._set_audio_ui_from_config("desktop", cfg.get("audio", {}).get("desktop", {}))
-            self._set_audio_ui_from_config("mic", cfg.get("audio", {}).get("mic", {}))
-            self._audio_ui_loading = False
-            save_config(cfg)
-            if show_message:
-                msg = "OBSが認識している音声デバイス一覧を更新しました。"
-                if result.get("obs_launched"):
-                    msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
-                QMessageBox.information(self, "音声デバイス一覧", msg)
-            return True
         except Exception as e:
-            self._audio_ui_loading = False
             if show_error:
-                QMessageBox.warning(self, "音声デバイス一覧", f"取得に失敗しました。\n{e}")
+                QMessageBox.warning(self, "音声デバイス一覧", f"取得準備に失敗しました。\n{e}")
             return False
-        finally:
-            self._audio_refresh_in_progress = False
+
+        self._audio_refresh_in_progress = True
+        self._audio_refresh_show_message = show_message
+        self._audio_refresh_show_error = show_error
+        self.audio_status_label.setText("音声デバイス一覧を読み込み中...")
+        self._set_audio_controls_enabled(False)
+
+        worker = AudioDeviceRefreshWorker(data, auto_launch=auto_launch)
+        self._audio_refresh_worker = worker
+        worker.loaded.connect(self._on_audio_devices_loaded)
+        worker.failed.connect(self._on_audio_devices_failed)
+        worker.finished.connect(self._on_audio_refresh_finished)
+        worker.start()
+        return True
+
+    def _on_audio_devices_loaded(self, result: dict[str, Any]) -> None:
+        cfg = result["config"]
+        catalog = result["catalog"]
+        for key in ("desktop", "mic"):
+            self.audio_device_cache[key] = list(catalog.get(key, []))
+        self._audio_ui_loading = True
+        self._set_audio_ui_from_config("desktop", cfg.get("audio", {}).get("desktop", {}))
+        self._set_audio_ui_from_config("mic", cfg.get("audio", {}).get("mic", {}))
+        self._audio_ui_loading = False
+        save_config(cfg)
+
+        msg = "OBSが認識している音声デバイス一覧を更新しました。"
+        if result.get("obs_launched"):
+            msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
+        self.audio_status_label.setText(msg)
+        if self._audio_refresh_show_message:
+            QMessageBox.information(self, "音声デバイス一覧", msg)
+
+    def _on_audio_devices_failed(self, message: str) -> None:
+        self._audio_ui_loading = False
+        self.audio_status_label.setText(f"音声デバイス一覧の取得に失敗しました: {message}")
+        if self._audio_refresh_show_error:
+            QMessageBox.warning(self, "音声デバイス一覧", f"取得に失敗しました。\n{message}")
+
+    def _on_audio_refresh_finished(self) -> None:
+        self._audio_refresh_in_progress = False
+        self._set_audio_controls_enabled(True)
+        if self._audio_refresh_worker:
+            self._audio_refresh_worker.deleteLater()
+            self._audio_refresh_worker = None
 
     def apply_audio_settings_to_obs(
         self, show_success: bool = True, show_error: bool = True, auto_launch: bool = True

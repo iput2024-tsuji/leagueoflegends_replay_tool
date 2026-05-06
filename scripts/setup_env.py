@@ -7,13 +7,15 @@ verifies SHA256 checksums, and places the runtime files where the app expects.
 from __future__ import annotations
 
 import asyncio
+import configparser
 import hashlib
 import shutil
 import sys
-import tempfile
 import urllib.request
+import uuid
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,6 +79,18 @@ def is_environment_ready() -> bool:
     return FFMPEG_EXE.exists() and OBS_EXE.exists()
 
 
+@contextmanager
+def temporary_workspace(prefix: str, parent: Path | None = None) -> Iterator[Path]:
+    base_dir = parent or (ROOT_DIR / "downloads" / "_tmp")
+    base_dir.mkdir(parents=True, exist_ok=True)
+    workspace = base_dir / f"{prefix}{uuid.uuid4().hex}"
+    workspace.mkdir(parents=True, exist_ok=False)
+    try:
+        yield workspace
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
 def _download(package: BinaryPackage, dest: Path, progress_cb: ProgressCallback | None = None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(package.url, headers={"User-Agent": "LoLReplayTool-setup/1.0"})
@@ -125,10 +139,34 @@ def _extract_ffmpeg(zip_path: Path, dest: Path) -> Path:
     return dest
 
 
+def _copy_tree_contents(src_dir: Path, dest_dir: Path) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for item in src_dir.iterdir():
+        target = dest_dir / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, target)
+
+
+def _find_obs_root(extract_dir: Path) -> Path:
+    matches = list(extract_dir.rglob("bin/64bit/obs64.exe"))
+    if not matches:
+        raise RuntimeError("obs64.exe was not found inside the downloaded ZIP.")
+    # obs64.exe -> 64bit -> bin -> OBS root
+    return matches[0].parents[2]
+
+
 def _extract_obs(zip_path: Path, dest_dir: Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as archive:
-        archive.extractall(dest_dir)
+    # Extract next to the destination so security policies on %TEMP% do not
+    # block executable-looking files during test/build setup.
+    with temporary_workspace("lol-replay-obs-extract-", parent=dest_dir.parent) as extract_dir:
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(extract_dir)
+        obs_root = _find_obs_root(extract_dir)
+        _copy_tree_contents(obs_root, dest_dir)
+
     obs_exe = dest_dir / "bin" / "64bit" / "obs64.exe"
     if not obs_exe.exists():
         raise RuntimeError(f"obs64.exe was not found after extraction: {obs_exe}")
@@ -146,34 +184,27 @@ def bootstrap_obs_portable_config(obs_dir: Path = OBS_PORTABLE_DIR) -> None:
     obs_config_dir = obs_dir / "config" / "obs-studio"
     obs_config_dir.mkdir(parents=True, exist_ok=True)
     global_ini = obs_config_dir / "global.ini"
-    text = global_ini.read_text(encoding="utf-8-sig", errors="replace") if global_ini.exists() else ""
-    if "[BasicWindow]" not in text:
-        text = (text.rstrip() + "\n\n[BasicWindow]\n").lstrip()
+    parser = configparser.ConfigParser(strict=False)
+    parser.optionxform = str
+    if global_ini.exists():
+        parser.read(global_ini, encoding="utf-8-sig")
 
-    desired = {
+    for section in ("General", "BasicWindow"):
+        if not parser.has_section(section):
+            parser.add_section(section)
+
+    tray_settings = {
         "SysTrayEnabled": "false",
         "SysTrayWhenStarted": "false",
         "SysTrayMinimizeToTray": "false",
         "HideTrayIcon": "true",
     }
-    lines = []
-    in_basic = False
-    inserted = False
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            if in_basic and not inserted:
-                lines.extend(f"{key}={value}" for key, value in desired.items())
-                inserted = True
-            in_basic = stripped.lower() == "[basicwindow]"
-            lines.append(line)
-            continue
-        if in_basic and ("systray" in stripped.lower() or "hidetray" in stripped.lower()):
-            continue
-        lines.append(line)
-    if in_basic and not inserted:
-        lines.extend(f"{key}={value}" for key, value in desired.items())
-    global_ini.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    for section in ("General", "BasicWindow"):
+        for key, value in tray_settings.items():
+            parser.set(section, key, value)
+
+    with open(global_ini, "w", encoding="utf-8") as f:
+        parser.write(f, space_around_delimiters=False)
 
 
 async def ensure_ffmpeg(progress_cb: ProgressCallback | None = None) -> Path:
@@ -181,8 +212,8 @@ async def ensure_ffmpeg(progress_cb: ProgressCallback | None = None) -> Path:
         report(progress_cb, FFMPEG_PACKAGE.progress_end, f"FFmpeg exists: {FFMPEG_EXE}")
         return FFMPEG_EXE
 
-    with tempfile.TemporaryDirectory(prefix="lol-replay-ffmpeg-") as tmp:
-        zip_path = Path(tmp) / FFMPEG_PACKAGE.archive_name
+    with temporary_workspace("lol-replay-ffmpeg-") as tmp:
+        zip_path = tmp / FFMPEG_PACKAGE.archive_name
         report(progress_cb, FFMPEG_PACKAGE.progress_start, "FFmpegを準備しています...")
         await download_file(FFMPEG_PACKAGE, zip_path, progress_cb)
         report(progress_cb, FFMPEG_PACKAGE.progress_end, "FFmpegのSHA256を検証しています...")
@@ -199,8 +230,8 @@ async def ensure_obs_portable(progress_cb: ProgressCallback | None = None) -> Pa
         report(progress_cb, OBS_PACKAGE.progress_end, f"OBS exists: {OBS_EXE}")
         return OBS_PORTABLE_DIR
 
-    with tempfile.TemporaryDirectory(prefix="lol-replay-obs-") as tmp:
-        zip_path = Path(tmp) / OBS_PACKAGE.archive_name
+    with temporary_workspace("lol-replay-obs-") as tmp:
+        zip_path = tmp / OBS_PACKAGE.archive_name
         report(progress_cb, OBS_PACKAGE.progress_start, "OBS Studio Portableを準備しています...")
         await download_file(OBS_PACKAGE, zip_path, progress_cb)
         report(progress_cb, OBS_PACKAGE.progress_end, "OBS StudioのSHA256を検証しています...")

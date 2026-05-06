@@ -1,7 +1,12 @@
+aiohttp
+ffmpeg-python
+numpy
 obsws-python
 opencv-python
-python-mpv
-aiohttp
-PyQt6
 pandas
+Pillow
+PyQt6
+python-mpv
+requests
 scikit-learn
+urllib3

@@ -40,7 +40,7 @@ def create_icon():
         font = ImageFont.truetype(font_path, font_size)
     except Exception:
         font = ImageFont.load_default()
-        print("警告: 太字フォントが見つからず、デフォルトフォントを使用しました。見た目が細くなる可能性があります。")
+        print("Warning: bold font was not found. Using the default font.")
 
     # 4. 文字を中央に配置
     # テキストのバウンディングボックスを取得して中心を計算
@@ -59,13 +59,13 @@ def create_icon():
 
     # PNG保存
     img.save(PNG_PATH)
-    print(f"PNG作成完了: {PNG_PATH}")
+    print(f"PNG created: {PNG_PATH}")
 
     # ICO保存（マルチサイズ格納）
     # 256, 48, 32, 16のサイズを含める
     icon_sizes = [(256, 256), (48, 48), (32, 32), (16, 16)]
     img.save(ICO_PATH, format="ICO", sizes=icon_sizes)
-    print(f"ICO作成完了: {ICO_PATH}")
+    print(f"ICO created: {ICO_PATH}")
 
 
 if __name__ == "__main__":

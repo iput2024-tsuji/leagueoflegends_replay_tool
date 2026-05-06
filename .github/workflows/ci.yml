@@ -64,6 +64,8 @@ jobs:
     name: Build Windows artifact
     runs-on: windows-latest
     needs: lint-test
+    env:
+      PYTHONIOENCODING: utf8
 
     steps:
       - name: Checkout repository

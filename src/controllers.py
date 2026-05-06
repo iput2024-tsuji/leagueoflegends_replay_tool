@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import Any, Callable
 
 try:
     from . import recordtest
@@ -19,7 +22,7 @@ SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
 class ConfigController:
     """設定ファイル、補完、プレフライトをUIから分離して扱う。"""
 
-    def apply_auto_defaults(self, data, force_obs_detect=False):
+    def apply_auto_defaults(self, data: dict[str, Any] | None, force_obs_detect: bool = False) -> tuple[dict[str, Any], bool, list[str]]:
         changed = False
         notes = []
 
@@ -109,12 +112,12 @@ class ConfigController:
 
         return data, changed, notes
 
-    def format_report_lines(self, lines):
+    def format_report_lines(self, lines: list[str] | tuple[str, ...] | None) -> str:
         if not lines:
             return "- なし"
         return "\n".join(f"- {line}" for line in lines)
 
-    def load_config(self):
+    def load_config(self) -> dict[str, Any]:
         if not CONFIG_PATH.exists():
             CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
             if SAMPLE_CONFIG_PATH.exists():
@@ -132,11 +135,11 @@ class ConfigController:
             self.save_config(data)
         return data
 
-    def save_config(self, data):
+    def save_config(self, data: dict[str, Any]) -> None:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
-    def run_preflight(self, config_data=None, auto_fix=True, force_obs_detect=True):
+    def run_preflight(self, config_data: dict[str, Any] | None = None, auto_fix: bool = True, force_obs_detect: bool = True) -> dict[str, Any]:
         data = config_data if config_data is not None else self.load_config()
         data, changed_defaults, default_notes = self.apply_auto_defaults(
             data,
@@ -147,7 +150,7 @@ class ConfigController:
         report["notes"] = list(default_notes) + list(report.get("notes", []))
         return report
 
-    def run_guided_auto_setup(self, config_data=None):
+    def run_guided_auto_setup(self, config_data: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
         report = self.run_preflight(config_data, auto_fix=True, force_obs_detect=True)
         if report.get("errors"):
             return report, None
@@ -165,7 +168,7 @@ class ConfigController:
         self.save_config(report["config"])
         return report, info
 
-    def test_obs_connection(self, config_data=None):
+    def test_obs_connection(self, config_data: dict[str, Any] | None = None) -> tuple[dict[str, Any], bool, str]:
         report = self.run_preflight(config_data, auto_fix=True, force_obs_detect=True)
         if report.get("changed"):
             self.save_config(report["config"])
@@ -180,7 +183,7 @@ class ConfigController:
         )
         return report, ok, detail
 
-    def total_storage_size(self, config_data=None):
+    def total_storage_size(self, config_data: dict[str, Any] | None = None) -> int:
         config = recordtest.AppConfig.from_dict(config_data or self.load_config())
         return recordtest.total_storage_size(config)
 
@@ -188,10 +191,10 @@ class ConfigController:
 class AudioSettingsController:
     """OBS音声・録画出力のインフラ操作をUIから分離する。"""
 
-    def __init__(self, config_controller=None):
+    def __init__(self, config_controller: ConfigController | None = None) -> None:
         self.config_controller = config_controller or ConfigController()
 
-    def _prepare_config(self, data, auto_fix=True, force_obs_detect=True):
+    def _prepare_config(self, data: dict[str, Any], auto_fix: bool = True, force_obs_detect: bool = True) -> tuple[dict[str, Any], recordtest.AppConfig]:
         report = self.config_controller.run_preflight(
             data,
             auto_fix=auto_fix,
@@ -205,7 +208,7 @@ class AudioSettingsController:
         recordtest.setup_environment(config)
         return report, config
 
-    def _open_recorder(self, config, auto_launch=False, max_retries=2, retry_delay=0.5):
+    def _open_recorder(self, config: recordtest.AppConfig, auto_launch: bool = False, max_retries: int = 2, retry_delay: float = 0.5) -> tuple[recordtest.LoLAutoRecorder, Any | None]:
         ok, _detail = recordtest.test_obs_connection(
             config.obs.host,
             config.obs.port,
@@ -233,7 +236,7 @@ class AudioSettingsController:
         )
         return recorder, launched_process
 
-    def refresh_audio_devices(self, data, auto_launch=True):
+    def refresh_audio_devices(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=True)
         recorder = None
         launched_process = None
@@ -249,8 +252,7 @@ class AudioSettingsController:
             if recorder:
                 recorder.disconnect_obs()
 
-
-    def apply_audio_settings(self, data, auto_launch=True):
+    def apply_audio_settings(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
         recorder = None
         launched_process = None
@@ -263,7 +265,7 @@ class AudioSettingsController:
             if recorder:
                 recorder.disconnect_obs()
 
-    def apply_runtime_output_settings(self, data):
+    def apply_runtime_output_settings(self, data: dict[str, Any]) -> bool:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
         ok, _detail = recordtest.test_obs_connection(
             config.obs.host,
@@ -294,10 +296,11 @@ class AudioSettingsController:
             if recorder:
                 recorder.disconnect_obs()
 
+
 class RecordingController:
     """録画監視ワーカーが使う録画ランタイム生成を担当する。"""
 
-    def create_recorder(self, config_data, status_cb=None):
+    def create_recorder(self, config_data: dict[str, Any], status_cb: Callable[[str], None] | None = None) -> recordtest.LoLAutoRecorder:
         config = recordtest.AppConfig.from_dict(config_data)
         recordtest.setup_environment(config)
         obs_process = recordtest.launch_obs(config)
@@ -311,10 +314,10 @@ class RecordingController:
 class AnalyticsController:
     """録画JSON分析をUIから分離して提供する。"""
 
-    def __init__(self, config_controller=None):
+    def __init__(self, config_controller: ConfigController | None = None) -> None:
         self.config_controller = config_controller or ConfigController()
 
-    def load_summary(self):
+    def load_summary(self) -> dict[str, Any]:
         config_data = self.config_controller.load_config()
         config = recordtest.AppConfig.from_dict(config_data)
         analyzer = GameDataAnalyzer(config=config)

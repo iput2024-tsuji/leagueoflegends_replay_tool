@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 import time
@@ -10,6 +12,7 @@ from dataclasses import dataclass
 import logging
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from typing import Any, Callable
 
 import aiohttp
 import urllib3
@@ -83,11 +86,11 @@ LOGGER = logging.getLogger("lol_replay")
 class StatusCallbackLogHandler(logging.Handler):
     """UIへログメッセージを転送する軽量ハンドラ。"""
 
-    def __init__(self, callback):
+    def __init__(self, callback: Callable[[str], None] | None) -> None:
         super().__init__(level=logging.INFO)
         self.callback = callback
 
-    def emit(self, record):
+    def emit(self, record: logging.LogRecord) -> None:
         if not self.callback:
             return
         try:
@@ -96,7 +99,7 @@ class StatusCallbackLogHandler(logging.Handler):
             self.handleError(record)
 
 
-def configure_logging():
+def configure_logging() -> None:
     if getattr(configure_logging, "_configured", False):
         return
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -168,7 +171,7 @@ class AudioSlotSettings:
     volume_db: float
     mute: bool
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return {
             "input_name": self.input_name,
             "device_id": self.device_id,
@@ -183,7 +186,7 @@ class AudioSettings:
     desktop: AudioSlotSettings
     mic: AudioSlotSettings
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         return {
             "desktop": self.desktop.to_dict(),
             "mic": self.mic.to_dict(),
@@ -199,7 +202,7 @@ class AppConfig:
     audio: AudioSettings
 
     @classmethod
-    def from_dict(cls, data):
+    def from_dict(cls, data: dict[str, Any] | None) -> AppConfig:
         source = data if isinstance(data, dict) else {}
         obs_cfg = source.get("obs", {}) if isinstance(source.get("obs", {}), dict) else {}
         paths_cfg = source.get("paths", {}) if isinstance(source.get("paths", {}), dict) else {}
@@ -282,10 +285,10 @@ class AppConfig:
         )
 
     @classmethod
-    def load(cls):
+    def load(cls) -> AppConfig:
         return cls.from_dict(load_settings())
 
-    def audio_to_dict(self):
+    def audio_to_dict(self) -> dict[str, Any]:
         return {"audio": self.audio.to_dict()}
 
 
@@ -294,59 +297,59 @@ class OBSClient(ABC):
 
     @property
     @abstractmethod
-    def raw_client(self):
+    def raw_client(self) -> Any:
         pass
 
     @abstractmethod
-    def connect(self):
+    def connect(self) -> None:
         pass
 
     @abstractmethod
-    def disconnect(self):
+    def disconnect(self) -> None:
         pass
 
     @abstractmethod
-    def setup_record_output(self):
+    def setup_record_output(self) -> None:
         pass
 
     @abstractmethod
-    def setup_sync_elements(self):
+    def setup_sync_elements(self) -> None:
         pass
 
     @abstractmethod
-    def apply_record_output_settings(self):
+    def apply_record_output_settings(self) -> bool:
         pass
 
     @abstractmethod
-    def apply_audio_profile(self, cfg, scene_name=None):
+    def apply_audio_profile(self, cfg: AppConfig, scene_name: str | None = None) -> bool:
         pass
 
     @abstractmethod
-    def get_audio_device_catalog(self, cfg=None, scene_name=None):
+    def get_audio_device_catalog(self, cfg: AppConfig | None = None, scene_name: str | None = None) -> dict[str, Any]:
         pass
 
     @abstractmethod
-    def get_sync_source_id(self):
+    def get_sync_source_id(self) -> int | None:
         pass
 
     @abstractmethod
-    def set_sync_marker_enabled(self, enabled, source_id=None):
+    def set_sync_marker_enabled(self, enabled: bool, source_id: int | None = None) -> None:
         pass
 
     @abstractmethod
-    def start_recording(self):
+    def start_recording(self) -> None:
         pass
 
     @abstractmethod
-    def stop_recording(self):
+    def stop_recording(self) -> str | None:
         pass
 
     @abstractmethod
-    def is_recording_active(self):
+    def is_recording_active(self) -> bool | None:
         pass
 
     @abstractmethod
-    def shutdown(self):
+    def shutdown(self) -> None:
         pass
 
 
@@ -354,15 +357,15 @@ class RiotAPIClient(ABC):
     """LoL Live Client APIの取得とパースだけを担当する抽象インターフェース。"""
 
     @abstractmethod
-    async def get_active_player_name(self):
+    async def get_active_player_name(self) -> str | None:
         pass
 
     @abstractmethod
-    async def get_event_data(self):
+    async def get_event_data(self) -> dict[str, Any] | None:
         pass
 
     @abstractmethod
-    async def get_all_game_data(self):
+    async def get_all_game_data(self) -> dict[str, Any] | None:
         pass
 
 
@@ -370,76 +373,76 @@ class RecordingSessionManager(ABC):
     """OBSClientとRiotAPIClientを注入され、録画ワークフローを管理する抽象インターフェース。"""
 
     @abstractmethod
-    def reset_session(self):
+    def reset_session(self) -> None:
         pass
 
     @abstractmethod
-    def request_stop(self):
+    def request_stop(self) -> None:
         pass
 
     @abstractmethod
-    def has_session_data(self):
+    def has_session_data(self) -> bool:
         pass
 
     @abstractmethod
-    def apply_record_output_settings(self):
+    def apply_record_output_settings(self) -> bool:
         pass
 
     @abstractmethod
-    def apply_audio_profile(self, cfg):
+    def apply_audio_profile(self, cfg: AppConfig) -> bool:
         pass
 
     @abstractmethod
-    def get_audio_device_catalog(self, cfg=None):
+    def get_audio_device_catalog(self, cfg: AppConfig | None = None) -> dict[str, Any]:
         pass
 
     @abstractmethod
-    async def wait_for_game_start_async(self):
+    async def wait_for_game_start_async(self) -> bool:
         pass
 
     @abstractmethod
-    async def start_recording_async(self):
+    async def start_recording_async(self) -> None:
         pass
 
     @abstractmethod
-    async def record_until_end_async(self):
+    async def record_until_end_async(self) -> bool:
         pass
 
     @abstractmethod
-    def stop_recording(self):
+    def stop_recording(self) -> None:
         pass
 
     @abstractmethod
-    def save_json(self):
+    def save_json(self) -> None:
         pass
 
     @abstractmethod
-    def shutdown_obs(self):
+    def shutdown_obs(self) -> None:
         pass
 
     @abstractmethod
-    def disconnect_obs(self):
+    def disconnect_obs(self) -> None:
         pass
 
 
-def obs_executable_path(base_dir):
+def obs_executable_path(base_dir: str | Path | None) -> Path | None:
     if not base_dir:
         return None
     return Path(base_dir) / "bin" / "64bit" / "obs64.exe"
 
 
-def is_valid_obs_dir(base_dir):
+def is_valid_obs_dir(base_dir: str | Path | None) -> bool:
     obs_exe = obs_executable_path(base_dir)
     return bool(obs_exe and obs_exe.exists())
 
 
-def detect_obs_dir():
+def detect_obs_dir() -> str | None:
     if is_valid_obs_dir(MANAGED_PORTABLE_OBS_DIR):
         return str(MANAGED_PORTABLE_OBS_DIR)
     return None
 
 
-def is_managed_portable_obs_dir(base_dir):
+def is_managed_portable_obs_dir(base_dir: str | Path | None) -> bool:
     if not base_dir:
         return False
     try:
@@ -449,44 +452,44 @@ def is_managed_portable_obs_dir(base_dir):
         return False
 
 
-def get_obs_websocket_config_path(base_dir):
+def get_obs_websocket_config_path(base_dir: str | Path) -> Path:
     return Path(base_dir) / "config" / "obs-studio" / "plugin_config" / "obs-websocket" / "config.json"
 
 
-def get_obs_config_dir(base_dir):
+def get_obs_config_dir(base_dir: str | Path) -> Path:
     return Path(base_dir) / "config" / "obs-studio"
 
 
-def get_obs_global_ini_path(base_dir):
+def get_obs_global_ini_path(base_dir: str | Path) -> Path:
     return get_obs_config_dir(base_dir) / "global.ini"
 
 
-def get_obs_portable_marker_path(base_dir):
+def get_obs_portable_marker_path(base_dir: str | Path) -> Path:
     return Path(base_dir) / PORTABLE_OBS_MARKER_NAME
 
 
 class OBSBootstrapper:
     """アプリ管理のポータブルOBSを初期化するBootstrapper。"""
 
-    def __init__(self, base_dir):
+    def __init__(self, base_dir: str | Path) -> None:
         self.base_dir = Path(base_dir).resolve()
 
-    def ensure_portable_mode_marker(self):
+    def ensure_portable_mode_marker(self) -> Path:
         return ensure_portable_mode_marker(self.base_dir)
 
-    def ensure_config_dir(self):
+    def ensure_config_dir(self) -> Path:
         config_dir = get_obs_config_dir(self.base_dir)
         config_dir.mkdir(parents=True, exist_ok=True)
         return config_dir
 
-    def ensure_global_ini(self):
+    def ensure_global_ini(self) -> tuple[bool, Path]:
         self.ensure_config_dir()
         return ensure_portable_obs_global_ini(self.base_dir)
 
-    def ensure_websocket_config(self, port, password):
+    def ensure_websocket_config(self, port: int, password: str) -> tuple[bool, Path]:
         return ensure_portable_obs_websocket_config(self.base_dir, port, password)
 
-    def bootstrap(self, port=None, password=""):
+    def bootstrap(self, port: int | None = None, password: str = "") -> dict[str, Any]:
         marker = self.ensure_portable_mode_marker()
         config_dir = self.ensure_config_dir()
         changed_ini, global_ini_path = self.ensure_global_ini()
@@ -502,7 +505,7 @@ class OBSBootstrapper:
         }
 
 
-def ensure_portable_obs_global_ini(base_dir):
+def ensure_portable_obs_global_ini(base_dir: str | Path) -> tuple[bool, Path]:
     """
     ポータブルOBSの global.ini にトレイ無効化設定を反映する。
     configparser を使い、キーの大文字小文字を維持して書き込む。
@@ -559,7 +562,7 @@ def ensure_portable_obs_global_ini(base_dir):
     return changed, ini_path
 
 
-def ensure_portable_obs_websocket_config(base_dir, port, password):
+def ensure_portable_obs_websocket_config(base_dir: str | Path, port: int, password: str) -> tuple[bool, Path]:
     """
     obs-portable に配置されたポータブルOBSのみを対象に、
     WebSocket設定を固定値へ自動補完する。
@@ -585,7 +588,7 @@ def ensure_portable_obs_websocket_config(base_dir, port, password):
 
     changed = False
 
-    def set_if_diff(key, value):
+    def set_if_diff(key: str, value: Any) -> None:
         nonlocal changed
         if data.get(key) != value:
             data[key] = value
@@ -605,7 +608,7 @@ def ensure_portable_obs_websocket_config(base_dir, port, password):
     return changed, config_path
 
 
-def _ensure_section_dict(root, key):
+def _ensure_section_dict(root: dict[str, Any], key: str) -> tuple[dict[str, Any], bool]:
     value = root.get(key)
     if isinstance(value, dict):
         return value, False
@@ -613,7 +616,7 @@ def _ensure_section_dict(root, key):
     return root[key], True
 
 
-def _safe_int(value, default, minimum=None, maximum=None):
+def _safe_int(value: Any, default: int, minimum: int | None = None, maximum: int | None = None) -> tuple[int, bool]:
     try:
         parsed = int(value)
     except Exception:
@@ -625,7 +628,7 @@ def _safe_int(value, default, minimum=None, maximum=None):
     return parsed, True
 
 
-def _safe_float(value, default, minimum=None):
+def _safe_float(value: Any, default: float, minimum: float | None = None) -> tuple[float, bool]:
     try:
         parsed = float(value)
     except Exception:
@@ -635,7 +638,7 @@ def _safe_float(value, default, minimum=None):
     return parsed, True
 
 
-def _safe_bool(value, default):
+def _safe_bool(value: Any, default: bool) -> tuple[bool, bool]:
     if isinstance(value, bool):
         return value, True
     if isinstance(value, (int, float)):
@@ -649,7 +652,7 @@ def _safe_bool(value, default):
     return default, False
 
 
-def _ensure_audio_config_defaults(data, auto_fix=True):
+def _ensure_audio_config_defaults(data: dict[str, Any], auto_fix: bool = True) -> dict[str, Any]:
     changed = False
     notes = []
     warnings = []
@@ -725,7 +728,7 @@ def _ensure_audio_config_defaults(data, auto_fix=True):
     }
 
 
-def parse_obs_source_color(value, default=DEFAULT_OBS_SOURCE_COLOR):
+def parse_obs_source_color(value: Any, default: int = DEFAULT_OBS_SOURCE_COLOR) -> tuple[int, bool]:
     if value is None:
         return default, False
     if isinstance(value, int):
@@ -753,7 +756,7 @@ def parse_obs_source_color(value, default=DEFAULT_OBS_SOURCE_COLOR):
         return default, False
 
 
-def obs_color_to_hex(color_value):
+def obs_color_to_hex(color_value: Any) -> str:
     value, _ = parse_obs_source_color(color_value, default=DEFAULT_OBS_SOURCE_COLOR)
     red = value & 0xFF
     green = (value >> 8) & 0xFF
@@ -761,7 +764,7 @@ def obs_color_to_hex(color_value):
     return f"#{red:02X}{green:02X}{blue:02X}"
 
 
-def _has_mpv_dll(bin_path):
+def _has_mpv_dll(bin_path: str | Path | None) -> bool:
     names = (
         "mpv-1.dll",
         "libmpv-1.dll",
@@ -771,7 +774,7 @@ def _has_mpv_dll(bin_path):
     return any((bin_path / name).exists() for name in names)
 
 
-def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
+def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs: bool = True) -> dict[str, Any]:
     report = {
         "config": cfg if isinstance(cfg, dict) else {},
         "changed": False,
@@ -827,7 +830,7 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
     }
     storage_defaults = {"max_size_gb": DEFAULT_MAX_STORAGE_GB}
 
-    def apply_defaults(target, defaults):
+    def apply_defaults(target: dict[str, Any], defaults: dict[str, Any]) -> None:
         for key, value in defaults.items():
             if target.get(key) in (None, ""):
                 if auto_fix:
@@ -990,7 +993,7 @@ def run_preflight_checks(cfg, auto_fix=True, ensure_dirs=True):
     return report
 
 
-def format_preflight_report(report):
+def format_preflight_report(report: dict[str, Any]) -> str:
     lines = []
     for note in report.get("notes", []):
         lines.append(f"- {note}")
@@ -1001,7 +1004,7 @@ def format_preflight_report(report):
     return "\n".join(lines)
 
 
-def test_obs_connection(host, port, password, timeout=2.5):
+def test_obs_connection(host: str | None, port: int | str | None, password: str | None, timeout: float = 2.5) -> tuple[bool, str]:
     host_text = str(host or "").strip() or DEFAULT_OBS_HOST
     try:
         port_num = int(port)
@@ -1049,7 +1052,7 @@ def test_obs_connection(host, port, password, timeout=2.5):
     return False, "OBS接続テストに失敗しました。"
 
 
-def connect_obs_client(host, port, password, timeout=2.5):
+def connect_obs_client(host: str | None, port: int | str | None, password: str | None, timeout: float = 2.5) -> tuple[Any, str]:
     host_text = str(host or "").strip() or DEFAULT_OBS_HOST
     port_num, ok = _safe_int(port, DEFAULT_OBS_PORT, minimum=1, maximum=65535)
     if not ok:
@@ -1084,7 +1087,7 @@ def connect_obs_client(host, port, password, timeout=2.5):
     ) from last_error
 
 
-def get_audio_config_defaults():
+def get_audio_config_defaults() -> dict[str, dict[str, Any]]:
     return {
         "desktop": {
             "input_name": DEFAULT_AUDIO_DESKTOP_INPUT_NAME,
@@ -1103,7 +1106,7 @@ def get_audio_config_defaults():
     }
 
 
-def normalize_audio_config(cfg, auto_fix=True):
+def normalize_audio_config(cfg: dict[str, Any], auto_fix: bool = True) -> dict[str, Any]:
     if isinstance(cfg, AppConfig):
         return cfg.audio.to_dict(), {
             "changed": False,
@@ -1117,7 +1120,7 @@ def normalize_audio_config(cfg, auto_fix=True):
     return audio_cfg, fix
 
 
-def _get_audio_slot_config(cfg, key):
+def _get_audio_slot_config(cfg: dict[str, Any], key: str) -> dict[str, Any]:
     if isinstance(cfg, AppConfig):
         slot = cfg.audio.desktop if key == "desktop" else cfg.audio.mic
         return slot.to_dict()
@@ -1137,7 +1140,7 @@ def _get_audio_slot_config(cfg, key):
     return merged
 
 
-def _audio_slot_from_config(cfg, key):
+def _audio_slot_from_config(cfg: dict[str, Any], key: str) -> AudioSlotSettings:
     slot = _get_audio_slot_config(cfg if isinstance(cfg, dict) else {}, key)
     return AudioSlotSettings(
         input_name=slot["input_name"],
@@ -1148,14 +1151,14 @@ def _audio_slot_from_config(cfg, key):
     )
 
 
-def _obs_raw(client, request_type, payload=None):
+def _obs_raw(client: Any, request_type: str, payload: dict[str, Any] | None = None) -> Any:
     try:
         return client.send(request_type, payload or {}, raw=True)
     except TypeError:
         return client.send(request_type, payload or {})
 
 
-def apply_obs_video_settings(client, fps_value=None):
+def apply_obs_video_settings(client: Any, fps_value: int | str | None = None) -> Any:
     fps_num, _ = _safe_int(fps_value, DEFAULT_OBS_FPS, minimum=1, maximum=240)
     return _obs_raw(
         client,
@@ -1167,7 +1170,7 @@ def apply_obs_video_settings(client, fps_value=None):
     )
 
 
-def apply_record_directory_to_obs(client, record_dir):
+def apply_record_directory_to_obs(client: Any, record_dir: str | Path) -> bool:
     """
     OBSの録画保存先をWebSocket経由で反映する。
     wrapper -> raw request の順で試し、環境差分を吸収する。
@@ -1197,7 +1200,7 @@ def apply_record_directory_to_obs(client, record_dir):
     )
 
 
-def ensure_obs_scene_exists(client, scene_name, status_cb=None):
+def ensure_obs_scene_exists(client: Any, scene_name: str, status_cb: Callable[[str], None] | None = None) -> bool:
     try:
         scene_resp = client.get_scene_list()
         scenes = getattr(scene_resp, "scenes", []) or []
@@ -1217,7 +1220,7 @@ def ensure_obs_scene_exists(client, scene_name, status_cb=None):
     return True
 
 
-def _ensure_single_audio_input(client, scene_name, key, slot_cfg):
+def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg: dict[str, Any]) -> bool:
     spec = MANAGED_AUDIO_INPUTS[key]
     input_name = str(slot_cfg.get("input_name") or spec["input_name"]).strip() or spec["input_name"]
     input_kind = spec["input_kind"]
@@ -1276,7 +1279,12 @@ def _ensure_single_audio_input(client, scene_name, key, slot_cfg):
     return created
 
 
-def ensure_managed_audio_inputs(client, scene_name, cfg=None, status_cb=None):
+def ensure_managed_audio_inputs(
+    client: Any,
+    scene_name: str,
+    cfg: dict[str, Any] | AppConfig | None = None,
+    status_cb: Callable[[str], None] | None = None,
+) -> bool:
     ensure_obs_scene_exists(client, scene_name, status_cb=status_cb)
     created_any = False
     for key in ("desktop", "mic"):
@@ -1293,7 +1301,7 @@ def ensure_managed_audio_inputs(client, scene_name, cfg=None, status_cb=None):
     return created_any
 
 
-def list_audio_devices_for_input(client, input_name):
+def list_audio_devices_for_input(client: Any, input_name: str) -> list[dict[str, str]]:
     try:
         resp = _obs_raw(
             client,
@@ -1322,7 +1330,12 @@ def list_audio_devices_for_input(client, input_name):
     return result
 
 
-def get_audio_device_catalog(client, cfg=None, scene_name=None, status_cb=None):
+def get_audio_device_catalog(
+    client: Any,
+    cfg: dict[str, Any] | AppConfig | None = None,
+    scene_name: str | None = None,
+    status_cb: Callable[[str], None] | None = None,
+) -> dict[str, list[dict[str, str]]]:
     scene_name = scene_name or (cfg.obs.scene_name if isinstance(cfg, AppConfig) else DEFAULT_OBS_SCENE_NAME)
     ensure_managed_audio_inputs(client, scene_name, cfg=cfg, status_cb=status_cb)
     desktop_cfg = _get_audio_slot_config(cfg or {}, "desktop")
@@ -1333,7 +1346,13 @@ def get_audio_device_catalog(client, cfg=None, scene_name=None, status_cb=None):
     }
 
 
-def apply_audio_input_settings(client, input_name, device_id=None, volume_db=None, mute=None):
+def apply_audio_input_settings(
+    client: Any,
+    input_name: str,
+    device_id: str | None = None,
+    volume_db: float | int | str | None = None,
+    mute: bool | None = None,
+) -> None:
     if device_id not in (None, ""):
         client.set_input_settings(input_name, {"device_id": str(device_id)}, overlay=True)
     if volume_db is not None:
@@ -1342,7 +1361,12 @@ def apply_audio_input_settings(client, input_name, device_id=None, volume_db=Non
         client.set_input_mute(input_name, bool(mute))
 
 
-def apply_audio_profile_from_config(client, cfg, scene_name=None, status_cb=None):
+def apply_audio_profile_from_config(
+    client: Any,
+    cfg: AppConfig,
+    scene_name: str | None = None,
+    status_cb: Callable[[str], None] | None = None,
+) -> bool:
     scene_name = scene_name or (cfg.obs.scene_name if isinstance(cfg, AppConfig) else DEFAULT_OBS_SCENE_NAME)
     ensure_managed_audio_inputs(client, scene_name, cfg=cfg, status_cb=status_cb)
 
@@ -1363,7 +1387,7 @@ def apply_audio_profile_from_config(client, cfg, scene_name=None, status_cb=None
     return True
 
 
-def setup_obs_sync_elements(cfg, status_cb=None, auto_launch=True):
+def setup_obs_sync_elements(cfg: dict[str, Any], status_cb: Callable[[str], None] | None = None, auto_launch: bool = True) -> dict[str, Any]:
     config = AppConfig.from_dict(cfg)
     setup_environment(config)
 
@@ -1440,7 +1464,7 @@ COMBAT_EVENTS = [
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
-def resolve_path(value, base_dir):
+def resolve_path(value: str | Path | None, base_dir: str | Path) -> Path | None:
     if value is None:
         return None
     value = os.path.expandvars(str(value))
@@ -1450,7 +1474,7 @@ def resolve_path(value, base_dir):
     return path
 
 
-def load_settings():
+def load_settings() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         raise RecorderError(
             "設定ファイルが見つかりません。\n"
@@ -1462,17 +1486,17 @@ def load_settings():
         return json.load(f)
 
 
-def load_app_config():
+def load_app_config() -> AppConfig:
     return AppConfig.from_dict(load_settings())
 
 
-def save_settings(cfg):
+def save_settings(cfg: dict[str, Any]) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4, ensure_ascii=False)
 
 
-def setup_environment(config):
+def setup_environment(config: AppConfig) -> None:
     """環境変数の設定 (MPVのDLLを読み込めるようにする)"""
     bin_dir = str(config.paths.bin_dir)
     if bin_dir:
@@ -1492,7 +1516,7 @@ def setup_environment(config):
     config.paths.json_dir.mkdir(parents=True, exist_ok=True)
 
 
-def parse_max_storage_bytes(storage_cfg):
+def parse_max_storage_bytes(storage_cfg: dict[str, Any]) -> int | None:
     max_bytes = storage_cfg.get("max_size_bytes")
     if isinstance(max_bytes, (int, float)) and max_bytes > 0:
         return int(max_bytes)
@@ -1505,7 +1529,7 @@ def parse_max_storage_bytes(storage_cfg):
     return None
 
 
-def is_within(child, parent):
+def is_within(child: str | Path, parent: str | Path) -> bool:
     try:
         child.resolve().relative_to(parent.resolve())
         return True
@@ -1513,7 +1537,7 @@ def is_within(child, parent):
         return False
 
 
-def get_dir_size(path):
+def get_dir_size(path: str | Path) -> int:
     total = 0
     try:
         for item in path.rglob("*"):
@@ -1527,7 +1551,7 @@ def get_dir_size(path):
     return total
 
 
-def total_storage_size(config=None):
+def total_storage_size(config: AppConfig | None = None) -> int:
     config = config or load_app_config()
     roots = []
     roots.append(Path(config.paths.recordings_dir))
@@ -1537,7 +1561,7 @@ def total_storage_size(config=None):
     return sum(get_dir_size(root) for root in roots if root.exists())
 
 
-def parse_saved_at(value):
+def parse_saved_at(value: Any) -> float | None:
     if not value:
         return None
     try:
@@ -1546,7 +1570,8 @@ def parse_saved_at(value):
         return None
 
 
-def load_json_metadata(path, config=None):
+def load_json_metadata(path: str | Path, config: AppConfig | None = None) -> tuple[float | None, Path | None]:
+    path = Path(path)
     config = config or load_app_config()
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -1574,7 +1599,7 @@ def load_json_metadata(path, config=None):
         return None, None
 
 
-def enforce_storage_limit(config=None, keep_paths=None):
+def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str | Path] | None = None) -> None:
     config = config or load_app_config()
     if not config.storage.max_size_bytes:
         return
@@ -1626,7 +1651,7 @@ def enforce_storage_limit(config=None, keep_paths=None):
                 return
 
 
-def launch_obs(config):
+def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     """OBSをバックグラウンドで起動する"""
     if not config.obs.obs_dir:
         raise RecorderError("OBSのパスが未設定です。設定画面の OBSフォルダ (obs.dir) を指定してください。")
@@ -1697,7 +1722,7 @@ def launch_obs(config):
         raise RecorderError(f"OBS起動エラー: {e}") from e
 
 
-def ensure_portable_mode_marker(base_dir):
+def ensure_portable_mode_marker(base_dir: str | Path) -> Path:
     if not base_dir:
         raise RecorderError("OBSディレクトリが未設定です。")
     base_path = Path(base_dir)
@@ -1715,7 +1740,7 @@ def ensure_portable_mode_marker(base_dir):
     return primary_marker
 
 
-def kill_stale_obs_processes():
+def kill_stale_obs_processes() -> None:
     """
     残存している obs64.exe を起動直前に全て終了する。
     旧プロセスがトレイ/ウィンドウを保持しているケースを排除する。
@@ -1730,7 +1755,7 @@ def kill_stale_obs_processes():
         pass
 
 
-def normalize_summoner_name(value):
+def normalize_summoner_name(value: Any) -> str | None:
     if not value:
         return None
     name = str(value).strip()
@@ -1739,7 +1764,7 @@ def normalize_summoner_name(value):
     return name.strip()
 
 
-def build_output_path(config):
+def build_output_path(config: AppConfig) -> Path:
     """重複回避のため、存在しないファイル名を返す"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     candidate = config.paths.json_dir / f"lol_{timestamp}.json"
@@ -1753,7 +1778,7 @@ def build_output_path(config):
     return build_output_path(config)
 
 
-def save_payload(path, payload):
+def save_payload(path: str | Path, payload: dict[str, Any]) -> None:
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, indent=4, ensure_ascii=False)
 
@@ -1761,10 +1786,10 @@ def save_payload(path, payload):
 class LiveClientRiotAPIClient(RiotAPIClient):
     """aiohttpでRiot Live Client APIを取得する本番用クライアント。"""
 
-    def __init__(self, session_factory=None):
+    def __init__(self, session_factory: Callable[..., Any] | None = None) -> None:
         self.session_factory = session_factory or aiohttp.ClientSession
 
-    async def _fetch(self, url, timeout_sec):
+    async def _fetch(self, url: str, timeout_sec: float) -> Any:
         timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
         try:
             async with self.session_factory(timeout=timeout) as session:
@@ -1784,21 +1809,28 @@ class LiveClientRiotAPIClient(RiotAPIClient):
         ):
             return None
 
-    async def get_active_player_name(self):
+    async def get_active_player_name(self) -> str | None:
         return await self._fetch(ACTIVE_PLAYER_URL, timeout_sec=5)
 
-    async def get_event_data(self):
+    async def get_event_data(self) -> dict[str, Any] | None:
         data = await self._fetch(EVENT_URL, timeout_sec=5)
         return data if isinstance(data, dict) else None
 
-    async def get_all_game_data(self):
+    async def get_all_game_data(self) -> dict[str, Any] | None:
         data = await self._fetch(ALL_GAME_URL, timeout_sec=1)
         return data if isinstance(data, dict) else None
 
 class ObsWebSocketClient(OBSClient):
     """obs-websocketを使う本番用OBSクライアント。"""
 
-    def __init__(self, config=None, obs_process=None, status_cb=None, max_retries=5, retry_delay=2.0):
+    def __init__(
+        self,
+        config: AppConfig | None = None,
+        obs_process: subprocess.Popen[Any] | None = None,
+        status_cb: Callable[[str], None] | None = None,
+        max_retries: int = 5,
+        retry_delay: float = 2.0,
+    ) -> None:
         self.config = config or load_app_config()
         self.client = None
         self.obs_process = obs_process
@@ -1812,13 +1844,13 @@ class ObsWebSocketClient(OBSClient):
         self.logger.propagate = True
 
     @property
-    def raw_client(self):
+    def raw_client(self) -> Any:
         return self.client
 
-    def log(self, message):
+    def log(self, message: str) -> None:
         self.logger.info(message)
 
-    def connect(self):
+    def connect(self) -> None:
         retry_count = 0
         last_error = None
         max_retries = max(1, self.max_retries)
@@ -1847,7 +1879,7 @@ class ObsWebSocketClient(OBSClient):
             f"詳細: {last_error}"
         )
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         if self.client:
             try:
                 self.client.disconnect()
@@ -1860,7 +1892,7 @@ class ObsWebSocketClient(OBSClient):
                 pass
             self._status_handler = None
 
-    def setup_record_output(self):
+    def setup_record_output(self) -> None:
         if self.config.paths.recordings_dir:
             try:
                 Path(self.config.paths.recordings_dir).mkdir(parents=True, exist_ok=True)
@@ -1880,11 +1912,11 @@ class ObsWebSocketClient(OBSClient):
             # 録画は続行可能なので警告のみ
             self.log(f"⚠️ OBS録画FPS設定の適用に失敗: {e}")
 
-    def apply_record_output_settings(self):
+    def apply_record_output_settings(self) -> bool:
         self.setup_record_output()
         return True
 
-    def apply_audio_profile(self, cfg, scene_name=None):
+    def apply_audio_profile(self, cfg: AppConfig, scene_name: str | None = None) -> bool:
         return apply_audio_profile_from_config(
             self.client,
             cfg,
@@ -1892,7 +1924,7 @@ class ObsWebSocketClient(OBSClient):
             status_cb=self.log,
         )
 
-    def get_audio_device_catalog(self, cfg=None, scene_name=None):
+    def get_audio_device_catalog(self, cfg: AppConfig | None = None, scene_name: str | None = None) -> dict[str, Any]:
         return get_audio_device_catalog(
             self.client,
             cfg=cfg,
@@ -1900,18 +1932,18 @@ class ObsWebSocketClient(OBSClient):
             status_cb=self.log,
         )
 
-    def setup_sync_elements(self):
+    def setup_sync_elements(self) -> None:
         self._ensure_scene_exists()
         self._ensure_sync_source_exists()
 
-    def _ensure_scene_exists(self):
+    def _ensure_scene_exists(self) -> None:
         scene_name = self.config.obs.scene_name
         try:
             ensure_obs_scene_exists(self.client, scene_name, status_cb=self.log)
         except Exception as e:
             raise RecorderError(f"シーン '{scene_name}' の自動作成に失敗しました: {e}") from e
 
-    def _ensure_sync_source_exists(self):
+    def _ensure_sync_source_exists(self) -> None:
         scene_name = self.config.obs.scene_name
         source_name = self.config.obs.source_name
         input_exists = False
@@ -1979,7 +2011,7 @@ class ObsWebSocketClient(OBSClient):
         except Exception:
             pass
 
-    def get_sync_source_id(self):
+    def get_sync_source_id(self) -> int | None:
         try:
             items = self.client.get_scene_item_list(self.config.obs.scene_name).scene_items
             for item in items:
@@ -1989,7 +2021,7 @@ class ObsWebSocketClient(OBSClient):
             self.logger.warning("⚠️ シーンアイテム取得エラー: %s", e)
         return None
 
-    def set_sync_marker_enabled(self, enabled, source_id=None):
+    def set_sync_marker_enabled(self, enabled: bool, source_id: int | None = None) -> None:
         item_id = source_id if source_id is not None else self.get_sync_source_id()
         if item_id is None:
             raise RecorderError(
@@ -1997,18 +2029,18 @@ class ObsWebSocketClient(OBSClient):
             )
         self.client.set_scene_item_enabled(self.config.obs.scene_name, item_id, bool(enabled))
 
-    def start_recording(self):
+    def start_recording(self) -> None:
         self.client.start_record()
 
-    def stop_recording(self):
+    def stop_recording(self) -> str | None:
         res = self.client.stop_record()
         return getattr(res, "output_path", None)
 
-    def is_recording_active(self):
+    def is_recording_active(self) -> bool | None:
         status = self.client.get_record_status()
         return getattr(status, "output_active", None)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         if self.obs_process:
             self.log("🧹 OBSを終了しています...")
 
@@ -2038,14 +2070,14 @@ class ObsWebSocketClient(OBSClient):
 class LoLAutoRecorder(RecordingSessionManager):
     def __init__(
         self,
-        config=None,
-        obs_process=None,
-        status_cb=None,
-        auto_setup=True,
-        obs_client=None,
-        riot_api_client=None,
-        stop_event=None,
-    ):
+        config: AppConfig | None = None,
+        obs_process: subprocess.Popen[Any] | None = None,
+        status_cb: Callable[[str], None] | None = None,
+        auto_setup: bool = True,
+        obs_client: OBSClient | None = None,
+        riot_api_client: RiotAPIClient | None = None,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
         self.config = config or load_app_config()
         self.my_name = None
         self.status_cb = status_cb
@@ -2069,13 +2101,13 @@ class LoLAutoRecorder(RecordingSessionManager):
         if auto_setup:
             self.ensure_sync_setup()
 
-    def log(self, message):
+    def log(self, message: str) -> None:
         self.logger.info(message)
 
-    def set_stop_event(self, stop_event):
+    def set_stop_event(self, stop_event: asyncio.Event | None) -> None:
         self.stop_event = stop_event
 
-    def request_stop(self):
+    def request_stop(self) -> None:
         self.stop_requested = True
         if self.stop_event is not None:
             try:
@@ -2083,10 +2115,10 @@ class LoLAutoRecorder(RecordingSessionManager):
             except Exception:
                 pass
 
-    def should_stop(self):
+    def should_stop(self) -> bool:
         return self.stop_requested or bool(self.stop_event and self.stop_event.is_set())
 
-    async def wait_with_stop_async(self, seconds, step=0.5):
+    async def wait_with_stop_async(self, seconds: float, step: float = 0.5) -> bool:
         if self.should_stop():
             return False
         if self.stop_event is not None:
@@ -2105,7 +2137,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             await asyncio.sleep(min(step, max(0.01, remaining)))
         return not self.should_stop()
 
-    def reset_session(self):
+    def reset_session(self) -> None:
         self.output_file = None
         self.sync_game_time = 0.0
         self.record_path = None
@@ -2124,7 +2156,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.game_result = None
         self.winning_team = None
 
-    def has_session_data(self):
+    def has_session_data(self) -> bool:
         return (
             self.session_started
             or self.recording_started
@@ -2134,44 +2166,44 @@ class LoLAutoRecorder(RecordingSessionManager):
             or bool(self.all_events)
         )
 
-    def connect_obs(self):
+    def connect_obs(self) -> None:
         self.obs_client.connect()
 
-    def apply_record_output_settings(self):
+    def apply_record_output_settings(self) -> bool:
         return self.obs_client.apply_record_output_settings()
 
-    def apply_audio_profile(self, cfg):
+    def apply_audio_profile(self, cfg: AppConfig) -> bool:
         return self.obs_client.apply_audio_profile(cfg, scene_name=self.config.obs.scene_name)
 
-    def get_audio_device_catalog(self, cfg=None):
+    def get_audio_device_catalog(self, cfg: AppConfig | None = None) -> dict[str, Any]:
         return self.obs_client.get_audio_device_catalog(
             cfg=cfg or self.config,
             scene_name=self.config.obs.scene_name,
         )
 
-    def get_source_id(self):
+    def get_source_id(self) -> int | None:
         return self.obs_client.get_sync_source_id()
 
-    def ensure_record_output_setup(self):
+    def ensure_record_output_setup(self) -> None:
         self.obs_client.setup_record_output()
 
-    def ensure_sync_setup(self):
+    def ensure_sync_setup(self) -> None:
         self.obs_client.setup_sync_elements()
 
-    def ensure_scene_exists(self):
+    def ensure_scene_exists(self) -> None:
         self.obs_client.setup_sync_elements()
 
-    def ensure_sync_source_exists(self):
+    def ensure_sync_source_exists(self) -> None:
         self.obs_client.setup_sync_elements()
 
-    async def try_update_player_name_async(self):
+    async def try_update_player_name_async(self) -> None:
         name = await self.riot_api_client.get_active_player_name()
         if name and name != self.my_name:
             self.my_name = name
             self.my_name_short = normalize_summoner_name(name)
             self.log(f"プレイヤー名を特定: {self.my_name}")
 
-    def update_player_info_from_game_data(self, data):
+    def update_player_info_from_game_data(self, data: dict[str, Any] | None) -> None:
         if not data or not self.my_name:
             return
         players = data.get("allPlayers", [])
@@ -2192,7 +2224,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                     enemy_champions.append(champion)
             self.enemy_champions = enemy_champions
 
-    def get_player_team_by_name(self, name):
+    def get_player_team_by_name(self, name: str | None) -> str | None:
         if not name or not self.last_game_data:
             return None
         lookup_name = normalize_summoner_name(name)
@@ -2204,7 +2236,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 return player.get("team")
         return None
 
-    def enrich_event(self, event):
+    def enrich_event(self, event: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(event or {})
         killer = enriched.get("KillerName") or enriched.get("killerName")
         killer_team = (
@@ -2219,7 +2251,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 enriched["team_relation"] = "own" if killer_team == self.player_team else "enemy"
         return enriched
 
-    def update_result_from_events(self, events):
+    def update_result_from_events(self, events: list[dict[str, Any]]) -> None:
         if not events:
             return
         for event in events:
@@ -2233,10 +2265,10 @@ class LoLAutoRecorder(RecordingSessionManager):
             return
 
     @staticmethod
-    def is_game_end_event(event):
+    def is_game_end_event(event: dict[str, Any] | None) -> bool:
         return bool(event and event.get("EventName") in {"GameEnd", "EndGame", "GameEnded", "GameComplete"})
 
-    async def wait_for_game_start_async(self):
+    async def wait_for_game_start_async(self) -> bool:
         """LoLの試合開始を監視"""
         self.log("⚔️  LoLの試合開始を待機中 (API監視)...")
         while True:
@@ -2254,7 +2286,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             if not await self.wait_with_stop_async(1.0):
                 return False
 
-    async def start_recording_async(self):
+    async def start_recording_async(self) -> None:
         """録画開始 -> 同期マーカー"""
         self.log("🎥 録画を開始します...")
         try:
@@ -2297,7 +2329,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.obs_client.set_sync_marker_enabled(False, item_id)
         self.log("✅ シグナル消灯。録画継続中。")
 
-    async def wait_until_game_start_event_async(self, timeout_sec=180):
+    async def wait_until_game_start_event_async(self, timeout_sec: float = 180) -> float | None:
         loop = asyncio.get_running_loop()
         start = loop.time()
         while loop.time() - start < timeout_sec:
@@ -2313,7 +2345,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.log("⚠️ GameStart を検知できませんでした。現在のゲーム時間で同期します。")
         return None
 
-    def process_events(self, events):
+    def process_events(self, events: list[dict[str, Any]]) -> None:
         for raw_event in events:
             event = self.enrich_event(raw_event)
             event_id = event.get("EventID")
@@ -2367,7 +2399,7 @@ class LoLAutoRecorder(RecordingSessionManager):
 
             self.processed_event_keys.add(event_key)
 
-    async def record_until_end_async(self):
+    async def record_until_end_async(self) -> bool:
         """試合終了まで待機して録画停止"""
         self.log("🛡️  試合終了を監視中...")
         error_count = 0
@@ -2403,7 +2435,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 return False
         return True
 
-    def stop_recording(self):
+    def stop_recording(self) -> None:
         if not self.obs_client.raw_client or self.record_path is not None:
             return
         if not self.recording_started:
@@ -2430,7 +2462,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         except Exception as e:
             self.log(f"⚠️ 録画停止エラー: {e}")
 
-    def shutdown_obs(self):
+    def shutdown_obs(self) -> None:
         self.obs_client.shutdown()
         if self._status_handler:
             try:
@@ -2439,7 +2471,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 pass
             self._status_handler = None
 
-    def disconnect_obs(self):
+    def disconnect_obs(self) -> None:
         self.obs_client.disconnect()
         if self._status_handler:
             try:
@@ -2448,7 +2480,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 pass
             self._status_handler = None
 
-    def save_json(self):
+    def save_json(self) -> None:
         if self.output_file is None:
             self.output_file = build_output_path(self.config)
 
@@ -2491,7 +2523,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         enforce_storage_limit(self.config, keep_paths=[self.output_file, self.record_path])
 
 
-async def run_cli_recorder():
+async def run_cli_recorder() -> None:
     app = None
     try:
         settings = load_settings()

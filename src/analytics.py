@@ -1,7 +1,11 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+from pandas import DataFrame, Series
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.tree import DecisionTreeClassifier, export_text
 
@@ -14,16 +18,16 @@ except ImportError:
 class GameDataAnalyzer:
     """蓄積された録画JSONをpandas DataFrameへ変換し、簡易分析する。"""
 
-    def __init__(self, json_dir=None, config=None):
+    def __init__(self, json_dir: str | Path | None = None, config: Any | None = None) -> None:
         self.config = config or recordtest.load_app_config()
         self.json_dir = Path(json_dir) if json_dir else Path(self.config.paths.json_dir)
 
-    def iter_json_files(self):
+    def iter_json_files(self) -> list[Path]:
         if not self.json_dir.exists():
             return []
         return sorted(self.json_dir.glob("*.json"))
 
-    def load_dataframe(self):
+    def load_dataframe(self) -> DataFrame:
         rows = []
         for match_index, json_path in enumerate(self.iter_json_files()):
             payload = self._read_payload(json_path)
@@ -45,7 +49,12 @@ class GameDataAnalyzer:
 
         return pd.DataFrame(rows)
 
-    def correlate_event_with_winrate(self, df, event_name, within_seconds=None):
+    def correlate_event_with_winrate(
+        self,
+        df: DataFrame | None,
+        event_name: str,
+        within_seconds: float | None = None,
+    ) -> dict[str, Any]:
         if df is None or df.empty:
             return {
                 "event_name": event_name,
@@ -90,11 +99,11 @@ class GameDataAnalyzer:
             "winrate_by_event_count": {int(k): float(v) for k, v in winrate_by_count.items()},
         }
 
-    def horde_kill_15min_winrate_correlation(self, df=None):
+    def horde_kill_15min_winrate_correlation(self, df: DataFrame | None = None) -> dict[str, Any]:
         source = df if df is not None else self.load_dataframe()
         return self.correlate_event_with_winrate(source, "HordeKill", within_seconds=15 * 60)
 
-    def build_feature_matrix(self, df=None):
+    def build_feature_matrix(self, df: DataFrame | None = None) -> tuple[DataFrame, Series]:
         source = df if df is not None else self.load_dataframe()
         feature_names = [
             "horde_kill_15m",
@@ -163,7 +172,7 @@ class GameDataAnalyzer:
         y = matches["is_win"].astype(int).rename("is_win")
         return x, y
 
-    def extract_tactical_insights(self):
+    def extract_tactical_insights(self) -> dict[str, Any]:
         x, y = self.build_feature_matrix()
         feature_labels = self._feature_labels(x)
         if x.empty or y.empty:
@@ -211,7 +220,7 @@ class GameDataAnalyzer:
             "reason": None,
         }
 
-    def _read_payload(self, path):
+    def _read_payload(self, path: Path) -> dict[str, Any] | None:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -219,7 +228,13 @@ class GameDataAnalyzer:
         except Exception:
             return None
 
-    def _match_base_row(self, payload, match_id, json_path, match_index):
+    def _match_base_row(
+        self,
+        payload: dict[str, Any],
+        match_id: str,
+        json_path: Path,
+        match_index: int,
+    ) -> dict[str, Any]:
         game_result = payload.get("game_result")
         player_team = payload.get("player_team")
         winning_team = payload.get("winning_team")
@@ -239,7 +254,7 @@ class GameDataAnalyzer:
             "obs_record_path": payload.get("obs_record_path"),
         }
 
-    def _event_row(self, event):
+    def _event_row(self, event: dict[str, Any]) -> dict[str, Any]:
         event_name = event.get("EventName")
         event_time = self._to_float(event.get("EventTime"))
         return {
@@ -261,7 +276,7 @@ class GameDataAnalyzer:
             "raw_event": event,
         }
 
-    def _empty_event_row(self):
+    def _empty_event_row(self) -> dict[str, Any]:
         return {
             "event_id": None,
             "event_name": None,
@@ -281,7 +296,7 @@ class GameDataAnalyzer:
             "raw_event": None,
         }
 
-    def _own_team_event_mask(self, df):
+    def _own_team_event_mask(self, df: DataFrame) -> Series:
         if df.empty:
             return pd.Series(False, index=df.index)
         relation = df.get("team_relation")
@@ -301,7 +316,7 @@ class GameDataAnalyzer:
             own_by_team = pd.Series(False, index=df.index)
         return own_by_relation | own_by_team
 
-    def _normalize_champion_list(self, champions):
+    def _normalize_champion_list(self, champions: Any) -> list[str]:
         if champions is None:
             return []
         if isinstance(champions, str):
@@ -318,7 +333,7 @@ class GameDataAnalyzer:
                 normalized.append(name)
         return sorted(set(normalized))
 
-    def _enemy_feature_name(self, champion, used_names):
+    def _enemy_feature_name(self, champion: str, used_names: set[str]) -> str:
         safe_name = "".join(char if char.isalnum() else "_" for char in str(champion).strip())
         while "__" in safe_name:
             safe_name = safe_name.replace("__", "_")
@@ -333,7 +348,7 @@ class GameDataAnalyzer:
         used_names.add(feature_name)
         return feature_name
 
-    def _feature_labels(self, x):
+    def _feature_labels(self, x: DataFrame) -> dict[str, str]:
         labels = {
             "horde_kill_15m": "15分以内HordeKill",
             "own_building_kill_15m": "15分以内タワー破壊",
@@ -347,13 +362,18 @@ class GameDataAnalyzer:
                 labels[feature_name] = f"敵に{feature_name.removeprefix('enemy_')}"
         return labels
 
-    def _decision_tree_leaf_rules(self, model, feature_names, feature_labels):
+    def _decision_tree_leaf_rules(
+        self,
+        model: DecisionTreeClassifier,
+        feature_names: list[str],
+        feature_labels: dict[str, str],
+    ) -> list[dict[str, Any]]:
         tree = model.tree_
         class_index = {int(label): index for index, label in enumerate(model.classes_)}
         win_index = class_index.get(1)
         leaves = []
 
-        def walk(node_id, conditions):
+        def walk(node_id: int, conditions: list[str]) -> None:
             left = tree.children_left[node_id]
             right = tree.children_right[node_id]
             if left == right:
@@ -383,7 +403,7 @@ class GameDataAnalyzer:
         walk(0, [])
         return leaves
 
-    def _format_tree_condition(self, label, feature_name, threshold, side):
+    def _format_tree_condition(self, label: str, feature_name: str, threshold: float, side: str) -> str:
         if feature_name == "first_blood":
             return f"{label}なし" if side == "left" else f"{label}あり"
         if feature_name.startswith("enemy_"):
@@ -396,12 +416,12 @@ class GameDataAnalyzer:
         value = int(threshold // 1) + 1
         return f"{label} >= {value}"
 
-    def _format_leaf_rule(self, leaf):
+    def _format_leaf_rule(self, leaf: dict[str, Any]) -> str:
         rule_text = " AND ".join(leaf["conditions"])
         win_rate = round(leaf["win_rate"] * 100)
         return f"{rule_text} -> WinRate {win_rate}% (n={leaf['samples']})"
 
-    def _is_win(self, game_result, player_team, winning_team):
+    def _is_win(self, game_result: Any, player_team: Any, winning_team: Any) -> bool | None:
         if isinstance(game_result, bool):
             return game_result
         text = str(game_result or "").strip().lower()
@@ -413,7 +433,7 @@ class GameDataAnalyzer:
             return str(player_team).strip().lower() == str(winning_team).strip().lower()
         return None
 
-    def _to_float(self, value):
+    def _to_float(self, value: Any) -> float | None:
         try:
             return float(value)
         except Exception:

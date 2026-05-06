@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any, Callable
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -56,7 +59,7 @@ APP_ICON_CANDIDATES = [
 ]
 
 
-def get_app_icon():
+def get_app_icon() -> QIcon | None:
     for path in APP_ICON_CANDIDATES:
         if path.exists():
             return QIcon(str(path))
@@ -69,15 +72,15 @@ RECORDING_CONTROLLER = RecordingController()
 ANALYTICS_CONTROLLER = AnalyticsController(CONFIG_CONTROLLER)
 
 
-def apply_auto_defaults(data, force_obs_detect=False):
+def apply_auto_defaults(data: dict[str, Any] | None, force_obs_detect: bool = False) -> tuple[dict[str, Any], bool, list[str]]:
     return CONFIG_CONTROLLER.apply_auto_defaults(data, force_obs_detect=force_obs_detect)
 
 
-def format_report_lines(lines):
+def format_report_lines(lines: list[str] | tuple[str, ...] | None) -> str:
     return CONFIG_CONTROLLER.format_report_lines(lines)
 
 
-def run_preflight(config_data=None, auto_fix=True, force_obs_detect=True):
+def run_preflight(config_data: dict[str, Any] | None = None, auto_fix: bool = True, force_obs_detect: bool = True) -> dict[str, Any]:
     return CONFIG_CONTROLLER.run_preflight(
         config_data,
         auto_fix=auto_fix,
@@ -85,15 +88,15 @@ def run_preflight(config_data=None, auto_fix=True, force_obs_detect=True):
     )
 
 
-def run_guided_auto_setup(config_data=None):
+def run_guided_auto_setup(config_data: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
     return CONFIG_CONTROLLER.run_guided_auto_setup(config_data)
 
 
-def load_config():
+def load_config() -> dict[str, Any]:
     return CONFIG_CONTROLLER.load_config()
 
 
-def save_config(data):
+def save_config(data: dict[str, Any]) -> None:
     CONFIG_CONTROLLER.save_config(data)
 
 
@@ -102,14 +105,14 @@ class RecorderWorker(QThread):
     error = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.stop_flag = False
         self.recorder = None
         self.loop = None
         self.stop_event = None
 
-    def run(self):
+    def run(self) -> None:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.stop_event = asyncio.Event()
@@ -137,7 +140,7 @@ class RecorderWorker(QThread):
                 self.stop_event = None
             self.finished.emit()
 
-    async def run_async(self):
+    async def run_async(self) -> None:
         try:
             settings = load_config()
             report = run_preflight(settings, auto_fix=True, force_obs_detect=True)
@@ -183,7 +186,7 @@ class RecorderWorker(QThread):
                     self.recorder.save_json()
                 self.recorder.shutdown_obs()
 
-    def stop(self):
+    def stop(self) -> None:
         self.stop_flag = True
         loop = self.loop
         if loop and loop.is_running():
@@ -191,7 +194,7 @@ class RecorderWorker(QThread):
         else:
             self._request_stop_on_loop()
 
-    def _request_stop_on_loop(self):
+    def _request_stop_on_loop(self) -> None:
         if self.stop_event:
             self.stop_event.set()
         if self.recorder:
@@ -202,7 +205,7 @@ class AnalyticsWorker(QThread):
     loaded = pyqtSignal(dict)
     error = pyqtSignal(str)
 
-    def run(self):
+    def run(self) -> None:
         try:
             self.loaded.emit(ANALYTICS_CONTROLLER.load_summary())
         except Exception as e:
@@ -214,7 +217,7 @@ class EnvironmentSetupWorker(QThread):
     completed = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def run(self):
+    def run(self) -> None:
         try:
             from scripts import setup_env
 
@@ -224,7 +227,7 @@ class EnvironmentSetupWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
-def run_environment_bootstrap(parent=None):
+def run_environment_bootstrap(parent: QWidget | None = None) -> bool:
     try:
         from scripts import setup_env
     except Exception as e:
@@ -247,16 +250,16 @@ def run_environment_bootstrap(parent=None):
     worker = EnvironmentSetupWorker()
     result = {"ok": False, "error": None}
 
-    def on_progress(percent, message):
+    def on_progress(percent: int, message: str) -> None:
         dialog.setValue(int(percent))
         dialog.setLabelText(str(message))
 
-    def on_completed():
+    def on_completed() -> None:
         result["ok"] = True
         dialog.setValue(100)
         dialog.close()
 
-    def on_failed(message):
+    def on_failed(message: str) -> None:
         result["error"] = message
         dialog.close()
 
@@ -280,7 +283,7 @@ def run_environment_bootstrap(parent=None):
 
 
 class SetupWizardDialog(QDialog):
-    def __init__(self, parent=None, startup_mode=False):
+    def __init__(self, parent: QWidget | None = None, startup_mode: bool = False) -> None:
         super().__init__(parent)
         self.startup_mode = startup_mode
         self.setWindowTitle("初回セットアップ")
@@ -333,7 +336,7 @@ class SetupWizardDialog(QDialog):
 
         self.load_values()
 
-    def load_values(self):
+    def load_values(self) -> None:
         data = load_config()
         obs = data.get("obs", {})
         paths = data.get("paths", {})
@@ -344,7 +347,7 @@ class SetupWizardDialog(QDialog):
         self.fields["paths.recordings_dir"].setText(str(paths.get("recordings_dir", "")))
         self.fields["paths.json_dir"].setText(str(paths.get("json_dir", "")))
 
-    def collect_data(self):
+    def collect_data(self) -> dict[str, Any]:
         data = load_config()
         data.setdefault("obs", {})
         data.setdefault("paths", {})
@@ -362,7 +365,7 @@ class SetupWizardDialog(QDialog):
         data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
         return data
 
-    def test_obs_connection(self):
+    def test_obs_connection(self) -> None:
         data = self.collect_data()
         report, ok, detail = CONFIG_CONTROLLER.test_obs_connection(data)
         if report.get("changed"):
@@ -381,7 +384,7 @@ class SetupWizardDialog(QDialog):
                 f"接続に失敗しました。\n{detail}"
             )
 
-    def run_quick_setup(self):
+    def run_quick_setup(self) -> bool:
         data = self.collect_data()
         report, info = run_guided_auto_setup(data)
         if report.get("errors"):
@@ -405,7 +408,7 @@ class SetupWizardDialog(QDialog):
         QMessageBox.information(self, "環境修復", message)
         return True
 
-    def run_diagnosis(self):
+    def run_diagnosis(self) -> None:
         data = self.collect_data()
         report = run_preflight(data, auto_fix=True, force_obs_detect=True)
         if report.get("changed"):
@@ -422,7 +425,7 @@ class SetupWizardDialog(QDialog):
         else:
             QMessageBox.information(self, "自動診断", message)
 
-    def save_and_accept(self):
+    def save_and_accept(self) -> None:
         if not self.run_quick_setup():
             return
 
@@ -433,7 +436,7 @@ class SetupWizardDialog(QDialog):
 
 
 class HomePage(QWidget):
-    def __init__(self, on_play, on_settings, on_analytics):
+    def __init__(self, on_play: Callable[[], None], on_settings: Callable[[], None], on_analytics: Callable[[], None]) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -481,7 +484,7 @@ class HomePage(QWidget):
         layout.addLayout(btn_layout)
         layout.addStretch(1)
 
-    def set_recorder_status(self, badge_text, color_hex="#cfcfcf", detail_text=None):
+    def set_recorder_status(self, badge_text: str, color_hex: str = "#cfcfcf", detail_text: str | None = None) -> None:
         self.status_label.setText(badge_text)
         self.status_label.setStyleSheet(
             "padding: 10px 14px; border-radius: 8px; "
@@ -493,7 +496,7 @@ class HomePage(QWidget):
 
 
 class PlayerPage(QWidget):
-    def __init__(self, on_back):
+    def __init__(self, on_back: Callable[[], None]) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -514,10 +517,10 @@ class PlayerPage(QWidget):
         self.player_widget = PlayerWidget(auto_open=False, fullscreen_cb=self.handle_fullscreen)
         layout.addWidget(self.player_widget, stretch=1)
 
-    def open_selector(self):
+    def open_selector(self) -> bool:
         return self.player_widget.open_replay_selector()
 
-    def handle_fullscreen(self, enabled):
+    def handle_fullscreen(self, enabled: bool) -> None:
         window = self.window()
         if enabled:
             self.back_btn.hide()
@@ -534,12 +537,12 @@ class PlayerPage(QWidget):
             self.back_btn.show()
             self.open_btn.show()
 
-    def on_leave(self):
+    def on_leave(self) -> None:
         self.player_widget.stop_playback()
 
 
 class AnalyticsPage(QWidget):
-    def __init__(self, on_back):
+    def __init__(self, on_back: Callable[[], None]) -> None:
         super().__init__()
         self.worker = None
 
@@ -607,10 +610,10 @@ class AnalyticsPage(QWidget):
         insight_layout.addWidget(self.insight_label)
         layout.addWidget(self.insight_frame)
 
-    def on_page_shown(self):
+    def on_page_shown(self) -> None:
         self.reload()
 
-    def reload(self):
+    def reload(self) -> None:
         if self.worker and self.worker.isRunning():
             return
         self.status_label.setText("分析中...")
@@ -624,7 +627,7 @@ class AnalyticsPage(QWidget):
         self.worker.finished.connect(self.on_worker_finished)
         self.worker.start()
 
-    def apply_result(self, result):
+    def apply_result(self, result: dict[str, Any]) -> None:
         total_matches = result.get("total_matches", 0)
         win_rate = result.get("win_rate")
         win_rate_text = "--" if win_rate is None else f"{win_rate * 100:.1f}%"
@@ -637,16 +640,16 @@ class AnalyticsPage(QWidget):
         self.populate_horde_table(result.get("horde_rows", []))
         self.populate_tactical_insights(result.get("tactical_insights", {}))
 
-    def apply_error(self, message):
+    def apply_error(self, message: str) -> None:
         self.status_label.setText(f"分析に失敗しました: {message}")
         self.summary_label.setText("総録画試合数: -- / 勝率: --")
         self.horde_table.setRowCount(0)
         self.insight_label.setText("データ不足のため分析できません。")
 
-    def on_worker_finished(self):
+    def on_worker_finished(self) -> None:
         self.refresh_btn.setEnabled(True)
 
-    def populate_horde_table(self, rows):
+    def populate_horde_table(self, rows: list[dict[str, Any]]) -> None:
         self.horde_table.setRowCount(len(rows))
         for row_index, row in enumerate(rows):
             count = int(row.get("count", 0))
@@ -676,7 +679,7 @@ class AnalyticsPage(QWidget):
             self.horde_table.setItem(0, 2, QTableWidgetItem("--"))
             self.horde_table.setItem(0, 3, QTableWidgetItem("分析できる試合結果がありません。"))
 
-    def populate_tactical_insights(self, insights):
+    def populate_tactical_insights(self, insights: dict[str, Any]) -> None:
         if not insights:
             self.insight_label.setText("データ不足のため分析できません。")
             return
@@ -699,7 +702,7 @@ class AnalyticsPage(QWidget):
 
 
 class SettingsPage(QWidget):
-    def __init__(self, on_back):
+    def __init__(self, on_back: Callable[[], None]) -> None:
         super().__init__()
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(12, 12, 12, 12)
@@ -858,7 +861,7 @@ class SettingsPage(QWidget):
         self.load_settings()
         QTimer.singleShot(0, lambda: self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False))
 
-    def _create_db_slider(self):
+    def _create_db_slider(self) -> tuple[QWidget, QSlider, QLabel]:
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -875,45 +878,45 @@ class SettingsPage(QWidget):
         layout.addWidget(value_label)
         return row, slider, value_label
 
-    def _set_db_slider_value(self, slider, value):
+    def _set_db_slider_value(self, slider: QSlider, value: float | int | str | None) -> None:
         try:
             db_value = float(value)
         except Exception:
             db_value = 0.0
         slider.setValue(int(round(db_value * 10)))
 
-    def _get_db_slider_value(self, slider):
+    def _get_db_slider_value(self, slider: QSlider) -> float:
         return float(slider.value()) / 10.0
 
-    def on_page_shown(self):
+    def on_page_shown(self) -> None:
         if not self._audio_auto_refreshed_once:
             self._audio_auto_refreshed_once = True
             self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
             return
         self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
 
-    def browse_recordings_dir(self):
+    def browse_recordings_dir(self) -> None:
         current = self.fields["paths.recordings_dir"].text().strip()
         start_dir = current or str(ROOT_DIR)
         selected = QFileDialog.getExistingDirectory(self, "録画保存ディレクトリを選択", start_dir)
         if selected:
             self.fields["paths.recordings_dir"].setText(selected)
 
-    def browse_json_dir(self):
+    def browse_json_dir(self) -> None:
         current = self.fields["paths.json_dir"].text().strip()
         start_dir = current or str(ROOT_DIR)
         selected = QFileDialog.getExistingDirectory(self, "JSONディレクトリを選択", start_dir)
         if selected:
             self.fields["paths.json_dir"].setText(selected)
 
-    def browse_icons_dir(self):
+    def browse_icons_dir(self) -> None:
         current = self.fields["paths.champion_icons_dir"].text().strip()
         start_dir = current or str(ROOT_DIR)
         selected = QFileDialog.getExistingDirectory(self, "アイコンディレクトリを選択", start_dir)
         if selected:
             self.fields["paths.champion_icons_dir"].setText(selected)
 
-    def update_storage_progress(self, data=None):
+    def update_storage_progress(self, data: dict[str, Any] | None = None) -> None:
         cfg = data if isinstance(data, dict) else load_config()
         storage_cfg = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
         max_bytes = recordtest.parse_max_storage_bytes(storage_cfg) or 0
@@ -937,7 +940,7 @@ class SettingsPage(QWidget):
         self.storage_progress.setFormat(text)
         self.storage_progress.setToolTip(text)
 
-    def load_settings(self):
+    def load_settings(self) -> None:
         data = load_config()
         obs = data.get("obs", {})
         paths = data.get("paths", {})
@@ -973,7 +976,7 @@ class SettingsPage(QWidget):
         self.update_storage_progress(data)
         self._audio_ui_loading = False
 
-    def save_settings(self):
+    def save_settings(self) -> None:
         data = load_config()
         data.setdefault("obs", {})
         data.setdefault("paths", {})
@@ -1027,14 +1030,14 @@ class SettingsPage(QWidget):
         self.load_settings()
         QMessageBox.information(self, "設定保存", "設定を保存しました。")
 
-    def _get_audio_widgets(self, key):
+    def _get_audio_widgets(self, key: str) -> tuple[QComboBox, QSlider, QCheckBox]:
         if key == "desktop":
             return self.audio_desktop_device, self.audio_desktop_volume, self.audio_desktop_mute
         if key == "mic":
             return self.audio_mic_device, self.audio_mic_volume, self.audio_mic_mute
         raise KeyError(key)
 
-    def _add_or_update_audio_combo_items(self, combo, items):
+    def _add_or_update_audio_combo_items(self, combo: QComboBox, items: list[dict[str, Any]]) -> None:
         current_id = combo.currentData()
         combo.blockSignals(True)
         combo.clear()
@@ -1045,7 +1048,7 @@ class SettingsPage(QWidget):
             self._select_combo_by_data(combo, current_id)
         combo.blockSignals(False)
 
-    def _select_combo_by_data(self, combo, value):
+    def _select_combo_by_data(self, combo: QComboBox, value: Any) -> bool:
         if value is None:
             return False
         value = str(value)
@@ -1055,7 +1058,7 @@ class SettingsPage(QWidget):
                 return True
         return False
 
-    def _set_audio_ui_from_config(self, key, slot_cfg):
+    def _set_audio_ui_from_config(self, key: str, slot_cfg: dict[str, Any]) -> None:
         defaults = recordtest.get_audio_config_defaults()
         slot = dict(defaults.get(key, {}))
         if isinstance(slot_cfg, dict):
@@ -1075,7 +1078,7 @@ class SettingsPage(QWidget):
         self._set_db_slider_value(volume, slot.get("volume_db", 0.0))
         mute.setChecked(bool(slot.get("mute", False)))
 
-    def _read_audio_slot_from_ui(self, key):
+    def _read_audio_slot_from_ui(self, key: str) -> dict[str, Any]:
         combo, volume, mute = self._get_audio_widgets(key)
         defaults = recordtest.get_audio_config_defaults()[key]
         device_id = combo.currentData()
@@ -1094,12 +1097,12 @@ class SettingsPage(QWidget):
             "mute": bool(mute.isChecked()),
         }
 
-    def _write_audio_settings_to_config(self, data):
+    def _write_audio_settings_to_config(self, data: dict[str, Any]) -> None:
         audio = data.setdefault("audio", {})
         audio["desktop"] = self._read_audio_slot_from_ui("desktop")
         audio["mic"] = self._read_audio_slot_from_ui("mic")
 
-    def _collect_settings_data_from_ui(self):
+    def _collect_settings_data_from_ui(self) -> dict[str, Any]:
         data = load_config()
         data.setdefault("obs", {})
         data.setdefault("paths", {})
@@ -1142,15 +1145,15 @@ class SettingsPage(QWidget):
         self._write_audio_settings_to_config(data)
         return data
 
-    def queue_audio_auto_apply(self, *_args):
+    def queue_audio_auto_apply(self, *_args: Any) -> None:
         if self._audio_ui_loading:
             return
         self._audio_apply_timer.start(350)
 
-    def _apply_audio_settings_auto(self):
+    def _apply_audio_settings_auto(self) -> None:
         self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=False)
 
-    def refresh_audio_devices(self, show_message=True, show_error=True, auto_launch=True):
+    def refresh_audio_devices(self, show_message: bool = True, show_error: bool = True, auto_launch: bool = True) -> bool:
         if self._audio_refresh_in_progress:
             return False
         self._audio_refresh_in_progress = True
@@ -1180,7 +1183,7 @@ class SettingsPage(QWidget):
         finally:
             self._audio_refresh_in_progress = False
 
-    def apply_audio_settings_to_obs(self, show_success=True, show_error=True, auto_launch=True):
+    def apply_audio_settings_to_obs(self, show_success: bool = True, show_error: bool = True, auto_launch: bool = True) -> bool:
         try:
             data = self._collect_settings_data_from_ui()
             result = AUDIO_CONTROLLER.apply_audio_settings(data, auto_launch=auto_launch)
@@ -1195,7 +1198,7 @@ class SettingsPage(QWidget):
                 QMessageBox.warning(self, "音声設定", f"OBSへの反映に失敗しました。\n{e}")
             return False
 
-    def apply_runtime_output_settings_to_obs(self, cfg=None, show_error=False):
+    def apply_runtime_output_settings_to_obs(self, cfg: dict[str, Any] | None = None, show_error: bool = False) -> bool:
         try:
             data = cfg if cfg is not None else load_config()
             return AUDIO_CONTROLLER.apply_runtime_output_settings(data)
@@ -1204,7 +1207,7 @@ class SettingsPage(QWidget):
                 QMessageBox.warning(self, "設定反映", f"録画設定のOBS反映に失敗しました。\n{e}")
             return False
 
-    def auto_fill_settings(self):
+    def auto_fill_settings(self) -> None:
         data = load_config()
         data, changed, notes = apply_auto_defaults(data, force_obs_detect=True)
         if changed:
@@ -1217,7 +1220,7 @@ class SettingsPage(QWidget):
             note_text = "- 変更なし"
         QMessageBox.information(self, "自動補完", f"設定の自動補完を実行しました。\n{note_text}")
 
-    def run_preflight_fix(self):
+    def run_preflight_fix(self) -> None:
         data = load_config()
         report = run_preflight(data, auto_fix=True, force_obs_detect=True)
         if report.get("changed"):
@@ -1234,13 +1237,13 @@ class SettingsPage(QWidget):
         else:
             QMessageBox.information(self, "録画前チェック", message)
 
-    def open_setup_wizard(self):
+    def open_setup_wizard(self) -> None:
         dialog = SetupWizardDialog(self, startup_mode=False)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.load_settings()
             self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
 
-    def run_quick_setup(self):
+    def run_quick_setup(self) -> bool:
         data = load_config()
         report, info = run_guided_auto_setup(data)
         if report.get("errors"):
@@ -1268,7 +1271,7 @@ class SettingsPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.bg_recorder_worker = None
         self._closing = False
@@ -1303,7 +1306,7 @@ class MainWindow(QMainWindow):
         self.run_startup_setup()
         self.start_background_recorder()
 
-    def init_tray_icon(self):
+    def init_tray_icon(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
 
@@ -1327,25 +1330,25 @@ class MainWindow(QMainWindow):
         self._tray_icon.activated.connect(self.on_tray_activated)
         self._tray_icon.show()
 
-    def on_tray_activated(self, reason):
+    def on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
             QSystemTrayIcon.ActivationReason.Trigger,
             QSystemTrayIcon.ActivationReason.DoubleClick,
         ):
             self.restore_from_tray()
 
-    def restore_from_tray(self):
+    def restore_from_tray(self) -> None:
         self.show()
         self.showNormal()
         self.raise_()
         self.activateWindow()
         self.show_home()
 
-    def exit_from_tray(self):
+    def exit_from_tray(self) -> None:
         self._is_quitting = True
         self.close()
 
-    def should_minimize_to_tray(self):
+    def should_minimize_to_tray(self) -> bool:
         if self._is_quitting:
             return False
         if not self._tray_icon or not self._tray_icon.isVisible():
@@ -1356,30 +1359,30 @@ class MainWindow(QMainWindow):
         except Exception:
             return True
 
-    def show_home(self):
+    def show_home(self) -> None:
         self.player_page.on_leave()
         self.stack.setCurrentWidget(self.home_page)
         if not self._closing:
             self.start_background_recorder()
 
-    def show_player(self):
+    def show_player(self) -> None:
         # MPV native window focus issues are avoided by showing player page first.
         self.stack.setCurrentWidget(self.player_page)
         success = self.player_page.open_selector()
         if not success:
             self.show_home()
 
-    def show_settings(self):
+    def show_settings(self) -> None:
         self.player_page.on_leave()
         self.stack.setCurrentWidget(self.settings_page)
         self.settings_page.on_page_shown()
 
-    def show_analytics(self):
+    def show_analytics(self) -> None:
         self.player_page.on_leave()
         self.stack.setCurrentWidget(self.analytics_page)
         self.analytics_page.on_page_shown()
 
-    def run_startup_setup(self):
+    def run_startup_setup(self) -> None:
         data = load_config()
         report = run_preflight(data, auto_fix=True, force_obs_detect=True)
         if report.get("changed"):
@@ -1402,7 +1405,7 @@ class MainWindow(QMainWindow):
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.settings_page.load_settings()
 
-    def _derive_recorder_home_status(self, raw_message):
+    def _derive_recorder_home_status(self, raw_message: str) -> tuple[str, str, str]:
         text = str(raw_message or "").strip()
         if not text:
             return "⚪ 停止", "#cfcfcf", "状態情報なし"
@@ -1423,11 +1426,11 @@ class MainWindow(QMainWindow):
             return "🟢 起動準備中...", "#7bd88f", text
         return "🟢 監視中", "#7bd88f", text
 
-    def _set_home_status_from_worker_message(self, raw_message):
+    def _set_home_status_from_worker_message(self, raw_message: str) -> None:
         badge, color, detail = self._derive_recorder_home_status(raw_message)
         self.home_page.set_recorder_status(badge, color_hex=color, detail_text=detail)
 
-    def start_background_recorder(self):
+    def start_background_recorder(self) -> None:
         if self.bg_recorder_worker and self.bg_recorder_worker.isRunning():
             return
 
@@ -1442,7 +1445,7 @@ class MainWindow(QMainWindow):
         )
         self.bg_recorder_worker.start()
 
-    def stop_background_recorder(self, wait_ms=5000):
+    def stop_background_recorder(self, wait_ms: int = 5000) -> None:
         worker = self.bg_recorder_worker
         if not worker:
             return
@@ -1450,17 +1453,17 @@ class MainWindow(QMainWindow):
             worker.stop()
             worker.wait(wait_ms)
 
-    def on_bg_recorder_status(self, message):
+    def on_bg_recorder_status(self, message: str) -> None:
         self._set_home_status_from_worker_message(message)
 
-    def on_bg_recorder_error(self, message):
+    def on_bg_recorder_error(self, message: str) -> None:
         self.home_page.set_recorder_status(
             "⚠️ 録画監視エラー",
             color_hex="#ffb74d",
             detail_text=str(message),
         )
 
-    def on_bg_recorder_finished(self):
+    def on_bg_recorder_finished(self) -> None:
         if self._closing:
             self.home_page.set_recorder_status("⚪ 停止", color_hex="#cfcfcf", detail_text="アプリ終了中")
             return
@@ -1470,7 +1473,7 @@ class MainWindow(QMainWindow):
             detail_text="バックグラウンド録画監視が停止しました。",
         )
 
-    def closeEvent(self, event):
+    def closeEvent(self, event: Any) -> None:
         if (not self._is_quitting) and self.should_minimize_to_tray():
             event.ignore()
             self.hide()
@@ -1506,7 +1509,7 @@ class MainWindow(QMainWindow):
             app.quit()
 
 
-def main():
+def main() -> None:
     app = QApplication([])
     icon = get_app_icon()
     if icon:

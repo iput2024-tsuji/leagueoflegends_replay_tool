@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sys
 import os
 import json
@@ -7,6 +9,7 @@ import shutil
 import subprocess
 import logging
 from pathlib import Path
+from typing import Any, Callable
 
 # --- 1. MPVのパス設定 ---
 try:
@@ -26,7 +29,7 @@ DEFAULT_JSON_DIR = ROOT_DIR / "recordings" / "json"
 LOGGER = logging.getLogger("lol_replay.player")
 
 
-def load_app_config():
+def load_app_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         return {}
     try:
@@ -39,7 +42,7 @@ def load_app_config():
     return {}
 
 
-def resolve_config_path(value, fallback):
+def resolve_config_path(value: str | Path | None, fallback: Path) -> Path:
     path = fallback
     if value not in (None, ""):
         path = Path(str(value))
@@ -48,7 +51,7 @@ def resolve_config_path(value, fallback):
     return path
 
 
-def get_config_media_paths(config_data=None):
+def get_config_media_paths(config_data: dict[str, Any] | None = None) -> tuple[dict[str, Any], Path, Path]:
     data = config_data if isinstance(config_data, dict) else load_app_config()
     paths = data.get("paths", {}) if isinstance(data, dict) else {}
     recordings_dir = resolve_config_path(paths.get("recordings_dir"), DEFAULT_RECORDINGS_DIR)
@@ -56,7 +59,7 @@ def get_config_media_paths(config_data=None):
     return data, recordings_dir, json_dir
 
 
-def resolve_video_path(json_path: Path, payload: dict, recordings_dir: Path):
+def resolve_video_path(json_path: Path, payload: dict[str, Any], recordings_dir: Path) -> Path | None:
     value = payload.get("obs_record_path")
     if not value:
         return None
@@ -90,12 +93,12 @@ def resolve_video_path(json_path: Path, payload: dict, recordings_dir: Path):
     return None
 
 
-def find_ffmpeg_executable():
+def find_ffmpeg_executable() -> str | None:
     ffmpeg_path = BIN_DIR / "ffmpeg.exe"
     return str(ffmpeg_path) if ffmpeg_path.exists() else None
 
 
-def format_seconds(value):
+def format_seconds(value: float | int | str | None) -> str:
     try:
         total = max(0.0, float(value))
     except Exception:
@@ -105,7 +108,7 @@ def format_seconds(value):
     return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
-def ensure_mpv_dll(bin_dir: Path, root_dir: Path):
+def ensure_mpv_dll(bin_dir: Path, root_dir: Path) -> None:
     candidates = []
     for base in (bin_dir, root_dir):
         if not base or not base.exists():
@@ -168,7 +171,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QShortcut, QPixmap, QFont, QColor
 
 
-def show_mpv_missing_dialog_and_exit(parent=None):
+def show_mpv_missing_dialog_and_exit(parent: QWidget | None = None) -> None:
     message = (
         "binフォルダに mpv-1.dll などのMPVコンポーネントが見つかりません。\n"
         "配置してから起動してください。\n\n"
@@ -186,7 +189,7 @@ def show_mpv_missing_dialog_and_exit(parent=None):
     raise SystemExit(1)
 
 
-def ensure_mpv_available_or_exit(parent=None):
+def ensure_mpv_available_or_exit(parent: QWidget | None = None) -> Any:
     if mpv_module is not None:
         return mpv_module
     show_mpv_missing_dialog_and_exit(parent)
@@ -197,12 +200,12 @@ class SyncWorker(QThread):
     finished = pyqtSignal(float)
     progress = pyqtSignal(str)
 
-    def __init__(self, video_path, max_seconds=180):
+    def __init__(self, video_path: str | Path, max_seconds: float = 180) -> None:
         super().__init__()
         self.video_path = str(video_path)
         self.max_seconds = max_seconds
 
-    def run(self):
+    def run(self) -> None:
         self.progress.emit("同期マーカーを高速捜索中...")
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
@@ -273,7 +276,7 @@ class ClipExportWorker(QThread):
     export_finished = pyqtSignal(str)
     export_failed = pyqtSignal(str)
 
-    def __init__(self, ffmpeg_path, input_path, output_path, start_sec, end_sec):
+    def __init__(self, ffmpeg_path: str | Path, input_path: str | Path, output_path: str | Path, start_sec: float, end_sec: float) -> None:
         super().__init__()
         self.ffmpeg_path = str(ffmpeg_path)
         self.input_path = str(input_path)
@@ -289,7 +292,7 @@ class ClipExportWorker(QThread):
         ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]),
     ]
 
-    def cancel(self):
+    def cancel(self) -> None:
         self._cancel_requested = True
         process = self.process
         if process and process.poll() is None:
@@ -298,7 +301,7 @@ class ClipExportWorker(QThread):
             except Exception:
                 pass
 
-    def run(self):
+    def run(self) -> None:
         if self.duration_sec <= 0:
             self.export_failed.emit("クリップ範囲が不正です。終了時間は開始時間より後にしてください。")
             return
@@ -338,7 +341,7 @@ class ClipExportWorker(QThread):
 
         self.export_failed.emit("FFmpegの実行に失敗しました。\n" + "\n\n".join(failures[-3:]))
 
-    def _build_ffmpeg_command(self, encoder_args):
+    def _build_ffmpeg_command(self, encoder_args: list[str]) -> list[str]:
         return [
             self.ffmpeg_path,
             "-hide_banner",
@@ -376,7 +379,7 @@ class ClipExportWorker(QThread):
             self.output_path,
         ]
 
-    def _run_ffmpeg_with_encoder(self, encoder_name, encoder_args):
+    def _run_ffmpeg_with_encoder(self, encoder_name: str, encoder_args: list[str]) -> tuple[bool, str]:
         cmd = self._build_ffmpeg_command(encoder_args)
         tail = []
         try:
@@ -412,7 +415,7 @@ class ClipExportWorker(QThread):
         except Exception as e:
             return False, str(e)
 
-    def _handle_progress_line(self, line, encoder_name):
+    def _handle_progress_line(self, line: str, encoder_name: str) -> None:
         if not line or "=" not in line:
             return
         key, value = line.split("=", 1)
@@ -430,7 +433,7 @@ class ClipExportWorker(QThread):
         percent = int(max(0, min(100, (out_sec / self.duration_sec) * 100)))
         self.progress.emit(percent, f"出力中... {percent}% ({encoder_name})")
 
-    def _parse_ffmpeg_time(self, value):
+    def _parse_ffmpeg_time(self, value: str) -> float | None:
         try:
             hours, minutes, seconds = str(value).split(":")
             return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
@@ -438,7 +441,7 @@ class ClipExportWorker(QThread):
             return None
 
 
-def normalize_result(result_value, team_value=None, winning_team=None):
+def normalize_result(result_value: Any, team_value: Any | None = None, winning_team: Any | None = None) -> str:
     if isinstance(result_value, str):
         val = result_value.strip().lower()
         if "win" in val:
@@ -465,7 +468,7 @@ def normalize_result(result_value, team_value=None, winning_team=None):
     return "Unknown"
 
 
-def normalize_summoner_name(value):
+def normalize_summoner_name(value: Any) -> str | None:
     if not value:
         return None
     name = str(value).strip()
@@ -474,11 +477,11 @@ def normalize_summoner_name(value):
     return name.strip()
 
 
-def normalize_icon_key(value):
+def normalize_icon_key(value: Any) -> str:
     return re.sub(r"[^\w]+", "", str(value or ""), flags=re.UNICODE).lower()
 
 
-def build_icon_index():
+def build_icon_index() -> None:
     global ICON_INDEX
     ICON_INDEX = {}
     if not ICON_DIR or not ICON_DIR.exists():
@@ -493,7 +496,7 @@ def build_icon_index():
             ICON_INDEX[key] = path
 
 
-def load_icon_aliases():
+def load_icon_aliases() -> None:
     global ICON_ALIASES
     ICON_ALIASES = {}
     if not ALIASES_PATH.exists():
@@ -507,7 +510,7 @@ def load_icon_aliases():
         ICON_ALIASES = {}
 
 
-def find_champion_icon(champion_name):
+def find_champion_icon(champion_name: str | None) -> Path | None:
     if not champion_name:
         return None
     global ICON_INDEX, ICON_ALIASES
@@ -560,7 +563,7 @@ def find_champion_icon(champion_name):
 
 
 class ReplaySelectDialog(QDialog):
-    def __init__(self, parent=None, json_dir=None, recordings_dir=None):
+    def __init__(self, parent: QWidget | None = None, json_dir: str | Path | None = None, recordings_dir: str | Path | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Replay Select")
         self.resize(820, 560)
@@ -621,7 +624,7 @@ class ReplaySelectDialog(QDialog):
         layout.addLayout(btn_row)
         self.refresh_list()
 
-    def refresh_list(self):
+    def refresh_list(self) -> None:
         self.meta_cache = []
         if self.json_dir.exists():
             files = sorted(self.json_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -632,7 +635,7 @@ class ReplaySelectDialog(QDialog):
         if self.list_widget.count() > 0:
             self.list_widget.setCurrentRow(0)
 
-    def load_meta(self, path):
+    def load_meta(self, path: Path) -> dict[str, Any]:
         meta = {
             "path": path,
             "champion_name": "Unknown",
@@ -659,7 +662,7 @@ class ReplaySelectDialog(QDialog):
             pass
         return meta
 
-    def build_item_widget(self, meta):
+    def build_item_widget(self, meta: dict[str, Any]) -> QWidget:
         widget = QWidget()
         layout = QHBoxLayout(widget)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -707,7 +710,7 @@ class ReplaySelectDialog(QDialog):
         layout.addWidget(status_label)
         return widget
 
-    def apply_filters(self):
+    def apply_filters(self) -> None:
         self.list_widget.clear()
         if not self.meta_cache:
             return
@@ -717,7 +720,7 @@ class ReplaySelectDialog(QDialog):
         sort_mode = self.sort_filter.currentText()
         hide_missing = self.missing_filter.isChecked()
 
-        def matches(meta):
+        def matches(meta: dict[str, Any]) -> bool:
             if hide_missing and not meta["video_exists"]:
                 return False
             if result_filter != "All" and meta["result"] != result_filter:
@@ -740,7 +743,7 @@ class ReplaySelectDialog(QDialog):
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, widget)
 
-    def accept_selected(self):
+    def accept_selected(self) -> None:
         item = self.list_widget.currentItem()
         if not item:
             return
@@ -751,7 +754,7 @@ class ReplaySelectDialog(QDialog):
         self.selected_path = item.data(Qt.ItemDataRole.UserRole)
         self.accept()
 
-    def open_file_dialog(self):
+    def open_file_dialog(self) -> None:
         fname, _ = QFileDialog.getOpenFileName(
             self,
             "Open JSON Log",
@@ -764,7 +767,7 @@ class ReplaySelectDialog(QDialog):
 
 
 class PlayerWidget(QWidget):
-    def __init__(self, auto_open=True, fullscreen_cb=None):
+    def __init__(self, auto_open: bool = True, fullscreen_cb: Callable[[bool], None] | None = None) -> None:
         super().__init__()
         self.fullscreen_cb = fullscreen_cb
         
@@ -941,7 +944,7 @@ class PlayerWidget(QWidget):
         if auto_open:
             self.open_replay_selector()
 
-    def init_mpv(self):
+    def init_mpv(self) -> None:
         try:
             mpv_runtime = ensure_mpv_available_or_exit(self)
             self.player = mpv_runtime.MPV(
@@ -958,7 +961,7 @@ class PlayerWidget(QWidget):
             QMessageBox.critical(self, "Error", f"MPV Init Failed: {e}")
             sys.exit(1)
 
-    def load_settings(self):
+    def load_settings(self) -> None:
         global ICON_DIR, ICON_INDEX, ICON_ALIASES, ALIASES_PATH
         self.recordings_dir = DEFAULT_RECORDINGS_DIR
         self.json_dir = DEFAULT_JSON_DIR
@@ -982,7 +985,7 @@ class PlayerWidget(QWidget):
         except Exception:
             pass
 
-    def register_shortcuts(self):
+    def register_shortcuts(self) -> None:
         QShortcut(QKeySequence(Qt.Key.Key_Space), self, activated=self.toggle_playback)
         QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=lambda: self.step_frame(1))
         QShortcut(QKeySequence(Qt.Key.Key_Left), self, activated=lambda: self.step_frame(-1))
@@ -992,7 +995,7 @@ class PlayerWidget(QWidget):
         QShortcut(QKeySequence(Qt.Key.Key_P), self, activated=self.prev_event)
 
     # --- キーボードイベント処理 (ここが重要) ---
-    def keyPressEvent(self, event):
+    def keyPressEvent(self, event: Any) -> None:
         key = event.key()
 
         # [Space] 再生/一時停止
@@ -1033,7 +1036,7 @@ class PlayerWidget(QWidget):
         else:
             super().keyPressEvent(event)
 
-    def toggle_fullscreen(self):
+    def toggle_fullscreen(self) -> None:
         if not self.is_fullscreen_mode:
             # フルスクリーン化
             self.right_panel.hide()    # サイドバーを消す
@@ -1059,30 +1062,30 @@ class PlayerWidget(QWidget):
             self.control_panel.show()
             self.is_fullscreen_mode = False
 
-    def on_escape(self):
+    def on_escape(self) -> None:
         if self.is_fullscreen_mode:
             self.toggle_fullscreen()
 
-    def next_event(self):
+    def next_event(self) -> None:
         row = self.event_list.currentRow()
         if row < self.event_list.count() - 1:
             self.event_list.setCurrentRow(row + 1)
             self.on_event_clicked(self.event_list.currentItem())
 
-    def prev_event(self):
+    def prev_event(self) -> None:
         row = self.event_list.currentRow()
         if row > 0:
             self.event_list.setCurrentRow(row - 1)
             self.on_event_clicked(self.event_list.currentItem())
 
-    def open_file_dialog(self):
+    def open_file_dialog(self) -> None:
         self.load_settings()
         initial_dir = str(self.json_dir if self.json_dir else ROOT_DIR)
         fname, _ = QFileDialog.getOpenFileName(self, "Open JSON Log", initial_dir, "JSON Files (*.json)")
         if fname:
             self.load_data(fname)
 
-    def open_replay_selector(self):
+    def open_replay_selector(self) -> bool:
         self.load_settings()
         dialog_parent = self.window() if self.window() else self
         dialog = ReplaySelectDialog(
@@ -1094,7 +1097,7 @@ class PlayerWidget(QWidget):
             return bool(self.load_data(dialog.selected_path))
         return False
 
-    def load_data(self, json_path):
+    def load_data(self, json_path: str | Path) -> bool:
         json_path = Path(json_path)
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
@@ -1134,13 +1137,13 @@ class PlayerWidget(QWidget):
             QMessageBox.critical(self, "Load Error", str(e))
             return False
 
-    def start_sync_worker(self):
+    def start_sync_worker(self) -> None:
         self.worker = SyncWorker(self.current_video_path, max_seconds=180)
         self.worker.progress.connect(lambda s: self.info_label.setText(s))
         self.worker.finished.connect(self.on_sync_finished)
         self.worker.start()
 
-    def on_sync_finished(self, found_time):
+    def on_sync_finished(self, found_time: float) -> None:
         if found_time < 0:
             self.info_label.setText("⚠️ No Marker Found\nOffset: 0s")
             self.offset = 0
@@ -1152,7 +1155,7 @@ class PlayerWidget(QWidget):
         self.player.pause = False
         self.play_btn.setText("Pause")
 
-    def update_video_fps(self):
+    def update_video_fps(self) -> None:
         try:
             cap = cv2.VideoCapture(str(self.current_video_path))
             if cap.isOpened():
@@ -1163,8 +1166,8 @@ class PlayerWidget(QWidget):
         except Exception:
             pass
 
-    def populate_event_list(self):
-        def build_events():
+    def populate_event_list(self) -> None:
+        def build_events() -> list[dict[str, Any]]:
             if self.events:
                 return list(self.events)
             if self.events_all:
@@ -1219,19 +1222,19 @@ class PlayerWidget(QWidget):
 
             self.add_event_item(display, time_sec, color)
 
-    def update_offset_label(self):
+    def update_offset_label(self) -> None:
         if self.offset is None:
             self.offset_label.setText("Offset: --")
         else:
             self.offset_label.setText(f"Offset: {self.offset:+.2f}s")
 
-    def adjust_offset(self, delta):
+    def adjust_offset(self, delta: float) -> None:
         if self.offset is None:
             self.offset = 0.0
         self.offset += delta
         self.update_offset_label()
 
-    def sync_to_current_position(self):
+    def sync_to_current_position(self) -> None:
         if not hasattr(self, "player"):
             return
         try:
@@ -1249,7 +1252,7 @@ class PlayerWidget(QWidget):
         self.offset = current - float(game_time)
         self.update_offset_label()
 
-    def get_current_position(self):
+    def get_current_position(self) -> float | None:
         if not hasattr(self, "player"):
             return None
         try:
@@ -1257,7 +1260,7 @@ class PlayerWidget(QWidget):
         except Exception:
             return None
 
-    def mark_clip_start(self):
+    def mark_clip_start(self) -> None:
         current = self.get_current_position()
         if current is None:
             QMessageBox.warning(self, "Clip", "現在の再生位置を取得できません。")
@@ -1267,7 +1270,7 @@ class PlayerWidget(QWidget):
             self.clip_end = None
         self.update_clip_label()
 
-    def mark_clip_end(self):
+    def mark_clip_end(self) -> None:
         current = self.get_current_position()
         if current is None:
             QMessageBox.warning(self, "Clip", "現在の再生位置を取得できません。")
@@ -1275,7 +1278,7 @@ class PlayerWidget(QWidget):
         self.clip_end = current
         self.update_clip_label()
 
-    def update_clip_label(self):
+    def update_clip_label(self) -> None:
         start_text = "--" if self.clip_start is None else format_seconds(self.clip_start)
         end_text = "--" if self.clip_end is None else format_seconds(self.clip_end)
         if self.clip_start is not None and self.clip_end is not None:
@@ -1285,7 +1288,7 @@ class PlayerWidget(QWidget):
             duration_text = ""
         self.clip_label.setText(f"Start: {start_text} / End: {end_text}{duration_text}")
 
-    def export_clip(self):
+    def export_clip(self) -> None:
         if self.clip_worker and self.clip_worker.isRunning():
             QMessageBox.information(self, "Clip", "クリップ出力中です。完了まで待ってください。")
             return
@@ -1352,29 +1355,29 @@ class PlayerWidget(QWidget):
         self.clip_worker.finished.connect(self.on_clip_worker_finished)
         self.clip_worker.start()
 
-    def on_clip_progress(self, percent, message):
+    def on_clip_progress(self, percent: int, message: str) -> None:
         self.clip_progress.setValue(int(percent))
         self.clip_progress.setFormat(message)
 
-    def on_clip_warning(self, message):
+    def on_clip_warning(self, message: str) -> None:
         self.clip_progress.setFormat(message)
         self.info_label.setText(message)
 
-    def on_clip_export_finished(self, output_path):
+    def on_clip_export_finished(self, output_path: str) -> None:
         self.clip_progress.setValue(100)
         self.clip_progress.setFormat("完了")
         QMessageBox.information(self, "Clip", f"クリップを書き出しました。\n{output_path}")
 
-    def on_clip_export_failed(self, message):
+    def on_clip_export_failed(self, message: str) -> None:
         self.clip_progress.setFormat("失敗")
         QMessageBox.critical(self, "Clip Export Error", message)
 
-    def on_clip_worker_finished(self):
+    def on_clip_worker_finished(self) -> None:
         self.clip_export_btn.setEnabled(True)
         self.clip_start_btn.setEnabled(True)
         self.clip_end_btn.setEnabled(True)
 
-    def add_event_item(self, text, game_time, color_hex):
+    def add_event_item(self, text: str, game_time: float, color_hex: str) -> None:
         m, s = divmod(int(game_time), 60)
         item_text = f"[{m:02d}:{s:02d}] {text}"
         item = QListWidgetItem(item_text)
@@ -1385,7 +1388,7 @@ class PlayerWidget(QWidget):
         item.setForeground(color)
         self.event_list.addItem(item)
 
-    def on_event_clicked(self, item):
+    def on_event_clicked(self, item: QListWidgetItem) -> None:
         if self.offset is None:
             return
         game_time = item.data(Qt.ItemDataRole.UserRole)
@@ -1398,11 +1401,11 @@ class PlayerWidget(QWidget):
         # フォーカスを外してキー入力を有効にする
         self.event_list.clearFocus() 
 
-    def toggle_playback(self):
+    def toggle_playback(self) -> None:
         self.player.pause = not self.player.pause
         self.play_btn.setText("Play" if self.player.pause else "Pause")
 
-    def stop_playback(self):
+    def stop_playback(self) -> None:
         if not hasattr(self, "player"):
             return
         try:
@@ -1414,7 +1417,7 @@ class PlayerWidget(QWidget):
         except Exception:
             pass
 
-    def set_fullscreen_mode(self, enabled):
+    def set_fullscreen_mode(self, enabled: bool) -> None:
         if not hasattr(self, "player"):
             return
         try:
@@ -1425,7 +1428,7 @@ class PlayerWidget(QWidget):
             except Exception:
                 pass
 
-    def step_frame(self, direction):
+    def step_frame(self, direction: int) -> None:
         if not self.player:
             return
         if self.video_fps <= 0:
@@ -1440,7 +1443,7 @@ class PlayerWidget(QWidget):
         self.player.seek(target, reference='absolute', precision='exact')
         self.play_btn.setText("Play")
 
-    def on_time_update(self, name, time_pos):
+    def on_time_update(self, name: str, time_pos: float | None) -> None:
         if time_pos is None: return
         if not self.is_slider_pressed and self.duration > 0:
             val = int((time_pos / self.duration) * 1000)
@@ -1450,13 +1453,13 @@ class PlayerWidget(QWidget):
         dm, ds = divmod(int(self.duration), 60)
         self.time_label.setText(f"{cm:02d}:{cs:02d} / {dm:02d}:{ds:02d}")
 
-    def on_duration_update(self, name, duration):
+    def on_duration_update(self, name: str, duration: float | None) -> None:
         if duration: self.duration = duration
 
-    def on_slider_pressed(self):
+    def on_slider_pressed(self) -> None:
         self.is_slider_pressed = True
 
-    def on_slider_released(self):
+    def on_slider_released(self) -> None:
         self.is_slider_pressed = False
         val = self.slider.value()
         if self.duration > 0:
@@ -1464,7 +1467,7 @@ class PlayerWidget(QWidget):
             # 【重要修正】ここで絶対時間指定をする
             self.player.seek(target, reference='absolute', precision='exact')
 
-    def closeEvent(self, event):
+    def closeEvent(self, event: Any) -> None:
         if self.clip_worker and self.clip_worker.isRunning():
             self.clip_worker.cancel()
             self.clip_worker.wait(1000)
@@ -1474,7 +1477,7 @@ class PlayerWidget(QWidget):
 
 
 class PlayerWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("LoL Smart Replay Player")
         self.resize(1280, 720)

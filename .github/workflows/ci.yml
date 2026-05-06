@@ -49,6 +49,11 @@ jobs:
       - name: Ruff check
         run: python -m ruff check .
 
+      - name: Create test settings
+        run: |
+          mkdir -p config
+          cp config/setting.sample.json config/setting.json
+
       - name: Run tests
         run: xvfb-run -a python -m pytest -p no:cacheprovider tests
 

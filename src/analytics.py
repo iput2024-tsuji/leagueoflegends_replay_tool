@@ -65,9 +65,7 @@ class GameDataAnalyzer:
             }
 
         matches = (
-            df.drop_duplicates("match_id")
-            .set_index("match_id")[["is_win", "champion_name", "game_result"]]
-            .copy()
+            df.drop_duplicates("match_id").set_index("match_id")[["is_win", "champion_name", "game_result"]].copy()
         )
         event_rows = df[df["event_name"] == event_name].copy()
         if within_seconds is not None:
@@ -84,12 +82,7 @@ class GameDataAnalyzer:
         else:
             correlation = float(matches["event_count"].corr(matches["is_win"].astype(float)))
 
-        winrate_by_count = (
-            matches.groupby("event_count")["is_win"]
-            .mean()
-            .sort_index()
-            .to_dict()
-        )
+        winrate_by_count = matches.groupby("event_count")["is_win"].mean().sort_index().to_dict()
 
         return {
             "event_name": event_name,
@@ -117,10 +110,7 @@ class GameDataAnalyzer:
         if "enemy_champions" in source.columns:
             match_columns.append("enemy_champions")
         matches = (
-            source.drop_duplicates("match_id")
-            .set_index("match_id")[match_columns]
-            .dropna(subset=["is_win"])
-            .copy()
+            source.drop_duplicates("match_id").set_index("match_id")[match_columns].dropna(subset=["is_win"]).copy()
         )
         if "enemy_champions" not in matches.columns:
             matches["enemy_champions"] = [[] for _ in range(len(matches))]
@@ -129,25 +119,13 @@ class GameDataAnalyzer:
 
         timed = source[source["event_time"].fillna(float("inf")) <= 15 * 60].copy()
 
-        horde_counts = (
-            timed[timed["event_name"] == "HordeKill"]
-            .groupby("match_id")
-            .size()
-        )
+        horde_counts = timed[timed["event_name"] == "HordeKill"].groupby("match_id").size()
 
         building_rows = timed[timed["event_name"] == "BuildingKill"].copy()
-        own_building_counts = (
-            building_rows[self._own_team_event_mask(building_rows)]
-            .groupby("match_id")
-            .size()
-        )
+        own_building_counts = building_rows[self._own_team_event_mask(building_rows)].groupby("match_id").size()
 
         first_blood_rows = source[source["is_first_blood"].fillna(False)].copy()
-        first_blood_owned = (
-            first_blood_rows[self._own_team_event_mask(first_blood_rows)]
-            .groupby("match_id")
-            .size()
-        )
+        first_blood_owned = first_blood_rows[self._own_team_event_mask(first_blood_rows)].groupby("match_id").size()
 
         x = pd.DataFrame(index=matches.index)
         x["horde_kill_15m"] = horde_counts.reindex(matches.index, fill_value=0).astype(int)
@@ -309,8 +287,7 @@ class GameDataAnalyzer:
         player_team = df.get("player_team")
         if killer_team is not None and player_team is not None:
             own_by_team = (
-                killer_team.fillna("").astype(str).str.lower()
-                == player_team.fillna("").astype(str).str.lower()
+                killer_team.fillna("").astype(str).str.lower() == player_team.fillna("").astype(str).str.lower()
             )
         else:
             own_by_team = pd.Series(False, index=df.index)

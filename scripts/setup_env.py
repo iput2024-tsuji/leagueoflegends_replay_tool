@@ -26,17 +26,11 @@ FFMPEG_EXE = BIN_DIR / "ffmpeg.exe"
 OBS_EXE = OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
 
 FFMPEG_VERSION = "8.1.1"
-FFMPEG_ZIP_URL = (
-    "https://www.gyan.dev/ffmpeg/builds/packages/"
-    "ffmpeg-8.1.1-essentials_build.zip"
-)
+FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip"
 FFMPEG_ZIP_SHA256 = "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541"
 
 OBS_VERSION = "32.1.2"
-OBS_ZIP_URL = (
-    "https://github.com/obsproject/obs-studio/releases/download/32.1.2/"
-    "OBS-Studio-32.1.2-Windows-x64.zip"
-)
+OBS_ZIP_URL = "https://github.com/obsproject/obs-studio/releases/download/32.1.2/OBS-Studio-32.1.2-Windows-x64.zip"
 OBS_ZIP_SHA256 = "8d97e4563bd8d22d03e63042aa7dccede1d555c9bd35ce8a9e5019b0d0201bf6"
 
 
@@ -117,11 +111,7 @@ def _sha256(path: Path) -> str:
 async def verify_sha256(path: Path, expected_sha256: str, label: str) -> None:
     actual = await asyncio.to_thread(_sha256, path)
     if actual.lower() != expected_sha256.lower():
-        raise RuntimeError(
-            f"{label} checksum mismatch.\n"
-            f"expected: {expected_sha256}\n"
-            f"actual:   {actual}"
-        )
+        raise RuntimeError(f"{label} checksum mismatch.\nexpected: {expected_sha256}\nactual:   {actual}")
 
 
 def _extract_ffmpeg(zip_path: Path, dest: Path) -> Path:

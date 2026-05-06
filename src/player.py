@@ -173,6 +173,7 @@ def ensure_mpv_dll(bin_dir: Path, root_dir: Path) -> None:
                 pass
             return
 
+
 ensure_mpv_dll(BIN_DIR, ROOT_DIR)
 if BIN_DIR.exists():
     os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ["PATH"]
@@ -180,6 +181,7 @@ if BIN_DIR.exists():
 # --- 2. MPVインポート ---
 try:
     import mpv as mpv_module
+
     MPV_IMPORT_ERROR = None
 except Exception as e:
     mpv_module = None
@@ -212,6 +214,7 @@ def ensure_mpv_available_or_exit(parent: QWidget | None = None) -> Any:
 
 class SyncWorker(QThread):
     """バックグラウンドで同期マーカーを探すスレッド"""
+
     finished = pyqtSignal(float)
     progress = pyqtSignal(str)
 
@@ -259,9 +262,9 @@ class SyncWorker(QThread):
                 h, w = frame.shape[:2]
                 rois = [
                     frame[0:roi_size, 0:roi_size],
-                    frame[0:roi_size, w - roi_size:w],
-                    frame[h - roi_size:h, 0:roi_size],
-                    frame[h - roi_size:h, w - roi_size:w],
+                    frame[0:roi_size, w - roi_size : w],
+                    frame[h - roi_size : h, 0:roi_size],
+                    frame[h - roi_size : h, w - roi_size : w],
                 ]
                 for roi in rois:
                     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -291,7 +294,9 @@ class ClipExportWorker(QThread):
     export_finished = pyqtSignal(str)
     export_failed = pyqtSignal(str)
 
-    def __init__(self, ffmpeg_path: str | Path, input_path: str | Path, output_path: str | Path, start_sec: float, end_sec: float) -> None:
+    def __init__(
+        self, ffmpeg_path: str | Path, input_path: str | Path, output_path: str | Path, start_sec: float, end_sec: float
+    ) -> None:
         super().__init__()
         self.ffmpeg_path = str(ffmpeg_path)
         self.input_path = str(input_path)
@@ -562,7 +567,7 @@ def find_champion_icon(champion_name: str | None) -> Path | None:
         "aurelionsol": "aurelionsol",
         "ksante": "ksante",
         "jarvaniv": "jarvaniv",
-        "leesin": "leesin"
+        "leesin": "leesin",
     }
 
     alias_value = None
@@ -578,7 +583,12 @@ def find_champion_icon(champion_name: str | None) -> Path | None:
 
 
 class ReplaySelectDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None, json_dir: str | Path | None = None, recordings_dir: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        json_dir: str | Path | None = None,
+        recordings_dir: str | Path | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Replay Select")
         self.resize(820, 560)
@@ -687,8 +697,9 @@ class ReplaySelectDialog(QDialog):
         icon_label.setStyleSheet("background-color: #222; border-radius: 6px;")
         icon_path = find_champion_icon(meta["champion_name"])
         if icon_path:
-            pixmap = QPixmap(str(icon_path)).scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio,
-                                                    Qt.TransformationMode.SmoothTransformation)
+            pixmap = QPixmap(str(icon_path)).scaled(
+                48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
             icon_label.setPixmap(pixmap)
         else:
             icon_label.setText("?")
@@ -771,10 +782,7 @@ class ReplaySelectDialog(QDialog):
 
     def open_file_dialog(self) -> None:
         fname, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open JSON Log",
-            str(self.json_dir if self.json_dir else ROOT_DIR),
-            "JSON Files (*.json)"
+            self, "Open JSON Log", str(self.json_dir if self.json_dir else ROOT_DIR), "JSON Files (*.json)"
         )
         if fname:
             self.selected_path = fname
@@ -785,12 +793,12 @@ class PlayerWidget(QWidget):
     def __init__(self, auto_open: bool = True, fullscreen_cb: Callable[[bool], None] | None = None) -> None:
         super().__init__()
         self.fullscreen_cb = fullscreen_cb
-        
+
         self.offset = None
         self.duration = 0
         self.is_slider_pressed = False
         self.current_video_path = None
-        self.is_fullscreen_mode = False # フルスクリーン状態管理
+        self.is_fullscreen_mode = False  # フルスクリーン状態管理
         self.video_fps = 30.0
         self.events = []
         self.events_all = []
@@ -805,13 +813,13 @@ class PlayerWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         # メインレイアウト
-        self.main_layout = QHBoxLayout(self) # selfをつけてアクセス可能に
+        self.main_layout = QHBoxLayout(self)  # selfをつけてアクセス可能に
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
         # --- 左側: 動画コンテナ ---
         video_container = QWidget()
-        self.video_layout = QVBoxLayout(video_container) # selfをつけてアクセス可能に
+        self.video_layout = QVBoxLayout(video_container)  # selfをつけてアクセス可能に
         self.video_layout.setContentsMargins(0, 0, 0, 0)
         self.video_layout.setSpacing(0)
 
@@ -846,7 +854,7 @@ class PlayerWidget(QWidget):
         control_layout.addWidget(self.play_btn)
         control_layout.addWidget(self.slider)
         control_layout.addWidget(self.time_label)
-        
+
         self.video_layout.addWidget(self.control_panel, stretch=0)
 
         # --- 右側: イベントリスト (フルスクリーン時に隠すため self にする) ---
@@ -869,7 +877,7 @@ class PlayerWidget(QWidget):
             QListWidget::item:selected { background-color: #d32f2f; color: white; }
             QListWidget::item:hover { background-color: #444; }
         """)
-        self.event_list.setFocusPolicy(Qt.FocusPolicy.NoFocus) # キー入力をウィンドウに譲る
+        self.event_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # キー入力をウィンドウに譲る
         self.event_list.itemClicked.connect(self.on_event_clicked)
         self.event_list.setEnabled(False)
 
@@ -899,7 +907,7 @@ class PlayerWidget(QWidget):
             btn.clicked.connect(lambda _, v=value: self.adjust_offset(v))
             offset_row.addWidget(btn)
         right_layout.addLayout(offset_row)
-        
+
         sync_btn = QPushButton("現在位置で同期")
         sync_btn.setFixedHeight(28)
         sync_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -968,10 +976,10 @@ class PlayerWidget(QWidget):
                 input_vo_keyboard=False,
                 keepaspect=True,
                 vo="gpu",
-                gpu_context="d3d11"
+                gpu_context="d3d11",
             )
-            self.player.observe_property('time-pos', self.on_time_update)
-            self.player.observe_property('duration', self.on_duration_update)
+            self.player.observe_property("time-pos", self.on_time_update)
+            self.player.observe_property("duration", self.on_duration_update)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"MPV Init Failed: {e}")
             sys.exit(1)
@@ -1016,7 +1024,7 @@ class PlayerWidget(QWidget):
         # [Space] 再生/一時停止
         if key == Qt.Key.Key_Space:
             self.toggle_playback()
-        
+
         # [→] コマ送り (1フレーム進む)
         elif key == Qt.Key.Key_Right:
             self.step_frame(1)
@@ -1054,7 +1062,7 @@ class PlayerWidget(QWidget):
     def toggle_fullscreen(self) -> None:
         if not self.is_fullscreen_mode:
             # フルスクリーン化
-            self.right_panel.hide()    # サイドバーを消す
+            self.right_panel.hide()  # サイドバーを消す
             self.control_panel.hide()  # 下のバーを消す
             self.set_fullscreen_mode(True)
             if self.fullscreen_cb:
@@ -1062,7 +1070,7 @@ class PlayerWidget(QWidget):
             else:
                 window = self.window()
                 if window:
-                    window.showFullScreen()      # ウィンドウ枠を消して最大化
+                    window.showFullScreen()  # ウィンドウ枠を消して最大化
             self.is_fullscreen_mode = True
         else:
             # 通常モードへ復帰
@@ -1115,7 +1123,7 @@ class PlayerWidget(QWidget):
     def load_data(self, json_path: str | Path) -> bool:
         json_path = Path(json_path)
         try:
-            with open(json_path, encoding='utf-8') as f:
+            with open(json_path, encoding="utf-8") as f:
                 data = json.load(f)
 
             video_path = resolve_video_path(json_path, data, self.recordings_dir)
@@ -1139,11 +1147,11 @@ class PlayerWidget(QWidget):
 
             self.info_label.setText(f"Player: {self.my_name}\nSyncing...")
             self.populate_event_list()
-            
+
             self.player.play(str(self.current_video_path))
             self.player.pause = True
             self.video_frame.setFocus()
-            
+
             self.update_video_fps()
             self.start_sync_worker()
             return True
@@ -1200,7 +1208,10 @@ class PlayerWidget(QWidget):
 
             if name == "ChampionKill":
                 if self.my_name_short:
-                    if killer not in (self.my_name, self.my_name_short) and victim not in (self.my_name, self.my_name_short):
+                    if killer not in (self.my_name, self.my_name_short) and victim not in (
+                        self.my_name,
+                        self.my_name_short,
+                    ):
                         continue
                 if not self.filter_kill.isChecked():
                     continue
@@ -1409,12 +1420,12 @@ class PlayerWidget(QWidget):
         game_time = item.data(Qt.ItemDataRole.UserRole)
         target = game_time + self.offset
         seek_pos = max(0, target - 5.0)
-        self.player.seek(seek_pos, reference='absolute', precision='exact')
+        self.player.seek(seek_pos, reference="absolute", precision="exact")
         self.player.pause = False
         self.play_btn.setText("Pause")
-        
+
         # フォーカスを外してキー入力を有効にする
-        self.event_list.clearFocus() 
+        self.event_list.clearFocus()
 
     def toggle_playback(self) -> None:
         self.player.pause = not self.player.pause
@@ -1455,7 +1466,7 @@ class PlayerWidget(QWidget):
         step = 1.0 / float(self.video_fps)
         target = max(0.0, current + (step * direction))
         self.player.pause = True
-        self.player.seek(target, reference='absolute', precision='exact')
+        self.player.seek(target, reference="absolute", precision="exact")
         self.play_btn.setText("Play")
 
     def on_time_update(self, name: str, time_pos: float | None) -> None:
@@ -1464,7 +1475,7 @@ class PlayerWidget(QWidget):
         if not self.is_slider_pressed and self.duration > 0:
             val = int((time_pos / self.duration) * 1000)
             self.slider.setValue(val)
-        
+
         cm, cs = divmod(int(time_pos), 60)
         dm, ds = divmod(int(self.duration), 60)
         self.time_label.setText(f"{cm:02d}:{cs:02d} / {dm:02d}:{ds:02d}")
@@ -1482,13 +1493,13 @@ class PlayerWidget(QWidget):
         if self.duration > 0:
             target = (val / 1000) * self.duration
             # 【重要修正】ここで絶対時間指定をする
-            self.player.seek(target, reference='absolute', precision='exact')
+            self.player.seek(target, reference="absolute", precision="exact")
 
     def closeEvent(self, event: Any) -> None:
         if self.clip_worker and self.clip_worker.isRunning():
             self.clip_worker.cancel()
             self.clip_worker.wait(1000)
-        if hasattr(self, 'player'):
+        if hasattr(self, "player"):
             self.player.terminate()
         event.accept()
 
@@ -1500,6 +1511,7 @@ class PlayerWindow(QMainWindow):
         self.resize(1280, 720)
         self.player_widget = PlayerWidget(auto_open=True)
         self.setCentralWidget(self.player_widget)
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

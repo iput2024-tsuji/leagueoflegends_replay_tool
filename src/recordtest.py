@@ -514,8 +514,7 @@ def ensure_portable_obs_global_ini(base_dir: str | Path) -> tuple[bool, Path]:
     """
     if not is_managed_portable_obs_dir(base_dir):
         raise RecorderError(
-            "このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n"
-            f"利用先: {MANAGED_PORTABLE_OBS_DIR}"
+            f"このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n利用先: {MANAGED_PORTABLE_OBS_DIR}"
         )
 
     ini_path = get_obs_global_ini_path(base_dir)
@@ -571,8 +570,7 @@ def ensure_portable_obs_websocket_config(base_dir: str | Path, port: int, passwo
     """
     if not is_managed_portable_obs_dir(base_dir):
         raise RecorderError(
-            "このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n"
-            f"利用先: {MANAGED_PORTABLE_OBS_DIR}"
+            f"このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n利用先: {MANAGED_PORTABLE_OBS_DIR}"
         )
 
     config_path = get_obs_websocket_config_path(base_dir)
@@ -945,9 +943,7 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
                 report["errors"].append(f"{label} を作成できません: {path_value} ({e})")
 
     if bin_dir and not _has_mpv_dll(bin_dir):
-        report["warnings"].append(
-            "binフォルダに mpv DLL が見つかりません。プレーヤー利用時に配置が必要です。"
-        )
+        report["warnings"].append("binフォルダに mpv DLL が見つかりません。プレーヤー利用時に配置が必要です。")
 
     current_obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), ROOT_DIR)
     expected_obs_dir = MANAGED_PORTABLE_OBS_DIR
@@ -956,14 +952,10 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         if auto_fix:
             obs_cfg["dir"] = DEFAULT_OBS_DIR
             report["changed"] = True
-            report["notes"].append(
-                f"OBSフォルダをアプリ管理用に固定しました: {DEFAULT_OBS_DIR}"
-            )
+            report["notes"].append(f"OBSフォルダをアプリ管理用に固定しました: {DEFAULT_OBS_DIR}")
             current_obs_dir = expected_obs_dir
         else:
-            report["errors"].append(
-                f"OBSフォルダは obs-portable のポータブルOBSのみ対応です: {expected_obs_dir}"
-            )
+            report["errors"].append(f"OBSフォルダは obs-portable のポータブルOBSのみ対応です: {expected_obs_dir}")
 
     if auto_fix and current_obs_dir and is_managed_portable_obs_dir(current_obs_dir):
         try:
@@ -978,18 +970,14 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             changed, global_ini_path = bootstrapper.ensure_global_ini()
             if changed:
                 report["changed"] = True
-                report["notes"].append(
-                    f"ポータブルOBSのトレイアイコン非表示を設定しました: {global_ini_path}"
-                )
+                report["notes"].append(f"ポータブルOBSのトレイアイコン非表示を設定しました: {global_ini_path}")
         except Exception as e:
             report["warnings"].append(f"OBS Bootstrapper の実行に失敗しました: {e}")
 
     has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
     if not has_valid_obs:
         report["errors"].append(
-            "ポータブルOBSが見つかりません。\n"
-            f"配置先: {expected_obs_dir}\n"
-            "obs64.exe が存在する状態で配置してください。"
+            f"ポータブルOBSが見つかりません。\n配置先: {expected_obs_dir}\nobs64.exe が存在する状態で配置してください。"
         )
 
     return report
@@ -1006,7 +994,9 @@ def format_preflight_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def test_obs_connection(host: str | None, port: int | str | None, password: str | None, timeout: float = 2.5) -> tuple[bool, str]:
+def test_obs_connection(
+    host: str | None, port: int | str | None, password: str | None, timeout: float = 2.5
+) -> tuple[bool, str]:
     host_text = str(host or "").strip() or DEFAULT_OBS_HOST
     try:
         port_num = int(port)
@@ -1049,12 +1039,14 @@ def test_obs_connection(host: str | None, port: int | str | None, password: str 
         return (
             False,
             "OBS WebSocket に接続できません。OBS設定で WebSocket有効化 / ポート番号 を確認してください。\n"
-            f"詳細: {type(last_error).__name__}: {last_error}"
+            f"詳細: {type(last_error).__name__}: {last_error}",
         )
     return False, "OBS接続テストに失敗しました。"
 
 
-def connect_obs_client(host: str | None, port: int | str | None, password: str | None, timeout: float = 2.5) -> tuple[Any, str]:
+def connect_obs_client(
+    host: str | None, port: int | str | None, password: str | None, timeout: float = 2.5
+) -> tuple[Any, str]:
     host_text = str(host or "").strip() or DEFAULT_OBS_HOST
     port_num, ok = _safe_int(port, DEFAULT_OBS_PORT, minimum=1, maximum=65535)
     if not ok:
@@ -1080,12 +1072,12 @@ def connect_obs_client(host: str | None, port: int | str | None, password: str |
             last_error = e
             message = f"{type(e).__name__}: {e}".lower()
             if any(token in message for token in ("auth", "authentication", "password", "identify")):
-                raise RecorderError("OBSには到達しましたが認証に失敗しました。WebSocketパスワードを確認してください。") from e
+                raise RecorderError(
+                    "OBSには到達しましたが認証に失敗しました。WebSocketパスワードを確認してください。"
+                ) from e
 
     raise RecorderError(
-        "OBS WebSocket に接続できません。\n"
-        f"接続先: {host_text}:{port_num}\n"
-        f"詳細: {last_error}"
+        f"OBS WebSocket に接続できません。\n接続先: {host_text}:{port_num}\n詳細: {last_error}"
     ) from last_error
 
 
@@ -1134,9 +1126,15 @@ def _get_audio_slot_config(cfg: dict[str, Any], key: str) -> dict[str, Any]:
     if isinstance(slot, dict):
         merged.update(slot)
 
-    merged["input_name"] = str(merged.get("input_name") or defaults[key]["input_name"]).strip() or defaults[key]["input_name"]
-    merged["device_id"] = str(merged.get("device_id") or defaults[key]["device_id"]).strip() or defaults[key]["device_id"]
-    merged["device_name"] = str(merged.get("device_name") or defaults[key]["device_name"]).strip() or defaults[key]["device_name"]
+    merged["input_name"] = (
+        str(merged.get("input_name") or defaults[key]["input_name"]).strip() or defaults[key]["input_name"]
+    )
+    merged["device_id"] = (
+        str(merged.get("device_id") or defaults[key]["device_id"]).strip() or defaults[key]["device_id"]
+    )
+    merged["device_name"] = (
+        str(merged.get("device_name") or defaults[key]["device_name"]).strip() or defaults[key]["device_name"]
+    )
     merged["volume_db"], _ = _safe_float(merged.get("volume_db"), defaults[key]["volume_db"])
     merged["mute"], _ = _safe_bool(merged.get("mute"), defaults[key]["mute"])
     return merged
@@ -1195,11 +1193,7 @@ def apply_record_directory_to_obs(client: Any, record_dir: str | Path) -> bool:
     except Exception as e:
         errors.append(f"raw: {type(e).__name__}: {e}")
 
-    raise RecorderError(
-        "録画保存ディレクトリをOBSに反映できませんでした。\n"
-        f"対象: {record_path}\n"
-        + "\n".join(errors)
-    )
+    raise RecorderError(f"録画保存ディレクトリをOBSに反映できませんでした。\n対象: {record_path}\n" + "\n".join(errors))
 
 
 def ensure_obs_scene_exists(client: Any, scene_name: str, status_cb: Callable[[str], None] | None = None) -> bool:
@@ -1239,7 +1233,7 @@ def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg:
             if item.get("inputName") != input_name:
                 continue
             input_exists = True
-            input_kind_matches = (item.get("inputKind") == input_kind)
+            input_kind_matches = item.get("inputKind") == input_kind
             break
     except Exception:
         input_exists = False
@@ -1264,9 +1258,7 @@ def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg:
             except Exception as e:
                 last_error = e
         if not input_exists:
-            raise RecorderError(
-                f"{spec['label']}ソース '{input_name}' の作成に失敗しました: {last_error}"
-            )
+            raise RecorderError(f"{spec['label']}ソース '{input_name}' の作成に失敗しました: {last_error}")
 
     # 保存されている device_id を先に適用（default でも可）
     try:
@@ -1295,9 +1287,7 @@ def ensure_managed_audio_inputs(
         created_any = created_any or created
         if created and status_cb:
             try:
-                status_cb(
-                    f"ℹ️ {MANAGED_AUDIO_INPUTS[key]['label']}ソース '{slot_cfg['input_name']}' を作成しました。"
-                )
+                status_cb(f"ℹ️ {MANAGED_AUDIO_INPUTS[key]['label']}ソース '{slot_cfg['input_name']}' を作成しました。")
             except Exception:
                 pass
     return created_any
@@ -1389,7 +1379,9 @@ def apply_audio_profile_from_config(
     return True
 
 
-def setup_obs_sync_elements(cfg: dict[str, Any], status_cb: Callable[[str], None] | None = None, auto_launch: bool = True) -> dict[str, Any]:
+def setup_obs_sync_elements(
+    cfg: dict[str, Any], status_cb: Callable[[str], None] | None = None, auto_launch: bool = True
+) -> dict[str, Any]:
     config = AppConfig.from_dict(cfg)
     setup_environment(config)
 
@@ -1448,18 +1440,19 @@ def setup_obs_sync_elements(cfg: dict[str, Any], status_cb: Callable[[str], None
             except Exception:
                 pass
 
+
 # ▼ 全員分保存する重要なイベント（オブジェクト）
 GLOBAL_OBJECTIVES = [
-    "DragonKill",   # ドラゴン
-    "BaronKill",    # バロン
-    "HeraldKill",   # ヘラルド
-    "HordeKill",    # ヴォイドグラブ（内部名称）
-    "BuildingKill"  # タワー / インヒビターなどの建造物破壊
+    "DragonKill",  # ドラゴン
+    "BaronKill",  # バロン
+    "HeraldKill",  # ヘラルド
+    "HordeKill",  # ヴォイドグラブ（内部名称）
+    "BuildingKill",  # タワー / インヒビターなどの建造物破壊
 ]
 
 # ▼ 自分が関与しているかチェックするイベント
 COMBAT_EVENTS = [
-    "ChampionKill"   # キル / デス（自分が関与したものだけ）
+    "ChampionKill"  # キル / デス（自分が関与したものだけ）
 ]
 
 # SSL警告の無視
@@ -1505,12 +1498,14 @@ def setup_environment(config: AppConfig) -> None:
         os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
 
         if not (
-            os.path.exists(os.path.join(bin_dir, "mpv-1.dll")) or
-            os.path.exists(os.path.join(bin_dir, "libmpv-1.dll")) or
-            os.path.exists(os.path.join(bin_dir, "mpv-2.dll")) or
-            os.path.exists(os.path.join(bin_dir, "libmpv-2.dll"))
+            os.path.exists(os.path.join(bin_dir, "mpv-1.dll"))
+            or os.path.exists(os.path.join(bin_dir, "libmpv-1.dll"))
+            or os.path.exists(os.path.join(bin_dir, "mpv-2.dll"))
+            or os.path.exists(os.path.join(bin_dir, "libmpv-2.dll"))
         ):
-            LOGGER.warning("⚠️ 警告: 'bin' フォルダ内に mpv-1.dll / mpv-2.dll (または libmpv-1.dll / libmpv-2.dll) が見つかりません。")
+            LOGGER.warning(
+                "⚠️ 警告: 'bin' フォルダ内に mpv-1.dll / mpv-2.dll (または libmpv-1.dll / libmpv-2.dll) が見つかりません。"
+            )
             LOGGER.warning("探した場所: %s", bin_dir)
     else:
         LOGGER.warning("⚠️ 警告: bin_dir が未設定です。")
@@ -1639,7 +1634,7 @@ def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str 
         video_exts = {".mp4", ".mkv", ".flv", ".mov", ".avi"}
         video_files = sorted(
             [p for p in Path(config.paths.recordings_dir).rglob("*") if p.is_file() and p.suffix.lower() in video_exts],
-            key=lambda p: p.stat().st_mtime
+            key=lambda p: p.stat().st_mtime,
         )
         for video_path in video_files:
             if video_path.resolve() in keep_paths:
@@ -1781,7 +1776,7 @@ def build_output_path(config: AppConfig) -> Path:
 
 
 def save_payload(path: str | Path, payload: dict[str, Any]) -> None:
-    with open(path, 'w', encoding='utf-8') as f:
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=4, ensure_ascii=False)
 
 
@@ -1801,7 +1796,7 @@ class LiveClientRiotAPIClient(RiotAPIClient):
                         return await response.json(content_type=None)
                     except Exception:
                         text = await response.text()
-                        return text.strip().replace('"', '')
+                        return text.strip().replace('"', "")
         except (
             aiohttp.ClientConnectionError,
             aiohttp.ClientResponseError,
@@ -1821,6 +1816,7 @@ class LiveClientRiotAPIClient(RiotAPIClient):
     async def get_all_game_data(self) -> dict[str, Any] | None:
         data = await self._fetch(ALL_GAME_URL, timeout_sec=1)
         return data if isinstance(data, dict) else None
+
 
 class ObsWebSocketClient(OBSClient):
     """obs-websocketを使う本番用OBSクライアント。"""
@@ -1952,10 +1948,7 @@ class ObsWebSocketClient(OBSClient):
         try:
             input_resp = self.client.get_input_list()
             input_items = getattr(input_resp, "inputs", []) or []
-            input_exists = any(
-                isinstance(item, dict) and item.get("inputName") == source_name
-                for item in input_items
-            )
+            input_exists = any(isinstance(item, dict) and item.get("inputName") == source_name for item in input_items)
         except Exception:
             input_exists = False
 
@@ -1965,13 +1958,7 @@ class ObsWebSocketClient(OBSClient):
             last_error = None
             for kind in ("color_source_v3", "color_source"):
                 try:
-                    self.client.create_input(
-                        scene_name,
-                        source_name,
-                        kind,
-                        settings,
-                        False
-                    )
+                    self.client.create_input(scene_name, source_name, kind, settings, False)
                     input_exists = True
                     break
                 except Exception as e:
@@ -1995,15 +1982,11 @@ class ObsWebSocketClient(OBSClient):
                 ) from e
 
         if scene_item_id is None:
-            raise RecorderError(
-                f"色ソース '{source_name}' は存在しますが、シーン '{scene_name}' で見つかりません。"
-            )
+            raise RecorderError(f"色ソース '{source_name}' は存在しますが、シーン '{scene_name}' で見つかりません。")
 
         try:
             self.client.set_scene_item_transform(
-                scene_name,
-                scene_item_id,
-                {"positionX": 0.0, "positionY": 0.0, "alignment": 5}
+                scene_name, scene_item_id, {"positionX": 0.0, "positionY": 0.0, "alignment": 5}
             )
         except Exception:
             pass
@@ -2017,8 +2000,8 @@ class ObsWebSocketClient(OBSClient):
         try:
             items = self.client.get_scene_item_list(self.config.obs.scene_name).scene_items
             for item in items:
-                if item['sourceName'] == self.config.obs.source_name:
-                    return item['sceneItemId']
+                if item["sourceName"] == self.config.obs.source_name:
+                    return item["sceneItemId"]
         except Exception as e:
             self.logger.warning("⚠️ シーンアイテム取得エラー: %s", e)
         return None
@@ -2241,11 +2224,7 @@ class LoLAutoRecorder(RecordingSessionManager):
     def enrich_event(self, event: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(event or {})
         killer = enriched.get("KillerName") or enriched.get("killerName")
-        killer_team = (
-            enriched.get("KillerTeam")
-            or enriched.get("killerTeam")
-            or self.get_player_team_by_name(killer)
-        )
+        killer_team = enriched.get("KillerTeam") or enriched.get("killerTeam") or self.get_player_team_by_name(killer)
         if killer_team:
             enriched["KillerTeam"] = killer_team
             enriched["killer_team"] = killer_team
@@ -2259,8 +2238,12 @@ class LoLAutoRecorder(RecordingSessionManager):
         for event in events:
             if not self.is_game_end_event(event):
                 continue
-            result_value = event.get("Result") or event.get("result") or event.get("GameResult") or event.get("gameResult")
-            winning_team = event.get("WinningTeam") or event.get("winningTeam") or event.get("Team") or event.get("team")
+            result_value = (
+                event.get("Result") or event.get("result") or event.get("GameResult") or event.get("gameResult")
+            )
+            winning_team = (
+                event.get("WinningTeam") or event.get("winningTeam") or event.get("Team") or event.get("team")
+            )
             self.game_result = result_value
             self.winning_team = winning_team
             return
@@ -2277,7 +2260,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 return False
             data = await self.riot_api_client.get_all_game_data()
             if data:
-                game_time = data.get('gameData', {}).get('gameTime', 0)
+                game_time = data.get("gameData", {}).get("gameTime", 0)
                 if game_time > 0:
                     self.log(f"🔥 試合開始検知！ GameTime: {game_time:.2f}s")
                     self.output_file = build_output_path(self.config)
@@ -2319,7 +2302,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         sync_time = 0.0
         data = await self.riot_api_client.get_all_game_data()
         if data:
-            sync_time = data.get('gameData', {}).get('gameTime', 0.0)
+            sync_time = data.get("gameData", {}).get("gameTime", 0.0)
         if (not sync_time or sync_time <= 0) and event_time is not None:
             sync_time = float(event_time)
 
@@ -2375,8 +2358,10 @@ class LoLAutoRecorder(RecordingSessionManager):
 
                 # 自分が関与したキル or デスのみ
                 is_involved = (
-                    killer == self.my_name or victim == self.my_name or
-                    killer == self.my_name_short or victim == self.my_name_short
+                    killer == self.my_name
+                    or victim == self.my_name
+                    or killer == self.my_name_short
+                    or victim == self.my_name_short
                 )
 
                 if is_involved:
@@ -2507,16 +2492,10 @@ class LoLAutoRecorder(RecordingSessionManager):
             "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "sync_game_time": self.sync_game_time,
             "obs_record_path": record_path_for_json,
-            "paths": {
-                "recordings_dir": str(self.config.paths.recordings_dir),
-                "json_path": str(self.output_file)
-            },
+            "paths": {"recordings_dir": str(self.config.paths.recordings_dir), "json_path": str(self.output_file)},
             "events": self.saved_events,
             "events_all": self.all_events,
-            "counts": {
-                "filtered": len(self.saved_events),
-                "all": len(self.all_events)
-            }
+            "counts": {"filtered": len(self.saved_events), "all": len(self.all_events)},
         }
         save_payload(self.output_file, payload)
         self.log(f"ログ保存完了: {self.output_file}")

@@ -73,7 +73,9 @@ RECORDING_CONTROLLER = RecordingController()
 ANALYTICS_CONTROLLER = AnalyticsController(CONFIG_CONTROLLER)
 
 
-def apply_auto_defaults(data: dict[str, Any] | None, force_obs_detect: bool = False) -> tuple[dict[str, Any], bool, list[str]]:
+def apply_auto_defaults(
+    data: dict[str, Any] | None, force_obs_detect: bool = False
+) -> tuple[dict[str, Any], bool, list[str]]:
     return CONFIG_CONTROLLER.apply_auto_defaults(data, force_obs_detect=force_obs_detect)
 
 
@@ -81,7 +83,9 @@ def format_report_lines(lines: list[str] | tuple[str, ...] | None) -> str:
     return CONFIG_CONTROLLER.format_report_lines(lines)
 
 
-def run_preflight(config_data: dict[str, Any] | None = None, auto_fix: bool = True, force_obs_detect: bool = True) -> dict[str, Any]:
+def run_preflight(
+    config_data: dict[str, Any] | None = None, auto_fix: bool = True, force_obs_detect: bool = True
+) -> dict[str, Any]:
     return CONFIG_CONTROLLER.run_preflight(
         config_data,
         auto_fix=auto_fix,
@@ -277,8 +281,7 @@ def run_environment_bootstrap(parent: QWidget | None = None) -> bool:
     QMessageBox.critical(
         parent,
         "環境構築エラー",
-        "必要な実行ファイルの自動セットアップに失敗しました。\n\n"
-        f"{result.get('error') or 'unknown error'}",
+        f"必要な実行ファイルの自動セットアップに失敗しました。\n\n{result.get('error') or 'unknown error'}",
     )
     return False
 
@@ -379,11 +382,7 @@ class SetupWizardDialog(QDialog):
         if ok:
             QMessageBox.information(self, "接続テスト", detail)
         else:
-            QMessageBox.warning(
-                self,
-                "接続テスト",
-                f"接続に失敗しました。\n{detail}"
-            )
+            QMessageBox.warning(self, "接続テスト", f"接続に失敗しました。\n{detail}")
 
     def run_quick_setup(self) -> bool:
         data = self.collect_data()
@@ -437,7 +436,9 @@ class SetupWizardDialog(QDialog):
 
 
 class HomePage(QWidget):
-    def __init__(self, on_play: Callable[[], None], on_settings: Callable[[], None], on_analytics: Callable[[], None]) -> None:
+    def __init__(
+        self, on_play: Callable[[], None], on_settings: Callable[[], None], on_analytics: Callable[[], None]
+    ) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -572,8 +573,7 @@ class AnalyticsPage(QWidget):
 
         self.summary_label = QLabel("総録画試合数: -- / 勝率: --")
         self.summary_label.setStyleSheet(
-            "padding: 12px; border: 1px solid #3a3a3a; border-radius: 8px; "
-            "background-color: #252525; font-size: 15px;"
+            "padding: 12px; border: 1px solid #3a3a3a; border-radius: 8px; background-color: #252525; font-size: 15px;"
         )
         layout.addWidget(self.summary_label)
 
@@ -598,8 +598,7 @@ class AnalyticsPage(QWidget):
         self.insight_frame = QFrame()
         self.insight_frame.setFrameShape(QFrame.Shape.StyledPanel)
         self.insight_frame.setStyleSheet(
-            "QFrame { background-color: #252525; border: 1px solid #3a3a3a; "
-            "border-radius: 8px; }"
+            "QFrame { background-color: #252525; border: 1px solid #3a3a3a; border-radius: 8px; }"
         )
         insight_layout = QVBoxLayout(self.insight_frame)
         insight_layout.setContentsMargins(12, 10, 12, 10)
@@ -696,9 +695,7 @@ class AnalyticsPage(QWidget):
             return
 
         self.insight_label.setText(
-            f"対象試合数: {sample_size}\n"
-            f"・勝利の方程式: {best_rule}\n"
-            f"・敗北のパターン: {worst_rule}"
+            f"対象試合数: {sample_size}\n・勝利の方程式: {best_rule}\n・敗北のパターン: {worst_rule}"
         )
 
 
@@ -806,7 +803,9 @@ class SettingsPage(QWidget):
         general_form.addRow("", self.minimize_to_tray_check)
 
         self.audio_desktop_device = QComboBox()
-        self.audio_desktop_volume_row, self.audio_desktop_volume, self.audio_desktop_volume_label = self._create_db_slider()
+        self.audio_desktop_volume_row, self.audio_desktop_volume, self.audio_desktop_volume_label = (
+            self._create_db_slider()
+        )
         self.audio_desktop_mute = QCheckBox("ミュート")
 
         self.audio_mic_device = QComboBox()
@@ -860,7 +859,9 @@ class SettingsPage(QWidget):
         self.audio_mic_mute.stateChanged.connect(self.queue_audio_auto_apply)
 
         self.load_settings()
-        QTimer.singleShot(0, lambda: self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False))
+        QTimer.singleShot(
+            0, lambda: self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
+        )
 
     def _create_db_slider(self) -> tuple[QWidget, QSlider, QLabel]:
         row = QWidget()
@@ -869,7 +870,7 @@ class SettingsPage(QWidget):
         layout.setSpacing(8)
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(-600, 200)  # -60.0dB ～ +20.0dB (0.1dB刻み)
-        slider.setSingleStep(5)     # 0.5dB
+        slider.setSingleStep(5)  # 0.5dB
         slider.setPageStep(10)
         value_label = QLabel("0.0 dB")
         value_label.setFixedWidth(64)
@@ -928,9 +929,9 @@ class SettingsPage(QWidget):
         except Exception:
             used_bytes = 0
 
-        used_gb = used_bytes / (1024 ** 3)
+        used_gb = used_bytes / (1024**3)
         if max_bytes > 0:
-            max_gb = max_bytes / (1024 ** 3)
+            max_gb = max_bytes / (1024**3)
             ratio = int(max(0, min(100, round((used_bytes / max_bytes) * 100))))
             text = f"{used_gb:.1f} GB / {max_gb:.1f} GB ({ratio}%)"
             self.storage_progress.setValue(ratio)
@@ -1154,7 +1155,9 @@ class SettingsPage(QWidget):
     def _apply_audio_settings_auto(self) -> None:
         self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=False)
 
-    def refresh_audio_devices(self, show_message: bool = True, show_error: bool = True, auto_launch: bool = True) -> bool:
+    def refresh_audio_devices(
+        self, show_message: bool = True, show_error: bool = True, auto_launch: bool = True
+    ) -> bool:
         if self._audio_refresh_in_progress:
             return False
         self._audio_refresh_in_progress = True
@@ -1184,7 +1187,9 @@ class SettingsPage(QWidget):
         finally:
             self._audio_refresh_in_progress = False
 
-    def apply_audio_settings_to_obs(self, show_success: bool = True, show_error: bool = True, auto_launch: bool = True) -> bool:
+    def apply_audio_settings_to_obs(
+        self, show_success: bool = True, show_error: bool = True, auto_launch: bool = True
+    ) -> bool:
         try:
             data = self._collect_settings_data_from_ui()
             result = AUDIO_CONTROLLER.apply_audio_settings(data, auto_launch=auto_launch)
@@ -1398,7 +1403,7 @@ class MainWindow(QMainWindow):
                 self,
                 "初回セットアップ",
                 "設定に不足があります。初回セットアップを開きます。\n\n"
-                f"{format_report_lines(report.get('errors', []))}"
+                f"{format_report_lines(report.get('errors', []))}",
             )
 
         if (not setup_completed) or has_errors:
@@ -1440,9 +1445,7 @@ class MainWindow(QMainWindow):
         self.bg_recorder_worker.error.connect(self.on_bg_recorder_error)
         self.bg_recorder_worker.finished.connect(self.on_bg_recorder_finished)
         self.home_page.set_recorder_status(
-            "🟢 起動準備中...",
-            color_hex="#7bd88f",
-            detail_text="バックグラウンド録画監視を起動しています。"
+            "🟢 起動準備中...", color_hex="#7bd88f", detail_text="バックグラウンド録画監視を起動しています。"
         )
         self.bg_recorder_worker.start()
 
@@ -1551,4 +1554,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

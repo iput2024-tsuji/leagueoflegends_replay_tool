@@ -22,7 +22,9 @@ SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
 class ConfigController:
     """設定ファイル、補完、プレフライトをUIから分離して扱う。"""
 
-    def apply_auto_defaults(self, data: dict[str, Any] | None, force_obs_detect: bool = False) -> tuple[dict[str, Any], bool, list[str]]:
+    def apply_auto_defaults(
+        self, data: dict[str, Any] | None, force_obs_detect: bool = False
+    ) -> tuple[dict[str, Any], bool, list[str]]:
         changed = False
         notes = []
 
@@ -139,7 +141,9 @@ class ConfigController:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
-    def run_preflight(self, config_data: dict[str, Any] | None = None, auto_fix: bool = True, force_obs_detect: bool = True) -> dict[str, Any]:
+    def run_preflight(
+        self, config_data: dict[str, Any] | None = None, auto_fix: bool = True, force_obs_detect: bool = True
+    ) -> dict[str, Any]:
         data = config_data if config_data is not None else self.load_config()
         data, changed_defaults, default_notes = self.apply_auto_defaults(
             data,
@@ -150,7 +154,9 @@ class ConfigController:
         report["notes"] = list(default_notes) + list(report.get("notes", []))
         return report
 
-    def run_guided_auto_setup(self, config_data: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    def run_guided_auto_setup(
+        self, config_data: dict[str, Any] | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         report = self.run_preflight(config_data, auto_fix=True, force_obs_detect=True)
         if report.get("errors"):
             return report, None
@@ -194,7 +200,9 @@ class AudioSettingsController:
     def __init__(self, config_controller: ConfigController | None = None) -> None:
         self.config_controller = config_controller or ConfigController()
 
-    def _prepare_config(self, data: dict[str, Any], auto_fix: bool = True, force_obs_detect: bool = True) -> tuple[dict[str, Any], recordtest.AppConfig]:
+    def _prepare_config(
+        self, data: dict[str, Any], auto_fix: bool = True, force_obs_detect: bool = True
+    ) -> tuple[dict[str, Any], recordtest.AppConfig]:
         report = self.config_controller.run_preflight(
             data,
             auto_fix=auto_fix,
@@ -208,7 +216,9 @@ class AudioSettingsController:
         recordtest.setup_environment(config)
         return report, config
 
-    def _open_recorder(self, config: recordtest.AppConfig, auto_launch: bool = False, max_retries: int = 2, retry_delay: float = 0.5) -> tuple[recordtest.LoLAutoRecorder, Any | None]:
+    def _open_recorder(
+        self, config: recordtest.AppConfig, auto_launch: bool = False, max_retries: int = 2, retry_delay: float = 0.5
+    ) -> tuple[recordtest.LoLAutoRecorder, Any | None]:
         ok, _detail = recordtest.test_obs_connection(
             config.obs.host,
             config.obs.port,
@@ -300,7 +310,9 @@ class AudioSettingsController:
 class RecordingController:
     """録画監視ワーカーが使う録画ランタイム生成を担当する。"""
 
-    def create_recorder(self, config_data: dict[str, Any], status_cb: Callable[[str], None] | None = None) -> recordtest.LoLAutoRecorder:
+    def create_recorder(
+        self, config_data: dict[str, Any], status_cb: Callable[[str], None] | None = None
+    ) -> recordtest.LoLAutoRecorder:
         config = recordtest.AppConfig.from_dict(config_data)
         recordtest.setup_environment(config)
         obs_process = recordtest.launch_obs(config)
@@ -344,10 +356,7 @@ class AnalyticsController:
         event_counts = horde_result.get("winrate_by_event_count", {})
         count_sizes = {}
         if "event_name" in df.columns and "event_time" in df.columns:
-            horde_rows = df[
-                (df["event_name"] == "HordeKill")
-                & (df["event_time"].fillna(float("inf")) <= 15 * 60)
-            ]
+            horde_rows = df[(df["event_name"] == "HordeKill") & (df["event_time"].fillna(float("inf")) <= 15 * 60)]
             counts = horde_rows.groupby("match_id").size()
             match_counts = counts.reindex(matches["match_id"], fill_value=0).astype(int)
             count_sizes = match_counts.value_counts().sort_index().to_dict()

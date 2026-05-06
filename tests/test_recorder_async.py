@@ -114,7 +114,7 @@ def test_game_end_event_flow_stops_recording_without_real_sleep():
                     "EventTime": 1200.0,
                     "Result": "Win",
                     "WinningTeam": "ORDER",
-                }
+                },
             ]
         }
     )

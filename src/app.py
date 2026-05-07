@@ -249,6 +249,71 @@ class AudioDeviceRefreshWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class AudioApplyWorker(QThread):
+    loaded = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, data: dict[str, Any], auto_launch: bool) -> None:
+        super().__init__()
+        self.data = data
+        self.auto_launch = auto_launch
+
+    def run(self) -> None:
+        try:
+            self.loaded.emit(AUDIO_CONTROLLER.apply_audio_settings(self.data, auto_launch=self.auto_launch))
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class RuntimeOutputApplyWorker(QThread):
+    loaded = pyqtSignal(bool)
+    failed = pyqtSignal(str)
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        super().__init__()
+        self.data = data
+
+    def run(self) -> None:
+        try:
+            self.loaded.emit(bool(AUDIO_CONTROLLER.apply_runtime_output_settings(self.data)))
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class PreflightWorker(QThread):
+    loaded = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        super().__init__()
+        self.data = data
+
+    def run(self) -> None:
+        try:
+            report = run_preflight(self.data, auto_fix=True, force_obs_detect=True)
+            if report.get("changed"):
+                save_config(report["config"])
+            self.loaded.emit(report)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class QuickSetupWorker(QThread):
+    loaded = pyqtSignal(dict, object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        super().__init__()
+        self.data = data
+
+    def run(self) -> None:
+        try:
+            report, info = run_guided_auto_setup(self.data)
+            self.loaded.emit(report, info)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 def run_environment_bootstrap(parent: QWidget | None = None) -> bool:
     try:
         from scripts import setup_env
@@ -730,6 +795,13 @@ class SettingsPage(QWidget):
         self._audio_refresh_worker = None
         self._audio_refresh_show_message = False
         self._audio_refresh_show_error = True
+        self._audio_apply_worker = None
+        self._audio_apply_pending = False
+        self._audio_apply_show_success = False
+        self._audio_apply_show_error = True
+        self._runtime_output_worker = None
+        self._preflight_worker = None
+        self._quick_setup_worker = None
         self._audio_apply_timer = QTimer(self)
         self._audio_apply_timer.setSingleShot(True)
         self._audio_apply_timer.timeout.connect(self._apply_audio_settings_auto)
@@ -1247,28 +1319,74 @@ class SettingsPage(QWidget):
     def apply_audio_settings_to_obs(
         self, show_success: bool = True, show_error: bool = True, auto_launch: bool = True
     ) -> bool:
+        if self._audio_apply_worker and self._audio_apply_worker.isRunning():
+            self._audio_apply_pending = True
+            return False
         try:
             data = self._collect_settings_data_from_ui()
-            result = AUDIO_CONTROLLER.apply_audio_settings(data, auto_launch=auto_launch)
-            if show_success:
-                msg = "音声設定をOBSへ反映しました。"
-                if result.get("obs_launched"):
-                    msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
-                QMessageBox.information(self, "音声設定", msg)
-            return True
         except Exception as e:
             if show_error:
-                QMessageBox.warning(self, "音声設定", f"OBSへの反映に失敗しました。\n{e}")
+                QMessageBox.warning(self, "音声設定", f"反映準備に失敗しました。\n{e}")
             return False
 
+        self._audio_apply_show_success = show_success
+        self._audio_apply_show_error = show_error
+        self.audio_status_label.setText("音声設定をOBSへ反映中...")
+        worker = AudioApplyWorker(data, auto_launch=auto_launch)
+        self._audio_apply_worker = worker
+        worker.loaded.connect(self._on_audio_settings_applied)
+        worker.failed.connect(self._on_audio_settings_apply_failed)
+        worker.finished.connect(self._on_audio_apply_finished)
+        worker.start()
+        return True
+
+    def _on_audio_settings_applied(self, result: dict[str, Any]) -> None:
+        msg = "音声設定をOBSへ反映しました。"
+        if result.get("obs_launched"):
+            msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
+        self.audio_status_label.setText(msg)
+        if self._audio_apply_show_success:
+            QMessageBox.information(self, "音声設定", msg)
+
+    def _on_audio_settings_apply_failed(self, message: str) -> None:
+        self.audio_status_label.setText(f"音声設定のOBS反映に失敗しました: {message}")
+        if self._audio_apply_show_error:
+            QMessageBox.warning(self, "音声設定", f"OBSへの反映に失敗しました。\n{message}")
+
+    def _on_audio_apply_finished(self) -> None:
+        if self._audio_apply_worker:
+            self._audio_apply_worker.deleteLater()
+            self._audio_apply_worker = None
+        if self._audio_apply_pending:
+            self._audio_apply_pending = False
+            self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=False)
+
     def apply_runtime_output_settings_to_obs(self, cfg: dict[str, Any] | None = None, show_error: bool = False) -> bool:
+        if self._runtime_output_worker and self._runtime_output_worker.isRunning():
+            return False
         try:
             data = cfg if cfg is not None else load_config()
-            return AUDIO_CONTROLLER.apply_runtime_output_settings(data)
         except Exception as e:
             if show_error:
-                QMessageBox.warning(self, "設定反映", f"録画設定のOBS反映に失敗しました。\n{e}")
+                QMessageBox.warning(self, "設定反映", f"録画設定の反映準備に失敗しました。\n{e}")
             return False
+        worker = RuntimeOutputApplyWorker(data)
+        self._runtime_output_worker = worker
+        worker.failed.connect(
+            lambda message: (
+                QMessageBox.warning(self, "設定反映", f"録画設定のOBS反映に失敗しました。\n{message}")
+                if show_error
+                else None
+            )
+        )
+        worker.finished.connect(self._on_runtime_output_apply_finished)
+        worker.start()
+        return True
+
+    def _on_runtime_output_apply_finished(self) -> None:
+        if self._runtime_output_worker:
+            self._runtime_output_worker.deleteLater()
+            self._runtime_output_worker = None
 
     def auto_fill_settings(self) -> None:
         data = load_config()
@@ -1284,10 +1402,20 @@ class SettingsPage(QWidget):
         QMessageBox.information(self, "自動補完", f"設定の自動補完を実行しました。\n{note_text}")
 
     def run_preflight_fix(self) -> None:
+        if self._preflight_worker and self._preflight_worker.isRunning():
+            QMessageBox.information(self, "録画前チェック", "チェック実行中です。完了まで待ってください。")
+            return
         data = load_config()
-        report = run_preflight(data, auto_fix=True, force_obs_detect=True)
-        if report.get("changed"):
-            save_config(report["config"])
+        self.preflight_btn.setEnabled(False)
+        self.preflight_btn.setText("チェック実行中...")
+        worker = PreflightWorker(data)
+        self._preflight_worker = worker
+        worker.loaded.connect(self._on_preflight_finished)
+        worker.failed.connect(self._on_preflight_failed)
+        worker.finished.connect(self._on_preflight_worker_finished)
+        worker.start()
+
+    def _on_preflight_finished(self, report: dict[str, Any]) -> None:
         self.load_settings()
 
         message = (
@@ -1300,6 +1428,16 @@ class SettingsPage(QWidget):
         else:
             QMessageBox.information(self, "録画前チェック", message)
 
+    def _on_preflight_failed(self, message: str) -> None:
+        QMessageBox.warning(self, "録画前チェック", f"チェックに失敗しました。\n{message}")
+
+    def _on_preflight_worker_finished(self) -> None:
+        self.preflight_btn.setEnabled(True)
+        self.preflight_btn.setText("録画前チェックを実行")
+        if self._preflight_worker:
+            self._preflight_worker.deleteLater()
+            self._preflight_worker = None
+
     def open_setup_wizard(self) -> None:
         dialog = SetupWizardDialog(self, startup_mode=False)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -1307,8 +1445,21 @@ class SettingsPage(QWidget):
             self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
 
     def run_quick_setup(self) -> bool:
+        if self._quick_setup_worker and self._quick_setup_worker.isRunning():
+            QMessageBox.information(self, "環境修復", "環境修復を実行中です。完了まで待ってください。")
+            return False
         data = load_config()
-        report, info = run_guided_auto_setup(data)
+        self.quick_fix_btn.setEnabled(False)
+        self.quick_fix_btn.setText("修復中...")
+        worker = QuickSetupWorker(data)
+        self._quick_setup_worker = worker
+        worker.loaded.connect(self._on_quick_setup_finished)
+        worker.failed.connect(self._on_quick_setup_failed)
+        worker.finished.connect(self._on_quick_setup_worker_finished)
+        worker.start()
+        return True
+
+    def _on_quick_setup_finished(self, report: dict[str, Any], info: object) -> None:
         if report.get("errors"):
             QMessageBox.critical(self, "環境修復", format_report_lines(report.get("errors", [])))
             return
@@ -1331,6 +1482,16 @@ class SettingsPage(QWidget):
         if report.get("warnings"):
             message += f"\n\n警告:\n{format_report_lines(report.get('warnings', []))}"
         QMessageBox.information(self, "環境修復", message)
+
+    def _on_quick_setup_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "環境修復", f"環境修復に失敗しました。\n{message}")
+
+    def _on_quick_setup_worker_finished(self) -> None:
+        self.quick_fix_btn.setEnabled(True)
+        self.quick_fix_btn.setText("環境を自動修復")
+        if self._quick_setup_worker:
+            self._quick_setup_worker.deleteLater()
+            self._quick_setup_worker = None
 
 
 class MainWindow(QMainWindow):

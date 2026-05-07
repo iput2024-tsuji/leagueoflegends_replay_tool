@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
 from typing import Any
 
@@ -8,19 +7,22 @@ try:
     from . import recordtest
     from .analytics import GameDataAnalyzer
     from .app_paths import get_app_root
+    from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
 except ImportError:
     import recordtest
     from analytics import GameDataAnalyzer
     from app_paths import get_app_root
+    from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
 
 
 ROOT_DIR = get_app_root()
-CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
-SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
 
 
 class ConfigController:
     """設定ファイル、補完、プレフライトをUIから分離して扱う。"""
+
+    def __init__(self, repository: ConfigRepository | None = None) -> None:
+        self.repository = repository or ConfigRepository(CONFIG_PATH, SAMPLE_CONFIG_PATH)
 
     def apply_auto_defaults(
         self, data: dict[str, Any] | None, force_obs_detect: bool = False
@@ -120,26 +122,14 @@ class ConfigController:
         return "\n".join(f"- {line}" for line in lines)
 
     def load_config(self) -> dict[str, Any]:
-        if not CONFIG_PATH.exists():
-            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            if SAMPLE_CONFIG_PATH.exists():
-                CONFIG_PATH.write_text(SAMPLE_CONFIG_PATH.read_text(encoding="utf-8"), encoding="utf-8")
-            else:
-                CONFIG_PATH.write_text(json.dumps({}, indent=4), encoding="utf-8")
-        try:
-            with open(CONFIG_PATH, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-
+        data = self.repository.load(create_if_missing=True)
         data, changed, _ = self.apply_auto_defaults(data, force_obs_detect=False)
         if changed:
             self.save_config(data)
         return data
 
     def save_config(self, data: dict[str, Any]) -> None:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        self.repository.save(data)
 
     def run_preflight(
         self, config_data: dict[str, Any] | None = None, auto_fix: bool = True, force_obs_detect: bool = True

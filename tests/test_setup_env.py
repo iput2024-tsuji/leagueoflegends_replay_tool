@@ -16,7 +16,6 @@ def test_extract_obs_flattens_top_level_zip_directory(monkeypatch):
     tmp_path = runtime_dir("setup_env_obs_extract")
     zip_path = tmp_path / "obs.zip"
     dest = tmp_path / "obs-portable"
-    monkeypatch.setattr(setup_env, "kill_stale_obs_processes", lambda: None)
 
     with zipfile.ZipFile(zip_path, "w") as archive:
         archive.writestr("OBS-Studio-Portable/bin/64bit/obs64.exe", "fake")
@@ -31,7 +30,6 @@ def test_extract_obs_flattens_top_level_zip_directory(monkeypatch):
 
 def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypatch):
     obs_dir = runtime_dir("setup_env_obs_bootstrap") / "obs-portable"
-    monkeypatch.setattr(setup_env, "kill_stale_obs_processes", lambda: None)
 
     setup_env.bootstrap_obs_portable_config(obs_dir)
 
@@ -51,13 +49,12 @@ def test_bootstrap_obs_portable_config_regenerates_corrupt_global_ini(monkeypatc
     global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
     global_ini.parent.mkdir(parents=True, exist_ok=True)
     global_ini.write_text("[General\nbroken", encoding="utf-8")
-    monkeypatch.setattr(setup_env, "kill_stale_obs_processes", lambda: None)
 
-    def regenerate(_obs_dir, target_ini, timeout_sec=8.0):
+    def regenerate(_self, target_ini, timeout_sec=8.0):
         assert not target_ini.exists()
         target_ini.write_text("[General]\nExisting=true\n\n[Other]\nKeep=true\n", encoding="utf-8")
 
-    monkeypatch.setattr(setup_env, "_regenerate_obs_global_ini_with_obs", regenerate)
+    monkeypatch.setattr(setup_env.OBSBootstrapper, "regenerate_global_ini_with_obs", regenerate)
 
     setup_env.bootstrap_obs_portable_config(obs_dir)
 

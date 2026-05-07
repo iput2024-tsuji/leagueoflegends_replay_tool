@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import configparser
 import json
 import logging
 import os
@@ -22,12 +21,29 @@ from obsws_python.error import OBSSDKRequestError
 
 try:
     from .app_paths import get_app_root
+    from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from .obs_bootstrap import (
+        OBSBootstrapper as SharedOBSBootstrapper,
+        get_obs_config_dir as shared_get_obs_config_dir,
+        get_obs_global_ini_path as shared_get_obs_global_ini_path,
+        get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
+        get_portable_marker_path as shared_get_portable_marker_path,
+    )
+    from .obs_process import OBSProcessManager
 except ImportError:
     from app_paths import get_app_root
+    from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from obs_bootstrap import (
+        OBSBootstrapper as SharedOBSBootstrapper,
+        get_obs_config_dir as shared_get_obs_config_dir,
+        get_obs_global_ini_path as shared_get_obs_global_ini_path,
+        get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
+        get_portable_marker_path as shared_get_portable_marker_path,
+    )
+    from obs_process import OBSProcessManager
 
 ROOT_DIR = get_app_root()
-CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
-SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
+CONFIG_REPOSITORY = ConfigRepository(CONFIG_PATH, SAMPLE_CONFIG_PATH)
 
 LIVECLIENT_BASE = "https://127.0.0.1:2999/liveclientdata"
 ACTIVE_PLAYER_URL = f"{LIVECLIENT_BASE}/activeplayername"
@@ -455,127 +471,30 @@ def is_managed_portable_obs_dir(base_dir: str | Path | None) -> bool:
 
 
 def get_obs_websocket_config_path(base_dir: str | Path) -> Path:
-    return Path(base_dir) / "config" / "obs-studio" / "plugin_config" / "obs-websocket" / "config.json"
+    return shared_get_obs_websocket_config_path(base_dir)
 
 
 def get_obs_config_dir(base_dir: str | Path) -> Path:
-    return Path(base_dir) / "config" / "obs-studio"
+    return shared_get_obs_config_dir(base_dir)
 
 
 def get_obs_global_ini_path(base_dir: str | Path) -> Path:
-    return get_obs_config_dir(base_dir) / "global.ini"
+    return shared_get_obs_global_ini_path(base_dir)
 
 
 def get_obs_portable_marker_path(base_dir: str | Path) -> Path:
-    return Path(base_dir) / PORTABLE_OBS_MARKER_NAME
+    return shared_get_portable_marker_path(base_dir)
 
 
-def _new_obs_ini_parser() -> configparser.ConfigParser:
-    parser = configparser.ConfigParser(interpolation=None, strict=False)
-    parser.optionxform = str  # キーの大文字小文字を維持
-    return parser
-
-
-def _isolated_obs_env(base_dir: str | Path) -> dict[str, str]:
-    obs_dir_abs = os.path.abspath(str(base_dir))
-    isolated_root = os.path.abspath(os.path.join(obs_dir_abs, "temp_appdata"))
-    isolated_roaming = os.path.join(isolated_root, "Roaming")
-    isolated_local = os.path.join(isolated_root, "Local")
-    isolated_profile = os.path.join(isolated_root, "UserProfile")
-    for path in (isolated_root, isolated_roaming, isolated_local, isolated_profile):
-        os.makedirs(path, exist_ok=True)
-
-    env = os.environ.copy()
-    env["APPDATA"] = isolated_roaming
-    env["LOCALAPPDATA"] = isolated_local
-    env["USERPROFILE"] = isolated_profile
-    return env
-
-
-def _startupinfo_hidden() -> subprocess.STARTUPINFO | None:
-    if os.name != "nt":
-        return None
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = 0  # SW_HIDE
-    return startupinfo
-
-
-def regenerate_obs_global_ini_with_obs(base_dir: str | Path, ini_path: Path, timeout_sec: float = 8.0) -> None:
-    """破損した global.ini をOBS自身に再生成させる。"""
-    obs_dir_abs = os.path.abspath(str(base_dir))
-    obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
-    working_dir = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit"))
-    if not os.path.exists(obs_exe):
-        raise RecorderError(f"global.ini の再生成に必要なOBS実行ファイルが見つかりません: {obs_exe}")
-
-    cmd = [obs_exe, "--portable", "--multi", "--disable-shutdown-check", "--disable-updater"]
-    popen_kwargs: dict[str, Any] = {"cwd": working_dir, "env": _isolated_obs_env(obs_dir_abs)}
-    startupinfo = _startupinfo_hidden()
-    if startupinfo is not None:
-        popen_kwargs["startupinfo"] = startupinfo
-
-    process = subprocess.Popen(cmd, **popen_kwargs)
-    try:
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            if ini_path.exists():
-                return
-            if process.poll() is not None:
-                break
-            time.sleep(0.25)
-    finally:
-        if process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=3)
-            except Exception:
-                try:
-                    process.kill()
-                    process.wait(timeout=2)
-                except Exception:
-                    pass
-        kill_stale_obs_processes()
-
-    if not ini_path.exists():
-        raise RecorderError(f"OBSによる global.ini の再生成に失敗しました: {ini_path}")
-
-
-class OBSBootstrapper:
+class OBSBootstrapper(SharedOBSBootstrapper):
     """アプリ管理のポータブルOBSを初期化するBootstrapper。"""
 
     def __init__(self, base_dir: str | Path) -> None:
-        self.base_dir = Path(base_dir).resolve()
-
-    def ensure_portable_mode_marker(self) -> Path:
-        return ensure_portable_mode_marker(self.base_dir)
-
-    def ensure_config_dir(self) -> Path:
-        config_dir = get_obs_config_dir(self.base_dir)
-        config_dir.mkdir(parents=True, exist_ok=True)
-        return config_dir
-
-    def ensure_global_ini(self) -> tuple[bool, Path]:
-        self.ensure_config_dir()
-        return ensure_portable_obs_global_ini(self.base_dir)
-
-    def ensure_websocket_config(self, port: int, password: str) -> tuple[bool, Path]:
-        return ensure_portable_obs_websocket_config(self.base_dir, port, password)
-
-    def bootstrap(self, port: int | None = None, password: str = "") -> dict[str, Any]:
-        marker = self.ensure_portable_mode_marker()
-        config_dir = self.ensure_config_dir()
-        changed_ini, global_ini_path = self.ensure_global_ini()
-        websocket_result = None
-        if port is not None:
-            websocket_result = self.ensure_websocket_config(port, password)
-        return {
-            "marker": marker,
-            "config_dir": config_dir,
-            "global_ini_changed": changed_ini,
-            "global_ini_path": global_ini_path,
-            "websocket": websocket_result,
-        }
+        if not is_managed_portable_obs_dir(base_dir):
+            raise RecorderError(
+                f"このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n利用先: {MANAGED_PORTABLE_OBS_DIR}"
+            )
+        super().__init__(base_dir, process_manager=OBSProcessManager(base_dir, logger=LOGGER), logger=LOGGER)
 
 
 def ensure_portable_obs_global_ini(base_dir: str | Path) -> tuple[bool, Path]:
@@ -583,62 +502,7 @@ def ensure_portable_obs_global_ini(base_dir: str | Path) -> tuple[bool, Path]:
     ポータブルOBSの global.ini にトレイ無効化設定を反映する。
     configparser を使い、キーの大文字小文字を維持して書き込む。
     """
-    if not is_managed_portable_obs_dir(base_dir):
-        raise RecorderError(
-            f"このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n利用先: {MANAGED_PORTABLE_OBS_DIR}"
-        )
-
-    # OBSが生きている状態でglobal.iniを書き換えても、終了時のフラッシュで
-    # 上書きされるため、ファイルI/O前に必ず排他する。
-    kill_stale_obs_processes()
-
-    ini_path = get_obs_global_ini_path(base_dir)
-    ini_path.parent.mkdir(parents=True, exist_ok=True)
-
-    parser = _new_obs_ini_parser()
-
-    parse_failed = False
-    if ini_path.exists():
-        try:
-            parser.read(ini_path, encoding="utf-8-sig")
-        except Exception as e:
-            LOGGER.warning("破損したOBS global.iniを削除して再生成します: %s (%s)", ini_path, e)
-            parse_failed = True
-            ini_path.unlink(missing_ok=True)
-            regenerate_obs_global_ini_with_obs(base_dir, ini_path)
-            parser = _new_obs_ini_parser()
-            parser.read(ini_path, encoding="utf-8-sig")
-
-    changed = parse_failed
-    for section in ("General", "BasicWindow"):
-        if not parser.has_section(section):
-            parser.add_section(section)
-            changed = True
-
-    desired = {
-        "SysTrayEnabled": "false",
-        "SysTrayWhenStarted": "false",
-        "SysTrayMinimizeToTray": "false",
-        "HideTrayIcon": "true",
-    }
-    for section in ("General", "BasicWindow"):
-        for key in list(parser.options(section)):
-            lower_key = key.lower()
-            if ("systray" in lower_key or "hidetray" in lower_key) and key not in desired:
-                parser.remove_option(section, key)
-                changed = True
-
-        for key, value in desired.items():
-            current = parser.get(section, key, fallback=None)
-            if current is None or str(current).strip().lower() != value:
-                parser.set(section, key, value)
-                changed = True
-
-    if changed or not ini_path.exists():
-        with open(ini_path, "w", encoding="utf-8") as f:
-            parser.write(f, space_around_delimiters=False)
-
-    return changed, ini_path
+    return OBSBootstrapper(base_dir).ensure_global_ini()
 
 
 def ensure_portable_obs_websocket_config(base_dir: str | Path, port: int, password: str) -> tuple[bool, Path]:
@@ -646,44 +510,7 @@ def ensure_portable_obs_websocket_config(base_dir: str | Path, port: int, passwo
     obs-portable に配置されたポータブルOBSのみを対象に、
     WebSocket設定を固定値へ自動補完する。
     """
-    if not is_managed_portable_obs_dir(base_dir):
-        raise RecorderError(
-            f"このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n利用先: {MANAGED_PORTABLE_OBS_DIR}"
-        )
-
-    config_path = get_obs_websocket_config_path(base_dir)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-
-    data = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                data = loaded
-        except Exception:
-            data = {}
-
-    changed = False
-
-    def set_if_diff(key: str, value: Any) -> None:
-        nonlocal changed
-        if data.get(key) != value:
-            data[key] = value
-            changed = True
-
-    port_value, _ = _safe_int(port, DEFAULT_OBS_PORT, minimum=1, maximum=65535)
-    password_text = str(password or "")
-
-    set_if_diff("server_enabled", True)
-    set_if_diff("server_port", port_value)
-    set_if_diff("auth_required", bool(password_text))
-    set_if_diff("server_password", password_text)
-
-    if changed:
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-    return changed, config_path
+    return OBSBootstrapper(base_dir).ensure_websocket_config(port, password)
 
 
 def _ensure_section_dict(root: dict[str, Any], key: str) -> tuple[dict[str, Any], bool]:
@@ -1035,22 +862,14 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         else:
             report["errors"].append(f"OBSフォルダは obs-portable のポータブルOBSのみ対応です: {expected_obs_dir}")
 
-    if auto_fix and current_obs_dir and is_managed_portable_obs_dir(current_obs_dir):
+    if current_obs_dir and is_managed_portable_obs_dir(current_obs_dir):
         try:
-            marker_path = get_obs_portable_marker_path(current_obs_dir)
-            marker_existed = marker_path.exists()
             bootstrapper = OBSBootstrapper(current_obs_dir)
-            marker = bootstrapper.ensure_portable_mode_marker()
-            if not marker_existed:
-                report["changed"] = True
-                report["notes"].append(f"OBSポータブルモードマーカーを作成しました: {marker}")
-
-            changed, global_ini_path = bootstrapper.ensure_global_ini()
-            if changed:
-                report["changed"] = True
-                report["notes"].append(f"ポータブルOBSのトレイアイコン非表示を設定しました: {global_ini_path}")
+            bootstrap_report = bootstrapper.check()
+            if bootstrap_report.needs_repair:
+                report["warnings"].append("OBS Bootstrapper の修復が必要です。録画開始または環境修復時に適用します。")
         except Exception as e:
-            report["warnings"].append(f"OBS Bootstrapper の実行に失敗しました: {e}")
+            report["warnings"].append(f"OBS Bootstrapper の検査に失敗しました: {e}")
 
     has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
     if not has_valid_obs:
@@ -1548,15 +1367,7 @@ def resolve_path(value: str | Path | None, base_dir: str | Path) -> Path | None:
 
 
 def load_settings() -> dict[str, Any]:
-    if not CONFIG_PATH.exists():
-        raise RecorderError(
-            "設定ファイルが見つかりません。\n"
-            f"作成先: {CONFIG_PATH}\n"
-            f"雛形: {SAMPLE_CONFIG_PATH}\n"
-            "雛形をコピーして setting.json を作成してください。"
-        )
-    with open(CONFIG_PATH, encoding="utf-8") as f:
-        return json.load(f)
+    return CONFIG_REPOSITORY.load(create_if_missing=True)
 
 
 def load_app_config() -> AppConfig:
@@ -1564,9 +1375,7 @@ def load_app_config() -> AppConfig:
 
 
 def save_settings(cfg: dict[str, Any]) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4, ensure_ascii=False)
+    CONFIG_REPOSITORY.save(cfg)
 
 
 def setup_environment(config: AppConfig) -> None:
@@ -1733,7 +1542,6 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
 
     obs_dir_abs = os.path.abspath(str(config.obs.obs_dir))
     obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
-    working_dir = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit"))
 
     if not os.path.exists(obs_exe):
         detected = detect_obs_dir()
@@ -1741,21 +1549,14 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
     # 最優先: 残存OBSを先に終了して、以降の設定更新とのレースを防ぐ。
-    kill_stale_obs_processes()
+    process_manager = OBSProcessManager(obs_dir_abs, logger=LOGGER)
+    process_manager.kill_stale_managed_processes()
 
     bootstrapper = OBSBootstrapper(obs_dir_abs)
     try:
         bootstrapper.ensure_portable_mode_marker()
     except Exception as e:
         raise RecorderError(f"{PORTABLE_OBS_MARKER_NAME} の準備に失敗しました: {e}") from e
-
-    # OBSが通常版設定(AppData)を読むのを防ぐため、隔離環境を用意する。
-    isolated_root = os.path.abspath(os.path.join(obs_dir_abs, "temp_appdata"))
-    isolated_roaming = os.path.join(isolated_root, "Roaming")
-    isolated_local = os.path.join(isolated_root, "Local")
-    isolated_profile = os.path.join(isolated_root, "UserProfile")
-    for path in (isolated_root, isolated_roaming, isolated_local, isolated_profile):
-        os.makedirs(path, exist_ok=True)
 
     try:
         changed_ini, global_ini_path = bootstrapper.ensure_global_ini()
@@ -1771,25 +1572,9 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         raise RecorderError(f"ポータブルOBS起動前設定の更新に失敗しました: {e}") from e
 
     LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
-    cmd = [obs_exe, "--portable", "--multi", "--disable-shutdown-check", "--disable-updater"]
 
     try:
-        startupinfo = None
-        if os.name == "nt":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = 0  # SW_HIDE
-
-        custom_env = os.environ.copy()
-        custom_env["APPDATA"] = isolated_roaming
-        custom_env["LOCALAPPDATA"] = isolated_local
-        custom_env["USERPROFILE"] = isolated_profile
-
-        popen_kwargs = {"cwd": working_dir, "env": custom_env}
-        if startupinfo is not None:
-            popen_kwargs["startupinfo"] = startupinfo
-
-        process = subprocess.Popen(cmd, **popen_kwargs)
+        process = process_manager.start_obs(env=process_manager.isolated_env(), hidden=True)
         # WebSocketの起動待ち
         time.sleep(2)
         return process
@@ -1817,17 +1602,10 @@ def ensure_portable_mode_marker(base_dir: str | Path) -> Path:
 
 def kill_stale_obs_processes() -> None:
     """
-    残存している obs64.exe を起動直前に全て終了する。
-    旧プロセスがトレイ/ウィンドウを保持しているケースを排除する。
+    アプリ管理OBSだけを起動直前に終了する。
+    通常版OBSやユーザーが別用途で起動したOBSは対象外にする。
     """
-    if os.name != "nt":
-        return
-    try:
-        os.system("taskkill /f /im obs64.exe >nul 2>&1")
-        # OS側のプロセス終了反映待ち
-        time.sleep(0.3)
-    except Exception:
-        pass
+    OBSProcessManager(MANAGED_PORTABLE_OBS_DIR, logger=LOGGER).kill_stale_managed_processes()
 
 
 def normalize_summoner_name(value: Any) -> str | None:
@@ -2106,26 +1884,7 @@ class ObsWebSocketClient(OBSClient):
     def shutdown(self) -> None:
         if self.obs_process:
             self.log("🧹 OBSを終了しています...")
-
-            if self.obs_process.poll() is None:
-                try:
-                    self.obs_process.terminate()
-                except Exception:
-                    pass
-
-                deadline = time.time() + 3.0
-                while time.time() < deadline:
-                    if self.obs_process.poll() is not None:
-                        break
-                    time.sleep(0.1)
-
-                if self.obs_process.poll() is None:
-                    self.log("⚠️ OBSが終了しないため強制終了します。")
-                    try:
-                        self.obs_process.kill()
-                        self.obs_process.wait(timeout=2)
-                    except Exception:
-                        pass
+            OBSProcessManager(self.config.obs.obs_dir, logger=self.logger).terminate_process(self.obs_process)
 
         self.disconnect()
 

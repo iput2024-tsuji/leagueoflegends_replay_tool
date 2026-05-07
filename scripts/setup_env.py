@@ -7,13 +7,9 @@ verifies SHA256 checksums, and places the runtime files where the app expects.
 from __future__ import annotations
 
 import asyncio
-import configparser
 import hashlib
-import os
 import shutil
-import subprocess
 import sys
-import time
 import urllib.request
 import uuid
 import zipfile
@@ -21,6 +17,9 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+from src.obs_bootstrap import OBSBootstrapper
+from src.obs_process import OBSProcessManager
 
 ProgressCallback = Callable[[int, str], None]
 
@@ -161,64 +160,7 @@ def _find_obs_root(extract_dir: Path) -> Path:
 
 
 def kill_stale_obs_processes() -> None:
-    if os.name != "nt":
-        return
-    try:
-        os.system("taskkill /f /im obs64.exe >nul 2>&1")
-        time.sleep(0.3)
-    except Exception:
-        pass
-
-
-def _new_obs_ini_parser() -> configparser.ConfigParser:
-    parser = configparser.ConfigParser(interpolation=None, strict=False)
-    parser.optionxform = str
-    return parser
-
-
-def _regenerate_obs_global_ini_with_obs(obs_dir: Path, global_ini: Path, timeout_sec: float = 8.0) -> None:
-    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
-    working_dir = obs_exe.parent
-    if not obs_exe.exists():
-        raise RuntimeError(f"global.ini regeneration requires obs64.exe: {obs_exe}")
-
-    startupinfo = None
-    if os.name == "nt":
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        startupinfo.wShowWindow = 0  # SW_HIDE
-
-    cmd = [
-        str(obs_exe),
-        "--portable",
-        "--multi",
-        "--disable-shutdown-check",
-        "--disable-updater",
-    ]
-    process = subprocess.Popen(cmd, cwd=str(working_dir), startupinfo=startupinfo)
-    try:
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            if global_ini.exists():
-                return
-            if process.poll() is not None:
-                break
-            time.sleep(0.25)
-    finally:
-        if process.poll() is None:
-            try:
-                process.terminate()
-                process.wait(timeout=3)
-            except Exception:
-                try:
-                    process.kill()
-                    process.wait(timeout=2)
-                except Exception:
-                    pass
-        kill_stale_obs_processes()
-
-    if not global_ini.exists():
-        raise RuntimeError(f"OBS did not regenerate global.ini: {global_ini}")
+    OBSProcessManager(OBS_PORTABLE_DIR).kill_stale_managed_processes()
 
 
 def _extract_obs(zip_path: Path, dest_dir: Path) -> Path:
@@ -239,42 +181,7 @@ def _extract_obs(zip_path: Path, dest_dir: Path) -> Path:
 
 
 def bootstrap_obs_portable_config(obs_dir: Path = OBS_PORTABLE_DIR) -> None:
-    kill_stale_obs_processes()
-    obs_dir.mkdir(parents=True, exist_ok=True)
-    for marker_name in ("obs_portable_mode.txt", "portable_mode.txt"):
-        marker = obs_dir / marker_name
-        if not marker.exists():
-            marker.write_text("", encoding="utf-8")
-
-    obs_config_dir = obs_dir / "config" / "obs-studio"
-    obs_config_dir.mkdir(parents=True, exist_ok=True)
-    global_ini = obs_config_dir / "global.ini"
-    parser = _new_obs_ini_parser()
-    if global_ini.exists():
-        try:
-            parser.read(global_ini, encoding="utf-8-sig")
-        except Exception:
-            global_ini.unlink(missing_ok=True)
-            _regenerate_obs_global_ini_with_obs(obs_dir, global_ini)
-            parser = _new_obs_ini_parser()
-            parser.read(global_ini, encoding="utf-8-sig")
-
-    for section in ("General", "BasicWindow"):
-        if not parser.has_section(section):
-            parser.add_section(section)
-
-    tray_settings = {
-        "SysTrayEnabled": "false",
-        "SysTrayWhenStarted": "false",
-        "SysTrayMinimizeToTray": "false",
-        "HideTrayIcon": "true",
-    }
-    for section in ("General", "BasicWindow"):
-        for key, value in tray_settings.items():
-            parser.set(section, key, value)
-
-    with open(global_ini, "w", encoding="utf-8") as f:
-        parser.write(f, space_around_delimiters=False)
+    OBSBootstrapper(obs_dir).apply()
 
 
 async def ensure_ffmpeg(progress_cb: ProgressCallback | None = None) -> Path:

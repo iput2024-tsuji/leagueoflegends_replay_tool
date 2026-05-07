@@ -129,6 +129,7 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
     obs_dir = Path("tests") / "_tmp" / "obs_bootstrapper" / "obs-portable"
     shutil.rmtree(obs_dir.parent, ignore_errors=True)
     monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
+    monkeypatch.setattr(recordtest, "kill_stale_obs_processes", lambda: None)
 
     result = recordtest.OBSBootstrapper(obs_dir).bootstrap()
     global_ini = result["global_ini_path"]
@@ -145,3 +146,30 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
     assert "SysTrayWhenStarted=false" in text
     assert "SysTrayMinimizeToTray=false" in text
     assert "HideTrayIcon=true" in text
+
+
+def test_global_ini_parse_error_deletes_and_regenerates_before_patch(monkeypatch):
+    obs_dir = Path("tests") / "_tmp" / "obs_bootstrapper_corrupt" / "obs-portable"
+    shutil.rmtree(obs_dir.parent, ignore_errors=True)
+    ini_path = obs_dir / "config" / "obs-studio" / "global.ini"
+    ini_path.parent.mkdir(parents=True, exist_ok=True)
+    ini_path.write_text("[BasicWindow\nbroken", encoding="utf-8")
+
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
+    monkeypatch.setattr(recordtest, "kill_stale_obs_processes", lambda: None)
+
+    def regenerate(_base_dir, target_ini, timeout_sec=8.0):
+        assert not target_ini.exists()
+        target_ini.write_text("[General]\nExisting=true\n\n[Other]\nKeep=true\n", encoding="utf-8")
+
+    monkeypatch.setattr(recordtest, "regenerate_obs_global_ini_with_obs", regenerate)
+
+    changed, result_path = recordtest.ensure_portable_obs_global_ini(obs_dir)
+
+    assert changed is True
+    assert result_path == ini_path
+    text = ini_path.read_text(encoding="utf-8")
+    assert "Existing=true" in text
+    assert "[Other]" in text
+    assert "Keep=true" in text
+    assert "SysTrayEnabled=false" in text

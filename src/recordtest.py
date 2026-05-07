@@ -470,6 +470,77 @@ def get_obs_portable_marker_path(base_dir: str | Path) -> Path:
     return Path(base_dir) / PORTABLE_OBS_MARKER_NAME
 
 
+def _new_obs_ini_parser() -> configparser.ConfigParser:
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str  # キーの大文字小文字を維持
+    return parser
+
+
+def _isolated_obs_env(base_dir: str | Path) -> dict[str, str]:
+    obs_dir_abs = os.path.abspath(str(base_dir))
+    isolated_root = os.path.abspath(os.path.join(obs_dir_abs, "temp_appdata"))
+    isolated_roaming = os.path.join(isolated_root, "Roaming")
+    isolated_local = os.path.join(isolated_root, "Local")
+    isolated_profile = os.path.join(isolated_root, "UserProfile")
+    for path in (isolated_root, isolated_roaming, isolated_local, isolated_profile):
+        os.makedirs(path, exist_ok=True)
+
+    env = os.environ.copy()
+    env["APPDATA"] = isolated_roaming
+    env["LOCALAPPDATA"] = isolated_local
+    env["USERPROFILE"] = isolated_profile
+    return env
+
+
+def _startupinfo_hidden() -> subprocess.STARTUPINFO | None:
+    if os.name != "nt":
+        return None
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = 0  # SW_HIDE
+    return startupinfo
+
+
+def regenerate_obs_global_ini_with_obs(base_dir: str | Path, ini_path: Path, timeout_sec: float = 8.0) -> None:
+    """破損した global.ini をOBS自身に再生成させる。"""
+    obs_dir_abs = os.path.abspath(str(base_dir))
+    obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
+    working_dir = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit"))
+    if not os.path.exists(obs_exe):
+        raise RecorderError(f"global.ini の再生成に必要なOBS実行ファイルが見つかりません: {obs_exe}")
+
+    cmd = [obs_exe, "--portable", "--multi", "--disable-shutdown-check", "--disable-updater"]
+    popen_kwargs: dict[str, Any] = {"cwd": working_dir, "env": _isolated_obs_env(obs_dir_abs)}
+    startupinfo = _startupinfo_hidden()
+    if startupinfo is not None:
+        popen_kwargs["startupinfo"] = startupinfo
+
+    process = subprocess.Popen(cmd, **popen_kwargs)
+    try:
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if ini_path.exists():
+                return
+            if process.poll() is not None:
+                break
+            time.sleep(0.25)
+    finally:
+        if process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+        kill_stale_obs_processes()
+
+    if not ini_path.exists():
+        raise RecorderError(f"OBSによる global.ini の再生成に失敗しました: {ini_path}")
+
+
 class OBSBootstrapper:
     """アプリ管理のポータブルOBSを初期化するBootstrapper。"""
 
@@ -517,26 +588,32 @@ def ensure_portable_obs_global_ini(base_dir: str | Path) -> tuple[bool, Path]:
             f"このアプリは obs-portable に配置されたポータブルOBSのみ対応です。\n利用先: {MANAGED_PORTABLE_OBS_DIR}"
         )
 
+    # OBSが生きている状態でglobal.iniを書き換えても、終了時のフラッシュで
+    # 上書きされるため、ファイルI/O前に必ず排他する。
+    kill_stale_obs_processes()
+
     ini_path = get_obs_global_ini_path(base_dir)
     ini_path.parent.mkdir(parents=True, exist_ok=True)
 
-    parser = configparser.ConfigParser(interpolation=None)
-    parser.optionxform = str  # キーの大文字小文字を維持
+    parser = _new_obs_ini_parser()
 
     parse_failed = False
     if ini_path.exists():
         try:
             parser.read(ini_path, encoding="utf-8-sig")
-        except Exception:
-            # 既存ファイルが壊れていても再生成で復旧する
+        except Exception as e:
+            LOGGER.warning("破損したOBS global.iniを削除して再生成します: %s (%s)", ini_path, e)
             parse_failed = True
-            parser = configparser.ConfigParser(interpolation=None)
-            parser.optionxform = str
+            ini_path.unlink(missing_ok=True)
+            regenerate_obs_global_ini_with_obs(base_dir, ini_path)
+            parser = _new_obs_ini_parser()
+            parser.read(ini_path, encoding="utf-8-sig")
 
     changed = parse_failed
-    if not parser.has_section("BasicWindow"):
-        parser.add_section("BasicWindow")
-        changed = True
+    for section in ("General", "BasicWindow"):
+        if not parser.has_section(section):
+            parser.add_section(section)
+            changed = True
 
     desired = {
         "SysTrayEnabled": "false",
@@ -544,17 +621,18 @@ def ensure_portable_obs_global_ini(base_dir: str | Path) -> tuple[bool, Path]:
         "SysTrayMinimizeToTray": "false",
         "HideTrayIcon": "true",
     }
-    for key in list(parser.options("BasicWindow")):
-        lower_key = key.lower()
-        if ("systray" in lower_key or "hidetray" in lower_key) and key not in desired:
-            parser.remove_option("BasicWindow", key)
-            changed = True
+    for section in ("General", "BasicWindow"):
+        for key in list(parser.options(section)):
+            lower_key = key.lower()
+            if ("systray" in lower_key or "hidetray" in lower_key) and key not in desired:
+                parser.remove_option(section, key)
+                changed = True
 
-    for key, value in desired.items():
-        current = parser.get("BasicWindow", key, fallback=None)
-        if current is None or str(current).strip().lower() != value:
-            parser.set("BasicWindow", key, value)
-            changed = True
+        for key, value in desired.items():
+            current = parser.get(section, key, fallback=None)
+            if current is None or str(current).strip().lower() != value:
+                parser.set(section, key, value)
+                changed = True
 
     if changed or not ini_path.exists():
         with open(ini_path, "w", encoding="utf-8") as f:

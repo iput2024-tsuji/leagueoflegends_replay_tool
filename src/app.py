@@ -854,6 +854,7 @@ class SettingsPage(QWidget):
         self.fields["paths.champion_icons_dir"] = QLineEdit()
         self.fields["storage.max_size_gb"] = QLineEdit()
         self.fields["polling.end_error_limit"] = QLineEdit()
+        self.fields["polling.end_missing_grace_sec"] = QLineEdit()
         self.fields["polling.end_poll_sec"] = QLineEdit()
         self.fields["polling.event_poll_sec"] = QLineEdit()
         self.fields["obs.host"].setReadOnly(True)
@@ -935,6 +936,7 @@ class SettingsPage(QWidget):
         advanced_form.addRow("ゲームキャプチャ名", self.fields["obs.game_capture_name"])
         advanced_form.addRow("対象ウィンドウ", self.fields["obs.game_capture_window"])
         advanced_form.addRow("終了検知エラー閾値", self.fields["polling.end_error_limit"])
+        advanced_form.addRow("API無応答猶予(秒)", self.fields["polling.end_missing_grace_sec"])
         advanced_form.addRow("終了監視間隔(秒)", self.fields["polling.end_poll_sec"])
         advanced_form.addRow("イベント監視間隔(秒)", self.fields["polling.event_poll_sec"])
 
@@ -1077,6 +1079,7 @@ class SettingsPage(QWidget):
         self.fields["paths.champion_icons_dir"].setText(str(paths.get("champion_icons_dir", "")))
         self.fields["storage.max_size_gb"].setText(str(storage.get("max_size_gb", "")))
         self.fields["polling.end_error_limit"].setText(str(polling.get("end_error_limit", "")))
+        self.fields["polling.end_missing_grace_sec"].setText(str(polling.get("end_missing_grace_sec", "")))
         self.fields["polling.end_poll_sec"].setText(str(polling.get("end_poll_sec", "")))
         self.fields["polling.event_poll_sec"].setText(str(polling.get("event_poll_sec", "")))
         self._set_audio_ui_from_config("desktop", desktop_audio)
@@ -1117,6 +1120,12 @@ class SettingsPage(QWidget):
             pass
         try:
             data["polling"]["end_error_limit"] = int(self.fields["polling.end_error_limit"].text().strip())
+        except ValueError:
+            pass
+        try:
+            data["polling"]["end_missing_grace_sec"] = float(
+                self.fields["polling.end_missing_grace_sec"].text().strip()
+            )
         except ValueError:
             pass
         try:
@@ -1244,6 +1253,12 @@ class SettingsPage(QWidget):
             pass
         try:
             data["polling"]["end_error_limit"] = int(self.fields["polling.end_error_limit"].text().strip())
+        except ValueError:
+            pass
+        try:
+            data["polling"]["end_missing_grace_sec"] = float(
+                self.fields["polling.end_missing_grace_sec"].text().strip()
+            )
         except ValueError:
             pass
         try:
@@ -1520,6 +1535,7 @@ class MainWindow(QMainWindow):
         self._is_quitting = False
         self._tray_icon = None
         self._tray_notice_shown = False
+        self._recorder_autostart_enabled = False
         self.setWindowTitle("LoL Replay Tool")
         self.resize(1200, 720)
         icon = get_app_icon()
@@ -1544,9 +1560,17 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.analytics_page)
         self.stack.addWidget(self.settings_page)
 
-        self.show_home()
-        self.run_startup_setup()
-        self.start_background_recorder()
+        self.stack.setCurrentWidget(self.home_page)
+        setup_ok = self.run_startup_setup()
+        self._recorder_autostart_enabled = setup_ok
+        if setup_ok:
+            self.start_background_recorder()
+        else:
+            self.home_page.set_recorder_status(
+                "⚪ セットアップ未完了",
+                color_hex="#cfcfcf",
+                detail_text="初回セットアップが完了するまで録画監視は開始しません。",
+            )
 
     def init_tray_icon(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -1604,7 +1628,7 @@ class MainWindow(QMainWindow):
     def show_home(self) -> None:
         self.player_page.on_leave()
         self.stack.setCurrentWidget(self.home_page)
-        if not self._closing:
+        if self._recorder_autostart_enabled and not self._closing:
             self.start_background_recorder()
 
     def show_player(self) -> None:
@@ -1624,7 +1648,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.analytics_page)
         self.analytics_page.on_page_shown()
 
-    def run_startup_setup(self) -> None:
+    def run_startup_setup(self) -> bool:
         data = load_config()
         report = run_preflight(data, auto_fix=True, force_obs_detect=True)
         if report.get("changed"):
@@ -1646,6 +1670,9 @@ class MainWindow(QMainWindow):
             dialog = SetupWizardDialog(self, startup_mode=True)
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 self.settings_page.load_settings()
+                return True
+            return False
+        return True
 
     def _derive_recorder_home_status(self, raw_message: str) -> tuple[str, str, str]:
         text = str(raw_message or "").strip()

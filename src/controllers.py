@@ -82,6 +82,7 @@ class ConfigController:
 
         defaults_polling = {
             "end_error_limit": recordtest.DEFAULT_END_ERROR_LIMIT,
+            "end_missing_grace_sec": recordtest.DEFAULT_END_MISSING_GRACE_SEC,
             "end_poll_sec": recordtest.DEFAULT_END_POLL_SEC,
             "event_poll_sec": recordtest.DEFAULT_EVENT_POLL_SEC,
         }

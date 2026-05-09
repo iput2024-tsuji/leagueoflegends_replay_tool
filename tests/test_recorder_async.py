@@ -3,6 +3,8 @@ import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import pytest
+
 from src import recordtest
 
 
@@ -48,6 +50,7 @@ def config_for(tmp_path, **overrides):
         },
         "polling": {
             "end_error_limit": 3,
+            "end_missing_grace_sec": 60.0,
             "end_poll_sec": 0.1,
             "event_poll_sec": 0.1,
         },
@@ -143,3 +146,58 @@ def test_game_end_event_flow_stops_recording_without_real_sleep():
     assert building_event["team_relation"] == "own"
     obs_client.stop_recording.assert_called_once()
     recorder.wait_with_stop_async.assert_not_awaited()
+
+
+def test_start_recording_failure_raises_and_does_not_create_session_data():
+    tmp_path = runtime_dir("recording_start_failure")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
+    obs_client.start_recording.side_effect = RuntimeError("OBS busy")
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=obs_client,
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.session_started = True
+
+    with pytest.raises(recordtest.RecorderError, match="OBS録画開始に失敗"):
+        run(recorder.start_recording_async())
+
+    assert recorder.recording_started is False
+    assert recorder.record_path is None
+    assert recorder.has_session_data() is False
+
+
+def test_record_until_end_does_not_stop_on_missing_api_count_before_grace():
+    tmp_path = runtime_dir("missing_api_grace")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
+    riot_client = Mock()
+    riot_client.get_all_game_data = AsyncMock(
+        side_effect=[
+            None,
+            None,
+            None,
+            {"gameData": {"gameTime": 1500.0}, "allPlayers": []},
+        ]
+    )
+    riot_client.get_active_player_name = AsyncMock(return_value="Tester#JP1")
+    riot_client.get_event_data = AsyncMock(
+        return_value={"Events": [{"EventID": 10, "EventName": "GameEnd", "EventTime": 1500.0}]}
+    )
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=obs_client,
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder.recording_started = True
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+
+    ended = run(recorder.record_until_end_async())
+
+    assert ended is True
+    assert riot_client.get_all_game_data.await_count == 4

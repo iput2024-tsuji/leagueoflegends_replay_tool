@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -277,3 +278,42 @@ def test_global_ini_parse_error_deletes_and_regenerates_before_patch(monkeypatch
     assert "[Other]" in text
     assert "Keep=true" in text
     assert "SysTrayEnabled=false" in text
+
+
+def test_storage_limit_only_deletes_json_referenced_app_video():
+    root = Path("tests") / "_tmp" / "storage_limit_scope"
+    shutil.rmtree(root, ignore_errors=True)
+    recordings_dir = root / "recordings"
+    json_dir = recordings_dir / "json"
+    json_dir.mkdir(parents=True, exist_ok=True)
+
+    owned_video = recordings_dir / "owned.mp4"
+    unrelated_video = recordings_dir / "unrelated.mp4"
+    owned_video.write_bytes(b"owned video")
+    unrelated_video.write_bytes(b"unrelated video that must remain")
+    json_path = json_dir / "lol_20260101_000000.json"
+    json_path.write_text(
+        json.dumps(
+            {
+                "saved_at": "2026-01-01 00:00:00",
+                "obs_record_path": owned_video.name,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = recordtest.AppConfig.from_dict(
+        {
+            "paths": {
+                "recordings_dir": str(recordings_dir),
+                "json_dir": str(json_dir),
+            },
+            "storage": {"max_size_bytes": 1},
+        }
+    )
+
+    recordtest.enforce_storage_limit(config)
+
+    assert not owned_video.exists()
+    assert not json_path.exists()
+    assert unrelated_video.exists()

@@ -67,6 +67,7 @@ DEFAULT_OBS_HOST = "localhost"
 DEFAULT_OBS_PORT = 4455
 DEFAULT_OBS_FPS = 60
 DEFAULT_END_ERROR_LIMIT = 3
+DEFAULT_END_MISSING_GRACE_SEC = 60.0
 DEFAULT_END_POLL_SEC = 5
 DEFAULT_EVENT_POLL_SEC = 1
 DEFAULT_MAX_STORAGE_GB = 50
@@ -175,6 +176,7 @@ class PathsSettings:
 @dataclass(frozen=True)
 class PollingSettings:
     end_error_limit: int
+    end_missing_grace_sec: float
     end_poll_sec: float
     event_poll_sec: float
 
@@ -242,6 +244,11 @@ class AppConfig:
             DEFAULT_END_ERROR_LIMIT,
             minimum=1,
         )
+        end_missing_grace, _ = _safe_float(
+            polling_cfg.get("end_missing_grace_sec"),
+            DEFAULT_END_MISSING_GRACE_SEC,
+            minimum=0.0,
+        )
         end_poll, _ = _safe_float(
             polling_cfg.get("end_poll_sec"),
             DEFAULT_END_POLL_SEC,
@@ -274,6 +281,9 @@ class AppConfig:
         if icons_dir is None:
             icons_dir = (ROOT_DIR / DEFAULT_CHAMPION_ICONS_DIR).resolve()
 
+        normalized_storage_cfg = dict(storage_cfg)
+        normalized_storage_cfg["max_size_gb"] = max_size_gb
+
         return cls(
             obs=OBSSettings(
                 host=str(obs_cfg.get("host") or DEFAULT_OBS_HOST),
@@ -295,12 +305,13 @@ class AppConfig:
             ),
             polling=PollingSettings(
                 end_error_limit=end_limit,
+                end_missing_grace_sec=end_missing_grace,
                 end_poll_sec=end_poll,
                 event_poll_sec=event_poll,
             ),
             storage=StorageSettings(
                 max_size_gb=max_size_gb,
-                max_size_bytes=parse_max_storage_bytes({"max_size_gb": max_size_gb}),
+                max_size_bytes=parse_max_storage_bytes(normalized_storage_cfg),
             ),
             audio=AudioSettings(
                 desktop=_audio_slot_from_config(source, "desktop"),
@@ -738,6 +749,7 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
     }
     poll_defaults = {
         "end_error_limit": DEFAULT_END_ERROR_LIMIT,
+        "end_missing_grace_sec": DEFAULT_END_MISSING_GRACE_SEC,
         "end_poll_sec": DEFAULT_END_POLL_SEC,
         "event_poll_sec": DEFAULT_EVENT_POLL_SEC,
     }
@@ -805,6 +817,17 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             poll_cfg["end_error_limit"] = end_error_limit
             report["changed"] = True
         report["warnings"].append("end_error_limit が不正だったため既定値を使用します。")
+
+    end_missing_grace_sec, ok = _safe_float(
+        poll_cfg.get("end_missing_grace_sec"),
+        DEFAULT_END_MISSING_GRACE_SEC,
+        minimum=0.0,
+    )
+    if not ok:
+        if auto_fix:
+            poll_cfg["end_missing_grace_sec"] = end_missing_grace_sec
+            report["changed"] = True
+        report["warnings"].append("end_missing_grace_sec が不正だったため既定値を使用します。")
 
     end_poll_sec, ok = _safe_float(poll_cfg.get("end_poll_sec"), DEFAULT_END_POLL_SEC, minimum=0.1)
     if not ok:
@@ -1501,6 +1524,19 @@ def load_json_metadata(path: str | Path, config: AppConfig | None = None) -> tup
         return None, None
 
 
+def is_app_owned_video_path(path: str | Path | None, config: AppConfig) -> bool:
+    if not path:
+        return False
+    try:
+        video_path = Path(path).resolve()
+        recordings_dir = Path(config.paths.recordings_dir).resolve()
+    except Exception:
+        return False
+    if not is_within(video_path, recordings_dir):
+        return False
+    return video_path.suffix.lower() in {".mp4", ".mkv", ".flv", ".mov", ".avi"}
+
+
 def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str | Path] | None = None) -> None:
     config = config or load_app_config()
     if not config.storage.max_size_bytes:
@@ -1523,7 +1559,12 @@ def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str 
             if json_path.resolve() in keep_paths:
                 continue
             try:
-                if video_path and video_path.exists() and video_path.resolve() not in keep_paths:
+                if (
+                    video_path
+                    and video_path.exists()
+                    and video_path.resolve() not in keep_paths
+                    and is_app_owned_video_path(video_path, config)
+                ):
                     video_path.unlink(missing_ok=True)
             except Exception:
                 pass
@@ -1535,22 +1576,12 @@ def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str 
             if total <= config.storage.max_size_bytes:
                 return
 
-    if Path(config.paths.recordings_dir).exists():
-        video_exts = {".mp4", ".mkv", ".flv", ".mov", ".avi"}
-        video_files = sorted(
-            [p for p in Path(config.paths.recordings_dir).rglob("*") if p.is_file() and p.suffix.lower() in video_exts],
-            key=lambda p: p.stat().st_mtime,
+    if total > config.storage.max_size_bytes:
+        LOGGER.warning(
+            "Storage limit is still exceeded after deleting app-owned sessions. "
+            "Untracked files under recordings_dir were left untouched: %s",
+            config.paths.recordings_dir,
         )
-        for video_path in video_files:
-            if video_path.resolve() in keep_paths:
-                continue
-            try:
-                video_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            total = total_storage_size(config)
-            if total <= config.storage.max_size_bytes:
-                return
 
 
 def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
@@ -2078,8 +2109,7 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     def has_session_data(self) -> bool:
         return (
-            self.session_started
-            or self.recording_started
+            self.recording_started
             or self.record_path is not None
             or self.sync_game_time > 0.0
             or bool(self.saved_events)
@@ -2213,10 +2243,10 @@ class LoLAutoRecorder(RecordingSessionManager):
             self.recording_started = True
         except OBSSDKRequestError as e:
             self.log(f"⚠️ 録画開始エラー: {e}")
-            return
+            raise RecorderError(f"OBS録画開始に失敗しました: {e}") from e
         except Exception as e:
             self.log(f"⚠️ 録画開始エラー: {e}")
-            return
+            raise RecorderError(f"OBS録画開始に失敗しました: {e}") from e
         if not await self.wait_with_stop_async(2.0):
             return
 
@@ -2323,13 +2353,22 @@ class LoLAutoRecorder(RecordingSessionManager):
         """試合終了まで待機して録画停止"""
         self.log("🛡️  試合終了を監視中...")
         error_count = 0
+        missing_started_at = None
+        loop = asyncio.get_running_loop()
         while True:
             if self.should_stop():
                 return False
             data = await self.riot_api_client.get_all_game_data()
             if not data:
+                now = loop.time()
+                if missing_started_at is None:
+                    missing_started_at = now
                 error_count += 1
-                if error_count >= self.config.polling.end_error_limit:
+                missing_duration = now - missing_started_at
+                if (
+                    error_count >= self.config.polling.end_error_limit
+                    and missing_duration >= self.config.polling.end_missing_grace_sec
+                ):
                     self.log("🏁 試合終了検知。録画を停止します。")
                     return True
                 if not await self.wait_with_stop_async(self.config.polling.end_poll_sec):
@@ -2337,6 +2376,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 continue
 
             error_count = 0
+            missing_started_at = None
             self.last_game_data = data
             if not self.my_name:
                 await self.try_update_player_name_async()

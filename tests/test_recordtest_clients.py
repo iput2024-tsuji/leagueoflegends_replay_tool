@@ -216,10 +216,41 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
     assert global_ini.exists()
 
     text = global_ini.read_text(encoding="utf-8")
+    assert "[BasicWindow]" in text
     assert "SysTrayEnabled=false" in text
-    assert "SysTrayWhenStarted=false" in text
-    assert "SysTrayMinimizeToTray=false" in text
-    assert "HideTrayIcon=true" in text
+    assert "SysTrayWhenStarted" not in text
+    assert "SysTrayMinimizeToTray" not in text
+    assert "HideTrayIcon" not in text
+
+
+def test_global_ini_removes_bom_and_nonstandard_tray_keys(monkeypatch):
+    obs_dir = Path("tests") / "_tmp" / "obs_bootstrapper_bom" / "obs-portable"
+    shutil.rmtree(obs_dir.parent, ignore_errors=True)
+    ini_path = obs_dir / "config" / "obs-studio" / "global.ini"
+    ini_path.parent.mkdir(parents=True, exist_ok=True)
+    ini_path.write_text(
+        "\ufeff[General]\nSysTrayEnabled=true\n\n"
+        "[BasicWindow]\n"
+        "SysTrayEnabled=true\n"
+        "SysTrayWhenStarted=false\n"
+        "SysTrayMinimizeToTray=false\n"
+        "HideTrayIcon=true\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
+
+    changed, _result_path = recordtest.ensure_portable_obs_global_ini(obs_dir)
+
+    assert changed is True
+    raw = ini_path.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf")
+    text = raw.decode("utf-8")
+    assert "[BasicWindow]" in text
+    assert "SysTrayEnabled=false" in text
+    assert "SysTrayWhenStarted" not in text
+    assert "SysTrayMinimizeToTray" not in text
+    assert "HideTrayIcon" not in text
 
 
 def test_global_ini_parse_error_deletes_and_regenerates_before_patch(monkeypatch):

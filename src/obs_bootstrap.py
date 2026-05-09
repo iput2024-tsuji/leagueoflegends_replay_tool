@@ -18,10 +18,8 @@ PORTABLE_OBS_MARKER_NAME = "obs_portable_mode.txt"
 LEGACY_PORTABLE_OBS_MARKER_NAME = "portable_mode.txt"
 TRAY_SETTINGS = {
     "SysTrayEnabled": "false",
-    "SysTrayWhenStarted": "false",
-    "SysTrayMinimizeToTray": "false",
-    "HideTrayIcon": "true",
 }
+TRAY_SETTINGS_SECTION = "BasicWindow"
 
 
 @dataclass(frozen=True)
@@ -81,6 +79,17 @@ def new_obs_ini_parser() -> configparser.ConfigParser:
     return parser
 
 
+def read_obs_ini_parser(path: Path) -> tuple[configparser.ConfigParser, bool]:
+    """BOMなしUTF-8として読み、混入BOMは除去対象として検出する。"""
+    parser = new_obs_ini_parser()
+    text = path.read_text(encoding="utf-8")
+    had_bom = text.startswith("\ufeff")
+    if had_bom:
+        text = text.lstrip("\ufeff")
+    parser.read_string(text)
+    return parser, had_bom
+
+
 class OBSBootstrapper:
     """ポータブルOBSの検査と修復を分離して扱う。"""
 
@@ -103,16 +112,22 @@ class OBSBootstrapper:
         parse_error = None
         missing = []
         if global_ini.exists():
-            parser = new_obs_ini_parser()
             try:
-                parser.read(global_ini, encoding="utf-8-sig")
-                for section in ("General", "BasicWindow"):
-                    if not parser.has_section(section):
-                        missing.extend(f"{section}.{key}" for key in TRAY_SETTINGS)
-                        continue
+                parser, had_bom = read_obs_ini_parser(global_ini)
+                if had_bom:
+                    missing.append("encoding.BOM")
+                if not parser.has_section(TRAY_SETTINGS_SECTION):
+                    missing.extend(f"{TRAY_SETTINGS_SECTION}.{key}" for key in TRAY_SETTINGS)
+                else:
                     for key, value in TRAY_SETTINGS.items():
-                        if parser.get(section, key, fallback=None) != value:
-                            missing.append(f"{section}.{key}")
+                        if parser.get(TRAY_SETTINGS_SECTION, key, fallback=None) != value:
+                            missing.append(f"{TRAY_SETTINGS_SECTION}.{key}")
+                    for section in parser.sections():
+                        for key in parser.options(section):
+                            lower_key = key.lower()
+                            allowed = section == TRAY_SETTINGS_SECTION and key in TRAY_SETTINGS
+                            if ("systray" in lower_key or "hidetray" in lower_key) and not allowed:
+                                missing.append(f"{section}.{key}")
             except Exception as e:
                 parse_error = f"{type(e).__name__}: {e}"
 
@@ -164,39 +179,42 @@ class OBSBootstrapper:
 
     def ensure_global_ini(self) -> tuple[bool, Path]:
         self.process_manager.kill_stale_managed_processes()
+        self.process_manager.wait_until_no_managed_processes()
         ini_path = get_obs_global_ini_path(self.base_dir)
         ini_path.parent.mkdir(parents=True, exist_ok=True)
         parser = new_obs_ini_parser()
 
         parse_failed = False
+        normalized_encoding = False
         if ini_path.exists():
             try:
-                parser.read(ini_path, encoding="utf-8-sig")
+                parser, normalized_encoding = read_obs_ini_parser(ini_path)
             except Exception as e:
                 self.logger.warning("Corrupt OBS global.ini will be regenerated: %s (%s)", ini_path, e)
                 parse_failed = True
                 ini_path.unlink(missing_ok=True)
                 self.regenerate_global_ini_with_obs(ini_path)
                 parser = new_obs_ini_parser()
-                parser.read(ini_path, encoding="utf-8-sig")
+                parser, normalized_encoding = read_obs_ini_parser(ini_path)
 
-        changed = parse_failed
-        for section in ("General", "BasicWindow"):
-            if not parser.has_section(section):
-                parser.add_section(section)
-                changed = True
-
+        changed = parse_failed or normalized_encoding
+        for section in parser.sections():
             for key in list(parser.options(section)):
                 lower_key = key.lower()
-                if ("systray" in lower_key or "hidetray" in lower_key) and key not in TRAY_SETTINGS:
+                allowed = section == TRAY_SETTINGS_SECTION and key in TRAY_SETTINGS
+                if ("systray" in lower_key or "hidetray" in lower_key) and not allowed:
                     parser.remove_option(section, key)
                     changed = True
 
-            for key, value in TRAY_SETTINGS.items():
-                current = parser.get(section, key, fallback=None)
-                if current is None or str(current).strip().lower() != value:
-                    parser.set(section, key, value)
-                    changed = True
+        if not parser.has_section(TRAY_SETTINGS_SECTION):
+            parser.add_section(TRAY_SETTINGS_SECTION)
+            changed = True
+
+        for key, value in TRAY_SETTINGS.items():
+            current = parser.get(TRAY_SETTINGS_SECTION, key, fallback=None)
+            if current is None or str(current).strip().lower() != value:
+                parser.set(TRAY_SETTINGS_SECTION, key, value)
+                changed = True
 
         if changed or not ini_path.exists():
             with open(ini_path, "w", encoding="utf-8") as f:
@@ -218,6 +236,7 @@ class OBSBootstrapper:
         finally:
             self.process_manager.terminate_process(process)
             self.process_manager.kill_stale_managed_processes()
+            self.process_manager.wait_until_no_managed_processes()
 
         if not ini_path.exists():
             raise RuntimeError(f"OBS did not regenerate global.ini: {ini_path}")

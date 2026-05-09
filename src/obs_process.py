@@ -64,7 +64,23 @@ class OBSProcessManager:
                 self._terminate_pid(process.pid, force=True)
                 if process.pid not in killed:
                     killed.append(process.pid)
+        self.wait_until_no_managed_processes(timeout_sec=timeout_sec)
         return killed
+
+    def wait_until_no_managed_processes(self, timeout_sec: float = 5.0, poll_interval: float = 0.2) -> bool:
+        """管理OBSプロセスが完全に消えるまでブロッキング待機する。"""
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        while True:
+            remaining = [process for process in self.list_obs_processes() if self.is_managed_process(process)]
+            if not remaining:
+                return True
+            if time.monotonic() >= deadline:
+                self.logger.warning(
+                    "Managed OBS processes are still running: %s",
+                    ", ".join(str(process.pid) for process in remaining),
+                )
+                return False
+            time.sleep(max(0.05, poll_interval))
 
     def start_obs(
         self,

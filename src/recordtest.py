@@ -56,6 +56,8 @@ DEFAULT_OBS_SOURCE_NAME = "color"
 # OBS color_source の color 値は ABGR。赤は 0xFF0000FF。
 DEFAULT_OBS_SOURCE_COLOR = 0xFF0000FF
 LEGACY_OBS_SOURCE_COLOR_BLUE = 0xFFFF0000
+DEFAULT_OBS_GAME_CAPTURE_NAME = "lol_game_capture"
+DEFAULT_OBS_GAME_CAPTURE_WINDOW = "League of Legends (TM) Client:League of Legends.exe:League of Legends.exe"
 DEFAULT_OBS_DIR = "obs-portable"
 DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
@@ -156,6 +158,8 @@ class OBSSettings:
     scene_name: str
     source_name: str
     source_color: int
+    game_capture_name: str
+    game_capture_window: str
     fps: int
     obs_dir: Path
 
@@ -278,6 +282,8 @@ class AppConfig:
                 scene_name=str(obs_cfg.get("scene_name") or DEFAULT_OBS_SCENE_NAME),
                 source_name=str(obs_cfg.get("source_name") or DEFAULT_OBS_SOURCE_NAME),
                 source_color=source_color,
+                game_capture_name=str(obs_cfg.get("game_capture_name") or DEFAULT_OBS_GAME_CAPTURE_NAME),
+                game_capture_window=str(obs_cfg.get("game_capture_window") or DEFAULT_OBS_GAME_CAPTURE_WINDOW),
                 fps=fps,
                 obs_dir=MANAGED_PORTABLE_OBS_DIR,
             ),
@@ -1788,7 +1794,9 @@ class ObsWebSocketClient(OBSClient):
 
     def setup_sync_elements(self) -> None:
         self._ensure_scene_exists()
-        self._ensure_sync_source_exists()
+        game_capture_item_id = self._ensure_game_capture_exists()
+        sync_source_item_id = self._ensure_sync_source_exists()
+        self._apply_scene_item_z_order(game_capture_item_id, sync_source_item_id)
 
     def _ensure_scene_exists(self) -> None:
         scene_name = self.config.obs.scene_name
@@ -1797,7 +1805,69 @@ class ObsWebSocketClient(OBSClient):
         except Exception as e:
             raise RecorderError(f"シーン '{scene_name}' の自動作成に失敗しました: {e}") from e
 
-    def _ensure_sync_source_exists(self) -> None:
+    def _ensure_game_capture_exists(self) -> int:
+        scene_name = self.config.obs.scene_name
+        source_name = self.config.obs.game_capture_name
+        settings = {
+            "capture_mode": "window",
+            "window": self.config.obs.game_capture_window,
+            "priority": 2,
+            "capture_cursor": False,
+            "capture_overlays": True,
+        }
+
+        input_exists = False
+        input_kind_matches = False
+        try:
+            input_resp = self.client.get_input_list()
+            input_items = getattr(input_resp, "inputs", []) or []
+            for item in input_items:
+                if not isinstance(item, dict) or item.get("inputName") != source_name:
+                    continue
+                input_exists = True
+                input_kind_matches = item.get("inputKind") == "game_capture"
+                break
+        except Exception:
+            input_exists = False
+
+        if input_exists and not input_kind_matches:
+            try:
+                self.client.remove_input(source_name)
+                input_exists = False
+            except Exception as e:
+                raise RecorderError(
+                    f"ゲームキャプチャ名 '{source_name}' は存在しますが、種別が game_capture ではありません: {e}"
+                ) from e
+
+        if not input_exists:
+            self.log(f"ℹ️ ゲームキャプチャ '{source_name}' を自動作成します。")
+            try:
+                self.client.create_input(scene_name, source_name, "game_capture", settings, True)
+            except Exception as e:
+                raise RecorderError(f"ゲームキャプチャ '{source_name}' の自動作成に失敗しました: {e}") from e
+        else:
+            try:
+                self.client.set_input_settings(source_name, settings, overlay=True)
+            except Exception:
+                pass
+
+        scene_item_id = self._get_scene_item_id(source_name)
+        if scene_item_id is None:
+            try:
+                self.client.create_scene_item(scene_name, source_name, True)
+                scene_item_id = self._get_scene_item_id(source_name)
+            except Exception as e:
+                raise RecorderError(
+                    f"ゲームキャプチャ '{source_name}' をシーン '{scene_name}' に配置できませんでした: {e}"
+                ) from e
+
+        if scene_item_id is None:
+            raise RecorderError(
+                f"ゲームキャプチャ '{source_name}' は存在しますが、シーン '{scene_name}' で見つかりません。"
+            )
+        return scene_item_id
+
+    def _ensure_sync_source_exists(self) -> int:
         scene_name = self.config.obs.scene_name
         source_name = self.config.obs.source_name
         input_exists = False
@@ -1851,16 +1921,32 @@ class ObsWebSocketClient(OBSClient):
             self.set_sync_marker_enabled(False, scene_item_id)
         except Exception:
             pass
+        return scene_item_id
 
-    def get_sync_source_id(self) -> int | None:
+    def _get_scene_item_id(self, source_name: str) -> int | None:
         try:
             items = self.client.get_scene_item_list(self.config.obs.scene_name).scene_items
             for item in items:
-                if item["sourceName"] == self.config.obs.source_name:
-                    return item["sceneItemId"]
+                if not isinstance(item, dict) or item.get("sourceName") != source_name:
+                    continue
+                item_id = item.get("sceneItemId")
+                return int(item_id) if item_id is not None else None
         except Exception as e:
             self.logger.warning("⚠️ シーンアイテム取得エラー: %s", e)
         return None
+
+    def _apply_scene_item_z_order(self, game_capture_item_id: int, sync_source_item_id: int) -> None:
+        scene_name = self.config.obs.scene_name
+        try:
+            # obs-websocketでは sceneItemIndex=0 が最背面。同期マーカーは最前面に置く。
+            self.client.set_scene_item_index(scene_name, game_capture_item_id, 0)
+            items = getattr(self.client.get_scene_item_list(scene_name), "scene_items", []) or []
+            self.client.set_scene_item_index(scene_name, sync_source_item_id, max(0, len(items) - 1))
+        except Exception as e:
+            self.log(f"⚠️ シーンアイテムの重なり順制御に失敗: {e}")
+
+    def get_sync_source_id(self) -> int | None:
+        return self._get_scene_item_id(self.config.obs.source_name)
 
     def set_sync_marker_enabled(self, enabled: bool, source_id: int | None = None) -> None:
         item_id = source_id if source_id is not None else self.get_sync_source_id()

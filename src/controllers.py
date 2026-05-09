@@ -48,6 +48,8 @@ class ConfigController:
             "scene_name": recordtest.DEFAULT_OBS_SCENE_NAME,
             "source_name": recordtest.DEFAULT_OBS_SOURCE_NAME,
             "source_color": recordtest.DEFAULT_OBS_SOURCE_COLOR,
+            "game_capture_name": recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME,
+            "game_capture_window": recordtest.DEFAULT_OBS_GAME_CAPTURE_WINDOW,
         }
         for key, value in defaults_obs.items():
             if obs.get(key) in (None, ""):

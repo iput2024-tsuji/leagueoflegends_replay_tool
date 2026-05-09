@@ -2,6 +2,7 @@ import asyncio
 import shutil
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import aiohttp
@@ -123,6 +124,81 @@ def test_obs_disconnect_clears_raw_client_even_when_socket_errors():
         client.disconnect()
 
     assert client.raw_client is None
+
+
+def test_setup_sync_elements_creates_game_capture_below_sync_marker():
+    class FakeObsRawClient:
+        def __init__(self):
+            self.scenes = [{"sceneName": recordtest.DEFAULT_OBS_SCENE_NAME}]
+            self.inputs = []
+            self.scene_items = []
+            self.created_inputs = []
+            self.index_calls = []
+            self.next_item_id = 1
+
+        def get_scene_list(self):
+            return SimpleNamespace(scenes=self.scenes)
+
+        def get_input_list(self):
+            return SimpleNamespace(inputs=self.inputs)
+
+        def create_input(self, scene_name, input_name, input_kind, input_settings, scene_item_enabled):
+            self.inputs.append({"inputName": input_name, "inputKind": input_kind})
+            self.created_inputs.append(
+                {
+                    "scene": scene_name,
+                    "name": input_name,
+                    "kind": input_kind,
+                    "settings": dict(input_settings),
+                    "enabled": scene_item_enabled,
+                }
+            )
+            self.scene_items.append(
+                {"sourceName": input_name, "sceneItemId": self.next_item_id, "sceneItemIndex": len(self.scene_items)}
+            )
+            self.next_item_id += 1
+
+        def create_scene_item(self, scene_name, source_name, enabled=None):
+            self.scene_items.append(
+                {"sourceName": source_name, "sceneItemId": self.next_item_id, "sceneItemIndex": len(self.scene_items)}
+            )
+            self.next_item_id += 1
+
+        def get_scene_item_list(self, scene_name):
+            return SimpleNamespace(scene_items=self.scene_items)
+
+        def set_scene_item_index(self, scene_name, item_id, item_index):
+            self.index_calls.append((scene_name, item_id, item_index))
+            for item in self.scene_items:
+                if item["sceneItemId"] == item_id:
+                    item["sceneItemIndex"] = item_index
+
+        def set_input_settings(self, input_name, settings, overlay=True):
+            return None
+
+        def set_scene_item_transform(self, scene_name, item_id, transform):
+            return None
+
+        def set_scene_item_enabled(self, scene_name, item_id, enabled):
+            return None
+
+    raw_client = FakeObsRawClient()
+    client = recordtest.ObsWebSocketClient(config=app_config())
+    client.client = raw_client
+
+    client.setup_sync_elements()
+
+    game_capture = raw_client.created_inputs[0]
+    sync_marker = raw_client.created_inputs[1]
+    assert game_capture["kind"] == "game_capture"
+    assert game_capture["settings"]["capture_mode"] == "window"
+    assert game_capture["settings"]["window"] == recordtest.DEFAULT_OBS_GAME_CAPTURE_WINDOW
+    assert sync_marker["name"] == recordtest.DEFAULT_OBS_SOURCE_NAME
+
+    game_item_id = raw_client.scene_items[0]["sceneItemId"]
+    sync_item_id = raw_client.scene_items[1]["sceneItemId"]
+    assert (recordtest.DEFAULT_OBS_SCENE_NAME, game_item_id, 0) in raw_client.index_calls
+    assert (recordtest.DEFAULT_OBS_SCENE_NAME, sync_item_id, 1) in raw_client.index_calls
 
 
 def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(monkeypatch):

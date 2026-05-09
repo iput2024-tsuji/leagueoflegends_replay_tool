@@ -78,7 +78,12 @@ def report(progress_cb: ProgressCallback | None, percent: int, message: str) -> 
 
 
 def is_environment_ready() -> bool:
-    return FFMPEG_EXE.exists() and OBS_EXE.exists()
+    if not (FFMPEG_EXE.exists() and OBS_EXE.exists()):
+        return False
+    try:
+        return OBSBootstrapper(OBS_PORTABLE_DIR).check().ready
+    except Exception:
+        return False
 
 
 @contextmanager

@@ -725,6 +725,8 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         "scene_name": DEFAULT_OBS_SCENE_NAME,
         "source_name": DEFAULT_OBS_SOURCE_NAME,
         "source_color": DEFAULT_OBS_SOURCE_COLOR,
+        "game_capture_name": DEFAULT_OBS_GAME_CAPTURE_NAME,
+        "game_capture_window": DEFAULT_OBS_GAME_CAPTURE_WINDOW,
         "dir": DEFAULT_OBS_DIR,
     }
     path_defaults = {
@@ -873,9 +875,19 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             bootstrapper = OBSBootstrapper(current_obs_dir)
             bootstrap_report = bootstrapper.check()
             if bootstrap_report.needs_repair:
-                report["warnings"].append("OBS Bootstrapper の修復が必要です。録画開始または環境修復時に適用します。")
+                if auto_fix:
+                    bootstrap_result = bootstrapper.apply(
+                        port=int(obs_cfg.get("port") or DEFAULT_OBS_PORT),
+                        password=str(obs_cfg.get("password") or ""),
+                    )
+                    report["changed"] = True
+                    report["notes"].append(
+                        f"ポータブルOBS設定を修復しました: {bootstrap_result.get('global_ini_path')}"
+                    )
+                else:
+                    report["warnings"].append("OBS Bootstrapper の修復が必要です。")
         except Exception as e:
-            report["warnings"].append(f"OBS Bootstrapper の検査に失敗しました: {e}")
+            report["warnings"].append(f"OBS Bootstrapper の検査/修復に失敗しました: {e}")
 
     has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
     if not has_valid_obs:

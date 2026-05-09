@@ -44,6 +44,30 @@ def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypat
     assert "HideTrayIcon" not in text
 
 
+def test_environment_ready_requires_bootstrapped_obs_global_ini(monkeypatch):
+    root = runtime_dir("setup_env_ready_requires_bootstrap")
+    ffmpeg = root / "bin" / "ffmpeg.exe"
+    obs_dir = root / "obs-portable"
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
+    ffmpeg.parent.mkdir(parents=True, exist_ok=True)
+    obs_exe.parent.mkdir(parents=True, exist_ok=True)
+    global_ini.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg.write_text("fake", encoding="utf-8")
+    obs_exe.write_text("fake", encoding="utf-8")
+    global_ini.write_text("[BasicWindow]\nSysTrayEnabled=true\n", encoding="utf-8")
+
+    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
+    monkeypatch.setattr(setup_env, "OBS_EXE", obs_exe)
+    monkeypatch.setattr(setup_env, "OBS_PORTABLE_DIR", obs_dir)
+
+    assert setup_env.is_environment_ready() is False
+
+    setup_env.bootstrap_obs_portable_config(obs_dir)
+
+    assert setup_env.is_environment_ready() is True
+
+
 def test_bootstrap_obs_portable_config_regenerates_corrupt_global_ini(monkeypatch):
     obs_dir = runtime_dir("setup_env_obs_bootstrap_corrupt") / "obs-portable"
     global_ini = obs_dir / "config" / "obs-studio" / "global.ini"

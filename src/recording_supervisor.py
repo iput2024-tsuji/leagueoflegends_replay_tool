@@ -25,6 +25,7 @@ class RecordingSupervisor:
         self.recording_controller = recording_controller or RecordingController()
         self.status_cb = status_cb
         self.recorder: Any | None = None
+        self.runtime: Any | None = None
         self.stop_event: asyncio.Event | None = None
 
     async def run(self, stop_event: asyncio.Event) -> None:
@@ -41,7 +42,11 @@ class RecordingSupervisor:
             if errors:
                 raise recordtest.RecorderError("\n".join(errors))
 
-            self.recorder = self.recording_controller.create_recorder(report["config"], status_cb=self.status_cb)
+            if hasattr(self.recording_controller, "create_runtime"):
+                self.runtime = self.recording_controller.create_runtime(report["config"], status_cb=self.status_cb)
+                self.recorder = self.runtime.recorder
+            else:
+                self.recorder = self.recording_controller.create_recorder(report["config"], status_cb=self.status_cb)
             self.recorder.set_stop_event(stop_event)
             self._apply_audio_profile()
 
@@ -69,8 +74,12 @@ class RecordingSupervisor:
         if not self.recorder:
             return
         self.recorder.request_stop()
-        self.recorder.finalize_session()
-        self.recorder.shutdown_obs()
+        if self.runtime:
+            self.runtime.close(finalize_session=True)
+        else:
+            self.recorder.finalize_session()
+            self.recorder.shutdown_obs()
+        self.runtime = None
         self.recorder = None
 
     def _apply_audio_profile(self) -> None:

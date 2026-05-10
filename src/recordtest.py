@@ -10,6 +10,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -149,6 +150,19 @@ configure_logging()
 
 class RecorderError(RuntimeError):
     pass
+
+
+class RiotPollStatus(str, Enum):
+    IN_GAME = "in_game"
+    NOT_IN_GAME = "not_in_game"
+    TEMPORARY_FAILURE = "temporary_failure"
+
+
+@dataclass(frozen=True)
+class RiotPollResult:
+    status: RiotPollStatus
+    payload: dict[str, Any] | None = None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -401,6 +415,10 @@ class RiotAPIClient(ABC):
 
     @abstractmethod
     async def get_all_game_data(self) -> dict[str, Any] | None:
+        pass
+
+    @abstractmethod
+    async def get_all_game_data_result(self) -> RiotPollResult:
         pass
 
 
@@ -1700,25 +1718,39 @@ class LiveClientRiotAPIClient(RiotAPIClient):
     def __init__(self, session_factory: Callable[..., Any] | None = None) -> None:
         self.session_factory = session_factory or aiohttp.ClientSession
 
-    async def _fetch(self, url: str, timeout_sec: float) -> Any:
+    async def _fetch_result(self, url: str, timeout_sec: float) -> RiotPollResult:
         timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
         try:
             async with self.session_factory(timeout=timeout) as session:
                 async with session.get(url, ssl=False) as response:
                     response.raise_for_status()
                     try:
-                        return await response.json(content_type=None)
+                        data = await response.json(content_type=None)
                     except Exception:
                         text = await response.text()
-                        return text.strip().replace('"', "")
+                        data = text.strip().replace('"', "")
+                    if isinstance(data, dict):
+                        return RiotPollResult(RiotPollStatus.IN_GAME, payload=data)
+                    return RiotPollResult(RiotPollStatus.IN_GAME, payload={"value": data})
+        except aiohttp.ClientResponseError as e:
+            if e.status in {404, 410}:
+                return RiotPollResult(RiotPollStatus.NOT_IN_GAME, error=str(e))
+            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
         except (
             aiohttp.ClientConnectionError,
-            aiohttp.ClientResponseError,
             aiohttp.ClientError,
             asyncio.TimeoutError,
             OSError,
-        ):
+        ) as e:
+            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
+
+    async def _fetch(self, url: str, timeout_sec: float) -> Any:
+        result = await self._fetch_result(url, timeout_sec)
+        if result.status != RiotPollStatus.IN_GAME:
             return None
+        if result.payload and set(result.payload.keys()) == {"value"}:
+            return result.payload["value"]
+        return result.payload
 
     async def get_active_player_name(self) -> str | None:
         return await self._fetch(ACTIVE_PLAYER_URL, timeout_sec=5)
@@ -1730,6 +1762,14 @@ class LiveClientRiotAPIClient(RiotAPIClient):
     async def get_all_game_data(self) -> dict[str, Any] | None:
         data = await self._fetch(ALL_GAME_URL, timeout_sec=1)
         return data if isinstance(data, dict) else None
+
+    async def get_all_game_data_result(self) -> RiotPollResult:
+        result = await self._fetch_result(ALL_GAME_URL, timeout_sec=1)
+        if result.status != RiotPollStatus.IN_GAME:
+            return result
+        if isinstance(result.payload, dict) and "gameData" in result.payload:
+            return result
+        return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error="Unexpected allgamedata payload")
 
 
 class ObsWebSocketClient(OBSClient):
@@ -2172,6 +2212,22 @@ class LoLAutoRecorder(RecordingSessionManager):
     def ensure_sync_source_exists(self) -> None:
         self.obs_client.setup_sync_elements()
 
+    async def poll_all_game_data(self) -> RiotPollResult:
+        get_result = getattr(self.riot_api_client, "get_all_game_data_result", None)
+        if get_result:
+            try:
+                result = get_result()
+                if hasattr(result, "__await__"):
+                    result = await result
+                if isinstance(result, RiotPollResult):
+                    return result
+            except TypeError:
+                pass
+        data = await self.riot_api_client.get_all_game_data()
+        if data:
+            return RiotPollResult(RiotPollStatus.IN_GAME, payload=data)
+        return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE)
+
     async def try_update_player_name_async(self) -> None:
         name = await self.riot_api_client.get_active_player_name()
         if name and name != self.my_name:
@@ -2249,7 +2305,8 @@ class LoLAutoRecorder(RecordingSessionManager):
         while True:
             if self.should_stop():
                 return False
-            data = await self.riot_api_client.get_all_game_data()
+            result = await self.poll_all_game_data()
+            data = result.payload
             if data:
                 game_time = data.get("gameData", {}).get("gameTime", 0)
                 if game_time > 0:
@@ -2291,7 +2348,8 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.obs_client.set_sync_marker_enabled(True, item_id)
 
         sync_time = 0.0
-        data = await self.riot_api_client.get_all_game_data()
+        result = await self.poll_all_game_data()
+        data = result.payload
         if data:
             sync_time = data.get("gameData", {}).get("gameTime", 0.0)
         if (not sync_time or sync_time <= 0) and event_time is not None:
@@ -2384,7 +2442,8 @@ class LoLAutoRecorder(RecordingSessionManager):
         while True:
             if self.should_stop():
                 return False
-            data = await self.riot_api_client.get_all_game_data()
+            result = await self.poll_all_game_data()
+            data = result.payload
             if not data:
                 now = loop.time()
                 if missing_started_at is None:
@@ -2392,7 +2451,8 @@ class LoLAutoRecorder(RecordingSessionManager):
                 error_count += 1
                 missing_duration = now - missing_started_at
                 if (
-                    error_count >= self.config.polling.end_error_limit
+                    result.status in {RiotPollStatus.NOT_IN_GAME, RiotPollStatus.TEMPORARY_FAILURE}
+                    and error_count >= self.config.polling.end_error_limit
                     and missing_duration >= self.config.polling.end_missing_grace_sec
                 ):
                     self.log("🏁 試合終了検知。録画を停止します。")

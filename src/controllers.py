@@ -8,11 +8,13 @@ try:
     from .analytics import GameDataAnalyzer
     from .app_paths import get_app_root
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from .obs_runtime import OBSRuntimeManager, RecorderRuntime
 except ImportError:
     import recordtest
     from analytics import GameDataAnalyzer
     from app_paths import get_app_root
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from obs_runtime import OBSRuntimeManager, RecorderRuntime
 
 
 ROOT_DIR = get_app_root()
@@ -190,8 +192,13 @@ class ConfigController:
 class AudioSettingsController:
     """OBS音声・録画出力のインフラ操作をUIから分離する。"""
 
-    def __init__(self, config_controller: ConfigController | None = None) -> None:
+    def __init__(
+        self,
+        config_controller: ConfigController | None = None,
+        runtime_manager: OBSRuntimeManager | None = None,
+    ) -> None:
         self.config_controller = config_controller or ConfigController()
+        self.runtime_manager = runtime_manager or OBSRuntimeManager()
 
     def _prepare_config(
         self, data: dict[str, Any], auto_fix: bool = True, force_obs_detect: bool = True
@@ -211,63 +218,42 @@ class AudioSettingsController:
 
     def _open_recorder(
         self, config: recordtest.AppConfig, auto_launch: bool = False, max_retries: int = 2, retry_delay: float = 0.5
-    ) -> tuple[recordtest.LoLAutoRecorder, Any | None]:
-        ok, _detail = recordtest.test_obs_connection(
-            config.obs.host,
-            config.obs.port,
-            config.obs.password,
-            timeout=1.5,
-        )
-
-        launched_process = None
-        if not ok and auto_launch:
-            launched_process = recordtest.launch_obs(config)
-
-        obs_client = recordtest.ObsWebSocketClient(
-            config=config,
-            obs_process=launched_process,
+    ) -> RecorderRuntime:
+        return self.runtime_manager.open_recorder(
+            config,
+            auto_launch=auto_launch,
+            auto_setup=False,
             status_cb=None,
             max_retries=max_retries,
             retry_delay=retry_delay,
         )
-        recorder = recordtest.LoLAutoRecorder(
-            config=config,
-            obs_process=launched_process,
-            status_cb=None,
-            auto_setup=False,
-            obs_client=obs_client,
-        )
-        recorder.open()
-        return recorder, launched_process
 
     def refresh_audio_devices(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=True)
-        recorder = None
-        launched_process = None
+        runtime = None
         try:
-            recorder, launched_process = self._open_recorder(config, auto_launch=auto_launch)
-            catalog = recorder.get_audio_device_catalog(cfg=config)
+            runtime = self._open_recorder(config, auto_launch=auto_launch)
+            catalog = runtime.recorder.get_audio_device_catalog(cfg=config)
             return {
                 "catalog": catalog,
                 "config": report["config"],
-                "obs_launched": bool(launched_process),
+                "obs_launched": runtime.owns_process,
             }
         finally:
-            if recorder:
-                recorder.disconnect_obs()
+            if runtime:
+                runtime.close()
 
     def apply_audio_settings(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
-        recorder = None
-        launched_process = None
+        runtime = None
         try:
-            recorder, launched_process = self._open_recorder(config, auto_launch=auto_launch)
-            recorder.apply_audio_profile(config)
+            runtime = self._open_recorder(config, auto_launch=auto_launch)
+            runtime.recorder.apply_audio_profile(config)
             self.config_controller.save_config(report["config"])
-            return {"config": report["config"], "obs_launched": bool(launched_process)}
+            return {"config": report["config"], "obs_launched": runtime.owns_process}
         finally:
-            if recorder:
-                recorder.disconnect_obs()
+            if runtime:
+                runtime.close()
 
     def apply_runtime_output_settings(self, data: dict[str, Any]) -> bool:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
@@ -280,44 +266,45 @@ class AudioSettingsController:
         if not ok:
             return False
 
-        recorder = None
+        runtime = None
         try:
-            obs_client = recordtest.ObsWebSocketClient(
-                config=config,
+            runtime = self.runtime_manager.open_recorder(
+                config,
+                auto_launch=False,
+                auto_setup=False,
                 status_cb=None,
                 max_retries=1,
                 retry_delay=0.0,
             )
-            recorder = recordtest.LoLAutoRecorder(
-                config=config,
-                status_cb=None,
-                auto_setup=False,
-                obs_client=obs_client,
-            )
-            recorder.open()
-            recorder.apply_record_output_settings()
+            runtime.recorder.apply_record_output_settings()
             return True
         finally:
-            if recorder:
-                recorder.disconnect_obs()
+            if runtime:
+                runtime.close()
 
 
 class RecordingController:
     """録画監視ワーカーが使う録画ランタイム生成を担当する。"""
 
+    def __init__(self, runtime_manager: OBSRuntimeManager | None = None) -> None:
+        self.runtime_manager = runtime_manager or OBSRuntimeManager()
+
+    def create_runtime(
+        self, config_data: dict[str, Any], status_cb: Callable[[str], None] | None = None
+    ) -> RecorderRuntime:
+        config = recordtest.AppConfig.from_dict(config_data)
+        recordtest.setup_environment(config)
+        return self.runtime_manager.open_recorder(
+            config,
+            force_launch=True,
+            auto_setup=True,
+            status_cb=status_cb,
+        )
+
     def create_recorder(
         self, config_data: dict[str, Any], status_cb: Callable[[str], None] | None = None
     ) -> recordtest.LoLAutoRecorder:
-        config = recordtest.AppConfig.from_dict(config_data)
-        recordtest.setup_environment(config)
-        obs_process = recordtest.launch_obs(config)
-        recorder = recordtest.LoLAutoRecorder(
-            config=config,
-            obs_process=obs_process,
-            status_cb=status_cb,
-        )
-        recorder.open()
-        return recorder
+        return self.create_runtime(config_data, status_cb=status_cb).recorder
 
 
 class AnalyticsController:

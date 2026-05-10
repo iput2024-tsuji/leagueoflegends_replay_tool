@@ -1049,54 +1049,7 @@ class SettingsPage(QWidget):
 
     def save_settings(self) -> None:
         data = load_config()
-        data.setdefault("obs", {})
-        data.setdefault("paths", {})
-        data.setdefault("storage", {})
-        data.setdefault("polling", {})
-        data.setdefault("app", {})
-        data.setdefault("audio", {})
-
-        data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
-        data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
-        data["obs"]["password"] = ""
-        data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
-        try:
-            data["obs"]["fps"] = int(self.obs_fps_combo.currentText())
-        except Exception:
-            data["obs"]["fps"] = recordtest.DEFAULT_OBS_FPS
-        data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
-        data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
-        data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
-        data["obs"]["game_capture_name"] = self.fields["obs.game_capture_name"].text().strip()
-        data["obs"]["game_capture_window"] = self.fields["obs.game_capture_window"].text().strip()
-
-        data["paths"]["recordings_dir"] = self.fields["paths.recordings_dir"].text().strip()
-        data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
-        data["paths"]["champion_icons_dir"] = self.fields["paths.champion_icons_dir"].text().strip()
-        try:
-            data["storage"]["max_size_gb"] = float(self.fields["storage.max_size_gb"].text().strip())
-        except ValueError:
-            pass
-        try:
-            data["polling"]["end_error_limit"] = int(self.fields["polling.end_error_limit"].text().strip())
-        except ValueError:
-            pass
-        try:
-            data["polling"]["end_missing_grace_sec"] = float(
-                self.fields["polling.end_missing_grace_sec"].text().strip()
-            )
-        except ValueError:
-            pass
-        try:
-            data["polling"]["end_poll_sec"] = float(self.fields["polling.end_poll_sec"].text().strip())
-        except ValueError:
-            pass
-        try:
-            data["polling"]["event_poll_sec"] = float(self.fields["polling.event_poll_sec"].text().strip())
-        except ValueError:
-            pass
-        data["app"]["minimize_to_tray"] = bool(self.minimize_to_tray_check.isChecked())
-        self._write_audio_settings_to_config(data)
+        self._write_settings_ui_to_config(data)
 
         report = run_preflight(data, auto_fix=True, force_obs_detect=False)
         if report.get("errors"):
@@ -1181,8 +1134,7 @@ class SettingsPage(QWidget):
         audio["desktop"] = self._read_audio_slot_from_ui("desktop")
         audio["mic"] = self._read_audio_slot_from_ui("mic")
 
-    def _collect_settings_data_from_ui(self) -> dict[str, Any]:
-        data = load_config()
+    def _write_settings_ui_to_config(self, data: dict[str, Any]) -> None:
         data.setdefault("obs", {})
         data.setdefault("paths", {})
         data.setdefault("storage", {})
@@ -1203,6 +1155,7 @@ class SettingsPage(QWidget):
         data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
         data["obs"]["game_capture_name"] = self.fields["obs.game_capture_name"].text().strip()
         data["obs"]["game_capture_window"] = self.fields["obs.game_capture_window"].text().strip()
+
         data["paths"]["recordings_dir"] = self.fields["paths.recordings_dir"].text().strip()
         data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
         data["paths"]["champion_icons_dir"] = self.fields["paths.champion_icons_dir"].text().strip()
@@ -1230,6 +1183,10 @@ class SettingsPage(QWidget):
             pass
         data["app"]["minimize_to_tray"] = bool(self.minimize_to_tray_check.isChecked())
         self._write_audio_settings_to_config(data)
+
+    def _collect_settings_data_from_ui(self) -> dict[str, Any]:
+        data = load_config()
+        self._write_settings_ui_to_config(data)
         return data
 
     def queue_audio_auto_apply(self, *_args: Any) -> None:

@@ -32,10 +32,23 @@ class FakeRecordingController:
     def __init__(self, recorder):
         self.recorder = recorder
         self.created_with = None
+        self.runtime = FakeRuntime(recorder)
 
-    def create_recorder(self, config_data, status_cb=None):
+    def create_runtime(self, config_data, status_cb=None):
         self.created_with = (config_data, status_cb)
-        return self.recorder
+        return self.runtime
+
+
+class FakeRuntime:
+    def __init__(self, recorder):
+        self.recorder = recorder
+        self.close_calls = []
+
+    def close(self, finalize_session=False):
+        self.close_calls.append(finalize_session)
+        self.recorder.calls.append("runtime_close")
+        if finalize_session:
+            self.recorder.finalize_session()
 
 
 class FakeRecorder:
@@ -131,9 +144,10 @@ def test_recording_supervisor_runs_one_session_and_cleans_up():
         "reset_session",
         "wait_for_game_start_async",
         "request_stop",
+        "runtime_close",
         "finalize_session",
-        "shutdown_obs",
     ]
+    assert recording_controller.runtime.close_calls == [True]
 
 
 def test_recording_supervisor_raises_preflight_errors_without_creating_recorder():
@@ -150,3 +164,4 @@ def test_recording_supervisor_raises_preflight_errors_without_creating_recorder(
 
     assert recording_controller.created_with is None
     assert recorder.calls == []
+    assert recording_controller.runtime.close_calls == []

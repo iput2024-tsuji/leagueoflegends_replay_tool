@@ -15,6 +15,10 @@ except ImportError:
     import recordtest
 
 
+MIN_TACTICAL_INSIGHT_MATCHES = 8
+MIN_TACTICAL_INSIGHT_CLASS_MATCHES = 2
+
+
 class GameDataAnalyzer:
     """蓄積された録画JSONをpandas DataFrameへ変換し、簡易分析する。"""
 
@@ -156,18 +160,28 @@ class GameDataAnalyzer:
         if x.empty or y.empty:
             return {
                 "sample_size": 0,
+                "confidence": "none",
                 "best_rule": None,
                 "worst_rule": None,
                 "tree_text": "",
                 "reason": "分析可能な試合データがありません。",
             }
-        if len(y) < 3 or y.nunique() < 2:
+        class_counts = y.value_counts().to_dict()
+        if (
+            len(y) < MIN_TACTICAL_INSIGHT_MATCHES
+            or y.nunique() < 2
+            or min(class_counts.values(), default=0) < MIN_TACTICAL_INSIGHT_CLASS_MATCHES
+        ):
             return {
                 "sample_size": int(len(y)),
+                "confidence": "insufficient",
                 "best_rule": None,
                 "worst_rule": None,
                 "tree_text": "",
-                "reason": "決定木分析には勝敗両方を含む3試合以上のデータが必要です。",
+                "reason": (
+                    f"決定木分析には勝敗両方を含む{MIN_TACTICAL_INSIGHT_MATCHES}試合以上、"
+                    f"かつ各結果{MIN_TACTICAL_INSIGHT_CLASS_MATCHES}試合以上のデータが必要です。"
+                ),
             }
 
         model = DecisionTreeClassifier(
@@ -182,6 +196,7 @@ class GameDataAnalyzer:
         if not leaves:
             return {
                 "sample_size": int(len(y)),
+                "confidence": "insufficient",
                 "best_rule": None,
                 "worst_rule": None,
                 "tree_text": export_text(model, feature_names=[feature_labels[name] for name in x.columns]),
@@ -192,6 +207,7 @@ class GameDataAnalyzer:
         worst = min(leaves, key=lambda item: (item["win_rate"], -item["samples"]))
         return {
             "sample_size": int(len(y)),
+            "confidence": "exploratory",
             "best_rule": self._format_leaf_rule(best),
             "worst_rule": self._format_leaf_rule(worst),
             "tree_text": export_text(model, feature_names=[feature_labels[name] for name in x.columns]),

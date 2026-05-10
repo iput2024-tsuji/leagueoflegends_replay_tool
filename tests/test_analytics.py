@@ -119,6 +119,20 @@ def test_extract_tactical_insights_returns_best_and_worst_rules():
     assert any(label in insights["tree_text"] for label in ["15分以内", "ファーストブラッド"])
 
 
+def test_extract_tactical_insights_marks_small_samples_as_insufficient():
+    tmp_path = runtime_dir("insights_small_sample")
+    write_match(tmp_path / "win.json", "Win", "Malphite", [])
+    write_match(tmp_path / "loss.json", "Loss", "Ahri", [])
+
+    insights = GameDataAnalyzer(json_dir=tmp_path).extract_tactical_insights()
+
+    assert insights["sample_size"] == 2
+    assert insights["confidence"] == "insufficient"
+    assert insights["best_rule"] is None
+    assert insights["worst_rule"] is None
+    assert "8試合以上" in insights["reason"]
+
+
 def test_enemy_champions_are_used_as_readable_decision_tree_features():
     tmp_path = runtime_dir("enemy_insights")
     for index in range(4):

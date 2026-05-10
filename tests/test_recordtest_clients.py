@@ -102,6 +102,47 @@ def test_riot_api_returns_none_when_lcu_server_is_down():
     assert run(client.get_all_game_data()) is None
 
 
+def test_riot_api_poll_result_distinguishes_live_client_states():
+    client = recordtest.LiveClientRiotAPIClient(
+        session_factory=FakeSessionFactory(
+            {
+                recordtest.ALL_GAME_URL: {
+                    "gameData": {"gameTime": 10.0},
+                    "allPlayers": [],
+                }
+            }
+        )
+    )
+
+    result = run(client.get_all_game_data_result())
+
+    assert result.status == recordtest.RiotPollStatus.IN_GAME
+    assert result.payload["gameData"]["gameTime"] == 10.0
+
+
+def test_riot_api_poll_result_treats_404_as_not_in_game():
+    error = aiohttp.ClientResponseError(
+        SimpleNamespace(real_url=recordtest.ALL_GAME_URL),
+        (),
+        status=404,
+    )
+    client = recordtest.LiveClientRiotAPIClient(session_factory=FakeSessionFactory(error=error))
+
+    result = run(client.get_all_game_data_result())
+
+    assert result.status == recordtest.RiotPollStatus.NOT_IN_GAME
+
+
+def test_riot_api_poll_result_treats_connection_error_as_temporary_failure():
+    client = recordtest.LiveClientRiotAPIClient(
+        session_factory=FakeSessionFactory(error=aiohttp.ClientConnectionError("down"))
+    )
+
+    result = run(client.get_all_game_data_result())
+
+    assert result.status == recordtest.RiotPollStatus.TEMPORARY_FAILURE
+
+
 def test_obs_websocket_timeout_is_wrapped_as_recorder_error():
     client = recordtest.ObsWebSocketClient(config=app_config(), max_retries=2, retry_delay=0)
 

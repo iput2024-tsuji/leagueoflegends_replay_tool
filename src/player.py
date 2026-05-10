@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -174,18 +175,33 @@ def ensure_mpv_dll(bin_dir: Path, root_dir: Path) -> None:
             return
 
 
-ensure_mpv_dll(BIN_DIR, ROOT_DIR)
-if BIN_DIR.exists():
-    os.environ["PATH"] = str(BIN_DIR) + os.pathsep + os.environ["PATH"]
+mpv_module = None
+MPV_IMPORT_ERROR = None
+MPV_BOOTSTRAPPED = False
 
-# --- 2. MPVインポート ---
-try:
-    import mpv as mpv_module
 
-    MPV_IMPORT_ERROR = None
-except Exception as e:
-    mpv_module = None
-    MPV_IMPORT_ERROR = e
+def bootstrap_mpv_runtime() -> Any | None:
+    global mpv_module, MPV_IMPORT_ERROR, MPV_BOOTSTRAPPED
+    if mpv_module is not None:
+        return mpv_module
+    if MPV_BOOTSTRAPPED and MPV_IMPORT_ERROR is not None:
+        return None
+
+    MPV_BOOTSTRAPPED = True
+    ensure_mpv_dll(BIN_DIR, ROOT_DIR)
+    if BIN_DIR.exists():
+        bin_text = str(BIN_DIR)
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        if bin_text not in path_parts:
+            os.environ["PATH"] = bin_text + os.pathsep + os.environ.get("PATH", "")
+
+    try:
+        mpv_module = importlib.import_module("mpv")
+        MPV_IMPORT_ERROR = None
+    except Exception as e:
+        mpv_module = None
+        MPV_IMPORT_ERROR = e
+    return mpv_module
 
 
 def show_mpv_missing_dialog_and_exit(parent: QWidget | None = None) -> None:
@@ -207,8 +223,9 @@ def show_mpv_missing_dialog_and_exit(parent: QWidget | None = None) -> None:
 
 
 def ensure_mpv_available_or_exit(parent: QWidget | None = None) -> Any:
-    if mpv_module is not None:
-        return mpv_module
+    runtime = bootstrap_mpv_runtime()
+    if runtime is not None:
+        return runtime
     show_mpv_missing_dialog_and_exit(parent)
 
 

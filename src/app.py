@@ -41,16 +41,18 @@ from PyQt6.QtWidgets import (
 try:
     from . import recordtest
     from .app_paths import get_app_root
-    from .controllers import AnalyticsController, AudioSettingsController, ConfigController, RecordingController
+    from .controllers import AnalyticsController, AudioSettingsController, ConfigController
     from .player import PlayerWidget
+    from .recording_supervisor import RecordingSupervisor
 except ImportError:
     SRC_DIR = Path(__file__).resolve().parent
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
     import recordtest
     from app_paths import get_app_root
-    from controllers import AnalyticsController, AudioSettingsController, ConfigController, RecordingController
+    from controllers import AnalyticsController, AudioSettingsController, ConfigController
     from player import PlayerWidget
+    from recording_supervisor import RecordingSupervisor
 
 
 ROOT_DIR = get_app_root()
@@ -70,7 +72,6 @@ def get_app_icon() -> QIcon | None:
 
 CONFIG_CONTROLLER = ConfigController()
 AUDIO_CONTROLLER = AudioSettingsController(CONFIG_CONTROLLER)
-RECORDING_CONTROLLER = RecordingController()
 ANALYTICS_CONTROLLER = AnalyticsController(CONFIG_CONTROLLER)
 
 
@@ -114,7 +115,7 @@ class RecorderWorker(QThread):
     def __init__(self) -> None:
         super().__init__()
         self.stop_flag = False
-        self.recorder = None
+        self.supervisor = None
         self.loop = None
         self.stop_event = None
 
@@ -147,50 +148,8 @@ class RecorderWorker(QThread):
             self.finished.emit()
 
     async def run_async(self) -> None:
-        try:
-            settings = load_config()
-            report = run_preflight(settings, auto_fix=True, force_obs_detect=True)
-            if report.get("changed"):
-                save_config(report["config"])
-
-            for note in report.get("notes", []):
-                self.status.emit(f"🛠️ {note}")
-            for warning in report.get("warnings", []):
-                self.status.emit(f"⚠️ {warning}")
-
-            errors = report.get("errors", [])
-            if errors:
-                raise recordtest.RecorderError("\n".join(errors))
-
-            settings = report["config"]
-            self.recorder = RECORDING_CONTROLLER.create_recorder(settings, status_cb=self.status.emit)
-            self.recorder.set_stop_event(self.stop_event)
-            try:
-                self.recorder.apply_audio_profile(self.recorder.config)
-                self.status.emit("🔊 音声設定をOBSへ適用しました。")
-            except Exception as e:
-                self.status.emit(f"⚠️ 音声設定の適用に失敗: {e}")
-
-            while not self.stop_event.is_set():
-                self.recorder.reset_session()
-                started = await self.recorder.wait_for_game_start_async()
-                if not started or self.stop_event.is_set():
-                    break
-                await self.recorder.start_recording_async()
-                if self.stop_event.is_set():
-                    break
-                await self.recorder.record_until_end_async()
-                self.recorder.stop_recording()
-                if self.recorder.has_session_data():
-                    self.recorder.save_json()
-                self.status.emit("✅ 試合記録完了。次の試合を待機します。")
-        finally:
-            if self.recorder:
-                self.recorder.request_stop()
-                self.recorder.stop_recording()
-                if self.recorder.has_session_data():
-                    self.recorder.save_json()
-                self.recorder.shutdown_obs()
+        self.supervisor = RecordingSupervisor(status_cb=self.status.emit)
+        await self.supervisor.run(self.stop_event)
 
     def stop(self) -> None:
         self.stop_flag = True
@@ -203,8 +162,8 @@ class RecorderWorker(QThread):
     def _request_stop_on_loop(self) -> None:
         if self.stop_event:
             self.stop_event.set()
-        if self.recorder:
-            self.recorder.request_stop()
+        if self.supervisor:
+            self.supervisor.request_stop()
 
 
 class AnalyticsWorker(QThread):

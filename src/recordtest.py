@@ -23,6 +23,7 @@ from obsws_python.error import OBSSDKRequestError
 try:
     from .app_paths import get_app_root
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
         get_obs_config_dir as shared_get_obs_config_dir,
@@ -36,6 +37,7 @@ try:
 except ImportError:
     from app_paths import get_app_root
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from mpv_support import has_mpv_dll
     from obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
         get_obs_config_dir as shared_get_obs_config_dir,
@@ -717,13 +719,7 @@ def obs_color_to_hex(color_value: Any) -> str:
 
 
 def _has_mpv_dll(bin_path: str | Path | None) -> bool:
-    names = (
-        "mpv-1.dll",
-        "libmpv-1.dll",
-        "mpv-2.dll",
-        "libmpv-2.dll",
-    )
-    return any((bin_path / name).exists() for name in names)
+    return has_mpv_dll(bin_path)
 
 
 def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs: bool = True) -> dict[str, Any]:
@@ -1456,12 +1452,7 @@ def setup_environment(config: AppConfig) -> None:
     if bin_dir:
         os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
 
-        if not (
-            os.path.exists(os.path.join(bin_dir, "mpv-1.dll"))
-            or os.path.exists(os.path.join(bin_dir, "libmpv-1.dll"))
-            or os.path.exists(os.path.join(bin_dir, "mpv-2.dll"))
-            or os.path.exists(os.path.join(bin_dir, "libmpv-2.dll"))
-        ):
+        if not has_mpv_dll(bin_dir):
             LOGGER.warning(
                 "⚠️ 警告: 'bin' フォルダ内に mpv-1.dll / mpv-2.dll (または libmpv-1.dll / libmpv-2.dll) が見つかりません。"
             )

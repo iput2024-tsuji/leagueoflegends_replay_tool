@@ -41,9 +41,11 @@ from PyQt6.QtWidgets import (
 # --- 1. MPVのパス設定 ---
 try:
     from .app_paths import get_app_root
+    from .mpv_support import MPV_DLL_NAMES, find_mpv_dll
     from .session_log import load_session_payload
 except ImportError:
     from app_paths import get_app_root
+    from mpv_support import MPV_DLL_NAMES, find_mpv_dll
     from session_log import load_session_payload
 
 ROOT_DIR = get_app_root()
@@ -142,7 +144,7 @@ def ensure_mpv_dll(bin_dir: Path, root_dir: Path) -> None:
     for base in (bin_dir, root_dir):
         if not base or not base.exists():
             continue
-        for name in ("mpv-1.dll", "libmpv-1.dll", "mpv-2.dll", "libmpv-2.dll"):
+        for name in MPV_DLL_NAMES:
             path = base / name
             if path.exists():
                 candidates.append(path)
@@ -180,6 +182,18 @@ def ensure_mpv_dll(bin_dir: Path, root_dir: Path) -> None:
 mpv_module = None
 MPV_IMPORT_ERROR = None
 MPV_BOOTSTRAPPED = False
+MPV_DLL_DIRECTORY_HANDLE = None
+
+
+def register_mpv_dll_directory(bin_dir: Path) -> None:
+    global MPV_DLL_DIRECTORY_HANDLE
+    if MPV_DLL_DIRECTORY_HANDLE is not None:
+        return
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    if not bin_dir.exists():
+        return
+    MPV_DLL_DIRECTORY_HANDLE = os.add_dll_directory(str(bin_dir))
 
 
 def bootstrap_mpv_runtime() -> Any | None:
@@ -191,11 +205,21 @@ def bootstrap_mpv_runtime() -> Any | None:
 
     MPV_BOOTSTRAPPED = True
     ensure_mpv_dll(BIN_DIR, ROOT_DIR)
+    dll_path = find_mpv_dll(BIN_DIR, ROOT_DIR)
+    if dll_path is None:
+        MPV_IMPORT_ERROR = FileNotFoundError(f"MPV DLL was not found under {BIN_DIR}")
+        return None
+
     if BIN_DIR.exists():
         bin_text = str(BIN_DIR)
         path_parts = os.environ.get("PATH", "").split(os.pathsep)
         if bin_text not in path_parts:
             os.environ["PATH"] = bin_text + os.pathsep + os.environ.get("PATH", "")
+        try:
+            register_mpv_dll_directory(BIN_DIR)
+        except Exception as e:
+            MPV_IMPORT_ERROR = e
+            return None
 
     try:
         mpv_module = importlib.import_module("mpv")
@@ -206,13 +230,27 @@ def bootstrap_mpv_runtime() -> Any | None:
     return mpv_module
 
 
-def show_mpv_missing_dialog_and_exit(parent: QWidget | None = None) -> None:
-    message = (
+def build_mpv_error_message() -> str:
+    dll_path = find_mpv_dll(BIN_DIR, ROOT_DIR)
+    if dll_path and MPV_IMPORT_ERROR:
+        return (
+            "MPV DLL は見つかりましたが、python-mpv の読み込みに失敗しました。\n"
+            "DLLの依存ファイル不足、32/64bit不一致、または破損したDLLの可能性があります。\n\n"
+            f"検出したDLL: {dll_path}\n"
+            f"エラー: {type(MPV_IMPORT_ERROR).__name__}: {MPV_IMPORT_ERROR}\n\n"
+            f"binフォルダ: {BIN_DIR}\n"
+            "対応DLL: mpv-1.dll / libmpv-1.dll / mpv-2.dll / libmpv-2.dll"
+        )
+    return (
         "binフォルダに mpv-1.dll などのMPVコンポーネントが見つかりません。\n"
         "配置してから起動してください。\n\n"
         f"探した場所: {BIN_DIR}\n\n"
         "対応DLL: mpv-1.dll / libmpv-1.dll / mpv-2.dll / libmpv-2.dll"
     )
+
+
+def show_mpv_missing_dialog_and_exit(parent: QWidget | None = None) -> None:
+    message = build_mpv_error_message()
     app = QApplication.instance()
     created_app = False
     if app is None:

@@ -408,6 +408,10 @@ class RecordingSessionManager(ABC):
     """OBSClientとRiotAPIClientを注入され、録画ワークフローを管理する抽象インターフェース。"""
 
     @abstractmethod
+    def open(self) -> None:
+        pass
+
+    @abstractmethod
     def reset_session(self) -> None:
         pass
 
@@ -449,6 +453,10 @@ class RecordingSessionManager(ABC):
 
     @abstractmethod
     def save_json(self) -> None:
+        pass
+
+    @abstractmethod
+    def finalize_session(self) -> None:
         pass
 
     @abstractmethod
@@ -1341,6 +1349,7 @@ def setup_obs_sync_elements(
             status_cb=status_cb,
             auto_setup=True,
         )
+        recorder.open()
         # 録画保存先も毎回明示して、環境差分でOBS設定がぶれないようにする。
         try:
             recorder.apply_record_output_settings()
@@ -2034,6 +2043,8 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.status_cb = status_cb
         self.stop_requested = False
         self.stop_event = stop_event
+        self.auto_setup = bool(auto_setup)
+        self.opened = False
         self.logger = logging.getLogger(f"lol_replay.recorder.{id(self)}")
         self._status_handler = StatusCallbackLogHandler(status_cb) if status_cb else None
         if self._status_handler:
@@ -2047,10 +2058,22 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.riot_api_client = riot_api_client or LiveClientRiotAPIClient()
         self.obs_process = getattr(self.obs_client, "obs_process", obs_process)
         self.reset_session()
-        self.connect_obs()
-        self.ensure_record_output_setup()
-        if auto_setup:
-            self.ensure_sync_setup()
+
+    def open(self) -> None:
+        if self.opened:
+            return
+        try:
+            self.connect_obs()
+            self.ensure_record_output_setup()
+            if self.auto_setup:
+                self.ensure_sync_setup()
+            self.opened = True
+        except Exception:
+            try:
+                self.shutdown_obs()
+            except Exception:
+                pass
+            raise
 
     def log(self, message: str) -> None:
         self.logger.info(message)
@@ -2106,8 +2129,11 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.enemy_champions = []
         self.game_result = None
         self.winning_team = None
+        self.session_finalized = False
 
     def has_session_data(self) -> bool:
+        if self.session_finalized:
+            return False
         return (
             self.recording_started
             or self.record_path is not None
@@ -2424,6 +2450,7 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     def shutdown_obs(self) -> None:
         self.obs_client.shutdown()
+        self.opened = False
         if self._status_handler:
             try:
                 self.logger.removeHandler(self._status_handler)
@@ -2433,6 +2460,7 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     def disconnect_obs(self) -> None:
         self.obs_client.disconnect()
+        self.opened = False
         if self._status_handler:
             try:
                 self.logger.removeHandler(self._status_handler)
@@ -2441,6 +2469,8 @@ class LoLAutoRecorder(RecordingSessionManager):
             self._status_handler = None
 
     def save_json(self) -> None:
+        if self.session_finalized:
+            return
         if self.output_file is None:
             self.output_file = build_output_path(self.config)
 
@@ -2473,8 +2503,14 @@ class LoLAutoRecorder(RecordingSessionManager):
             "counts": {"filtered": len(self.saved_events), "all": len(self.all_events)},
         }
         save_payload(self.output_file, payload)
+        self.session_finalized = True
         self.log(f"ログ保存完了: {self.output_file}")
         enforce_storage_limit(self.config, keep_paths=[self.output_file, self.record_path])
+
+    def finalize_session(self) -> None:
+        self.stop_recording()
+        if self.has_session_data():
+            self.save_json()
 
 
 async def run_cli_recorder() -> None:
@@ -2496,6 +2532,7 @@ async def run_cli_recorder() -> None:
         obs_process = launch_obs(config)
 
         app = LoLAutoRecorder(config=config, obs_process=obs_process)
+        app.open()
         try:
             app.apply_audio_profile(config)
             LOGGER.info("🔊 音声設定をOBSへ適用しました。")
@@ -2508,8 +2545,7 @@ async def run_cli_recorder() -> None:
                 break
             await app.start_recording_async()
             await app.record_until_end_async()
-            app.stop_recording()
-            app.save_json()
+            app.finalize_session()
             LOGGER.info("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
         LOGGER.info("中断を検知しました。終了処理を行います。")
@@ -2518,9 +2554,7 @@ async def run_cli_recorder() -> None:
         sys.exit(1)
     finally:
         if app:
-            app.stop_recording()
-            if app.has_session_data():
-                app.save_json()
+            app.finalize_session()
             app.shutdown_obs()
         LOGGER.info("👋 全ての処理が完了しました。")
 

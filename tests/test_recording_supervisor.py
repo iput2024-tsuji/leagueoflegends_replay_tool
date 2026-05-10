@@ -80,6 +80,11 @@ class FakeRecorder:
         self.calls.append("save_json")
         self.session_has_data = False
 
+    def finalize_session(self):
+        self.calls.append("finalize_session")
+        if self.session_has_data:
+            self.save_json()
+
     def request_stop(self):
         self.calls.append("request_stop")
 
@@ -121,12 +126,12 @@ def test_recording_supervisor_runs_one_session_and_cleans_up():
         "wait_for_game_start_async",
         "start_recording_async",
         "record_until_end_async",
-        "stop_recording",
+        "finalize_session",
         "save_json",
         "reset_session",
         "wait_for_game_start_async",
         "request_stop",
-        "stop_recording",
+        "finalize_session",
         "shutdown_obs",
     ]
 

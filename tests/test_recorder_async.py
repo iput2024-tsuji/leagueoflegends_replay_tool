@@ -87,6 +87,30 @@ def test_wait_for_game_start_retries_after_timeout_without_real_sleep():
     recorder.wait_with_stop_async.assert_awaited_once()
 
 
+def test_recorder_constructor_has_no_obs_side_effects_until_open():
+    tmp_path = runtime_dir("constructor_no_side_effects")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=obs_client,
+        riot_api_client=Mock(),
+        auto_setup=True,
+    )
+
+    obs_client.connect.assert_not_called()
+    obs_client.setup_record_output.assert_not_called()
+    obs_client.setup_sync_elements.assert_not_called()
+
+    recorder.open()
+    recorder.open()
+
+    obs_client.connect.assert_called_once()
+    obs_client.setup_record_output.assert_called_once()
+    obs_client.setup_sync_elements.assert_called_once()
+
+
 def test_game_end_event_flow_stops_recording_without_real_sleep():
     tmp_path = runtime_dir("game_end")
     config = config_for(tmp_path)
@@ -201,3 +225,26 @@ def test_record_until_end_does_not_stop_on_missing_api_count_before_grace():
 
     assert ended is True
     assert riot_client.get_all_game_data.await_count == 4
+
+
+def test_save_json_is_idempotent(monkeypatch):
+    tmp_path = runtime_dir("save_json_idempotent")
+    config = config_for(tmp_path)
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.output_file = tmp_path / "json" / "session.json"
+    recorder.sync_game_time = 1.0
+    recorder.all_events = [{"EventID": 1, "EventName": "GameStart", "EventTime": 0.0}]
+    saved_payloads = []
+    monkeypatch.setattr(recordtest, "save_payload", lambda path, payload: saved_payloads.append((path, payload)))
+    monkeypatch.setattr(recordtest, "enforce_storage_limit", lambda *args, **kwargs: None)
+
+    recorder.save_json()
+    recorder.save_json()
+
+    assert len(saved_payloads) == 1
+    assert recorder.has_session_data() is False

@@ -237,6 +237,7 @@ class AudioSettingsController:
             auto_setup=False,
             obs_client=obs_client,
         )
+        recorder.open()
         return recorder, launched_process
 
     def refresh_audio_devices(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
@@ -293,6 +294,7 @@ class AudioSettingsController:
                 auto_setup=False,
                 obs_client=obs_client,
             )
+            recorder.open()
             recorder.apply_record_output_settings()
             return True
         finally:
@@ -309,11 +311,13 @@ class RecordingController:
         config = recordtest.AppConfig.from_dict(config_data)
         recordtest.setup_environment(config)
         obs_process = recordtest.launch_obs(config)
-        return recordtest.LoLAutoRecorder(
+        recorder = recordtest.LoLAutoRecorder(
             config=config,
             obs_process=obs_process,
             status_cb=status_cb,
         )
+        recorder.open()
+        return recorder
 
 
 class AnalyticsController:

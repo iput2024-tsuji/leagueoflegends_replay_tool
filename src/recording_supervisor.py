@@ -54,9 +54,7 @@ class RecordingSupervisor:
                 if stop_event.is_set():
                     break
                 await self.recorder.record_until_end_async()
-                self.recorder.stop_recording()
-                if self.recorder.has_session_data():
-                    self.recorder.save_json()
+                self.recorder.finalize_session()
                 self._emit("✅ 試合記録完了。次の試合を待機します。")
         finally:
             self.shutdown()
@@ -71,9 +69,7 @@ class RecordingSupervisor:
         if not self.recorder:
             return
         self.recorder.request_stop()
-        self.recorder.stop_recording()
-        if self.recorder.has_session_data():
-            self.recorder.save_json()
+        self.recorder.finalize_session()
         self.recorder.shutdown_obs()
         self.recorder = None
 

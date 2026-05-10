@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -11,8 +10,10 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 
 try:
     from . import recordtest
+    from .session_log import load_session_payload
 except ImportError:
     import recordtest
+    from session_log import load_session_payload
 
 
 MIN_TACTICAL_INSIGHT_MATCHES = 8
@@ -216,9 +217,7 @@ class GameDataAnalyzer:
 
     def _read_payload(self, path: Path) -> dict[str, Any] | None:
         try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-            return data if isinstance(data, dict) else None
+            return load_session_payload(path)
         except Exception:
             return None
 

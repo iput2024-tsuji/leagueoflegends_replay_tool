@@ -31,6 +31,8 @@ try:
         get_portable_marker_path as shared_get_portable_marker_path,
     )
     from .obs_process import OBSProcessManager
+    from .recording_state import RecordingEndDetector
+    from .session_log import SessionLogV1, load_session_payload
 except ImportError:
     from app_paths import get_app_root
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
@@ -42,6 +44,8 @@ except ImportError:
         get_portable_marker_path as shared_get_portable_marker_path,
     )
     from obs_process import OBSProcessManager
+    from recording_state import RecordingEndDetector
+    from session_log import SessionLogV1, load_session_payload
 
 ROOT_DIR = get_app_root()
 CONFIG_REPOSITORY = ConfigRepository(CONFIG_PATH, SAMPLE_CONFIG_PATH)
@@ -1526,8 +1530,7 @@ def load_json_metadata(path: str | Path, config: AppConfig | None = None) -> tup
     path = Path(path)
     config = config or load_app_config()
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+        data = load_session_payload(path)
         saved_at = parse_saved_at(data.get("saved_at"))
         video_path = data.get("obs_record_path")
         if not video_path:
@@ -1624,9 +1627,9 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         hint = f"\n自動検出候補: {detected}" if detected else ""
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
-    # 最優先: 残存OBSを先に終了して、以降の設定更新とのレースを防ぐ。
+    # 前回このアプリが起動したOBSだけを終了し、同じポータブルOBSを使う手動起動は巻き込まない。
     process_manager = OBSProcessManager(obs_dir_abs, logger=LOGGER)
-    process_manager.kill_stale_managed_processes()
+    process_manager.kill_stale_owned_processes()
 
     bootstrapper = OBSBootstrapper(obs_dir_abs)
     try:
@@ -2436,33 +2439,26 @@ class LoLAutoRecorder(RecordingSessionManager):
     async def record_until_end_async(self) -> bool:
         """試合終了まで待機して録画停止"""
         self.log("🛡️  試合終了を監視中...")
-        error_count = 0
-        missing_started_at = None
         loop = asyncio.get_running_loop()
+        end_detector = RecordingEndDetector(
+            error_limit=self.config.polling.end_error_limit,
+            missing_grace_sec=self.config.polling.end_missing_grace_sec,
+        )
         while True:
             if self.should_stop():
                 return False
             result = await self.poll_all_game_data()
             data = result.payload
             if not data:
-                now = loop.time()
-                if missing_started_at is None:
-                    missing_started_at = now
-                error_count += 1
-                missing_duration = now - missing_started_at
-                if (
-                    result.status in {RiotPollStatus.NOT_IN_GAME, RiotPollStatus.TEMPORARY_FAILURE}
-                    and error_count >= self.config.polling.end_error_limit
-                    and missing_duration >= self.config.polling.end_missing_grace_sec
-                ):
+                decision = end_detector.observe_poll_status(result.status, loop.time())
+                if decision.should_end:
                     self.log("🏁 試合終了検知。録画を停止します。")
                     return True
                 if not await self.wait_with_stop_async(self.config.polling.end_poll_sec):
                     return False
                 continue
 
-            error_count = 0
-            missing_started_at = None
+            end_detector.observe_poll_status(result.status, loop.time())
             self.last_game_data = data
             if not self.my_name:
                 await self.try_update_player_name_async()
@@ -2474,6 +2470,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 self.process_events(events)
                 self.update_result_from_events(events)
                 if any(self.is_game_end_event(event) for event in events):
+                    end_detector.observe_game_end_event()
                     self.log("🏁 GameEndイベントを検知。録画を停止します。")
                     return True
 
@@ -2547,22 +2544,22 @@ class LoLAutoRecorder(RecordingSessionManager):
             except Exception:
                 record_path_for_json = str(self.record_path)
 
-        payload = {
-            "summoner_name": self.my_name,
-            "champion_name": self.champion_name,
-            "enemy_champions": self.enemy_champions,
-            "player_team": self.player_team,
-            "game_result": self.game_result,
-            "winning_team": self.winning_team,
-            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "sync_game_time": self.sync_game_time,
-            "obs_record_path": record_path_for_json,
-            "paths": {"recordings_dir": str(self.config.paths.recordings_dir), "json_path": str(self.output_file)},
-            "events": self.saved_events,
-            "events_all": self.all_events,
-            "counts": {"filtered": len(self.saved_events), "all": len(self.all_events)},
-        }
-        save_payload(self.output_file, payload)
+        session_log = SessionLogV1(
+            summoner_name=self.my_name,
+            champion_name=self.champion_name,
+            enemy_champions=list(self.enemy_champions),
+            player_team=self.player_team,
+            game_result=self.game_result,
+            winning_team=self.winning_team,
+            saved_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            sync_game_time=self.sync_game_time,
+            obs_record_path=record_path_for_json,
+            recordings_dir=str(self.config.paths.recordings_dir),
+            json_path=str(self.output_file),
+            events=list(self.saved_events),
+            events_all=list(self.all_events),
+        )
+        save_payload(self.output_file, session_log.to_payload())
         self.session_finalized = True
         self.log(f"ログ保存完了: {self.output_file}")
         enforce_storage_limit(self.config, keep_paths=[self.output_file, self.record_path])

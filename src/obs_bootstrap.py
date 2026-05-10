@@ -178,8 +178,7 @@ class OBSBootstrapper:
         return config_dir
 
     def ensure_global_ini(self) -> tuple[bool, Path]:
-        self.process_manager.kill_stale_managed_processes()
-        self.process_manager.wait_until_no_managed_processes()
+        self.process_manager.kill_stale_owned_processes()
         ini_path = get_obs_global_ini_path(self.base_dir)
         ini_path.parent.mkdir(parents=True, exist_ok=True)
         parser = new_obs_ini_parser()
@@ -235,8 +234,7 @@ class OBSBootstrapper:
                 time.sleep(0.25)
         finally:
             self.process_manager.terminate_process(process)
-            self.process_manager.kill_stale_managed_processes()
-            self.process_manager.wait_until_no_managed_processes()
+            self.process_manager.kill_stale_owned_processes()
 
         if not ini_path.exists():
             raise RuntimeError(f"OBS did not regenerate global.ini: {ini_path}")

@@ -41,8 +41,10 @@ from PyQt6.QtWidgets import (
 # --- 1. MPVのパス設定 ---
 try:
     from .app_paths import get_app_root
+    from .session_log import load_session_payload
 except ImportError:
     from app_paths import get_app_root
+    from session_log import load_session_payload
 
 ROOT_DIR = get_app_root()
 CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
@@ -688,8 +690,7 @@ class ReplaySelectDialog(QDialog):
             "video_path": None,
         }
         try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
+            data = load_session_payload(path)
             meta["champion_name"] = data.get("champion_name") or data.get("player_champion") or "Unknown"
             meta["summoner"] = data.get("summoner_name") or "Unknown"
             meta["saved_at"] = data.get("saved_at") or path.stem
@@ -1140,8 +1141,7 @@ class PlayerWidget(QWidget):
     def load_data(self, json_path: str | Path) -> bool:
         json_path = Path(json_path)
         try:
-            with open(json_path, encoding="utf-8") as f:
-                data = json.load(f)
+            data = load_session_payload(json_path)
 
             video_path = resolve_video_path(json_path, data, self.recordings_dir)
             if video_path is None:

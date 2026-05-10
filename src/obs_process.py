@@ -19,6 +19,13 @@ class OBSProcessInfo:
     executable_path: Path | None
 
 
+@dataclass(frozen=True)
+class OBSProcessLease:
+    pid: int
+    executable_path: Path
+    created_at: float
+
+
 class OBSProcessManager:
     """アプリ管理OBSだけを対象に起動・終了する安全境界。"""
 
@@ -27,6 +34,7 @@ class OBSProcessManager:
         self.obs_exe = (self.obs_dir / "bin" / "64bit" / "obs64.exe").resolve()
         self.working_dir = self.obs_exe.parent
         self.logger = logger or LOGGER
+        self.lease_path = self.obs_dir / ".lol_replay_obs_lease.json"
 
     def list_obs_processes(self) -> list[OBSProcessInfo]:
         if os.name != "nt":
@@ -67,6 +75,39 @@ class OBSProcessManager:
         self.wait_until_no_managed_processes(timeout_sec=timeout_sec)
         return killed
 
+    def kill_stale_owned_processes(self, timeout_sec: float = 3.0) -> list[int]:
+        """前回このアプリが起動したOBSだけをleaseから特定して終了する。"""
+        lease = self.read_process_lease()
+        if lease is None:
+            return []
+
+        process = self._find_process_by_pid(lease.pid)
+        if process is None:
+            self.clear_process_lease()
+            return []
+        if not self.is_managed_process(process):
+            self.clear_process_lease()
+            return []
+
+        killed = []
+        if self._terminate_pid(process.pid, force=False):
+            killed.append(process.pid)
+
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if self._find_process_by_pid(process.pid) is None:
+                self.clear_process_lease()
+                return killed
+            time.sleep(0.1)
+
+        if self._find_process_by_pid(process.pid) is not None:
+            self._terminate_pid(process.pid, force=True)
+            if process.pid not in killed:
+                killed.append(process.pid)
+        if self._find_process_by_pid(process.pid) is None:
+            self.clear_process_lease()
+        return killed
+
     def wait_until_no_managed_processes(self, timeout_sec: float = 5.0, poll_interval: float = 0.2) -> bool:
         """管理OBSプロセスが完全に消えるまでブロッキング待機する。"""
         deadline = time.monotonic() + max(0.0, timeout_sec)
@@ -103,22 +144,67 @@ class OBSProcessManager:
         startupinfo = self._startupinfo_hidden() if hidden else None
         if startupinfo is not None:
             popen_kwargs["startupinfo"] = startupinfo
-        return subprocess.Popen(cmd, **popen_kwargs)
+        process = subprocess.Popen(cmd, **popen_kwargs)
+        self.write_process_lease(process)
+        return process
 
     def terminate_process(self, process: subprocess.Popen[Any] | None, timeout_sec: float = 3.0) -> None:
-        if process is None or process.poll() is not None:
+        if process is None:
+            return
+        if process.poll() is not None:
+            self.clear_process_lease(process)
             return
         try:
             process.terminate()
             process.wait(timeout=timeout_sec)
+            self.clear_process_lease(process)
             return
         except Exception:
             pass
         try:
             process.kill()
             process.wait(timeout=2)
+            self.clear_process_lease(process)
         except Exception as e:
             self.logger.warning("Failed to kill managed OBS process: %s", e, exc_info=True)
+
+    def write_process_lease(self, process: subprocess.Popen[Any]) -> None:
+        try:
+            self.obs_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "pid": int(process.pid),
+                "executable_path": str(self.obs_exe),
+                "created_at": time.time(),
+            }
+            with open(self.lease_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            self.logger.warning("Failed to write OBS process lease: %s", e, exc_info=True)
+
+    def read_process_lease(self) -> OBSProcessLease | None:
+        try:
+            with open(self.lease_path, encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return None
+            return OBSProcessLease(
+                pid=int(data["pid"]),
+                executable_path=Path(str(data["executable_path"])).resolve(),
+                created_at=float(data.get("created_at") or 0.0),
+            )
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+
+    def clear_process_lease(self, process: subprocess.Popen[Any] | None = None) -> None:
+        lease = self.read_process_lease()
+        if process is not None and lease is not None and lease.pid != int(process.pid):
+            return
+        try:
+            self.lease_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def isolated_env(self) -> dict[str, str]:
         isolated_root = self.obs_dir / "temp_appdata"
@@ -202,6 +288,12 @@ class OBSProcessManager:
                 )
             )
         return result
+
+    def _find_process_by_pid(self, pid: int) -> OBSProcessInfo | None:
+        for process in self.list_obs_processes():
+            if process.pid == int(pid):
+                return process
+        return None
 
     def _terminate_pid(self, pid: int, force: bool) -> bool:
         command = ["taskkill", "/pid", str(int(pid))]

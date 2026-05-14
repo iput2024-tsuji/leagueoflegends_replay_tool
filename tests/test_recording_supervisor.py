@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from src import recordtest
+from src.recording_state import RecordingOutcome
 from src.recording_supervisor import RecordingSupervisor
 
 
@@ -81,7 +82,7 @@ class FakeRecorder:
 
     async def record_until_end_async(self):
         self.calls.append("record_until_end_async")
-        return True
+        return RecordingOutcome.COMPLETED
 
     def stop_recording(self):
         self.calls.append("stop_recording")
@@ -144,10 +145,10 @@ def test_recording_supervisor_runs_one_session_and_cleans_up():
         "reset_session",
         "wait_for_game_start_async",
         "request_stop",
+        "stop_recording",
         "runtime_close",
-        "finalize_session",
     ]
-    assert recording_controller.runtime.close_calls == [True]
+    assert recording_controller.runtime.close_calls == [False]
 
 
 def test_recording_supervisor_raises_preflight_errors_without_creating_recorder():
@@ -165,3 +166,26 @@ def test_recording_supervisor_raises_preflight_errors_without_creating_recorder(
     assert recording_controller.created_with is None
     assert recorder.calls == []
     assert recording_controller.runtime.close_calls == []
+
+
+def test_recording_supervisor_does_not_finalize_cancelled_session():
+    class CancelledRecorder(FakeRecorder):
+        async def record_until_end_async(self):
+            self.calls.append("record_until_end_async")
+            return RecordingOutcome.CANCELLED
+
+    statuses = []
+    recorder = CancelledRecorder()
+    recording_controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+        status_cb=statuses.append,
+    )
+
+    run(run_supervisor(supervisor))
+
+    assert "⏹️ 録画セッションを中断しました。" in statuses
+    assert "save_json" not in recorder.calls
+    assert recorder.calls[-3:] == ["request_stop", "stop_recording", "runtime_close"]
+    assert recording_controller.runtime.close_calls == [False]

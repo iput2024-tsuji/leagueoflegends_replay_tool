@@ -157,10 +157,10 @@ def test_game_end_event_flow_stops_recording_without_real_sleep():
     recorder.recording_started = True
     recorder.wait_with_stop_async = AsyncMock(return_value=True)
 
-    ended = run(recorder.record_until_end_async())
+    outcome = run(recorder.record_until_end_async())
     recorder.stop_recording()
 
-    assert ended is True
+    assert outcome == recordtest.RecordingOutcome.COMPLETED
     assert recorder.game_result == "Win"
     assert recorder.winning_team == "ORDER"
     assert recorder.enemy_champions == ["Darius"]
@@ -221,9 +221,9 @@ def test_record_until_end_does_not_stop_on_missing_api_count_before_grace():
     recorder.recording_started = True
     recorder.wait_with_stop_async = AsyncMock(return_value=True)
 
-    ended = run(recorder.record_until_end_async())
+    outcome = run(recorder.record_until_end_async())
 
-    assert ended is True
+    assert outcome == recordtest.RecordingOutcome.COMPLETED
     assert riot_client.get_all_game_data.await_count == 4
 
 
@@ -266,9 +266,9 @@ def test_record_until_end_ignores_temporary_failures_past_error_limit():
     recorder.recording_started = True
     recorder.wait_with_stop_async = AsyncMock(return_value=True)
 
-    ended = run(recorder.record_until_end_async())
+    outcome = run(recorder.record_until_end_async())
 
-    assert ended is True
+    assert outcome == recordtest.RecordingOutcome.COMPLETED
     assert riot_client.get_all_game_data_result.await_count == 4
     riot_client.get_event_data.assert_awaited_once()
 
@@ -306,11 +306,27 @@ def test_record_until_end_stops_after_confirmed_not_in_game():
     recorder.recording_started = True
     recorder.wait_with_stop_async = AsyncMock(return_value=True)
 
-    ended = run(recorder.record_until_end_async())
+    outcome = run(recorder.record_until_end_async())
 
-    assert ended is True
+    assert outcome == recordtest.RecordingOutcome.COMPLETED
     assert riot_client.get_all_game_data_result.await_count == 3
     riot_client.get_event_data.assert_not_awaited()
+
+
+def test_record_until_end_returns_cancelled_when_stop_requested():
+    tmp_path = runtime_dir("record_until_end_cancelled")
+    config = config_for(tmp_path)
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.request_stop()
+
+    outcome = run(recorder.record_until_end_async())
+
+    assert outcome == recordtest.RecordingOutcome.CANCELLED
 
 
 def test_save_json_is_idempotent(monkeypatch):

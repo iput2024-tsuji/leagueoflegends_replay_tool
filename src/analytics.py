@@ -10,10 +10,10 @@ from sklearn.tree import DecisionTreeClassifier, export_text
 
 try:
     from . import recordtest
-    from .session_log import load_session_payload
+    from .session_log import load_session_payload_result
 except ImportError:
     import recordtest
-    from session_log import load_session_payload
+    from session_log import load_session_payload_result
 
 
 MIN_TACTICAL_INSIGHT_MATCHES = 8
@@ -26,6 +26,7 @@ class GameDataAnalyzer:
     def __init__(self, json_dir: str | Path | None = None, config: Any | None = None) -> None:
         self.config = config or recordtest.load_app_config()
         self.json_dir = Path(json_dir) if json_dir else Path(self.config.paths.json_dir)
+        self.load_errors: list[dict[str, str]] = []
 
     def iter_json_files(self) -> list[Path]:
         if not self.json_dir.exists():
@@ -34,6 +35,7 @@ class GameDataAnalyzer:
 
     def load_dataframe(self) -> DataFrame:
         rows = []
+        self.load_errors = []
         for match_index, json_path in enumerate(self.iter_json_files()):
             payload = self._read_payload(json_path)
             if not payload:
@@ -216,10 +218,21 @@ class GameDataAnalyzer:
         }
 
     def _read_payload(self, path: Path) -> dict[str, Any] | None:
-        try:
-            return load_session_payload(path)
-        except Exception:
-            return None
+        result = load_session_payload_result(path)
+        if result.valid:
+            return result.payload
+        self.load_errors.append(
+            {
+                "path": str(path),
+                "error": "; ".join(result.errors) if result.errors else "unknown session log error",
+            }
+        )
+        return None
+
+    def get_load_errors(self) -> list[dict[str, str]]:
+        if not self.load_errors:
+            self.load_dataframe()
+        return list(self.load_errors)
 
     def _match_base_row(
         self,

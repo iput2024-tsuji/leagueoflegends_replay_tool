@@ -42,10 +42,12 @@ from PyQt6.QtWidgets import (
 try:
     from .app_paths import get_app_root
     from .mpv_support import MPV_DLL_NAMES, find_mpv_dll
+    from .qt_lifecycle import request_worker_stop
     from .session_log import load_session_payload
 except ImportError:
     from app_paths import get_app_root
     from mpv_support import MPV_DLL_NAMES, find_mpv_dll
+    from qt_lifecycle import request_worker_stop
     from session_log import load_session_payload
 
 ROOT_DIR = get_app_root()
@@ -279,6 +281,10 @@ class SyncWorker(QThread):
         super().__init__()
         self.video_path = str(video_path)
         self.max_seconds = max_seconds
+        self._cancel_requested = False
+
+    def cancel(self) -> None:
+        self._cancel_requested = True
 
     def run(self) -> None:
         self.progress.emit("同期マーカーを高速捜索中...")
@@ -304,6 +310,8 @@ class SyncWorker(QThread):
 
         frame_idx = 0
         while frame_idx < max_frames:
+            if self._cancel_requested:
+                break
             if not cap.grab():
                 break
 
@@ -1216,10 +1224,18 @@ class PlayerWidget(QWidget):
             return False
 
     def start_sync_worker(self) -> None:
+        self.cancel_sync_worker()
         self.worker = SyncWorker(self.current_video_path, max_seconds=180)
         self.worker.progress.connect(lambda s: self.info_label.setText(s))
         self.worker.finished.connect(self.on_sync_finished)
         self.worker.start()
+
+    def cancel_sync_worker(self, timeout_ms: int = 1000) -> bool:
+        worker = getattr(self, "worker", None)
+        stopped = request_worker_stop(worker, timeout_ms, cancel_method="cancel")
+        if stopped:
+            self.worker = None
+        return stopped
 
     def on_sync_finished(self, found_time: float) -> None:
         if found_time < 0:
@@ -1457,6 +1473,14 @@ class PlayerWidget(QWidget):
         self.clip_export_btn.setEnabled(True)
         self.clip_start_btn.setEnabled(True)
         self.clip_end_btn.setEnabled(True)
+        self.clip_worker = None
+
+    def cancel_background_tasks(self, timeout_ms: int = 1000) -> bool:
+        sync_stopped = self.cancel_sync_worker(timeout_ms=timeout_ms)
+        clip_stopped = request_worker_stop(self.clip_worker, timeout_ms, cancel_method="cancel")
+        if clip_stopped:
+            self.clip_worker = None
+        return sync_stopped and clip_stopped
 
     def add_event_item(self, text: str, game_time: float, color_hex: str) -> None:
         m, s = divmod(int(game_time), 60)
@@ -1551,9 +1575,7 @@ class PlayerWidget(QWidget):
             self.player.seek(target, reference="absolute", precision="exact")
 
     def closeEvent(self, event: Any) -> None:
-        if self.clip_worker and self.clip_worker.isRunning():
-            self.clip_worker.cancel()
-            self.clip_worker.wait(1000)
+        self.cancel_background_tasks(timeout_ms=1000)
         if hasattr(self, "player"):
             self.player.terminate()
         event.accept()

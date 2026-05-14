@@ -32,7 +32,7 @@ try:
         get_portable_marker_path as shared_get_portable_marker_path,
     )
     from .obs_process import OBSProcessManager
-    from .recording_state import RecordingEndDetector
+    from .recording_state import RecordingEndDetector, RecordingOutcome
     from .session_log import SessionLogV1, load_session_payload
 except ImportError:
     from app_paths import get_app_root
@@ -46,7 +46,7 @@ except ImportError:
         get_portable_marker_path as shared_get_portable_marker_path,
     )
     from obs_process import OBSProcessManager
-    from recording_state import RecordingEndDetector
+    from recording_state import RecordingEndDetector, RecordingOutcome
     from session_log import SessionLogV1, load_session_payload
 
 ROOT_DIR = get_app_root()
@@ -468,7 +468,7 @@ class RecordingSessionManager(ABC):
         pass
 
     @abstractmethod
-    async def record_until_end_async(self) -> bool:
+    async def record_until_end_async(self) -> RecordingOutcome:
         pass
 
     @abstractmethod
@@ -2427,7 +2427,7 @@ class LoLAutoRecorder(RecordingSessionManager):
 
             self.processed_event_keys.add(event_key)
 
-    async def record_until_end_async(self) -> bool:
+    async def record_until_end_async(self) -> RecordingOutcome:
         """試合終了まで待機して録画停止"""
         self.log("🛡️  試合終了を監視中...")
         loop = asyncio.get_running_loop()
@@ -2437,16 +2437,16 @@ class LoLAutoRecorder(RecordingSessionManager):
         )
         while True:
             if self.should_stop():
-                return False
+                return RecordingOutcome.CANCELLED
             result = await self.poll_all_game_data()
             data = result.payload
             if not data:
                 decision = end_detector.observe_poll_status(result.status, loop.time())
                 if decision.should_end:
                     self.log("🏁 試合終了検知。録画を停止します。")
-                    return True
+                    return RecordingOutcome.COMPLETED
                 if not await self.wait_with_stop_async(self.config.polling.end_poll_sec):
-                    return False
+                    return RecordingOutcome.CANCELLED
                 continue
 
             end_detector.observe_poll_status(result.status, loop.time())
@@ -2463,11 +2463,11 @@ class LoLAutoRecorder(RecordingSessionManager):
                 if any(self.is_game_end_event(event) for event in events):
                     end_detector.observe_game_end_event()
                     self.log("🏁 GameEndイベントを検知。録画を停止します。")
-                    return True
+                    return RecordingOutcome.COMPLETED
 
             if not await self.wait_with_stop_async(self.config.polling.event_poll_sec):
-                return False
-        return True
+                return RecordingOutcome.CANCELLED
+        return RecordingOutcome.COMPLETED
 
     def stop_recording(self) -> None:
         if not self.obs_client.raw_client or self.record_path is not None:
@@ -2592,7 +2592,10 @@ async def run_cli_recorder() -> None:
             if not started:
                 break
             await app.start_recording_async()
-            await app.record_until_end_async()
+            outcome = await app.record_until_end_async()
+            if outcome != RecordingOutcome.COMPLETED:
+                LOGGER.info("⏹️ 録画セッションを中断しました。")
+                break
             app.finalize_session()
             LOGGER.info("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
@@ -2602,7 +2605,7 @@ async def run_cli_recorder() -> None:
         sys.exit(1)
     finally:
         if app:
-            app.finalize_session()
+            app.stop_recording()
             app.shutdown_obs()
         LOGGER.info("👋 全ての処理が完了しました。")
 

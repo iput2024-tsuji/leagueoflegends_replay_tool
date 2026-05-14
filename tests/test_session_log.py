@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from src.session_log import SESSION_LOG_SCHEMA_VERSION, SessionLogV1, load_session_payload
+from src.session_log import SESSION_LOG_SCHEMA_VERSION, SessionLogV1, load_session_payload, load_session_payload_result
 
 
 def test_session_log_payload_round_trips_with_schema_version(tmp_path):
@@ -60,3 +60,15 @@ def test_session_log_loader_rejects_unknown_schema_version(tmp_path):
 
     with pytest.raises(ValueError, match="unsupported session log schema_version"):
         load_session_payload(path)
+
+
+def test_session_log_result_reports_load_errors(tmp_path):
+    path = tmp_path / "broken.json"
+    path.write_text("{broken", encoding="utf-8")
+
+    result = load_session_payload_result(path)
+
+    assert result.valid is False
+    assert result.payload is None
+    assert result.errors
+    assert str(path) == str(result.path)

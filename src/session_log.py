@@ -9,6 +9,17 @@ SESSION_LOG_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
+class SessionLogLoadResult:
+    path: Path
+    payload: dict[str, Any] | None = None
+    errors: tuple[str, ...] = ()
+
+    @property
+    def valid(self) -> bool:
+        return self.payload is not None and not self.errors
+
+
+@dataclass(frozen=True)
 class SessionLogV1:
     summoner_name: str | None = None
     champion_name: str | None = None
@@ -78,6 +89,14 @@ def load_session_payload(path: str | Path) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
     return SessionLogV1.from_payload(payload).to_payload()
+
+
+def load_session_payload_result(path: str | Path) -> SessionLogLoadResult:
+    source_path = Path(path)
+    try:
+        return SessionLogLoadResult(path=source_path, payload=load_session_payload(source_path))
+    except Exception as e:
+        return SessionLogLoadResult(path=source_path, errors=(f"{type(e).__name__}: {e}",))
 
 
 def _optional_str(value: Any) -> str | None:

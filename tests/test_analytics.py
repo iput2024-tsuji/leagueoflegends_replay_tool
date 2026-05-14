@@ -133,6 +133,20 @@ def test_extract_tactical_insights_marks_small_samples_as_insufficient():
     assert "8試合以上" in insights["reason"]
 
 
+def test_analyzer_reports_invalid_session_logs():
+    tmp_path = runtime_dir("analytics_invalid_logs")
+    write_match(tmp_path / "valid.json", "Win", "Malphite", [])
+    (tmp_path / "broken.json").write_text("{broken", encoding="utf-8")
+
+    analyzer = GameDataAnalyzer(json_dir=tmp_path)
+    df = analyzer.load_dataframe()
+
+    assert not df.empty
+    assert len(analyzer.load_errors) == 1
+    assert analyzer.load_errors[0]["path"].endswith("broken.json")
+    assert "JSONDecodeError" in analyzer.load_errors[0]["error"]
+
+
 def test_enemy_champions_are_used_as_readable_decision_tree_features():
     tmp_path = runtime_dir("enemy_insights")
     for index in range(4):

@@ -7,9 +7,11 @@ from typing import Any
 try:
     from . import recordtest
     from .controllers import ConfigController, RecordingController
+    from .recording_state import RecordingOutcome
 except ImportError:
     import recordtest
     from controllers import ConfigController, RecordingController
+    from recording_state import RecordingOutcome
 
 
 class RecordingSupervisor:
@@ -27,6 +29,7 @@ class RecordingSupervisor:
         self.recorder: Any | None = None
         self.runtime: Any | None = None
         self.stop_event: asyncio.Event | None = None
+        self.session_completed = False
 
     async def run(self, stop_event: asyncio.Event) -> None:
         self.stop_event = stop_event
@@ -52,13 +55,18 @@ class RecordingSupervisor:
 
             while not stop_event.is_set():
                 self.recorder.reset_session()
+                self.session_completed = False
                 started = await self.recorder.wait_for_game_start_async()
                 if not started or stop_event.is_set():
                     break
                 await self.recorder.start_recording_async()
                 if stop_event.is_set():
                     break
-                await self.recorder.record_until_end_async()
+                outcome = await self.recorder.record_until_end_async()
+                if outcome != RecordingOutcome.COMPLETED:
+                    self._emit("⏹️ 録画セッションを中断しました。")
+                    break
+                self.session_completed = True
                 self.recorder.finalize_session()
                 self._emit("✅ 試合記録完了。次の試合を待機します。")
         finally:
@@ -74,11 +82,15 @@ class RecordingSupervisor:
         if not self.recorder:
             return
         self.recorder.request_stop()
+        if not self.session_completed:
+            self.recorder.stop_recording()
         if self.runtime:
-            self.runtime.close(finalize_session=True)
+            self.runtime.close(finalize_session=self.session_completed)
         else:
-            self.recorder.finalize_session()
+            if self.session_completed:
+                self.recorder.finalize_session()
             self.recorder.shutdown_obs()
+        self.session_completed = False
         self.runtime = None
         self.recorder = None
 

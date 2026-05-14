@@ -17,6 +17,7 @@ LOGGER = logging.getLogger("lol_replay.obs_process")
 class OBSProcessInfo:
     pid: int
     executable_path: Path | None
+    creation_time: float | None = None
 
 
 @dataclass(frozen=True)
@@ -24,6 +25,7 @@ class OBSProcessLease:
     pid: int
     executable_path: Path
     created_at: float
+    process_creation_time: float | None = None
 
 
 class OBSProcessManager:
@@ -85,7 +87,7 @@ class OBSProcessManager:
         if process is None:
             self.clear_process_lease()
             return []
-        if not self.is_managed_process(process):
+        if not self.is_owned_process(process, lease):
             self.clear_process_lease()
             return []
 
@@ -148,6 +150,21 @@ class OBSProcessManager:
         self.write_process_lease(process)
         return process
 
+    def is_owned_process(self, process: OBSProcessInfo, lease: OBSProcessLease) -> bool:
+        if process.pid != lease.pid:
+            return False
+        if not self.is_managed_process(process):
+            return False
+        try:
+            if lease.executable_path.resolve() != self.obs_exe:
+                return False
+        except Exception:
+            if str(lease.executable_path).casefold() != str(self.obs_exe).casefold():
+                return False
+        if lease.process_creation_time is None or process.creation_time is None:
+            return True
+        return abs(float(process.creation_time) - float(lease.process_creation_time)) <= 2.0
+
     def terminate_process(self, process: subprocess.Popen[Any] | None, timeout_sec: float = 3.0) -> None:
         if process is None:
             return
@@ -171,10 +188,12 @@ class OBSProcessManager:
     def write_process_lease(self, process: subprocess.Popen[Any]) -> None:
         try:
             self.obs_dir.mkdir(parents=True, exist_ok=True)
+            process_info = self._find_process_by_pid(int(process.pid))
             payload = {
                 "pid": int(process.pid),
                 "executable_path": str(self.obs_exe),
                 "created_at": time.time(),
+                "process_creation_time": process_info.creation_time if process_info else None,
             }
             with open(self.lease_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
@@ -191,6 +210,9 @@ class OBSProcessManager:
                 pid=int(data["pid"]),
                 executable_path=Path(str(data["executable_path"])).resolve(),
                 created_at=float(data.get("created_at") or 0.0),
+                process_creation_time=float(data["process_creation_time"])
+                if data.get("process_creation_time") is not None
+                else None,
             )
         except FileNotFoundError:
             return None
@@ -227,7 +249,7 @@ class OBSProcessManager:
             "where",
             "name='obs64.exe'",
             "get",
-            "ProcessId,ExecutablePath",
+            "ProcessId,ExecutablePath,CreationDate",
             "/format:csv",
         ]
         try:
@@ -243,7 +265,7 @@ class OBSProcessManager:
             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
             "$OutputEncoding = [System.Text.Encoding]::UTF8; "
             "Get-CimInstance Win32_Process -Filter \"Name='obs64.exe'\" "
-            "| Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress"
+            "| Select-Object ProcessId,ExecutablePath,CreationDate | ConvertTo-Json -Compress"
         )
         try:
             completed = subprocess.run(
@@ -271,7 +293,13 @@ class OBSProcessManager:
             except Exception:
                 continue
             exe_text = str(row.get("ExecutablePath") or "").strip()
-            result.append(OBSProcessInfo(pid=pid_int, executable_path=Path(exe_text) if exe_text else None))
+            result.append(
+                OBSProcessInfo(
+                    pid=pid_int,
+                    executable_path=Path(exe_text) if exe_text else None,
+                    creation_time=_parse_windows_process_creation_time(row.get("CreationDate")),
+                )
+            )
         return result
 
     def _parse_wmic_csv(self, text: str) -> list[OBSProcessInfo]:
@@ -285,6 +313,7 @@ class OBSProcessManager:
                 OBSProcessInfo(
                     pid=int(pid_text),
                     executable_path=Path(exe_text) if exe_text else None,
+                    creation_time=_parse_windows_process_creation_time(row.get("CreationDate")),
                 )
             )
         return result
@@ -313,3 +342,34 @@ class OBSProcessManager:
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         startupinfo.wShowWindow = 0  # SW_HIDE
         return startupinfo
+
+
+def _parse_windows_process_creation_time(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.startswith("/Date(") and text.endswith(")/"):
+        try:
+            return int(text[6:-2].split("+", 1)[0].split("-", 1)[0]) / 1000.0
+        except Exception:
+            return None
+    try:
+        return float(text)
+    except Exception:
+        pass
+    try:
+        base = text[:14]
+        offset_text = text[21:] if len(text) > 21 else ""
+        parsed = time.strptime(base, "%Y%m%d%H%M%S")
+        timestamp = time.mktime(parsed)
+        if offset_text:
+            sign = 1 if offset_text.startswith("+") else -1
+            minutes = int(offset_text[1:])
+            timestamp -= sign * minutes * 60
+            if time.localtime().tm_isdst > 0:
+                timestamp -= 3600
+        return timestamp
+    except Exception:
+        return None

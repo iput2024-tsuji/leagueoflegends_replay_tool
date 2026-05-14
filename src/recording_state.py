@@ -11,6 +11,15 @@ class RecordingEndReason(str, Enum):
     NOT_IN_GAME_CONFIRMED = "not_in_game_confirmed"
 
 
+class RecordingOutcome(str, Enum):
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+    @property
+    def completed(self) -> bool:
+        return self is RecordingOutcome.COMPLETED
+
+
 @dataclass(frozen=True)
 class RecordingEndDecision:
     should_end: bool

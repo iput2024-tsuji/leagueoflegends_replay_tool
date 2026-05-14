@@ -43,6 +43,7 @@ try:
     from .app_paths import get_app_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController
     from .player import PlayerWidget
+    from .qt_lifecycle import request_worker_stop
     from .recording_supervisor import RecordingSupervisor
 except ImportError:
     SRC_DIR = Path(__file__).resolve().parent
@@ -52,6 +53,7 @@ except ImportError:
     from app_paths import get_app_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController
     from player import PlayerWidget
+    from qt_lifecycle import request_worker_stop
     from recording_supervisor import RecordingSupervisor
 
 
@@ -589,6 +591,7 @@ class PlayerPage(QWidget):
             self.open_btn.show()
 
     def on_leave(self) -> None:
+        self.player_widget.cancel_background_tasks()
         self.player_widget.stop_playback()
 
 
@@ -679,13 +682,21 @@ class AnalyticsPage(QWidget):
     def apply_result(self, result: dict[str, Any]) -> None:
         total_matches = result.get("total_matches", 0)
         win_rate = result.get("win_rate")
+        invalid_logs = result.get("invalid_logs", []) or []
         win_rate_text = "--" if win_rate is None else f"{win_rate * 100:.1f}%"
         self.summary_label.setText(f"総録画試合数: {total_matches} / 勝率: {win_rate_text}")
 
         horde = result.get("horde", {})
         correlation = horde.get("correlation")
         corr_text = "--" if correlation is None else f"{correlation:.3f}"
-        self.status_label.setText(f"分析完了。HordeKillと勝敗の相関: {corr_text}")
+        invalid_text = f" / 無効なログ: {len(invalid_logs)}件" if invalid_logs else ""
+        self.status_label.setText(f"分析完了。HordeKillと勝敗の相関: {corr_text}{invalid_text}")
+        if invalid_logs:
+            self.status_label.setToolTip(
+                "\n".join(f"{item.get('path')}: {item.get('error')}" for item in invalid_logs[:20])
+            )
+        else:
+            self.status_label.setToolTip("")
         self.populate_horde_table(result.get("horde_rows", []))
         self.populate_tactical_insights(result.get("tactical_insights", {}))
 
@@ -1633,8 +1644,13 @@ class MainWindow(QMainWindow):
         if not worker:
             return
         if worker.isRunning():
-            worker.stop()
-            worker.wait(wait_ms)
+            stopped = request_worker_stop(worker, wait_ms, cancel_method="stop")
+            if not stopped:
+                self.home_page.set_recorder_status(
+                    "⚠️ 停止待機中",
+                    color_hex="#ffb74d",
+                    detail_text="録画監視の停止がタイムアウトしました。終了処理を継続します。",
+                )
 
     def on_bg_recorder_status(self, message: str) -> None:
         self._set_home_status_from_worker_message(message)

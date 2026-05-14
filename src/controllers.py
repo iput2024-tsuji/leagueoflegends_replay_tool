@@ -328,6 +328,7 @@ class AnalyticsController:
                 "horde": horde_result,
                 "horde_rows": [],
                 "tactical_insights": tactical_insights,
+                "invalid_logs": list(analyzer.load_errors),
             }
 
         matches = df.drop_duplicates("match_id").copy()
@@ -360,4 +361,5 @@ class AnalyticsController:
             "horde": horde_result,
             "horde_rows": horde_rows,
             "tactical_insights": tactical_insights,
+            "invalid_logs": list(analyzer.load_errors),
         }

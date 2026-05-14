@@ -30,6 +30,7 @@ class RecordingSupervisor:
         self.runtime: Any | None = None
         self.stop_event: asyncio.Event | None = None
         self.session_completed = False
+        self.session_should_finalize = False
 
     async def run(self, stop_event: asyncio.Event) -> None:
         self.stop_event = stop_event
@@ -56,18 +57,33 @@ class RecordingSupervisor:
             while not stop_event.is_set():
                 self.recorder.reset_session()
                 self.session_completed = False
+                self.session_should_finalize = False
                 started = await self.recorder.wait_for_game_start_async()
                 if not started or stop_event.is_set():
                     break
-                await self.recorder.start_recording_async()
-                if stop_event.is_set():
-                    break
-                outcome = await self.recorder.record_until_end_async()
+                try:
+                    await self.recorder.start_recording_async()
+                    if stop_event.is_set():
+                        break
+                    outcome = await self.recorder.record_until_end_async()
+                except Exception as e:
+                    if self._has_session_data():
+                        self._mark_failed_partial(e)
+                        self.session_should_finalize = True
+                        self.recorder.finalize_session(
+                            outcome=RecordingOutcome.FAILED_PARTIAL,
+                            failure_reason=e,
+                        )
+                        self.session_should_finalize = False
+                        self._emit("⚠️ 録画セッションを部分保存しました。")
+                    raise
                 if outcome != RecordingOutcome.COMPLETED:
                     self._emit("⏹️ 録画セッションを中断しました。")
                     break
                 self.session_completed = True
+                self.session_should_finalize = True
                 self.recorder.finalize_session()
+                self.session_should_finalize = False
                 self._emit("✅ 試合記録完了。次の試合を待機します。")
         finally:
             self.shutdown()
@@ -82,15 +98,16 @@ class RecordingSupervisor:
         if not self.recorder:
             return
         self.recorder.request_stop()
-        if not self.session_completed:
+        if not self.session_should_finalize:
             self.recorder.stop_recording()
         if self.runtime:
-            self.runtime.close(finalize_session=self.session_completed)
+            self.runtime.close(finalize_session=self.session_should_finalize)
         else:
-            if self.session_completed:
+            if self.session_should_finalize:
                 self.recorder.finalize_session()
             self.recorder.shutdown_obs()
         self.session_completed = False
+        self.session_should_finalize = False
         self.runtime = None
         self.recorder = None
 
@@ -110,3 +127,14 @@ class RecordingSupervisor:
     def _emit(self, message: str) -> None:
         if self.status_cb:
             self.status_cb(message)
+
+    def _has_session_data(self) -> bool:
+        has_session_data = getattr(self.recorder, "has_session_data", None)
+        if callable(has_session_data):
+            return bool(has_session_data())
+        return False
+
+    def _mark_failed_partial(self, error: BaseException) -> None:
+        marker = getattr(self.recorder, "mark_session_failed", None)
+        if callable(marker):
+            marker(error)

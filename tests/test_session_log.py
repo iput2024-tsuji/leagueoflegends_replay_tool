@@ -1,8 +1,15 @@
 import json
+import os
 
 import pytest
 
-from src.session_log import SESSION_LOG_SCHEMA_VERSION, SessionLogV1, load_session_payload, load_session_payload_result
+from src.session_log import (
+    SESSION_LOG_SCHEMA_VERSION,
+    SessionLogRepository,
+    SessionLogV1,
+    load_session_payload,
+    load_session_payload_result,
+)
 
 
 def test_session_log_payload_round_trips_with_schema_version(tmp_path):
@@ -27,6 +34,9 @@ def test_session_log_payload_round_trips_with_schema_version(tmp_path):
     payload = load_session_payload(path)
 
     assert payload["schema_version"] == SESSION_LOG_SCHEMA_VERSION
+    assert payload["session_status"] == "completed"
+    assert payload["session_phase"] is None
+    assert payload["failure_reason"] is None
     assert payload["summoner_name"] == "Tester#JP1"
     assert payload["enemy_champions"] == ["Darius", "Lux"]
     assert payload["counts"] == {"filtered": 1, "all": 1}
@@ -72,3 +82,34 @@ def test_session_log_result_reports_load_errors(tmp_path):
     assert result.payload is None
     assert result.errors
     assert str(path) == str(result.path)
+
+
+def test_session_log_repository_saves_atomically(tmp_path):
+    path = tmp_path / "session.json"
+    payload = SessionLogV1(
+        session_status="failed_partial",
+        failure_reason="OBS disconnected",
+        events_all=[{"EventID": 1}],
+    ).to_payload()
+
+    SessionLogRepository().save_payload(path, payload)
+
+    assert not path.with_name("session.json.tmp").exists()
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    assert loaded["session_status"] == "failed_partial"
+    assert loaded["failure_reason"] == "OBS disconnected"
+
+
+def test_session_log_repository_leaves_previous_file_when_replace_fails(monkeypatch, tmp_path):
+    path = tmp_path / "session.json"
+    path.write_text('{"old": true}', encoding="utf-8")
+
+    def fail_replace(src, dst):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        SessionLogRepository().save_payload(path, {"new": True})
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {"old": True}

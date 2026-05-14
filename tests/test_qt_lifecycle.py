@@ -1,4 +1,4 @@
-from src.qt_lifecycle import request_worker_stop
+from src.qt_lifecycle import WorkerRegistry, request_worker_stop
 
 
 class FakeWorker:
@@ -51,3 +51,18 @@ def test_request_worker_stop_ignores_already_stopped_worker():
     assert stopped is True
     assert worker.cancel_called == 0
     assert worker.wait_calls == []
+
+
+def test_worker_registry_stops_registered_workers():
+    registry = WorkerRegistry()
+    first = registry.register(FakeWorker(running=True, wait_result=True))
+    second = registry.register(FakeWorker(running=True, wait_result=False), cancel_method="stop")
+
+    stopped = registry.stop_all(250)
+
+    assert stopped is False
+    assert first.cancel_called == 1
+    assert second.cancel_called == 1
+    assert first.wait_calls == [250]
+    assert second.wait_calls == [250]
+    assert registry.running_workers() == [second]

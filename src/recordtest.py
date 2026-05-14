@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import subprocess
@@ -32,8 +31,8 @@ try:
         get_portable_marker_path as shared_get_portable_marker_path,
     )
     from .obs_process import OBSProcessManager
-    from .recording_state import RecordingEndDetector, RecordingOutcome
-    from .session_log import SessionLogV1, load_session_payload
+    from .recording_state import RecordingEndDetector, RecordingOutcome, RecordingPhase
+    from .session_log import SessionLogV1, load_session_payload, save_session_payload
 except ImportError:
     from app_paths import get_app_root
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
@@ -46,8 +45,8 @@ except ImportError:
         get_portable_marker_path as shared_get_portable_marker_path,
     )
     from obs_process import OBSProcessManager
-    from recording_state import RecordingEndDetector, RecordingOutcome
-    from session_log import SessionLogV1, load_session_payload
+    from recording_state import RecordingEndDetector, RecordingOutcome, RecordingPhase
+    from session_log import SessionLogV1, load_session_payload, save_session_payload
 
 ROOT_DIR = get_app_root()
 CONFIG_REPOSITORY = ConfigRepository(CONFIG_PATH, SAMPLE_CONFIG_PATH)
@@ -480,7 +479,11 @@ class RecordingSessionManager(ABC):
         pass
 
     @abstractmethod
-    def finalize_session(self) -> None:
+    def finalize_session(
+        self,
+        outcome: RecordingOutcome | None = None,
+        failure_reason: str | BaseException | None = None,
+    ) -> None:
         pass
 
     @abstractmethod
@@ -1702,8 +1705,7 @@ def build_output_path(config: AppConfig) -> Path:
 
 
 def save_payload(path: str | Path, payload: dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=4, ensure_ascii=False)
+    save_session_payload(path, payload)
 
 
 class LiveClientRiotAPIClient(RiotAPIClient):
@@ -2147,6 +2149,9 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     def reset_session(self) -> None:
         self.output_file = None
+        self.session_phase = RecordingPhase.IDLE
+        self.session_outcome = RecordingOutcome.COMPLETED
+        self.failure_reason = None
         self.sync_game_time = 0.0
         self.record_path = None
         self.recording_started = False
@@ -2175,6 +2180,12 @@ class LoLAutoRecorder(RecordingSessionManager):
             or bool(self.saved_events)
             or bool(self.all_events)
         )
+
+    def mark_session_failed(self, reason: str | BaseException | None) -> None:
+        self.session_phase = RecordingPhase.FAILED
+        self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+        if reason:
+            self.failure_reason = str(reason)
 
     def connect_obs(self) -> None:
         self.obs_client.connect()
@@ -2295,9 +2306,11 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     async def wait_for_game_start_async(self) -> bool:
         """LoLの試合開始を監視"""
+        self.session_phase = RecordingPhase.WAITING_FOR_GAME
         self.log("⚔️  LoLの試合開始を待機中 (API監視)...")
         while True:
             if self.should_stop():
+                self.session_phase = RecordingPhase.CANCELLED
                 return False
             result = await self.poll_all_game_data()
             data = result.payload
@@ -2308,16 +2321,27 @@ class LoLAutoRecorder(RecordingSessionManager):
                     self.output_file = build_output_path(self.config)
                     await self.try_update_player_name_async()
                     self.session_started = True
+                    self.session_phase = RecordingPhase.STARTING
                     return True
             if not await self.wait_with_stop_async(1.0):
+                self.session_phase = RecordingPhase.CANCELLED
                 return False
 
     async def start_recording_async(self) -> None:
         """録画開始 -> 同期マーカー"""
+        self.session_phase = RecordingPhase.STARTING
         self.log("🎥 録画を開始します...")
+        item_id = self.get_source_id()
+        if not item_id:
+            raise RecorderError(
+                f"同期用ソース '{self.config.obs.source_name}' がシーン '{self.config.obs.scene_name}' に見つかりません。\n"
+                "設定画面の「OBSにシーン/色ソースを作成」を実行してください。"
+            )
+
         try:
             self.obs_client.start_recording()
             self.recording_started = True
+            self.session_phase = RecordingPhase.RECORDING
         except OBSSDKRequestError as e:
             self.log(f"⚠️ 録画開始エラー: {e}")
             raise RecorderError(f"OBS録画開始に失敗しました: {e}") from e
@@ -2327,15 +2351,9 @@ class LoLAutoRecorder(RecordingSessionManager):
         if not await self.wait_with_stop_async(2.0):
             return
 
-        item_id = self.get_source_id()
-        if not item_id:
-            raise RecorderError(
-                f"同期用ソース '{self.config.obs.source_name}' がシーン '{self.config.obs.scene_name}' に見つかりません。\n"
-                "設定画面の「OBSにシーン/色ソースを作成」を実行してください。"
-            )
-
         event_time = await self.wait_until_game_start_event_async()
         if self.should_stop():
+            self.session_phase = RecordingPhase.CANCELLED
             return
 
         self.log("⚡ 同期シグナル送信 (Marker ON)")
@@ -2429,6 +2447,7 @@ class LoLAutoRecorder(RecordingSessionManager):
 
     async def record_until_end_async(self) -> RecordingOutcome:
         """試合終了まで待機して録画停止"""
+        self.session_phase = RecordingPhase.RECORDING
         self.log("🛡️  試合終了を監視中...")
         loop = asyncio.get_running_loop()
         end_detector = RecordingEndDetector(
@@ -2437,6 +2456,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         )
         while True:
             if self.should_stop():
+                self.session_phase = RecordingPhase.CANCELLED
                 return RecordingOutcome.CANCELLED
             result = await self.poll_all_game_data()
             data = result.payload
@@ -2444,8 +2464,10 @@ class LoLAutoRecorder(RecordingSessionManager):
                 decision = end_detector.observe_poll_status(result.status, loop.time())
                 if decision.should_end:
                     self.log("🏁 試合終了検知。録画を停止します。")
+                    self.session_phase = RecordingPhase.FINALIZING
                     return RecordingOutcome.COMPLETED
                 if not await self.wait_with_stop_async(self.config.polling.end_poll_sec):
+                    self.session_phase = RecordingPhase.CANCELLED
                     return RecordingOutcome.CANCELLED
                 continue
 
@@ -2463,9 +2485,11 @@ class LoLAutoRecorder(RecordingSessionManager):
                 if any(self.is_game_end_event(event) for event in events):
                     end_detector.observe_game_end_event()
                     self.log("🏁 GameEndイベントを検知。録画を停止します。")
+                    self.session_phase = RecordingPhase.FINALIZING
                     return RecordingOutcome.COMPLETED
 
             if not await self.wait_with_stop_async(self.config.polling.event_poll_sec):
+                self.session_phase = RecordingPhase.CANCELLED
                 return RecordingOutcome.CANCELLED
         return RecordingOutcome.COMPLETED
 
@@ -2536,6 +2560,9 @@ class LoLAutoRecorder(RecordingSessionManager):
                 record_path_for_json = str(self.record_path)
 
         session_log = SessionLogV1(
+            session_status=self.session_outcome.value,
+            session_phase=self.session_phase.value,
+            failure_reason=self.failure_reason,
             summoner_name=self.my_name,
             champion_name=self.champion_name,
             enemy_champions=list(self.enemy_champions),
@@ -2555,10 +2582,22 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.log(f"ログ保存完了: {self.output_file}")
         enforce_storage_limit(self.config, keep_paths=[self.output_file, self.record_path])
 
-    def finalize_session(self) -> None:
+    def finalize_session(
+        self,
+        outcome: RecordingOutcome | None = None,
+        failure_reason: str | BaseException | None = None,
+    ) -> None:
+        if outcome is not None:
+            self.session_outcome = outcome
+        self.session_phase = RecordingPhase.FINALIZING
+        if self.session_outcome is RecordingOutcome.FAILED_PARTIAL and failure_reason:
+            self.failure_reason = str(failure_reason)
         self.stop_recording()
         if self.has_session_data():
             self.save_json()
+        self.session_phase = (
+            RecordingPhase.COMPLETED if self.session_outcome is RecordingOutcome.COMPLETED else RecordingPhase.FAILED
+        )
 
 
 async def run_cli_recorder() -> None:
@@ -2591,8 +2630,15 @@ async def run_cli_recorder() -> None:
             started = await app.wait_for_game_start_async()
             if not started:
                 break
-            await app.start_recording_async()
-            outcome = await app.record_until_end_async()
+            try:
+                await app.start_recording_async()
+                outcome = await app.record_until_end_async()
+            except Exception as e:
+                if app.has_session_data():
+                    app.mark_session_failed(e)
+                    app.finalize_session(outcome=RecordingOutcome.FAILED_PARTIAL, failure_reason=e)
+                    LOGGER.warning("⚠️ 録画セッションを部分保存しました: %s", e)
+                raise
             if outcome != RecordingOutcome.COMPLETED:
                 LOGGER.info("⏹️ 録画セッションを中断しました。")
                 break

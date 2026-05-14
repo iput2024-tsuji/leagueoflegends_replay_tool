@@ -59,6 +59,8 @@ class FakeRecorder:
         self.stop_event = None
         self.wait_count = 0
         self.session_has_data = False
+        self.failure_reason = None
+        self.finalize_outcomes = []
 
     def set_stop_event(self, stop_event):
         self.stop_event = stop_event
@@ -94,10 +96,17 @@ class FakeRecorder:
         self.calls.append("save_json")
         self.session_has_data = False
 
-    def finalize_session(self):
+    def finalize_session(self, outcome=None, failure_reason=None):
         self.calls.append("finalize_session")
+        self.finalize_outcomes.append(outcome)
+        if failure_reason:
+            self.failure_reason = str(failure_reason)
         if self.session_has_data:
             self.save_json()
+
+    def mark_session_failed(self, reason):
+        self.calls.append("mark_session_failed")
+        self.failure_reason = str(reason)
 
     def request_stop(self):
         self.calls.append("request_stop")
@@ -187,5 +196,32 @@ def test_recording_supervisor_does_not_finalize_cancelled_session():
 
     assert "⏹️ 録画セッションを中断しました。" in statuses
     assert "save_json" not in recorder.calls
+    assert recorder.calls[-3:] == ["request_stop", "stop_recording", "runtime_close"]
+    assert recording_controller.runtime.close_calls == [False]
+
+
+def test_recording_supervisor_saves_partial_session_when_recording_fails():
+    class FailingRecorder(FakeRecorder):
+        async def record_until_end_async(self):
+            self.calls.append("record_until_end_async")
+            raise RuntimeError("sync marker failed")
+
+    statuses = []
+    recorder = FailingRecorder()
+    recording_controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+        status_cb=statuses.append,
+    )
+
+    with pytest.raises(RuntimeError, match="sync marker failed"):
+        run(run_supervisor(supervisor))
+
+    assert "⚠️ 録画セッションを部分保存しました。" in statuses
+    assert "mark_session_failed" in recorder.calls
+    assert "save_json" in recorder.calls
+    assert recorder.finalize_outcomes == [RecordingOutcome.FAILED_PARTIAL]
+    assert recorder.failure_reason == "sync marker failed"
     assert recorder.calls[-3:] == ["request_stop", "stop_recording", "runtime_close"]
     assert recording_controller.runtime.close_calls == [False]

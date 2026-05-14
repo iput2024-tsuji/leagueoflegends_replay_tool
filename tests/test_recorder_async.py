@@ -194,6 +194,28 @@ def test_start_recording_failure_raises_and_does_not_create_session_data():
     assert recorder.has_session_data() is False
 
 
+def test_start_recording_validates_sync_source_before_obs_recording():
+    tmp_path = runtime_dir("recording_sync_source_missing")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
+    obs_client.get_sync_source_id.return_value = None
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=obs_client,
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.session_started = True
+
+    with pytest.raises(recordtest.RecorderError, match="同期用ソース"):
+        run(recorder.start_recording_async())
+
+    obs_client.start_recording.assert_not_called()
+    assert recorder.recording_started is False
+    assert recorder.has_session_data() is False
+
+
 def test_record_until_end_does_not_stop_on_missing_api_count_before_grace():
     tmp_path = runtime_dir("missing_api_grace")
     config = config_for(tmp_path)
@@ -350,4 +372,32 @@ def test_save_json_is_idempotent(monkeypatch):
 
     assert len(saved_payloads) == 1
     assert saved_payloads[0][1]["schema_version"] == 1
+    assert saved_payloads[0][1]["session_status"] == "completed"
     assert recorder.has_session_data() is False
+
+
+def test_finalize_failed_partial_session_marks_json_status(monkeypatch):
+    tmp_path = runtime_dir("failed_partial_status")
+    config = config_for(tmp_path)
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.output_file = tmp_path / "json" / "session.json"
+    recorder.recording_started = True
+    recorder.all_events = [{"EventID": 1, "EventName": "GameStart", "EventTime": 0.0}]
+    saved_payloads = []
+    monkeypatch.setattr(recordtest, "save_payload", lambda path, payload: saved_payloads.append((path, payload)))
+    monkeypatch.setattr(recordtest, "enforce_storage_limit", lambda *args, **kwargs: None)
+
+    recorder.finalize_session(
+        outcome=recordtest.RecordingOutcome.FAILED_PARTIAL,
+        failure_reason=RuntimeError("OBS disconnected"),
+    )
+
+    assert len(saved_payloads) == 1
+    assert saved_payloads[0][1]["session_status"] == "failed_partial"
+    assert saved_payloads[0][1]["session_phase"] == "finalizing"
+    assert saved_payloads[0][1]["failure_reason"] == "OBS disconnected"

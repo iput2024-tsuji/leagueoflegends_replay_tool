@@ -43,7 +43,7 @@ try:
     from .app_paths import get_app_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController
     from .player import PlayerWidget
-    from .qt_lifecycle import request_worker_stop
+    from .qt_lifecycle import WorkerRegistry, request_worker_stop
     from .recording_supervisor import RecordingSupervisor
 except ImportError:
     SRC_DIR = Path(__file__).resolve().parent
@@ -53,7 +53,7 @@ except ImportError:
     from app_paths import get_app_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController
     from player import PlayerWidget
-    from qt_lifecycle import request_worker_stop
+    from qt_lifecycle import WorkerRegistry, request_worker_stop
     from recording_supervisor import RecordingSupervisor
 
 
@@ -599,6 +599,7 @@ class AnalyticsPage(QWidget):
     def __init__(self, on_back: Callable[[], None]) -> None:
         super().__init__()
         self.worker = None
+        self.worker_registry = WorkerRegistry()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -673,7 +674,7 @@ class AnalyticsPage(QWidget):
         self.horde_table.setRowCount(0)
         self.insight_label.setText("戦術インサイトを分析中...")
 
-        self.worker = AnalyticsWorker()
+        self.worker = self.worker_registry.register(AnalyticsWorker())
         self.worker.loaded.connect(self.apply_result)
         self.worker.error.connect(self.apply_error)
         self.worker.finished.connect(self.on_worker_finished)
@@ -708,6 +709,16 @@ class AnalyticsPage(QWidget):
 
     def on_worker_finished(self) -> None:
         self.refresh_btn.setEnabled(True)
+        self.worker_registry.unregister(self.worker)
+        if self.worker:
+            self.worker.deleteLater()
+            self.worker = None
+
+    def stop_workers(self, timeout_ms: int = 1000) -> bool:
+        stopped = self.worker_registry.stop_all(timeout_ms)
+        if stopped:
+            self.worker = None
+        return stopped
 
     def populate_horde_table(self, rows: list[dict[str, Any]]) -> None:
         self.horde_table.setRowCount(len(rows))
@@ -783,6 +794,7 @@ class SettingsPage(QWidget):
         self._audio_apply_timer = QTimer(self)
         self._audio_apply_timer.setSingleShot(True)
         self._audio_apply_timer.timeout.connect(self._apply_audio_settings_auto)
+        self.worker_registry = WorkerRegistry()
 
         back_btn = QPushButton("← 戻る")
         back_btn.clicked.connect(on_back)
@@ -1237,7 +1249,7 @@ class SettingsPage(QWidget):
         self.audio_status_label.setText("音声デバイス一覧を読み込み中...")
         self._set_audio_controls_enabled(False)
 
-        worker = AudioDeviceRefreshWorker(data, auto_launch=auto_launch)
+        worker = self.worker_registry.register(AudioDeviceRefreshWorker(data, auto_launch=auto_launch))
         self._audio_refresh_worker = worker
         worker.loaded.connect(self._on_audio_devices_loaded)
         worker.failed.connect(self._on_audio_devices_failed)
@@ -1292,7 +1304,7 @@ class SettingsPage(QWidget):
         self._audio_apply_show_success = show_success
         self._audio_apply_show_error = show_error
         self.audio_status_label.setText("音声設定をOBSへ反映中...")
-        worker = AudioApplyWorker(data, auto_launch=auto_launch)
+        worker = self.worker_registry.register(AudioApplyWorker(data, auto_launch=auto_launch))
         self._audio_apply_worker = worker
         worker.loaded.connect(self._on_audio_settings_applied)
         worker.failed.connect(self._on_audio_settings_apply_failed)
@@ -1330,7 +1342,7 @@ class SettingsPage(QWidget):
             if show_error:
                 QMessageBox.warning(self, "設定反映", f"録画設定の反映準備に失敗しました。\n{e}")
             return False
-        worker = RuntimeOutputApplyWorker(data)
+        worker = self.worker_registry.register(RuntimeOutputApplyWorker(data))
         self._runtime_output_worker = worker
         worker.failed.connect(
             lambda message: (
@@ -1368,7 +1380,7 @@ class SettingsPage(QWidget):
         data = load_config()
         self.preflight_btn.setEnabled(False)
         self.preflight_btn.setText("チェック実行中...")
-        worker = PreflightWorker(data)
+        worker = self.worker_registry.register(PreflightWorker(data))
         self._preflight_worker = worker
         worker.loaded.connect(self._on_preflight_finished)
         worker.failed.connect(self._on_preflight_failed)
@@ -1411,7 +1423,7 @@ class SettingsPage(QWidget):
         data = load_config()
         self.quick_fix_btn.setEnabled(False)
         self.quick_fix_btn.setText("修復中...")
-        worker = QuickSetupWorker(data)
+        worker = self.worker_registry.register(QuickSetupWorker(data))
         self._quick_setup_worker = worker
         worker.loaded.connect(self._on_quick_setup_finished)
         worker.failed.connect(self._on_quick_setup_failed)
@@ -1453,11 +1465,23 @@ class SettingsPage(QWidget):
             self._quick_setup_worker.deleteLater()
             self._quick_setup_worker = None
 
+    def stop_workers(self, timeout_ms: int = 1500) -> bool:
+        self._audio_apply_timer.stop()
+        stopped = self.worker_registry.stop_all(timeout_ms)
+        if stopped:
+            self._audio_refresh_worker = None
+            self._audio_apply_worker = None
+            self._runtime_output_worker = None
+            self._preflight_worker = None
+            self._quick_setup_worker = None
+        return stopped
+
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.bg_recorder_worker = None
+        self.worker_registry = WorkerRegistry()
         self._closing = False
         self._is_quitting = False
         self._tray_icon = None
@@ -1630,7 +1654,7 @@ class MainWindow(QMainWindow):
         if self.bg_recorder_worker and self.bg_recorder_worker.isRunning():
             return
 
-        self.bg_recorder_worker = RecorderWorker()
+        self.bg_recorder_worker = self.worker_registry.register(RecorderWorker(), cancel_method="stop")
         self.bg_recorder_worker.status.connect(self.on_bg_recorder_status)
         self.bg_recorder_worker.error.connect(self.on_bg_recorder_error)
         self.bg_recorder_worker.finished.connect(self.on_bg_recorder_finished)
@@ -1639,18 +1663,25 @@ class MainWindow(QMainWindow):
         )
         self.bg_recorder_worker.start()
 
-    def stop_background_recorder(self, wait_ms: int = 5000) -> None:
+    def stop_background_recorder(self, wait_ms: int = 5000) -> bool:
         worker = self.bg_recorder_worker
         if not worker:
-            return
-        if worker.isRunning():
-            stopped = request_worker_stop(worker, wait_ms, cancel_method="stop")
-            if not stopped:
-                self.home_page.set_recorder_status(
-                    "⚠️ 停止待機中",
-                    color_hex="#ffb74d",
-                    detail_text="録画監視の停止がタイムアウトしました。終了処理を継続します。",
-                )
+            return True
+        if not worker.isRunning():
+            self.worker_registry.unregister(worker)
+            self.bg_recorder_worker = None
+            return True
+        stopped = request_worker_stop(worker, wait_ms, cancel_method="stop")
+        if not stopped:
+            self.home_page.set_recorder_status(
+                "⚠️ 停止待機中",
+                color_hex="#ffb74d",
+                detail_text="録画監視の停止がタイムアウトしました。停止完了まで終了を待機します。",
+            )
+            return False
+        self.worker_registry.unregister(worker)
+        self.bg_recorder_worker = None
+        return True
 
     def on_bg_recorder_status(self, message: str) -> None:
         self._set_home_status_from_worker_message(message)
@@ -1671,6 +1702,9 @@ class MainWindow(QMainWindow):
             color_hex="#cfcfcf",
             detail_text="バックグラウンド録画監視が停止しました。",
         )
+        if self.bg_recorder_worker:
+            self.worker_registry.unregister(self.bg_recorder_worker)
+            self.bg_recorder_worker = None
 
     def closeEvent(self, event: Any) -> None:
         if (not self._is_quitting) and self.should_minimize_to_tray():
@@ -1695,7 +1729,20 @@ class MainWindow(QMainWindow):
             self.player_page.on_leave()
         except Exception:
             pass
-        self.stop_background_recorder(wait_ms=6000)
+        workers_stopped = True
+        workers_stopped = self.analytics_page.stop_workers(timeout_ms=1500) and workers_stopped
+        workers_stopped = self.settings_page.stop_workers(timeout_ms=2000) and workers_stopped
+        workers_stopped = self.stop_background_recorder(wait_ms=6000) and workers_stopped
+        workers_stopped = self.worker_registry.stop_all(timeout_ms=1000) and workers_stopped
+        if not workers_stopped:
+            self.home_page.set_recorder_status(
+                "⚠️ 停止待機中",
+                color_hex="#ffb74d",
+                detail_text="一部のバックグラウンド処理が停止完了していません。",
+            )
+            event.ignore()
+            QTimer.singleShot(1000, self.close)
+            return
         if self._tray_icon:
             try:
                 self._tray_icon.hide()

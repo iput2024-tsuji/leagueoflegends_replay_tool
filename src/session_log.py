@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,9 @@ class SessionLogLoadResult:
 
 @dataclass(frozen=True)
 class SessionLogV1:
+    session_status: str = "completed"
+    session_phase: str | None = None
+    failure_reason: str | None = None
     summoner_name: str | None = None
     champion_name: str | None = None
     enemy_champions: list[str] = field(default_factory=list)
@@ -45,6 +49,9 @@ class SessionLogV1:
 
         paths = payload.get("paths") if isinstance(payload.get("paths"), dict) else {}
         return cls(
+            session_status=_optional_str(payload.get("session_status")) or "completed",
+            session_phase=_optional_str(payload.get("session_phase")),
+            failure_reason=_optional_str(payload.get("failure_reason")),
             summoner_name=_optional_str(payload.get("summoner_name")),
             champion_name=_optional_str(payload.get("champion_name")),
             enemy_champions=_string_list(payload.get("enemy_champions")),
@@ -63,6 +70,9 @@ class SessionLogV1:
     def to_payload(self) -> dict[str, Any]:
         return {
             "schema_version": SESSION_LOG_SCHEMA_VERSION,
+            "session_status": self.session_status,
+            "session_phase": self.session_phase,
+            "failure_reason": self.failure_reason,
             "summoner_name": self.summoner_name,
             "champion_name": self.champion_name,
             "enemy_champions": list(self.enemy_champions),
@@ -89,6 +99,24 @@ def load_session_payload(path: str | Path) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
     return SessionLogV1.from_payload(payload).to_payload()
+
+
+class SessionLogRepository:
+    """Session JSON を途中破損しないよう atomic に保存する。"""
+
+    def save_payload(self, path: str | Path, payload: dict[str, Any]) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_name(f"{target.name}.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, target)
+
+
+def save_session_payload(path: str | Path, payload: dict[str, Any]) -> None:
+    SessionLogRepository().save_payload(path, payload)
 
 
 def load_session_payload_result(path: str | Path) -> SessionLogLoadResult:

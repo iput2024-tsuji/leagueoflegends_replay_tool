@@ -854,6 +854,9 @@ class ReplaySelectDialog(QDialog):
 
 
 class PlayerWidget(QWidget):
+    mpv_time_pos_changed = pyqtSignal(float)
+    mpv_duration_changed = pyqtSignal(float)
+
     def __init__(self, auto_open: bool = True, fullscreen_cb: Callable[[bool], None] | None = None) -> None:
         super().__init__()
         self.fullscreen_cb = fullscreen_cb
@@ -871,6 +874,10 @@ class PlayerWidget(QWidget):
         self.clip_start = None
         self.clip_end = None
         self.clip_worker = None
+        self.worker = None
+        self._sync_generation = 0
+        self.mpv_time_pos_changed.connect(self.apply_time_update)
+        self.mpv_duration_changed.connect(self.apply_duration_update)
 
         self.load_settings()
 
@@ -1042,8 +1049,8 @@ class PlayerWidget(QWidget):
                 vo="gpu",
                 gpu_context="d3d11",
             )
-            self.player.observe_property("time-pos", self.on_time_update)
-            self.player.observe_property("duration", self.on_duration_update)
+            self.player.observe_property("time-pos", self.on_mpv_time_update)
+            self.player.observe_property("duration", self.on_mpv_duration_update)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"MPV Init Failed: {e}")
             sys.exit(1)
@@ -1225,19 +1232,30 @@ class PlayerWidget(QWidget):
 
     def start_sync_worker(self) -> None:
         self.cancel_sync_worker()
+        self._sync_generation += 1
+        generation = self._sync_generation
         self.worker = SyncWorker(self.current_video_path, max_seconds=180)
-        self.worker.progress.connect(lambda s: self.info_label.setText(s))
-        self.worker.finished.connect(self.on_sync_finished)
+        self.worker.progress.connect(lambda s, gen=generation: self.on_sync_progress(gen, s))
+        self.worker.finished.connect(lambda found_time, gen=generation: self.on_sync_finished(gen, found_time))
         self.worker.start()
 
     def cancel_sync_worker(self, timeout_ms: int = 1000) -> bool:
+        self._sync_generation += 1
         worker = getattr(self, "worker", None)
         stopped = request_worker_stop(worker, timeout_ms, cancel_method="cancel")
         if stopped:
             self.worker = None
         return stopped
 
-    def on_sync_finished(self, found_time: float) -> None:
+    def on_sync_progress(self, generation: int, message: str) -> None:
+        if generation != self._sync_generation:
+            return
+        self.info_label.setText(message)
+
+    def on_sync_finished(self, generation: int, found_time: float) -> None:
+        if generation != self._sync_generation:
+            return
+        self.worker = None
         if found_time < 0:
             self.info_label.setText("⚠️ No Marker Found\nOffset: 0s")
             self.offset = 0
@@ -1548,9 +1566,15 @@ class PlayerWidget(QWidget):
         self.player.seek(target, reference="absolute", precision="exact")
         self.play_btn.setText("Play")
 
-    def on_time_update(self, name: str, time_pos: float | None) -> None:
+    def on_mpv_time_update(self, name: str, time_pos: float | None) -> None:
         if time_pos is None:
             return
+        try:
+            self.mpv_time_pos_changed.emit(float(time_pos))
+        except Exception:
+            pass
+
+    def apply_time_update(self, time_pos: float) -> None:
         if not self.is_slider_pressed and self.duration > 0:
             val = int((time_pos / self.duration) * 1000)
             self.slider.setValue(val)
@@ -1559,7 +1583,14 @@ class PlayerWidget(QWidget):
         dm, ds = divmod(int(self.duration), 60)
         self.time_label.setText(f"{cm:02d}:{cs:02d} / {dm:02d}:{ds:02d}")
 
-    def on_duration_update(self, name: str, duration: float | None) -> None:
+    def on_mpv_duration_update(self, name: str, duration: float | None) -> None:
+        if duration:
+            try:
+                self.mpv_duration_changed.emit(float(duration))
+            except Exception:
+                pass
+
+    def apply_duration_update(self, duration: float) -> None:
         if duration:
             self.duration = duration
 

@@ -22,6 +22,13 @@ TRAY_SETTINGS = {
     "SysTrayMinimizeToTray": "false",
 }
 TRAY_SETTINGS_SECTION = "BasicWindow"
+STARTUP_SETTINGS = {
+    # OBS shows the Auto-Configuration Wizard when FirstRun is false and
+    # LastVersion has not been written yet. Portable builds can hit that path
+    # on a fresh bootstrap unless we explicitly mark the profile initialized.
+    "FirstRun": "true",
+}
+STARTUP_SETTINGS_SECTION = "General"
 
 
 @dataclass(frozen=True)
@@ -34,6 +41,7 @@ class BootstrapReport:
     global_ini_exists: bool
     global_ini_parse_error: str | None = None
     missing_tray_settings: tuple[str, ...] = field(default_factory=tuple)
+    missing_startup_settings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def ready(self) -> bool:
@@ -44,6 +52,7 @@ class BootstrapReport:
             and self.global_ini_exists
             and self.global_ini_parse_error is None
             and not self.missing_tray_settings
+            and not self.missing_startup_settings
         )
 
     @property
@@ -92,6 +101,40 @@ def read_obs_ini_parser(path: Path) -> tuple[configparser.ConfigParser, bool]:
     return parser, had_bom
 
 
+def missing_ini_settings(
+    parser: configparser.ConfigParser,
+    section: str,
+    settings: dict[str, str],
+) -> list[str]:
+    if not parser.has_section(section):
+        return [f"{section}.{key}" for key in settings]
+
+    missing = []
+    for key, value in settings.items():
+        current = parser.get(section, key, fallback=None)
+        if current is None or str(current).strip().lower() != value:
+            missing.append(f"{section}.{key}")
+    return missing
+
+
+def apply_ini_settings(
+    parser: configparser.ConfigParser,
+    section: str,
+    settings: dict[str, str],
+) -> bool:
+    changed = False
+    if not parser.has_section(section):
+        parser.add_section(section)
+        changed = True
+
+    for key, value in settings.items():
+        current = parser.get(section, key, fallback=None)
+        if current is None or str(current).strip().lower() != value:
+            parser.set(section, key, value)
+            changed = True
+    return changed
+
+
 class OBSBootstrapper:
     """ポータブルOBSの検査と修復を分離して扱う。"""
 
@@ -112,24 +155,21 @@ class OBSBootstrapper:
     def check(self) -> BootstrapReport:
         global_ini = get_obs_global_ini_path(self.base_dir)
         parse_error = None
-        missing = []
+        missing_tray = []
+        missing_startup = []
         if global_ini.exists():
             try:
                 parser, had_bom = read_obs_ini_parser(global_ini)
                 if had_bom:
-                    missing.append("encoding.BOM")
-                if not parser.has_section(TRAY_SETTINGS_SECTION):
-                    missing.extend(f"{TRAY_SETTINGS_SECTION}.{key}" for key in TRAY_SETTINGS)
-                else:
-                    for key, value in TRAY_SETTINGS.items():
-                        if parser.get(TRAY_SETTINGS_SECTION, key, fallback=None) != value:
-                            missing.append(f"{TRAY_SETTINGS_SECTION}.{key}")
-                    for section in parser.sections():
-                        for key in parser.options(section):
-                            lower_key = key.lower()
-                            allowed = section == TRAY_SETTINGS_SECTION and key in TRAY_SETTINGS
-                            if ("systray" in lower_key or "hidetray" in lower_key) and not allowed:
-                                missing.append(f"{section}.{key}")
+                    missing_tray.append("encoding.BOM")
+                missing_startup.extend(missing_ini_settings(parser, STARTUP_SETTINGS_SECTION, STARTUP_SETTINGS))
+                missing_tray.extend(missing_ini_settings(parser, TRAY_SETTINGS_SECTION, TRAY_SETTINGS))
+                for section in parser.sections():
+                    for key in parser.options(section):
+                        lower_key = key.lower()
+                        allowed = section == TRAY_SETTINGS_SECTION and key in TRAY_SETTINGS
+                        if ("systray" in lower_key or "hidetray" in lower_key) and not allowed:
+                            missing_tray.append(f"{section}.{key}")
             except Exception as e:
                 parse_error = f"{type(e).__name__}: {e}"
 
@@ -141,7 +181,8 @@ class OBSBootstrapper:
             config_dir_exists=get_obs_config_dir(self.base_dir).exists(),
             global_ini_exists=global_ini.exists(),
             global_ini_parse_error=parse_error,
-            missing_tray_settings=tuple(missing),
+            missing_tray_settings=tuple(missing_tray),
+            missing_startup_settings=tuple(missing_startup),
         )
 
     def apply(self, port: int | None = None, password: str = "") -> dict[str, Any]:
@@ -209,15 +250,8 @@ class OBSBootstrapper:
                     parser.remove_option(section, key)
                     changed = True
 
-        if not parser.has_section(TRAY_SETTINGS_SECTION):
-            parser.add_section(TRAY_SETTINGS_SECTION)
-            changed = True
-
-        for key, value in TRAY_SETTINGS.items():
-            current = parser.get(TRAY_SETTINGS_SECTION, key, fallback=None)
-            if current is None or str(current).strip().lower() != value:
-                parser.set(TRAY_SETTINGS_SECTION, key, value)
-                changed = True
+        changed = apply_ini_settings(parser, STARTUP_SETTINGS_SECTION, STARTUP_SETTINGS) or changed
+        changed = apply_ini_settings(parser, TRAY_SETTINGS_SECTION, TRAY_SETTINGS) or changed
 
         if changed or not ini_path.exists():
             with open(ini_path, "w", encoding="utf-8") as f:

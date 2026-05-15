@@ -258,6 +258,8 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
     assert global_ini.exists()
 
     text = global_ini.read_text(encoding="utf-8")
+    assert "[General]" in text
+    assert "FirstRun=true" in text
     assert "[BasicWindow]" in text
     assert "SysTrayEnabled=false" in text
     assert "SysTrayWhenStarted=false" in text
@@ -271,7 +273,7 @@ def test_global_ini_removes_bom_and_nonstandard_tray_keys(monkeypatch):
     ini_path = obs_dir / "config" / "obs-studio" / "global.ini"
     ini_path.parent.mkdir(parents=True, exist_ok=True)
     ini_path.write_text(
-        "\ufeff[General]\nSysTrayEnabled=true\n\n"
+        "\ufeff[General]\nFirstRun=false\nSysTrayEnabled=true\n\n"
         "[BasicWindow]\n"
         "SysTrayEnabled=true\n"
         "SysTrayWhenStarted=false\n"
@@ -288,6 +290,8 @@ def test_global_ini_removes_bom_and_nonstandard_tray_keys(monkeypatch):
     raw = ini_path.read_bytes()
     assert not raw.startswith(b"\xef\xbb\xbf")
     text = raw.decode("utf-8")
+    assert "[General]" in text
+    assert "FirstRun=true" in text
     assert "[BasicWindow]" in text
     assert "SysTrayEnabled=false" in text
     assert "SysTrayWhenStarted=false" in text
@@ -318,6 +322,7 @@ def test_global_ini_parse_error_deletes_and_regenerates_before_patch(monkeypatch
     assert "Existing=true" in text
     assert "[Other]" in text
     assert "Keep=true" in text
+    assert "FirstRun=true" in text
     assert "SysTrayEnabled=false" in text
     assert "SysTrayWhenStarted=false" in text
     assert "SysTrayMinimizeToTray=false" in text

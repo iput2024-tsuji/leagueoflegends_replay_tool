@@ -39,6 +39,15 @@ class WorkerRegistry:
                 stopped = False
         return stopped
 
+    def force_stop_all(self, timeout_ms: int) -> bool:
+        stopped = True
+        for handle in list(self._handles.values()):
+            if force_worker_stop(handle.worker, timeout_ms, cancel_method=handle.cancel_method):
+                self.unregister(handle.worker)
+            else:
+                stopped = False
+        return stopped
+
     def running_workers(self) -> list[Any]:
         return [handle.worker for handle in self._handles.values() if _is_running(handle.worker)]
 
@@ -59,6 +68,20 @@ def request_worker_stop(worker: Any, timeout_ms: int, cancel_method: str = "canc
     result = wait(max(0, int(timeout_ms)))
     if isinstance(result, bool):
         return result
+    return not _is_running(worker)
+
+
+def force_worker_stop(worker: Any, timeout_ms: int, cancel_method: str = "cancel") -> bool:
+    if request_worker_stop(worker, timeout_ms, cancel_method=cancel_method):
+        return True
+    terminate = getattr(worker, "terminate", None)
+    if callable(terminate):
+        terminate()
+    wait = getattr(worker, "wait", None)
+    if callable(wait):
+        result = wait(max(0, int(timeout_ms)))
+        if isinstance(result, bool) and result:
+            return result
     return not _is_running(worker)
 
 

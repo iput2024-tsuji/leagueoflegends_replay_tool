@@ -61,6 +61,7 @@ class FakeRecorder:
         self.session_has_data = False
         self.failure_reason = None
         self.finalize_outcomes = []
+        self.session_finalized = False
 
     def set_stop_event(self, stop_event):
         self.stop_event = stop_event
@@ -72,6 +73,7 @@ class FakeRecorder:
     def reset_session(self):
         self.calls.append("reset_session")
         self.session_has_data = False
+        self.session_finalized = False
 
     async def wait_for_game_start_async(self):
         self.calls.append("wait_for_game_start_async")
@@ -95,6 +97,7 @@ class FakeRecorder:
     def save_json(self):
         self.calls.append("save_json")
         self.session_has_data = False
+        self.session_finalized = True
 
     def finalize_session(self, outcome=None, failure_reason=None):
         self.calls.append("finalize_session")
@@ -103,9 +106,14 @@ class FakeRecorder:
             self.failure_reason = str(failure_reason)
         if self.session_has_data:
             self.save_json()
+        return SimpleNamespace(success=True, error=None)
 
     def mark_session_failed(self, reason):
         self.calls.append("mark_session_failed")
+        self.failure_reason = str(reason)
+
+    def mark_session_aborted(self, reason):
+        self.calls.append("mark_session_aborted")
         self.failure_reason = str(reason)
 
     def request_stop(self):
@@ -194,9 +202,11 @@ def test_recording_supervisor_does_not_finalize_cancelled_session():
 
     run(run_supervisor(supervisor))
 
-    assert "⏹️ 録画セッションを中断しました。" in statuses
-    assert "save_json" not in recorder.calls
-    assert recorder.calls[-3:] == ["request_stop", "stop_recording", "runtime_close"]
+    assert "⏹️ 録画セッションを中断ログとして保存しました。" in statuses
+    assert "save_json" in recorder.calls
+    assert recorder.finalize_outcomes == [RecordingOutcome.ABORTED]
+    assert recorder.failure_reason == "recording was cancelled"
+    assert recorder.calls[-2:] == ["request_stop", "runtime_close"]
     assert recording_controller.runtime.close_calls == [False]
 
 
@@ -223,5 +233,29 @@ def test_recording_supervisor_saves_partial_session_when_recording_fails():
     assert "save_json" in recorder.calls
     assert recorder.finalize_outcomes == [RecordingOutcome.FAILED_PARTIAL]
     assert recorder.failure_reason == "sync marker failed"
+    assert recorder.calls[-2:] == ["request_stop", "runtime_close"]
+    assert recording_controller.runtime.close_calls == [False]
+
+
+def test_recording_supervisor_does_not_finalize_twice_when_save_fails():
+    class SaveFailingRecorder(FakeRecorder):
+        def finalize_session(self, outcome=None, failure_reason=None):
+            self.calls.append("finalize_session")
+            self.finalize_outcomes.append(outcome)
+            return SimpleNamespace(success=False, error="disk full")
+
+    statuses = []
+    recorder = SaveFailingRecorder()
+    recording_controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+        status_cb=statuses.append,
+    )
+
+    run(run_supervisor(supervisor))
+
+    assert "⚠️ セッション保存に失敗しました: disk full" in statuses
+    assert recorder.calls.count("finalize_session") == 1
     assert recorder.calls[-3:] == ["request_stop", "stop_recording", "runtime_close"]
     assert recording_controller.runtime.close_calls == [False]

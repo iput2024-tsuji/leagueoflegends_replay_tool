@@ -399,5 +399,55 @@ def test_finalize_failed_partial_session_marks_json_status(monkeypatch):
 
     assert len(saved_payloads) == 1
     assert saved_payloads[0][1]["session_status"] == "failed_partial"
-    assert saved_payloads[0][1]["session_phase"] == "finalizing"
+    assert saved_payloads[0][1]["session_phase"] == "failed"
     assert saved_payloads[0][1]["failure_reason"] == "OBS disconnected"
+
+
+def test_finalize_aborted_session_marks_json_status(monkeypatch):
+    tmp_path = runtime_dir("aborted_status")
+    config = config_for(tmp_path)
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.output_file = tmp_path / "json" / "session.json"
+    recorder.recording_started = True
+    saved_payloads = []
+    monkeypatch.setattr(recordtest, "save_payload", lambda path, payload: saved_payloads.append((path, payload)))
+    monkeypatch.setattr(recordtest, "enforce_storage_limit", lambda *args, **kwargs: None)
+
+    result = recorder.finalize_session(
+        outcome=recordtest.RecordingOutcome.ABORTED,
+        failure_reason="user stopped recording",
+    )
+
+    assert result.success is True
+    assert saved_payloads[0][1]["session_status"] == "aborted"
+    assert saved_payloads[0][1]["session_phase"] == "aborted"
+    assert saved_payloads[0][1]["failure_reason"] == "user stopped recording"
+
+
+def test_finalize_writes_pending_session_when_atomic_save_fails(monkeypatch):
+    tmp_path = runtime_dir("pending_after_save_failure")
+    config = config_for(tmp_path)
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.output_file = tmp_path / "json" / "session.json"
+    recorder.recording_started = True
+    recorder.all_events = [{"EventID": 1, "EventName": "GameStart", "EventTime": 0.0}]
+    monkeypatch.setattr(recordtest, "save_payload", Mock(side_effect=OSError("disk full")))
+    monkeypatch.setattr(recordtest, "enforce_storage_limit", lambda *args, **kwargs: None)
+
+    result = recorder.finalize_session(outcome=recordtest.RecordingOutcome.COMPLETED)
+
+    assert result.success is False
+    assert "disk full" in result.error
+    assert result.pending_path
+    assert Path(result.pending_path).exists()
+    assert "finalize_error" in Path(result.pending_path).read_text(encoding="utf-8")

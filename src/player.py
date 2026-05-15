@@ -271,6 +271,26 @@ def ensure_mpv_available_or_exit(parent: QWidget | None = None) -> Any:
     show_mpv_missing_dialog_and_exit(parent)
 
 
+class PlayerRuntimeError(RuntimeError):
+    """Raised when a replay player backend cannot be created."""
+
+
+class PlayerRuntime:
+    def create_player(self, window_id: int | str) -> Any:
+        mpv_runtime = bootstrap_mpv_runtime()
+        if mpv_runtime is None:
+            raise PlayerRuntimeError(build_mpv_error_message())
+
+        return mpv_runtime.MPV(
+            wid=str(int(window_id)),
+            input_default_bindings=False,
+            input_vo_keyboard=False,
+            keepaspect=True,
+            vo="gpu",
+            gpu_context="d3d11",
+        )
+
+
 class SyncWorker(QThread):
     """バックグラウンドで同期マーカーを探すスレッド"""
 
@@ -875,6 +895,9 @@ class PlayerWidget(QWidget):
         self.clip_end = None
         self.clip_worker = None
         self.worker = None
+        self.player = None
+        self.player_runtime = PlayerRuntime()
+        self._mpv_error_message = None
         self._sync_generation = 0
         self.mpv_time_pos_changed.connect(self.apply_time_update)
         self.mpv_duration_changed.connect(self.apply_duration_update)
@@ -1035,25 +1058,23 @@ class PlayerWidget(QWidget):
         self.register_shortcuts()
 
         # リプレイ選択ダイアログ
-        if auto_open:
+        if auto_open and self.player is not None:
             self.open_replay_selector()
 
-    def init_mpv(self) -> None:
+    def init_mpv(self) -> bool:
         try:
-            mpv_runtime = ensure_mpv_available_or_exit(self)
-            self.player = mpv_runtime.MPV(
-                wid=str(int(self.video_frame.winId())),
-                input_default_bindings=False,
-                input_vo_keyboard=False,
-                keepaspect=True,
-                vo="gpu",
-                gpu_context="d3d11",
-            )
+            self.player = self.player_runtime.create_player(self.video_frame.winId())
             self.player.observe_property("time-pos", self.on_mpv_time_update)
             self.player.observe_property("duration", self.on_mpv_duration_update)
+            self._mpv_error_message = None
+            return True
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"MPV Init Failed: {e}")
-            sys.exit(1)
+            self.player = None
+            self._mpv_error_message = str(e)
+            self.info_label.setText("MPVを初期化できません。")
+            self.info_label.setToolTip(str(e))
+            QMessageBox.warning(self, "MPV Init Failed", str(e))
+            return False
 
     def load_settings(self) -> None:
         global ICON_DIR, ICON_INDEX, ICON_ALIASES, ALIASES_PATH
@@ -1192,6 +1213,13 @@ class PlayerWidget(QWidget):
         return False
 
     def load_data(self, json_path: str | Path) -> bool:
+        if self.player is None:
+            message = self._mpv_error_message or "MPVを初期化できません。binフォルダのDLLを確認してください。"
+            self.info_label.setText("MPVを初期化できません。")
+            self.info_label.setToolTip(message)
+            QMessageBox.warning(self, "MPV Init Failed", message)
+            return False
+
         json_path = Path(json_path)
         try:
             data = load_session_payload(json_path)
@@ -1264,6 +1292,8 @@ class PlayerWidget(QWidget):
             self.info_label.setText(f"✅ Synced\nOffset: {self.offset:.2f}s")
         self.update_offset_label()
         self.event_list.setEnabled(True)
+        if self.player is None:
+            return
         self.player.pause = False
         self.play_btn.setText("Pause")
 
@@ -1350,7 +1380,7 @@ class PlayerWidget(QWidget):
         self.update_offset_label()
 
     def sync_to_current_position(self) -> None:
-        if not hasattr(self, "player"):
+        if self.player is None:
             return
         try:
             current = float(self.player.time_pos or 0.0)
@@ -1368,7 +1398,7 @@ class PlayerWidget(QWidget):
         self.update_offset_label()
 
     def get_current_position(self) -> float | None:
-        if not hasattr(self, "player"):
+        if self.player is None:
             return None
         try:
             return float(self.player.time_pos or 0.0)
@@ -1512,6 +1542,8 @@ class PlayerWidget(QWidget):
         self.event_list.addItem(item)
 
     def on_event_clicked(self, item: QListWidgetItem) -> None:
+        if self.player is None:
+            return
         if self.offset is None:
             return
         game_time = item.data(Qt.ItemDataRole.UserRole)
@@ -1525,11 +1557,13 @@ class PlayerWidget(QWidget):
         self.event_list.clearFocus()
 
     def toggle_playback(self) -> None:
+        if self.player is None:
+            return
         self.player.pause = not self.player.pause
         self.play_btn.setText("Play" if self.player.pause else "Pause")
 
     def stop_playback(self) -> None:
-        if not hasattr(self, "player"):
+        if self.player is None:
             return
         try:
             self.player.command("stop")
@@ -1541,7 +1575,7 @@ class PlayerWidget(QWidget):
             pass
 
     def set_fullscreen_mode(self, enabled: bool) -> None:
-        if not hasattr(self, "player"):
+        if self.player is None:
             return
         try:
             self.player["panscan"] = 1.0 if enabled else 0.0
@@ -1600,14 +1634,14 @@ class PlayerWidget(QWidget):
     def on_slider_released(self) -> None:
         self.is_slider_pressed = False
         val = self.slider.value()
-        if self.duration > 0:
+        if self.duration > 0 and self.player is not None:
             target = (val / 1000) * self.duration
             # 【重要修正】ここで絶対時間指定をする
             self.player.seek(target, reference="absolute", precision="exact")
 
     def closeEvent(self, event: Any) -> None:
         self.cancel_background_tasks(timeout_ms=1000)
-        if hasattr(self, "player"):
+        if self.player is not None:
             self.player.terminate()
         event.accept()
 

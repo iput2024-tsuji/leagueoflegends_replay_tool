@@ -14,6 +14,7 @@ class RecordingEndReason(str, Enum):
 class RecordingOutcome(str, Enum):
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+    ABORTED = "aborted"
     FAILED_PARTIAL = "failed_partial"
 
     @property
@@ -22,7 +23,7 @@ class RecordingOutcome(str, Enum):
 
     @property
     def should_save_session(self) -> bool:
-        return self in {RecordingOutcome.COMPLETED, RecordingOutcome.FAILED_PARTIAL}
+        return self in {RecordingOutcome.COMPLETED, RecordingOutcome.ABORTED, RecordingOutcome.FAILED_PARTIAL}
 
 
 class RecordingPhase(str, Enum):
@@ -33,7 +34,17 @@ class RecordingPhase(str, Enum):
     FINALIZING = "finalizing"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+    ABORTED = "aborted"
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class FinalizeResult:
+    success: bool
+    outcome: RecordingOutcome
+    saved: bool = False
+    error: str | None = None
+    pending_path: str | None = None
 
 
 @dataclass(frozen=True)

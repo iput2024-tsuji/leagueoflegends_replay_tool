@@ -1,0 +1,10 @@
+aiohttp
+ffmpeg-python
+numpy
+obsws-python
+opencv-python
+pandas
+PyQt6
+python-mpv
+requests
+scikit-learn

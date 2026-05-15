@@ -179,6 +179,8 @@ copy config\setting.sample.json config\setting.json
 python main.py
 ```
 
+直接依存は `requirements.in` / `requirements-dev.in`、固定済み依存は `requirements.txt` / `requirements-dev.txt` で管理します。Python や PyQt の更新時は `.in` ファイルを基準にロックファイルを再生成してください。
+
 通常は `config/setting.json` を手動編集する必要はありません。
 
 - OBS は `obs-portable` に配置されたポータブル版のみ利用します

@@ -6,6 +6,8 @@ class FakeWorker:
         self.running = running
         self.wait_result = wait_result
         self.cancel_called = 0
+        self.terminate_called = 0
+        self.terminated = False
         self.wait_calls = []
 
     def isRunning(self):
@@ -17,9 +19,14 @@ class FakeWorker:
     def stop(self):
         self.cancel_called += 1
 
+    def terminate(self):
+        self.terminate_called += 1
+        self.terminated = True
+        self.running = False
+
     def wait(self, timeout_ms):
         self.wait_calls.append(timeout_ms)
-        self.running = not self.wait_result
+        self.running = False if self.terminated else not self.wait_result
         return self.wait_result
 
 
@@ -66,3 +73,15 @@ def test_worker_registry_stops_registered_workers():
     assert first.wait_calls == [250]
     assert second.wait_calls == [250]
     assert registry.running_workers() == [second]
+
+
+def test_worker_registry_force_stops_after_timeout():
+    registry = WorkerRegistry()
+    worker = registry.register(FakeWorker(running=True, wait_result=False))
+
+    stopped = registry.force_stop_all(100)
+
+    assert stopped is True
+    assert worker.cancel_called == 1
+    assert worker.terminate_called == 1
+    assert registry.running_workers() == []

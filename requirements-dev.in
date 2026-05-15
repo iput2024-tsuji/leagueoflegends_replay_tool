@@ -1,0 +1,7 @@
+-r requirements.in
+Pillow
+pyinstaller
+pytest
+pytest-asyncio
+pytest-qt
+ruff

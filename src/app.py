@@ -43,7 +43,7 @@ try:
     from .app_paths import get_app_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController
     from .player import PlayerWidget
-    from .qt_lifecycle import WorkerRegistry, request_worker_stop
+    from .qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
     from .recording_supervisor import RecordingSupervisor
 except ImportError:
     SRC_DIR = Path(__file__).resolve().parent
@@ -53,7 +53,7 @@ except ImportError:
     from app_paths import get_app_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController
     from player import PlayerWidget
-    from qt_lifecycle import WorkerRegistry, request_worker_stop
+    from qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
     from recording_supervisor import RecordingSupervisor
 
 
@@ -1487,6 +1487,8 @@ class MainWindow(QMainWindow):
         self._tray_icon = None
         self._tray_notice_shown = False
         self._recorder_autostart_enabled = False
+        self._shutdown_attempts = 0
+        self._shutdown_max_attempts = 3
         self.setWindowTitle("LoL Replay Tool")
         self.resize(1200, 720)
         icon = get_app_icon()
@@ -1663,7 +1665,7 @@ class MainWindow(QMainWindow):
         )
         self.bg_recorder_worker.start()
 
-    def stop_background_recorder(self, wait_ms: int = 5000) -> bool:
+    def stop_background_recorder(self, wait_ms: int = 5000, force: bool = False) -> bool:
         worker = self.bg_recorder_worker
         if not worker:
             return True
@@ -1671,7 +1673,8 @@ class MainWindow(QMainWindow):
             self.worker_registry.unregister(worker)
             self.bg_recorder_worker = None
             return True
-        stopped = request_worker_stop(worker, wait_ms, cancel_method="stop")
+        stop_func = force_worker_stop if force else request_worker_stop
+        stopped = stop_func(worker, wait_ms, cancel_method="stop")
         if not stopped:
             self.home_page.set_recorder_status(
                 "⚠️ 停止待機中",
@@ -1682,6 +1685,21 @@ class MainWindow(QMainWindow):
         self.worker_registry.unregister(worker)
         self.bg_recorder_worker = None
         return True
+
+    def _stop_all_background_work(self, force: bool = False) -> bool:
+        workers_stopped = True
+        if force:
+            self.analytics_page.stop_workers(timeout_ms=1500)
+            self.settings_page.stop_workers(timeout_ms=2000)
+            workers_stopped = self.stop_background_recorder(wait_ms=2000, force=True) and workers_stopped
+            workers_stopped = self.worker_registry.force_stop_all(timeout_ms=1000) and workers_stopped
+            return workers_stopped
+
+        workers_stopped = self.analytics_page.stop_workers(timeout_ms=1500) and workers_stopped
+        workers_stopped = self.settings_page.stop_workers(timeout_ms=2000) and workers_stopped
+        workers_stopped = self.stop_background_recorder(wait_ms=6000) and workers_stopped
+        workers_stopped = self.worker_registry.stop_all(timeout_ms=1000) and workers_stopped
+        return workers_stopped
 
     def on_bg_recorder_status(self, message: str) -> None:
         self._set_home_status_from_worker_message(message)
@@ -1729,20 +1747,31 @@ class MainWindow(QMainWindow):
             self.player_page.on_leave()
         except Exception:
             pass
-        workers_stopped = True
-        workers_stopped = self.analytics_page.stop_workers(timeout_ms=1500) and workers_stopped
-        workers_stopped = self.settings_page.stop_workers(timeout_ms=2000) and workers_stopped
-        workers_stopped = self.stop_background_recorder(wait_ms=6000) and workers_stopped
-        workers_stopped = self.worker_registry.stop_all(timeout_ms=1000) and workers_stopped
+        self._shutdown_attempts += 1
+        force_shutdown = self._shutdown_attempts > self._shutdown_max_attempts
+        workers_stopped = self._stop_all_background_work(force=force_shutdown)
         if not workers_stopped:
             self.home_page.set_recorder_status(
                 "⚠️ 停止待機中",
                 color_hex="#ffb74d",
                 detail_text="一部のバックグラウンド処理が停止完了していません。",
             )
-            event.ignore()
-            QTimer.singleShot(1000, self.close)
-            return
+            if force_shutdown:
+                reply = QMessageBox.warning(
+                    self,
+                    "終了処理",
+                    "一部のバックグラウンド処理を停止できませんでした。\n強制終了しますか？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    workers_stopped = self._stop_all_background_work(force=True)
+                else:
+                    self._shutdown_attempts = 0
+            if not workers_stopped:
+                event.ignore()
+                QTimer.singleShot(1000, self.close)
+                return
         if self._tray_icon:
             try:
                 self._tray_icon.hide()

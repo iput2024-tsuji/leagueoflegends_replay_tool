@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -31,7 +32,7 @@ try:
         get_portable_marker_path as shared_get_portable_marker_path,
     )
     from .obs_process import OBSProcessManager
-    from .recording_state import RecordingEndDetector, RecordingOutcome, RecordingPhase
+    from .recording_state import FinalizeResult, RecordingEndDetector, RecordingOutcome, RecordingPhase
     from .session_log import SessionLogV1, load_session_payload, save_session_payload
 except ImportError:
     from app_paths import get_app_root
@@ -45,7 +46,7 @@ except ImportError:
         get_portable_marker_path as shared_get_portable_marker_path,
     )
     from obs_process import OBSProcessManager
-    from recording_state import RecordingEndDetector, RecordingOutcome, RecordingPhase
+    from recording_state import FinalizeResult, RecordingEndDetector, RecordingOutcome, RecordingPhase
     from session_log import SessionLogV1, load_session_payload, save_session_payload
 
 ROOT_DIR = get_app_root()
@@ -483,7 +484,7 @@ class RecordingSessionManager(ABC):
         self,
         outcome: RecordingOutcome | None = None,
         failure_reason: str | BaseException | None = None,
-    ) -> None:
+    ) -> FinalizeResult:
         pass
 
     @abstractmethod
@@ -2187,6 +2188,12 @@ class LoLAutoRecorder(RecordingSessionManager):
         if reason:
             self.failure_reason = str(reason)
 
+    def mark_session_aborted(self, reason: str | BaseException | None = None) -> None:
+        self.session_phase = RecordingPhase.ABORTED
+        self.session_outcome = RecordingOutcome.ABORTED
+        if reason:
+            self.failure_reason = str(reason)
+
     def connect_obs(self) -> None:
         self.obs_client.connect()
 
@@ -2540,9 +2547,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 pass
             self._status_handler = None
 
-    def save_json(self) -> None:
-        if self.session_finalized:
-            return
+    def build_session_payload(self) -> dict[str, Any]:
         if self.output_file is None:
             self.output_file = build_output_path(self.config)
 
@@ -2559,7 +2564,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             except Exception:
                 record_path_for_json = str(self.record_path)
 
-        session_log = SessionLogV1(
+        return SessionLogV1(
             session_status=self.session_outcome.value,
             session_phase=self.session_phase.value,
             failure_reason=self.failure_reason,
@@ -2576,28 +2581,71 @@ class LoLAutoRecorder(RecordingSessionManager):
             json_path=str(self.output_file),
             events=list(self.saved_events),
             events_all=list(self.all_events),
-        )
-        save_payload(self.output_file, session_log.to_payload())
+        ).to_payload()
+
+    def save_json(self) -> None:
+        if self.session_finalized:
+            return
+        if self.output_file is None:
+            self.output_file = build_output_path(self.config)
+        payload = self.build_session_payload()
+        save_payload(self.output_file, payload)
         self.session_finalized = True
         self.log(f"ログ保存完了: {self.output_file}")
         enforce_storage_limit(self.config, keep_paths=[self.output_file, self.record_path])
+
+    def write_pending_session_payload(self, error: BaseException) -> Path | None:
+        try:
+            if self.output_file is None:
+                self.output_file = build_output_path(self.config)
+            payload = self.build_session_payload()
+            payload["finalize_error"] = f"{type(error).__name__}: {error}"
+            pending_path = self.output_file.with_name(f"{self.output_file.name}.pending")
+            pending_path.parent.mkdir(parents=True, exist_ok=True)
+            pending_path.write_text(json.dumps(payload, indent=4, ensure_ascii=False), encoding="utf-8")
+            return pending_path
+        except Exception as pending_error:
+            self.log(f"⚠️ pendingセッションログの保存にも失敗しました: {pending_error}")
+            return None
 
     def finalize_session(
         self,
         outcome: RecordingOutcome | None = None,
         failure_reason: str | BaseException | None = None,
-    ) -> None:
+    ) -> FinalizeResult:
+        if self.session_finalized:
+            return FinalizeResult(success=True, outcome=self.session_outcome, saved=False)
         if outcome is not None:
             self.session_outcome = outcome
         self.session_phase = RecordingPhase.FINALIZING
         if self.session_outcome is RecordingOutcome.FAILED_PARTIAL and failure_reason:
             self.failure_reason = str(failure_reason)
+        if self.session_outcome is RecordingOutcome.ABORTED and failure_reason:
+            self.failure_reason = str(failure_reason)
         self.stop_recording()
-        if self.has_session_data():
-            self.save_json()
-        self.session_phase = (
-            RecordingPhase.COMPLETED if self.session_outcome is RecordingOutcome.COMPLETED else RecordingPhase.FAILED
-        )
+        saved = False
+        if self.session_outcome is RecordingOutcome.COMPLETED:
+            self.session_phase = RecordingPhase.COMPLETED
+        elif self.session_outcome is RecordingOutcome.ABORTED:
+            self.session_phase = RecordingPhase.ABORTED
+        else:
+            self.session_phase = RecordingPhase.FAILED
+        try:
+            if self.has_session_data() and self.session_outcome.should_save_session:
+                self.save_json()
+                saved = True
+            return FinalizeResult(success=True, outcome=self.session_outcome, saved=saved)
+        except Exception as e:
+            self.session_phase = RecordingPhase.FAILED
+            pending_path = self.write_pending_session_payload(e)
+            self.log(f"⚠️ セッションfinalizeに失敗しました: {e}")
+            return FinalizeResult(
+                success=False,
+                outcome=self.session_outcome,
+                saved=False,
+                error=f"{type(e).__name__}: {e}",
+                pending_path=str(pending_path) if pending_path else None,
+            )
 
 
 async def run_cli_recorder() -> None:
@@ -2636,13 +2684,29 @@ async def run_cli_recorder() -> None:
             except Exception as e:
                 if app.has_session_data():
                     app.mark_session_failed(e)
-                    app.finalize_session(outcome=RecordingOutcome.FAILED_PARTIAL, failure_reason=e)
-                    LOGGER.warning("⚠️ 録画セッションを部分保存しました: %s", e)
+                    result = app.finalize_session(outcome=RecordingOutcome.FAILED_PARTIAL, failure_reason=e)
+                    if result.success:
+                        LOGGER.warning("⚠️ 録画セッションを部分保存しました: %s", e)
+                    else:
+                        LOGGER.error("❌ 録画セッションの部分保存に失敗しました: %s", result.error)
                 raise
             if outcome != RecordingOutcome.COMPLETED:
+                if app.has_session_data():
+                    app.mark_session_aborted("recording was cancelled")
+                    result = app.finalize_session(
+                        outcome=RecordingOutcome.ABORTED,
+                        failure_reason="recording was cancelled",
+                    )
+                    if result.success:
+                        LOGGER.info("⏹️ 録画セッションを中断ログとして保存しました。")
+                    else:
+                        LOGGER.error("❌ 中断ログの保存に失敗しました: %s", result.error)
                 LOGGER.info("⏹️ 録画セッションを中断しました。")
                 break
-            app.finalize_session()
+            result = app.finalize_session(outcome=RecordingOutcome.COMPLETED)
+            if not result.success:
+                LOGGER.error("❌ セッション保存に失敗しました: %s", result.error)
+                break
             LOGGER.info("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
         LOGGER.info("中断を検知しました。終了処理を行います。")

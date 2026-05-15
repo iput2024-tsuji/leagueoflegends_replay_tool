@@ -1,5 +1,7 @@
 import importlib
 
+import pytest
+
 
 def reset_player_runtime(player, monkeypatch):
     monkeypatch.setattr(player, "mpv_module", None)
@@ -47,3 +49,45 @@ def test_mpv_error_message_distinguishes_import_failure_from_missing_dll(monkeyp
     assert "MPV DLL は見つかりました" in message
     assert str(dll_path) in message
     assert "OSError: cannot load mpv dependency" in message
+
+
+def test_player_runtime_raises_without_exiting(monkeypatch):
+    player = importlib.import_module("src.player")
+    reset_player_runtime(player, monkeypatch)
+
+    monkeypatch.setattr(player, "bootstrap_mpv_runtime", lambda: None)
+    monkeypatch.setattr(player, "build_mpv_error_message", lambda: "mpv is missing")
+
+    with pytest.raises(player.PlayerRuntimeError, match="mpv is missing"):
+        player.PlayerRuntime().create_player(1)
+
+
+def test_player_runtime_creates_mpv_with_window_id(monkeypatch):
+    player = importlib.import_module("src.player")
+    reset_player_runtime(player, monkeypatch)
+    created_player = object()
+
+    class FakeMpvRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def MPV(self, **kwargs):
+            self.calls.append(kwargs)
+            return created_player
+
+    fake_runtime = FakeMpvRuntime()
+    monkeypatch.setattr(player, "bootstrap_mpv_runtime", lambda: fake_runtime)
+
+    result = player.PlayerRuntime().create_player("123")
+
+    assert result is created_player
+    assert fake_runtime.calls == [
+        {
+            "wid": "123",
+            "input_default_bindings": False,
+            "input_vo_keyboard": False,
+            "keepaspect": True,
+            "vo": "gpu",
+            "gpu_context": "d3d11",
+        }
+    ]

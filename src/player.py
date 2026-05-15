@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import importlib
 import json
 import logging
@@ -185,6 +186,7 @@ mpv_module = None
 MPV_IMPORT_ERROR = None
 MPV_BOOTSTRAPPED = False
 MPV_DLL_DIRECTORY_HANDLE = None
+MPV_DLL_LOAD_HANDLE = None
 
 
 def register_mpv_dll_directory(bin_dir: Path) -> None:
@@ -198,8 +200,16 @@ def register_mpv_dll_directory(bin_dir: Path) -> None:
     MPV_DLL_DIRECTORY_HANDLE = os.add_dll_directory(str(bin_dir))
 
 
+def load_mpv_dll(dll_path: Path) -> Any:
+    flags = 0
+    if os.name == "nt":
+        # LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+        flags = 0x00001000 | 0x00000100
+    return ctypes.CDLL(str(dll_path), flags) if flags else ctypes.CDLL(str(dll_path))
+
+
 def bootstrap_mpv_runtime() -> Any | None:
-    global mpv_module, MPV_IMPORT_ERROR, MPV_BOOTSTRAPPED
+    global MPV_DLL_LOAD_HANDLE, MPV_BOOTSTRAPPED, MPV_IMPORT_ERROR, mpv_module
     if mpv_module is not None:
         return mpv_module
     if MPV_BOOTSTRAPPED and MPV_IMPORT_ERROR is not None:
@@ -224,6 +234,12 @@ def bootstrap_mpv_runtime() -> Any | None:
             return None
 
     try:
+        MPV_DLL_LOAD_HANDLE = load_mpv_dll(dll_path)
+    except Exception as e:
+        MPV_IMPORT_ERROR = e
+        return None
+
+    try:
         mpv_module = importlib.import_module("mpv")
         MPV_IMPORT_ERROR = None
     except Exception as e:
@@ -232,16 +248,30 @@ def bootstrap_mpv_runtime() -> Any | None:
     return mpv_module
 
 
+def is_python_mpv_module_missing(error: BaseException | None) -> bool:
+    return isinstance(error, ModuleNotFoundError) and getattr(error, "name", None) == "mpv"
+
+
 def build_mpv_error_message() -> str:
     dll_path = find_mpv_dll(BIN_DIR, ROOT_DIR)
+    if dll_path and is_python_mpv_module_missing(MPV_IMPORT_ERROR):
+        return (
+            "MPV DLL は見つかりましたが、python-mpv モジュールが読み込めません。\n"
+            "配布版に python-mpv が同梱されていない、または実行環境にインストールされていない可能性があります。\n\n"
+            f"検出したDLL: {dll_path}\n"
+            f"エラー: {type(MPV_IMPORT_ERROR).__name__}: {MPV_IMPORT_ERROR}\n\n"
+            "開発環境では `pip install python-mpv` を実行してください。\n"
+            "PyInstallerビルドでは `--hidden-import mpv` が必要です。"
+        )
     if dll_path and MPV_IMPORT_ERROR:
         return (
             "MPV DLL は見つかりましたが、python-mpv の読み込みに失敗しました。\n"
-            "DLLの依存ファイル不足、32/64bit不一致、または破損したDLLの可能性があります。\n\n"
+            "DLLの依存ファイル不足、32/64bit不一致、破損したDLL、または互換性のないDLLが優先検出された可能性があります。\n\n"
             f"検出したDLL: {dll_path}\n"
             f"エラー: {type(MPV_IMPORT_ERROR).__name__}: {MPV_IMPORT_ERROR}\n\n"
             f"binフォルダ: {BIN_DIR}\n"
-            "対応DLL: mpv-1.dll / libmpv-1.dll / mpv-2.dll / libmpv-2.dll"
+            "対応DLL: mpv-2.dll / libmpv-2.dll / mpv-1.dll / libmpv-1.dll\n"
+            "同じbinフォルダにDLL依存ファイル一式を配置してください。"
         )
     return (
         "binフォルダに mpv-1.dll などのMPVコンポーネントが見つかりません。\n"

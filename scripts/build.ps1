@@ -21,6 +21,7 @@ $pyArgs = @(
   "--contents-directory", ".",
   "--name", "LoLReplayTool",
   "--clean",
+  "--hidden-import", "mpv",
   "--add-data", "config\\setting.sample.json;config",
   "--add-data", "config\\champion_aliases.json;config"
 )

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-MPV_DLL_NAMES = ("mpv-1.dll", "libmpv-1.dll", "mpv-2.dll", "libmpv-2.dll")
+# Keep this order aligned with python-mpv's Windows loader preference.
+MPV_DLL_NAMES = ("mpv-2.dll", "libmpv-2.dll", "mpv-1.dll", "libmpv-1.dll")
 
 
 def find_mpv_dll(bin_dir: str | Path | None, root_dir: str | Path | None = None) -> Path | None:

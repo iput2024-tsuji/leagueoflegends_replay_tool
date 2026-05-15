@@ -265,6 +265,8 @@ class AudioSettingsController:
         )
         if not ok:
             return False
+        if not recordtest.OBSProcessManager(config.obs.obs_dir).has_owned_process():
+            return False
 
         runtime = None
         try:

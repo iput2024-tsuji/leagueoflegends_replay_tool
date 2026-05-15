@@ -51,9 +51,31 @@ class OBSProcessManager:
         except Exception:
             return str(process.executable_path).casefold() == str(self.obs_exe).casefold()
 
+    def managed_processes(self) -> list[OBSProcessInfo]:
+        return [process for process in self.list_obs_processes() if self.is_managed_process(process)]
+
+    def has_managed_process(self) -> bool:
+        return bool(self.managed_processes())
+
+    def find_owned_process(self) -> OBSProcessInfo | None:
+        lease = self.read_process_lease()
+        if lease is None:
+            return None
+        process = self._find_process_by_pid(lease.pid)
+        if process is None:
+            self.clear_process_lease()
+            return None
+        if not self.is_owned_process(process, lease):
+            self.clear_process_lease()
+            return None
+        return process
+
+    def has_owned_process(self) -> bool:
+        return self.find_owned_process() is not None
+
     def kill_stale_managed_processes(self, timeout_sec: float = 3.0) -> list[int]:
         """管理OBSに一致するプロセスだけを終了する。通常版OBSは触らない。"""
-        targets = [process for process in self.list_obs_processes() if self.is_managed_process(process)]
+        targets = self.managed_processes()
         if not targets:
             return []
 
@@ -79,16 +101,8 @@ class OBSProcessManager:
 
     def kill_stale_owned_processes(self, timeout_sec: float = 3.0) -> list[int]:
         """前回このアプリが起動したOBSだけをleaseから特定して終了する。"""
-        lease = self.read_process_lease()
-        if lease is None:
-            return []
-
-        process = self._find_process_by_pid(lease.pid)
+        process = self.find_owned_process()
         if process is None:
-            self.clear_process_lease()
-            return []
-        if not self.is_owned_process(process, lease):
-            self.clear_process_lease()
             return []
 
         killed = []

@@ -249,6 +249,10 @@ dist\LoLReplayTool\
   - `bin/` に `mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll` のいずれかを配置してください。
 - `FFmpegが見つかりません`
   - `bin/ffmpeg.exe` を配置してください。クリップ出力はシステム PATH の FFmpeg を使用しません。
+- `OBS WebSocketポートが既に使用されています`
+  - 通常版 OBS や手動起動した OBS が動いている場合は終了してください。このアプリは `obs-portable` 配下の管理対象 OBS だけを起動・制御します。
+- OBS がタスクトレイに表示される
+  - 既存の OBS をすべて終了してからアプリを起動してください。管理対象 OBS は起動直前に `global.ini` のトレイ設定を無効化します。
 - イベントが表示されない
   - JSON の `events` / `events_all` を確認してください。
 - 分析結果が表示されない

@@ -1,3 +1,5 @@
+import pytest
+
 from src import recordtest
 from src.obs_runtime import OBSRuntimeManager
 
@@ -45,6 +47,7 @@ def test_runtime_closes_owned_obs_process_with_shutdown(monkeypatch):
 def test_runtime_closes_borrowed_obs_connection_with_disconnect(monkeypatch):
     recorder = FakeRecorder()
     monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (True, "ok"))
+    monkeypatch.setattr(recordtest.OBSProcessManager, "has_owned_process", lambda self: True)
     monkeypatch.setattr(recordtest, "launch_obs", lambda config: (_ for _ in ()).throw(AssertionError("no launch")))
     monkeypatch.setattr(recordtest, "ObsWebSocketClient", lambda *args, **kwargs: object())
     monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda *args, **kwargs: recorder)
@@ -57,6 +60,15 @@ def test_runtime_closes_borrowed_obs_connection_with_disconnect(monkeypatch):
     assert recorder.finalize_called == 0
     assert recorder.shutdown_called == 0
     assert recorder.disconnect_called == 1
+
+
+def test_runtime_rejects_unowned_existing_obs_connection(monkeypatch):
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (True, "ok"))
+    monkeypatch.setattr(recordtest.OBSProcessManager, "has_owned_process", lambda self: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: (_ for _ in ()).throw(AssertionError("no launch")))
+
+    with pytest.raises(recordtest.RecorderError, match="管理対象OBSではありません"):
+        OBSRuntimeManager().open_recorder(recordtest.AppConfig.from_dict({}), auto_launch=True)
 
 
 def test_runtime_still_closes_obs_when_finalize_fails(monkeypatch):

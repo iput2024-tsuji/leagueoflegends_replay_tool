@@ -18,6 +18,8 @@ PORTABLE_OBS_MARKER_NAME = "obs_portable_mode.txt"
 LEGACY_PORTABLE_OBS_MARKER_NAME = "portable_mode.txt"
 TRAY_SETTINGS = {
     "SysTrayEnabled": "false",
+    "SysTrayWhenStarted": "false",
+    "SysTrayMinimizeToTray": "false",
 }
 TRAY_SETTINGS_SECTION = "BasicWindow"
 
@@ -178,7 +180,9 @@ class OBSBootstrapper:
         return config_dir
 
     def ensure_global_ini(self) -> tuple[bool, Path]:
-        self.process_manager.kill_stale_owned_processes()
+        # OBS reads global.ini only at startup and may rewrite it on exit.
+        # Stop every process from this managed portable tree before patching.
+        self.process_manager.kill_stale_managed_processes()
         ini_path = get_obs_global_ini_path(self.base_dir)
         ini_path.parent.mkdir(parents=True, exist_ok=True)
         parser = new_obs_ini_parser()

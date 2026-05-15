@@ -260,8 +260,8 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
     text = global_ini.read_text(encoding="utf-8")
     assert "[BasicWindow]" in text
     assert "SysTrayEnabled=false" in text
-    assert "SysTrayWhenStarted" not in text
-    assert "SysTrayMinimizeToTray" not in text
+    assert "SysTrayWhenStarted=false" in text
+    assert "SysTrayMinimizeToTray=false" in text
     assert "HideTrayIcon" not in text
 
 
@@ -290,8 +290,8 @@ def test_global_ini_removes_bom_and_nonstandard_tray_keys(monkeypatch):
     text = raw.decode("utf-8")
     assert "[BasicWindow]" in text
     assert "SysTrayEnabled=false" in text
-    assert "SysTrayWhenStarted" not in text
-    assert "SysTrayMinimizeToTray" not in text
+    assert "SysTrayWhenStarted=false" in text
+    assert "SysTrayMinimizeToTray=false" in text
     assert "HideTrayIcon" not in text
 
 
@@ -319,6 +319,37 @@ def test_global_ini_parse_error_deletes_and_regenerates_before_patch(monkeypatch
     assert "[Other]" in text
     assert "Keep=true" in text
     assert "SysTrayEnabled=false" in text
+    assert "SysTrayWhenStarted=false" in text
+    assert "SysTrayMinimizeToTray=false" in text
+
+
+def test_launch_obs_refuses_external_websocket_port(monkeypatch):
+    obs_dir = Path("tests") / "_tmp" / "obs_launch_port_conflict" / "obs-portable"
+    shutil.rmtree(obs_dir.parent, ignore_errors=True)
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True, exist_ok=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
+
+    class FakeProcessManager:
+        def __init__(self, obs_dir_arg, logger=None):
+            self.obs_dir = Path(obs_dir_arg)
+            self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            return []
+
+        def isolated_env(self):
+            return {}
+
+        def start_obs(self, *args, **kwargs):
+            raise AssertionError("managed OBS must not start when the websocket port is occupied")
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", FakeProcessManager)
+    monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: True)
+
+    with pytest.raises(recordtest.RecorderError, match="OBS WebSocketポート"):
+        recordtest.launch_obs(recordtest.AppConfig.from_dict({}))
 
 
 def test_storage_limit_only_deletes_json_referenced_app_video():

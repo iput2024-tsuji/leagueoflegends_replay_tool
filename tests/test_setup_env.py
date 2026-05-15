@@ -39,8 +39,8 @@ def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypat
     assert (obs_dir / "obs_portable_mode.txt").exists()
     assert "[BasicWindow]" in text
     assert "SysTrayEnabled=false" in text
-    assert "SysTrayWhenStarted" not in text
-    assert "SysTrayMinimizeToTray" not in text
+    assert "SysTrayWhenStarted=false" in text
+    assert "SysTrayMinimizeToTray=false" in text
     assert "HideTrayIcon" not in text
 
 
@@ -87,3 +87,5 @@ def test_bootstrap_obs_portable_config_regenerates_corrupt_global_ini(monkeypatc
     assert "[Other]" in text
     assert "Keep=true" in text
     assert "SysTrayEnabled=false" in text
+    assert "SysTrayWhenStarted=false" in text
+    assert "SysTrayMinimizeToTray=false" in text

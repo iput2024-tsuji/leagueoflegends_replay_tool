@@ -92,3 +92,26 @@ def test_process_manager_owned_kill_ignores_reused_pid_with_different_creation_t
 
     assert killed == []
     assert calls == []
+
+
+def test_process_manager_reports_owned_process_from_lease(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/owned_obs_detect").resolve())
+    manager.write_process_lease(SimpleNamespace(pid=100))
+
+    monkeypatch.setattr(
+        manager,
+        "read_process_lease",
+        lambda: SimpleNamespace(
+            pid=100,
+            executable_path=manager.obs_exe,
+            created_at=1.0,
+            process_creation_time=10.0,
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "list_obs_processes",
+        lambda: [OBSProcessInfo(pid=100, executable_path=manager.obs_exe, creation_time=10.0)],
+    )
+
+    assert manager.has_owned_process() is True

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -564,6 +565,25 @@ def ensure_portable_obs_websocket_config(base_dir: str | Path, port: int, passwo
     WebSocket設定を固定値へ自動補完する。
     """
     return OBSBootstrapper(base_dir).ensure_websocket_config(port, password)
+
+
+def is_tcp_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((str(host), int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ensure_obs_websocket_port_free(config: AppConfig, timeout: float = 0.5) -> None:
+    if not is_tcp_port_open(config.obs.host, config.obs.port, timeout=timeout):
+        return
+    raise RecorderError(
+        "OBS WebSocketポートが既に使用されています。\n"
+        f"接続先: {config.obs.host}:{config.obs.port}\n"
+        "別のOBS、またはこのアプリ管理外のOBSが起動している可能性があります。\n"
+        "既存のOBSを終了してから再実行してください。"
+    )
 
 
 def _ensure_section_dict(root: dict[str, Any], key: str) -> tuple[dict[str, Any], bool]:
@@ -1362,7 +1382,15 @@ def setup_obs_sync_elements(
             config.obs.password,
             timeout=1.5,
         )
-        if not ok and auto_launch:
+        if ok:
+            process_manager = OBSProcessManager(config.obs.obs_dir, logger=LOGGER)
+            if not process_manager.has_owned_process():
+                raise RecorderError(
+                    "OBS WebSocketには接続できますが、このアプリが起動した管理対象OBSではありません。\n"
+                    f"接続先: {config.obs.host}:{config.obs.port}\n"
+                    "既存のOBSを終了してから再実行してください。"
+                )
+        elif auto_launch:
             launched_process = launch_obs(config)
 
         recorder = LoLAutoRecorder(
@@ -1622,9 +1650,10 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         hint = f"\n自動検出候補: {detected}" if detected else ""
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
-    # 前回このアプリが起動したOBSだけを終了し、同じポータブルOBSを使う手動起動は巻き込まない。
+    # OBSは起動時にglobal.iniを読み、終了時に再保存する。
+    # 管理対象OBSが既に動いている場合は、設定反映前に必ず止める。
     process_manager = OBSProcessManager(obs_dir_abs, logger=LOGGER)
-    process_manager.kill_stale_owned_processes()
+    process_manager.kill_stale_managed_processes()
 
     bootstrapper = OBSBootstrapper(obs_dir_abs)
     try:
@@ -1644,6 +1673,8 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
             LOGGER.info("ℹ️ ポータブルOBSのWebSocket設定を更新しました: %s", ws_cfg_path)
     except Exception as e:
         raise RecorderError(f"ポータブルOBS起動前設定の更新に失敗しました: {e}") from e
+
+    ensure_obs_websocket_port_free(config)
 
     LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
 

@@ -40,6 +40,7 @@ class OBSRuntimeManager:
         retry_delay: float = 0.5,
     ) -> RecorderRuntime:
         launched_process = None
+        process_manager = recordtest.OBSProcessManager(config.obs.obs_dir)
         if force_launch:
             launched_process = recordtest.launch_obs(config)
         elif auto_launch:
@@ -49,8 +50,22 @@ class OBSRuntimeManager:
                 config.obs.password,
                 timeout=1.5,
             )
-            if not ok:
+            if ok:
+                if not process_manager.has_owned_process():
+                    raise recordtest.RecorderError(
+                        "OBS WebSocketには接続できますが、このアプリが起動した管理対象OBSではありません。\n"
+                        f"接続先: {config.obs.host}:{config.obs.port}\n"
+                        "既存のOBSを終了してから再実行してください。"
+                    )
+            else:
                 launched_process = recordtest.launch_obs(config)
+        elif recordtest.is_tcp_port_open(config.obs.host, config.obs.port, timeout=0.3):
+            if not process_manager.has_owned_process():
+                raise recordtest.RecorderError(
+                    "OBS WebSocketポートは使用中ですが、このアプリが起動した管理対象OBSではありません。\n"
+                    f"接続先: {config.obs.host}:{config.obs.port}\n"
+                    "既存のOBSを終了してから再実行してください。"
+                )
 
         obs_client = recordtest.ObsWebSocketClient(
             config=config,

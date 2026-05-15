@@ -27,6 +27,7 @@ try:
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
+        copy_obs_tree_contents,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
@@ -41,6 +42,7 @@ except ImportError:
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
+        copy_obs_tree_contents,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
@@ -67,6 +69,7 @@ LEGACY_OBS_SOURCE_COLOR_BLUE = 0xFFFF0000
 DEFAULT_OBS_GAME_CAPTURE_NAME = "lol_game_capture"
 DEFAULT_OBS_GAME_CAPTURE_WINDOW = "League of Legends (TM) Client:League of Legends.exe:League of Legends.exe"
 DEFAULT_OBS_DIR = "obs-portable"
+LEGACY_OBS_DIR = "bin/OBS-Studio"
 DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
 DEFAULT_JSON_DIR = "recordings/json"
@@ -89,6 +92,7 @@ DEFAULT_AUDIO_DESKTOP_MUTE = False
 DEFAULT_AUDIO_MIC_MUTE = False
 
 MANAGED_PORTABLE_OBS_DIR = (ROOT_DIR / DEFAULT_OBS_DIR).resolve()
+LEGACY_MANAGED_OBS_DIR = (ROOT_DIR / LEGACY_OBS_DIR).resolve()
 PORTABLE_OBS_MARKER_NAME = "obs_portable_mode.txt"
 LEGACY_PORTABLE_OBS_MARKER_NAME = "portable_mode.txt"
 MANAGED_AUDIO_INPUTS = {
@@ -511,6 +515,8 @@ def is_valid_obs_dir(base_dir: str | Path | None) -> bool:
 def detect_obs_dir() -> str | None:
     if is_valid_obs_dir(MANAGED_PORTABLE_OBS_DIR):
         return str(MANAGED_PORTABLE_OBS_DIR)
+    if is_valid_obs_dir(LEGACY_MANAGED_OBS_DIR):
+        return str(LEGACY_MANAGED_OBS_DIR)
     return None
 
 
@@ -522,6 +528,51 @@ def is_managed_portable_obs_dir(base_dir: str | Path | None) -> bool:
         return candidate == MANAGED_PORTABLE_OBS_DIR
     except Exception:
         return False
+
+
+def is_legacy_managed_obs_dir(base_dir: str | Path | None) -> bool:
+    if not base_dir:
+        return False
+    try:
+        candidate = Path(base_dir).resolve()
+        return candidate == LEGACY_MANAGED_OBS_DIR
+    except Exception:
+        return False
+
+
+def bootstrap_obs_dir(base_dir: str | Path, port: int | None = None, password: str = "") -> dict[str, Any]:
+    base_path = Path(base_dir).resolve()
+    bootstrapper = SharedOBSBootstrapper(
+        base_path,
+        process_manager=OBSProcessManager(base_path, logger=LOGGER),
+        logger=LOGGER,
+    )
+    return bootstrapper.apply(port=port, password=password)
+
+
+def migrate_legacy_managed_obs_if_needed(port: int | None = None, password: str = "") -> Path | None:
+    if is_valid_obs_dir(MANAGED_PORTABLE_OBS_DIR):
+        return None
+    if not is_valid_obs_dir(LEGACY_MANAGED_OBS_DIR):
+        return None
+
+    OBSProcessManager(LEGACY_MANAGED_OBS_DIR, logger=LOGGER).kill_stale_managed_processes()
+    MANAGED_PORTABLE_OBS_DIR.mkdir(parents=True, exist_ok=True)
+    copy_obs_tree_contents(LEGACY_MANAGED_OBS_DIR, MANAGED_PORTABLE_OBS_DIR)
+    bootstrap_obs_dir(MANAGED_PORTABLE_OBS_DIR, port=port, password=password)
+    LOGGER.info(
+        "旧OBS配置を obs-portable へコピー移行しました: %s -> %s",
+        LEGACY_MANAGED_OBS_DIR,
+        MANAGED_PORTABLE_OBS_DIR,
+    )
+    return LEGACY_MANAGED_OBS_DIR
+
+
+def repair_legacy_managed_obs_if_present(port: int | None = None, password: str = "") -> Path | None:
+    if not is_valid_obs_dir(LEGACY_MANAGED_OBS_DIR):
+        return None
+    bootstrap_obs_dir(LEGACY_MANAGED_OBS_DIR, port=port, password=password)
+    return LEGACY_MANAGED_OBS_DIR
 
 
 def get_obs_websocket_config_path(base_dir: str | Path) -> Path:
@@ -930,6 +981,26 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
 
     if bin_dir and not _has_mpv_dll(bin_dir):
         report["warnings"].append("binフォルダに mpv DLL が見つかりません。プレーヤー利用時に配置が必要です。")
+
+    obs_password = str(obs_cfg.get("password") or "")
+    if auto_fix:
+        try:
+            migrated_from = migrate_legacy_managed_obs_if_needed(port=port, password=obs_password)
+            if migrated_from is not None:
+                report["changed"] = True
+                report["notes"].append(
+                    f"旧OBS配置を obs-portable へコピー移行しました: {migrated_from}"
+                )
+        except Exception as e:
+            report["warnings"].append(f"旧OBS配置の移行に失敗しました: {e}")
+
+        try:
+            repaired_legacy = repair_legacy_managed_obs_if_present(port=port, password=obs_password)
+            if repaired_legacy is not None:
+                report["changed"] = True
+                report["notes"].append(f"旧OBS配置の起動前設定も修復しました: {repaired_legacy}")
+        except Exception as e:
+            report["warnings"].append(f"旧OBS配置の設定修復に失敗しました: {e}")
 
     current_obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), ROOT_DIR)
     expected_obs_dir = MANAGED_PORTABLE_OBS_DIR
@@ -1642,6 +1713,13 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     if not config.obs.obs_dir:
         raise RecorderError("OBSのパスが未設定です。設定画面の OBSフォルダ (obs.dir) を指定してください。")
 
+    if is_managed_portable_obs_dir(config.obs.obs_dir):
+        try:
+            migrate_legacy_managed_obs_if_needed(port=config.obs.port, password=config.obs.password)
+            repair_legacy_managed_obs_if_present(port=config.obs.port, password=config.obs.password)
+        except Exception as e:
+            LOGGER.warning("旧OBS配置の移行/修復に失敗しました: %s", e, exc_info=True)
+
     obs_dir_abs = os.path.abspath(str(config.obs.obs_dir))
     obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
 
@@ -1654,6 +1732,18 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     # 管理対象OBSが既に動いている場合は、設定反映前に必ず止める。
     process_manager = OBSProcessManager(obs_dir_abs, logger=LOGGER)
     process_manager.kill_stale_managed_processes()
+    unmanaged_processes = process_manager.unmanaged_processes()
+    if unmanaged_processes:
+        details = []
+        for process in unmanaged_processes[:5]:
+            path_text = str(process.executable_path) if process.executable_path else "path unknown"
+            details.append(f"pid={process.pid} {path_text}")
+        raise RecorderError(
+            "管理対象外のOBSが既に起動しています。\n"
+            "通常版OBSまたは旧配置のOBSが起動していると、このアプリの起動前設定は反映されません。\n"
+            + "\n".join(details)
+            + "\n既存のOBSを終了してから再実行してください。"
+        )
 
     bootstrapper = OBSBootstrapper(obs_dir_abs)
     try:
@@ -1679,10 +1769,24 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
 
     try:
+        started_at = time.time()
         process = process_manager.start_obs(env=process_manager.isolated_env(), hidden=True)
         # WebSocketの起動待ち
         time.sleep(2)
+        portable_mode = process_manager.latest_log_portable_mode(since=started_at - 1.0)
+        if portable_mode is False:
+            process_manager.terminate_process(process)
+            raise RecorderError(
+                "OBSがポータブルモードではなく通常モードで起動しました。\n"
+                f"起動対象: {obs_exe}\n"
+                "この状態では obs-portable の global.ini が読まれないため、"
+                "自動構成ウィザードやタスクトレイ設定を抑止できません。"
+            )
+        if portable_mode is None:
+            LOGGER.warning("OBSログから Portable mode を確認できませんでした: %s", obs_dir_abs)
         return process
+    except RecorderError:
+        raise
     except Exception as e:
         raise RecorderError(f"OBS起動エラー: {e}") from e
 

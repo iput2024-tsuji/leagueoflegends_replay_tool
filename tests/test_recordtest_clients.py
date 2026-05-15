@@ -344,6 +344,9 @@ def test_launch_obs_refuses_external_websocket_port(monkeypatch):
         def kill_stale_managed_processes(self, timeout_sec=3.0):
             return []
 
+        def unmanaged_processes(self):
+            return []
+
         def isolated_env(self):
             return {}
 
@@ -354,6 +357,92 @@ def test_launch_obs_refuses_external_websocket_port(monkeypatch):
     monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: True)
 
     with pytest.raises(recordtest.RecorderError, match="OBS WebSocketポート"):
+        recordtest.launch_obs(recordtest.AppConfig.from_dict({}))
+
+
+def test_preflight_migrates_legacy_obs_studio_to_managed_portable(monkeypatch):
+    root = Path("tests") / "_tmp" / "preflight_legacy_obs_migration"
+    shutil.rmtree(root, ignore_errors=True)
+    managed_dir = (root / "obs-portable").resolve()
+    legacy_dir = (root / "bin" / "OBS-Studio").resolve()
+    legacy_exe = legacy_dir / "bin" / "64bit" / "obs64.exe"
+    legacy_ini = legacy_dir / "config" / "obs-studio" / "global.ini"
+    legacy_exe.parent.mkdir(parents=True, exist_ok=True)
+    legacy_ini.parent.mkdir(parents=True, exist_ok=True)
+    legacy_exe.write_text("fake", encoding="utf-8")
+    legacy_ini.write_text(
+        "[General]\n"
+        "FirstRun=false\n\n"
+        "[BasicWindow]\n"
+        "SysTrayEnabled=true\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(recordtest, "ROOT_DIR", root.resolve())
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", legacy_dir)
+
+    report = recordtest.run_preflight_checks(
+        {
+            "obs": {"dir": str(legacy_dir), "port": 4455, "password": ""},
+            "paths": {
+                "bin_dir": str(root / "bin"),
+                "recordings_dir": str(root / "recordings"),
+                "json_dir": str(root / "recordings" / "json"),
+                "champion_icons_dir": str(root / "assets" / "champions" / "icons"),
+            },
+        },
+        auto_fix=True,
+        ensure_dirs=True,
+    )
+
+    assert report["errors"] == []
+    assert report["config"]["obs"]["dir"] == recordtest.DEFAULT_OBS_DIR
+    migrated_ini = managed_dir / "config" / "obs-studio" / "global.ini"
+    assert (managed_dir / "bin" / "64bit" / "obs64.exe").exists()
+    text = migrated_ini.read_text(encoding="utf-8")
+    assert "FirstRun=true" in text
+    assert "SysTrayEnabled=false" in text
+    legacy_text = legacy_ini.read_text(encoding="utf-8")
+    assert "FirstRun=true" in legacy_text
+    assert "SysTrayEnabled=false" in legacy_text
+
+
+def test_launch_obs_refuses_unmanaged_obs_process(monkeypatch):
+    obs_dir = Path("tests") / "_tmp" / "obs_launch_unmanaged_process" / "obs-portable"
+    shutil.rmtree(obs_dir.parent, ignore_errors=True)
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True, exist_ok=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", (obs_dir.parent / "bin" / "OBS-Studio").resolve())
+
+    class FakeProcessManager:
+        def __init__(self, obs_dir_arg, logger=None):
+            self.obs_dir = Path(obs_dir_arg)
+            self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            return []
+
+        def unmanaged_processes(self):
+            return [
+                SimpleNamespace(
+                    pid=200,
+                    executable_path=Path("C:/Program Files/obs-studio/bin/64bit/obs64.exe"),
+                )
+            ]
+
+        def isolated_env(self):
+            return {}
+
+        def start_obs(self, *args, **kwargs):
+            raise AssertionError("managed OBS must not start while unmanaged OBS is running")
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", FakeProcessManager)
+    monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: False)
+
+    with pytest.raises(recordtest.RecorderError, match="管理対象外のOBS"):
         recordtest.launch_obs(recordtest.AppConfig.from_dict({}))
 
 

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -115,3 +116,34 @@ def test_process_manager_reports_owned_process_from_lease(monkeypatch):
     )
 
     assert manager.has_owned_process() is True
+
+
+def test_process_manager_reads_latest_portable_mode_log(tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    logs_dir = manager.obs_dir / "config" / "obs-studio" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    old_log = logs_dir / "2026-01-01 00-00-00.txt"
+    new_log = logs_dir / "2026-01-01 00-00-01.txt"
+    old_log.write_text("Portable mode: false\n", encoding="utf-8")
+    new_log.write_text("Portable mode: true\n", encoding="utf-8")
+    os.utime(old_log, (1, 1))
+    os.utime(new_log, (2, 2))
+
+    assert manager.latest_log_portable_mode() is True
+
+
+def test_process_manager_reports_unmanaged_obs_process(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/unmanaged_obs_detect").resolve())
+    other_exe = Path("C:/Program Files/obs-studio/bin/64bit/obs64.exe")
+    monkeypatch.setattr(
+        manager,
+        "list_obs_processes",
+        lambda: [
+            OBSProcessInfo(pid=100, executable_path=manager.obs_exe, creation_time=10.0),
+            OBSProcessInfo(pid=200, executable_path=other_exe, creation_time=20.0),
+        ],
+    )
+
+    unmanaged = manager.unmanaged_processes()
+
+    assert [process.pid for process in unmanaged] == [200]

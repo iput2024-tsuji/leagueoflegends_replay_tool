@@ -57,6 +57,12 @@ class OBSProcessManager:
     def has_managed_process(self) -> bool:
         return bool(self.managed_processes())
 
+    def unmanaged_processes(self) -> list[OBSProcessInfo]:
+        return [process for process in self.list_obs_processes() if not self.is_managed_process(process)]
+
+    def has_unmanaged_process(self) -> bool:
+        return bool(self.unmanaged_processes())
+
     def find_owned_process(self) -> OBSProcessInfo | None:
         lease = self.read_process_lease()
         if lease is None:
@@ -163,6 +169,33 @@ class OBSProcessManager:
         process = subprocess.Popen(cmd, **popen_kwargs)
         self.write_process_lease(process)
         return process
+
+    def latest_log_path(self, since: float | None = None) -> Path | None:
+        logs_dir = self.obs_dir / "config" / "obs-studio" / "logs"
+        try:
+            candidates = [path for path in logs_dir.glob("*.txt") if path.is_file()]
+        except Exception:
+            return None
+        if since is not None:
+            candidates = [path for path in candidates if path.stat().st_mtime >= since]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+
+    def latest_log_portable_mode(self, since: float | None = None) -> bool | None:
+        log_path = self.latest_log_path(since=since)
+        if log_path is None:
+            return None
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            self.logger.debug("Failed to read OBS log for portable mode check: %s", e)
+            return None
+        if "Portable mode: true" in text:
+            return True
+        if "Portable mode: false" in text:
+            return False
+        return None
 
     def is_owned_process(self, process: OBSProcessInfo, lease: OBSProcessLease) -> bool:
         if process.pid != lease.pid:

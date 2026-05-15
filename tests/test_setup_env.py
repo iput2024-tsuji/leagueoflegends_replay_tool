@@ -124,3 +124,34 @@ def test_bootstrap_obs_portable_config_regenerates_corrupt_global_ini(monkeypatc
     assert "SysTrayEnabled=false" in text
     assert "SysTrayWhenStarted=false" in text
     assert "SysTrayMinimizeToTray=false" in text
+
+
+def test_ensure_obs_portable_migrates_legacy_obs_studio(monkeypatch):
+    root = runtime_dir("setup_env_legacy_obs_migration")
+    legacy_dir = root / "bin" / "OBS-Studio"
+    obs_dir = root / "obs-portable"
+    legacy_exe = legacy_dir / "bin" / "64bit" / "obs64.exe"
+    legacy_ini = legacy_dir / "config" / "obs-studio" / "global.ini"
+    legacy_exe.parent.mkdir(parents=True, exist_ok=True)
+    legacy_ini.parent.mkdir(parents=True, exist_ok=True)
+    legacy_exe.write_text("fake", encoding="utf-8")
+    legacy_ini.write_text(
+        "[General]\n"
+        "FirstRun=false\n\n"
+        "[BasicWindow]\n"
+        "SysTrayEnabled=true\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(setup_env, "OBS_PORTABLE_DIR", obs_dir)
+    monkeypatch.setattr(setup_env, "LEGACY_OBS_PORTABLE_DIR", legacy_dir)
+    monkeypatch.setattr(setup_env, "OBS_EXE", obs_dir / "bin" / "64bit" / "obs64.exe")
+    monkeypatch.setattr(setup_env, "LEGACY_OBS_EXE", legacy_exe)
+
+    assert setup_env.migrate_legacy_obs_portable() is True
+
+    migrated_ini = obs_dir / "config" / "obs-studio" / "global.ini"
+    assert (obs_dir / "bin" / "64bit" / "obs64.exe").exists()
+    text = migrated_ini.read_text(encoding="utf-8")
+    assert "FirstRun=true" in text
+    assert "SysTrayEnabled=false" in text

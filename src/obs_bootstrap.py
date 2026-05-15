@@ -3,6 +3,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ STARTUP_SETTINGS = {
     "FirstRun": "true",
 }
 STARTUP_SETTINGS_SECTION = "General"
+OBS_COPY_SKIP_NAMES = frozenset({".lol_replay_obs_lease.json", "temp_appdata"})
 
 
 @dataclass(frozen=True)
@@ -133,6 +135,20 @@ def apply_ini_settings(
             parser.set(section, key, value)
             changed = True
     return changed
+
+
+def copy_obs_tree_contents(src_dir: str | Path, dest_dir: str | Path) -> None:
+    src_path = Path(src_dir)
+    dest_path = Path(dest_dir)
+    dest_path.mkdir(parents=True, exist_ok=True)
+    for item in src_path.iterdir():
+        if item.name in OBS_COPY_SKIP_NAMES:
+            continue
+        target = dest_path / item.name
+        if item.is_dir():
+            shutil.copytree(item, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(item, target)
 
 
 class OBSBootstrapper:

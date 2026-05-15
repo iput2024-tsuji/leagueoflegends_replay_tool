@@ -26,8 +26,10 @@ ProgressCallback = Callable[[int, str], None]
 ROOT_DIR = Path(__file__).resolve().parents[1]
 BIN_DIR = ROOT_DIR / "bin"
 OBS_PORTABLE_DIR = ROOT_DIR / "obs-portable"
+LEGACY_OBS_PORTABLE_DIR = ROOT_DIR / "bin" / "OBS-Studio"
 FFMPEG_EXE = BIN_DIR / "ffmpeg.exe"
 OBS_EXE = OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
+LEGACY_OBS_EXE = LEGACY_OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
 
 FFMPEG_VERSION = "8.1.1"
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip"
@@ -149,6 +151,8 @@ def _extract_ffmpeg(zip_path: Path, dest: Path) -> Path:
 def _copy_tree_contents(src_dir: Path, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     for item in src_dir.iterdir():
+        if item.name in {".lol_replay_obs_lease.json", "temp_appdata"}:
+            continue
         target = dest_dir / item.name
         if item.is_dir():
             shutil.copytree(item, target, dirs_exist_ok=True)
@@ -189,6 +193,18 @@ def bootstrap_obs_portable_config(obs_dir: Path = OBS_PORTABLE_DIR) -> None:
     OBSBootstrapper(obs_dir).apply()
 
 
+def migrate_legacy_obs_portable(progress_cb: ProgressCallback | None = None) -> bool:
+    if OBS_EXE.exists() or not LEGACY_OBS_EXE.exists():
+        return False
+
+    report(progress_cb, OBS_PACKAGE.progress_start, "旧OBS配置を obs-portable に移行しています...")
+    OBSProcessManager(LEGACY_OBS_PORTABLE_DIR).kill_stale_managed_processes()
+    _copy_tree_contents(LEGACY_OBS_PORTABLE_DIR, OBS_PORTABLE_DIR)
+    bootstrap_obs_portable_config(OBS_PORTABLE_DIR)
+    report(progress_cb, OBS_PACKAGE.progress_end, f"OBS migrated: {OBS_PORTABLE_DIR}")
+    return True
+
+
 async def ensure_ffmpeg(progress_cb: ProgressCallback | None = None) -> Path:
     if FFMPEG_EXE.exists():
         report(progress_cb, FFMPEG_PACKAGE.progress_end, f"FFmpeg exists: {FFMPEG_EXE}")
@@ -210,6 +226,9 @@ async def ensure_obs_portable(progress_cb: ProgressCallback | None = None) -> Pa
     if OBS_EXE.exists():
         bootstrap_obs_portable_config(OBS_PORTABLE_DIR)
         report(progress_cb, OBS_PACKAGE.progress_end, f"OBS exists: {OBS_EXE}")
+        return OBS_PORTABLE_DIR
+
+    if await asyncio.to_thread(migrate_legacy_obs_portable, progress_cb):
         return OBS_PORTABLE_DIR
 
     with temporary_workspace("lol-replay-obs-") as tmp:

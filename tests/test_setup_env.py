@@ -34,7 +34,9 @@ def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypat
     setup_env.bootstrap_obs_portable_config(obs_dir)
 
     global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
     text = global_ini.read_text(encoding="utf-8")
+    user_text = user_ini.read_text(encoding="utf-8")
 
     assert (obs_dir / "obs_portable_mode.txt").exists()
     assert "[General]" in text
@@ -44,6 +46,10 @@ def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypat
     assert "SysTrayWhenStarted=false" in text
     assert "SysTrayMinimizeToTray=false" in text
     assert "HideTrayIcon" not in text
+    assert "FirstRun=true" in user_text
+    assert "SysTrayEnabled=false" in user_text
+    assert "SysTrayWhenStarted=false" in user_text
+    assert "SysTrayMinimizeToTray=false" in user_text
 
 
 def test_environment_ready_requires_bootstrapped_obs_global_ini(monkeypatch):
@@ -102,28 +108,54 @@ def test_environment_ready_requires_obs_first_run_initialized(monkeypatch):
     assert setup_env.is_environment_ready() is True
 
 
-def test_bootstrap_obs_portable_config_regenerates_corrupt_global_ini(monkeypatch):
+def test_environment_ready_requires_bootstrapped_obs_user_ini(monkeypatch):
+    root = runtime_dir("setup_env_ready_requires_user_ini")
+    ffmpeg = root / "bin" / "ffmpeg.exe"
+    obs_dir = root / "obs-portable"
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
+    ffmpeg.parent.mkdir(parents=True, exist_ok=True)
+    obs_exe.parent.mkdir(parents=True, exist_ok=True)
+    global_ini.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg.write_text("fake", encoding="utf-8")
+    obs_exe.write_text("fake", encoding="utf-8")
+    global_ini.write_text(
+        "[General]\n"
+        "FirstRun=true\n\n"
+        "[BasicWindow]\n"
+        "SysTrayEnabled=false\n"
+        "SysTrayWhenStarted=false\n"
+        "SysTrayMinimizeToTray=false\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
+    monkeypatch.setattr(setup_env, "OBS_EXE", obs_exe)
+    monkeypatch.setattr(setup_env, "OBS_PORTABLE_DIR", obs_dir)
+
+    assert setup_env.is_environment_ready() is False
+
+    setup_env.bootstrap_obs_portable_config(obs_dir)
+
+    assert setup_env.is_environment_ready() is True
+
+
+def test_bootstrap_obs_portable_config_regenerates_corrupt_global_ini():
     obs_dir = runtime_dir("setup_env_obs_bootstrap_corrupt") / "obs-portable"
     global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
     global_ini.parent.mkdir(parents=True, exist_ok=True)
     global_ini.write_text("[General\nbroken", encoding="utf-8")
 
-    def regenerate(_self, target_ini, timeout_sec=8.0):
-        assert not target_ini.exists()
-        target_ini.write_text("[General]\nExisting=true\n\n[Other]\nKeep=true\n", encoding="utf-8")
-
-    monkeypatch.setattr(setup_env.OBSBootstrapper, "regenerate_global_ini_with_obs", regenerate)
-
     setup_env.bootstrap_obs_portable_config(obs_dir)
 
     text = global_ini.read_text(encoding="utf-8")
-    assert "Existing=true" in text
-    assert "[Other]" in text
-    assert "Keep=true" in text
     assert "FirstRun=true" in text
     assert "SysTrayEnabled=false" in text
     assert "SysTrayWhenStarted=false" in text
     assert "SysTrayMinimizeToTray=false" in text
+    user_text = (obs_dir / "config" / "obs-studio" / "user.ini").read_text(encoding="utf-8")
+    assert "FirstRun=true" in user_text
+    assert "SysTrayEnabled=false" in user_text
 
 
 def test_ensure_obs_portable_migrates_legacy_obs_studio(monkeypatch):
@@ -151,7 +183,11 @@ def test_ensure_obs_portable_migrates_legacy_obs_studio(monkeypatch):
     assert setup_env.migrate_legacy_obs_portable() is True
 
     migrated_ini = obs_dir / "config" / "obs-studio" / "global.ini"
+    migrated_user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
     assert (obs_dir / "bin" / "64bit" / "obs64.exe").exists()
     text = migrated_ini.read_text(encoding="utf-8")
     assert "FirstRun=true" in text
     assert "SysTrayEnabled=false" in text
+    user_text = migrated_user_ini.read_text(encoding="utf-8")
+    assert "FirstRun=true" in user_text
+    assert "SysTrayEnabled=false" in user_text

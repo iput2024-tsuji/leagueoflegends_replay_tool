@@ -41,9 +41,13 @@ class BootstrapReport:
     legacy_marker_exists: bool
     config_dir_exists: bool
     global_ini_exists: bool
+    user_ini_exists: bool
     global_ini_parse_error: str | None = None
+    user_ini_parse_error: str | None = None
     missing_tray_settings: tuple[str, ...] = field(default_factory=tuple)
     missing_startup_settings: tuple[str, ...] = field(default_factory=tuple)
+    missing_user_tray_settings: tuple[str, ...] = field(default_factory=tuple)
+    missing_user_startup_settings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def ready(self) -> bool:
@@ -52,9 +56,13 @@ class BootstrapReport:
             and self.portable_marker_exists
             and self.config_dir_exists
             and self.global_ini_exists
+            and self.user_ini_exists
             and self.global_ini_parse_error is None
+            and self.user_ini_parse_error is None
             and not self.missing_tray_settings
             and not self.missing_startup_settings
+            and not self.missing_user_tray_settings
+            and not self.missing_user_startup_settings
         )
 
     @property
@@ -72,6 +80,10 @@ def get_obs_config_dir(base_dir: str | Path) -> Path:
 
 def get_obs_global_ini_path(base_dir: str | Path) -> Path:
     return get_obs_config_dir(base_dir) / "global.ini"
+
+
+def get_obs_user_ini_path(base_dir: str | Path) -> Path:
+    return get_obs_config_dir(base_dir) / "user.ini"
 
 
 def get_obs_websocket_config_path(base_dir: str | Path) -> Path:
@@ -170,9 +182,13 @@ class OBSBootstrapper:
 
     def check(self) -> BootstrapReport:
         global_ini = get_obs_global_ini_path(self.base_dir)
-        parse_error = None
+        user_ini = get_obs_user_ini_path(self.base_dir)
+        global_parse_error = None
+        user_parse_error = None
         missing_tray = []
         missing_startup = []
+        missing_user_tray = []
+        missing_user_startup = []
         if global_ini.exists():
             try:
                 parser, had_bom = read_obs_ini_parser(global_ini)
@@ -187,7 +203,22 @@ class OBSBootstrapper:
                         if ("systray" in lower_key or "hidetray" in lower_key) and not allowed:
                             missing_tray.append(f"{section}.{key}")
             except Exception as e:
-                parse_error = f"{type(e).__name__}: {e}"
+                global_parse_error = f"{type(e).__name__}: {e}"
+        if user_ini.exists():
+            try:
+                parser, had_bom = read_obs_ini_parser(user_ini)
+                if had_bom:
+                    missing_user_tray.append("encoding.BOM")
+                missing_user_startup.extend(missing_ini_settings(parser, STARTUP_SETTINGS_SECTION, STARTUP_SETTINGS))
+                missing_user_tray.extend(missing_ini_settings(parser, TRAY_SETTINGS_SECTION, TRAY_SETTINGS))
+                for section in parser.sections():
+                    for key in parser.options(section):
+                        lower_key = key.lower()
+                        allowed = section == TRAY_SETTINGS_SECTION and key in TRAY_SETTINGS
+                        if ("systray" in lower_key or "hidetray" in lower_key) and not allowed:
+                            missing_user_tray.append(f"{section}.{key}")
+            except Exception as e:
+                user_parse_error = f"{type(e).__name__}: {e}"
 
         return BootstrapReport(
             obs_dir=self.base_dir,
@@ -196,15 +227,20 @@ class OBSBootstrapper:
             legacy_marker_exists=get_legacy_marker_path(self.base_dir).exists(),
             config_dir_exists=get_obs_config_dir(self.base_dir).exists(),
             global_ini_exists=global_ini.exists(),
-            global_ini_parse_error=parse_error,
+            user_ini_exists=user_ini.exists(),
+            global_ini_parse_error=global_parse_error,
+            user_ini_parse_error=user_parse_error,
             missing_tray_settings=tuple(missing_tray),
             missing_startup_settings=tuple(missing_startup),
+            missing_user_tray_settings=tuple(missing_user_tray),
+            missing_user_startup_settings=tuple(missing_user_startup),
         )
 
     def apply(self, port: int | None = None, password: str = "") -> dict[str, Any]:
         marker = self.ensure_portable_mode_marker()
         config_dir = self.ensure_config_dir()
         changed_ini, global_ini_path = self.ensure_global_ini()
+        changed_user_ini, user_ini_path = self.ensure_user_ini()
         websocket_result = None
         if port is not None:
             websocket_result = self.ensure_websocket_config(port, password)
@@ -213,6 +249,8 @@ class OBSBootstrapper:
             "config_dir": config_dir,
             "global_ini_changed": changed_ini,
             "global_ini_path": global_ini_path,
+            "user_ini_changed": changed_user_ini,
+            "user_ini_path": user_ini_path,
             "websocket": websocket_result,
         }
 
@@ -240,7 +278,14 @@ class OBSBootstrapper:
         # OBS reads global.ini only at startup and may rewrite it on exit.
         # Stop every process from this managed portable tree before patching.
         self.process_manager.kill_stale_managed_processes()
-        ini_path = get_obs_global_ini_path(self.base_dir)
+        return self._ensure_obs_ini(get_obs_global_ini_path(self.base_dir), label="global.ini", regenerate_with_obs=False)
+
+    def ensure_user_ini(self) -> tuple[bool, Path]:
+        # OBS 32.x reads UI startup and tray flags from user.ini.
+        self.process_manager.kill_stale_managed_processes()
+        return self._ensure_obs_ini(get_obs_user_ini_path(self.base_dir), label="user.ini", regenerate_with_obs=False)
+
+    def _ensure_obs_ini(self, ini_path: Path, label: str, regenerate_with_obs: bool) -> tuple[bool, Path]:
         ini_path.parent.mkdir(parents=True, exist_ok=True)
         parser = new_obs_ini_parser()
 
@@ -250,12 +295,13 @@ class OBSBootstrapper:
             try:
                 parser, normalized_encoding = read_obs_ini_parser(ini_path)
             except Exception as e:
-                self.logger.warning("Corrupt OBS global.ini will be regenerated: %s (%s)", ini_path, e)
+                self.logger.warning("Corrupt OBS %s will be regenerated: %s (%s)", label, ini_path, e)
                 parse_failed = True
                 ini_path.unlink(missing_ok=True)
-                self.regenerate_global_ini_with_obs(ini_path)
-                parser = new_obs_ini_parser()
-                parser, normalized_encoding = read_obs_ini_parser(ini_path)
+                if regenerate_with_obs:
+                    self.regenerate_global_ini_with_obs(ini_path)
+                    parser = new_obs_ini_parser()
+                    parser, normalized_encoding = read_obs_ini_parser(ini_path)
 
         changed = parse_failed or normalized_encoding
         for section in parser.sections():

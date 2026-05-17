@@ -197,6 +197,51 @@ class OBSProcessManager:
             return False
         return None
 
+    def hide_main_windows(
+        self,
+        process: subprocess.Popen[Any] | int,
+        timeout_sec: float = 3.0,
+        poll_interval: float = 0.1,
+    ) -> int:
+        if os.name != "nt":
+            return 0
+        pid = int(process.pid if hasattr(process, "pid") else process)
+        deadline = time.monotonic() + max(0.0, timeout_sec)
+        hidden = 0
+        while True:
+            hidden += self._hide_windows_by_pid_windows(pid)
+            if hidden > 0 or time.monotonic() >= deadline:
+                return hidden
+            time.sleep(max(0.05, poll_interval))
+
+    def _hide_windows_by_pid_windows(self, pid: int) -> int:
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except Exception:
+            return 0
+
+        user32 = ctypes.windll.user32
+        target_pid = int(pid)
+        hidden_count = 0
+        enum_windows_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def callback(hwnd: int, _lparam: int) -> bool:
+            nonlocal hidden_count
+            window_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(window_pid))
+            if int(window_pid.value) == target_pid and user32.IsWindowVisible(hwnd):
+                user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                hidden_count += 1
+            return True
+
+        try:
+            user32.EnumWindows(enum_windows_proc(callback), 0)
+        except Exception as e:
+            self.logger.debug("Failed to hide OBS windows for pid=%s: %s", pid, e)
+            return hidden_count
+        return hidden_count
+
     def is_owned_process(self, process: OBSProcessInfo, lease: OBSProcessLease) -> bool:
         if process.pid != lease.pid:
             return False

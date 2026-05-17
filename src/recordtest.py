@@ -30,6 +30,7 @@ try:
         copy_obs_tree_contents,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
+        get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
     )
@@ -45,6 +46,7 @@ except ImportError:
         copy_obs_tree_contents,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
+        get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
     )
@@ -587,6 +589,10 @@ def get_obs_global_ini_path(base_dir: str | Path) -> Path:
     return shared_get_obs_global_ini_path(base_dir)
 
 
+def get_obs_user_ini_path(base_dir: str | Path) -> Path:
+    return shared_get_obs_user_ini_path(base_dir)
+
+
 def get_obs_portable_marker_path(base_dir: str | Path) -> Path:
     return shared_get_portable_marker_path(base_dir)
 
@@ -608,6 +614,14 @@ def ensure_portable_obs_global_ini(base_dir: str | Path) -> tuple[bool, Path]:
     configparser を使い、キーの大文字小文字を維持して書き込む。
     """
     return OBSBootstrapper(base_dir).ensure_global_ini()
+
+
+def ensure_portable_obs_user_ini(base_dir: str | Path) -> tuple[bool, Path]:
+    """
+    ポータブルOBSの user.ini に初回起動・トレイ無効化設定を反映する。
+    OBS 32.x は UI 起動設定を global.ini ではなく user.ini から読む。
+    """
+    return OBSBootstrapper(base_dir).ensure_user_ini()
 
 
 def ensure_portable_obs_websocket_config(base_dir: str | Path, port: int, password: str) -> tuple[bool, Path]:
@@ -1746,21 +1760,23 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         )
 
     bootstrapper = OBSBootstrapper(obs_dir_abs)
-    try:
-        bootstrapper.ensure_portable_mode_marker()
-    except Exception as e:
-        raise RecorderError(f"{PORTABLE_OBS_MARKER_NAME} の準備に失敗しました: {e}") from e
 
     try:
-        changed_ini, global_ini_path = bootstrapper.ensure_global_ini()
-        if changed_ini and global_ini_path:
+        bootstrap_result = bootstrapper.apply(port=config.obs.port, password=config.obs.password)
+        global_ini_path = bootstrap_result.get("global_ini_path")
+        user_ini_path = bootstrap_result.get("user_ini_path")
+        if bootstrap_result.get("global_ini_changed") and global_ini_path:
             LOGGER.info("ℹ️ ポータブルOBSの global.ini を更新しました: %s", global_ini_path)
-        changed, ws_cfg_path = bootstrapper.ensure_websocket_config(
-            config.obs.port,
-            config.obs.password,
-        )
+        if bootstrap_result.get("user_ini_changed") and user_ini_path:
+            LOGGER.info("ℹ️ ポータブルOBSの user.ini を更新しました: %s", user_ini_path)
+        websocket_result = bootstrap_result.get("websocket")
+        if websocket_result:
+            changed, ws_cfg_path = websocket_result
+        else:
+            changed, ws_cfg_path = False, None
         if changed and ws_cfg_path:
             LOGGER.info("ℹ️ ポータブルOBSのWebSocket設定を更新しました: %s", ws_cfg_path)
+        LOGGER.info("OBS bootstrap paths: global.ini=%s user.ini=%s", global_ini_path, user_ini_path)
     except Exception as e:
         raise RecorderError(f"ポータブルOBS起動前設定の更新に失敗しました: {e}") from e
 
@@ -1771,8 +1787,12 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     try:
         started_at = time.time()
         process = process_manager.start_obs(env=process_manager.isolated_env(), hidden=True)
+        hidden_windows = process_manager.hide_main_windows(process, timeout_sec=3.0)
+        if hidden_windows:
+            LOGGER.info("OBSウィンドウを非表示にしました: pid=%s windows=%s", process.pid, hidden_windows)
         # WebSocketの起動待ち
         time.sleep(2)
+        process_manager.hide_main_windows(process, timeout_sec=0.5)
         portable_mode = process_manager.latest_log_portable_mode(since=started_at - 1.0)
         if portable_mode is False:
             process_manager.terminate_process(process)

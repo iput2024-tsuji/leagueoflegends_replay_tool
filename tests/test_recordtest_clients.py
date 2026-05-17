@@ -249,6 +249,7 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
     monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
     result = recordtest.OBSBootstrapper(obs_dir).bootstrap()
     global_ini = result["global_ini_path"]
+    user_ini = result["user_ini_path"]
     config_dir = result["config_dir"]
 
     assert (obs_dir / "obs_portable_mode.txt").exists()
@@ -256,6 +257,7 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
     assert config_dir == (obs_dir / "config" / "obs-studio").resolve()
     assert config_dir.exists()
     assert global_ini.exists()
+    assert user_ini.exists()
 
     text = global_ini.read_text(encoding="utf-8")
     assert "[General]" in text
@@ -265,6 +267,14 @@ def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(m
     assert "SysTrayWhenStarted=false" in text
     assert "SysTrayMinimizeToTray=false" in text
     assert "HideTrayIcon" not in text
+
+    user_text = user_ini.read_text(encoding="utf-8")
+    assert "[General]" in user_text
+    assert "FirstRun=true" in user_text
+    assert "[BasicWindow]" in user_text
+    assert "SysTrayEnabled=false" in user_text
+    assert "SysTrayWhenStarted=false" in user_text
+    assert "SysTrayMinimizeToTray=false" in user_text
 
 
 def test_global_ini_removes_bom_and_nonstandard_tray_keys(monkeypatch):
@@ -308,20 +318,39 @@ def test_global_ini_parse_error_deletes_and_regenerates_before_patch(monkeypatch
 
     monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
 
-    def regenerate(_self, target_ini, timeout_sec=8.0):
-        assert not target_ini.exists()
-        target_ini.write_text("[General]\nExisting=true\n\n[Other]\nKeep=true\n", encoding="utf-8")
-
-    monkeypatch.setattr(recordtest.OBSBootstrapper, "regenerate_global_ini_with_obs", regenerate)
-
     changed, result_path = recordtest.ensure_portable_obs_global_ini(obs_dir)
 
     assert changed is True
     assert result_path == ini_path.resolve()
     text = ini_path.read_text(encoding="utf-8")
-    assert "Existing=true" in text
-    assert "[Other]" in text
-    assert "Keep=true" in text
+    assert "FirstRun=true" in text
+    assert "SysTrayEnabled=false" in text
+    assert "SysTrayWhenStarted=false" in text
+    assert "SysTrayMinimizeToTray=false" in text
+
+
+def test_user_ini_is_primary_source_for_first_run_and_tray(monkeypatch):
+    obs_dir = Path("tests") / "_tmp" / "obs_bootstrapper_user_ini" / "obs-portable"
+    shutil.rmtree(obs_dir.parent, ignore_errors=True)
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
+    user_ini.parent.mkdir(parents=True, exist_ok=True)
+    user_ini.write_text(
+        "[General]\n"
+        "FirstRun=false\n\n"
+        "[BasicWindow]\n"
+        "SysTrayEnabled=true\n"
+        "SysTrayWhenStarted=true\n"
+        "SysTrayMinimizeToTray=true\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir.resolve())
+
+    changed, result_path = recordtest.ensure_portable_obs_user_ini(obs_dir)
+
+    assert changed is True
+    assert result_path == user_ini.resolve()
+    text = user_ini.read_text(encoding="utf-8")
     assert "FirstRun=true" in text
     assert "SysTrayEnabled=false" in text
     assert "SysTrayWhenStarted=false" in text
@@ -399,13 +428,21 @@ def test_preflight_migrates_legacy_obs_studio_to_managed_portable(monkeypatch):
     assert report["errors"] == []
     assert report["config"]["obs"]["dir"] == recordtest.DEFAULT_OBS_DIR
     migrated_ini = managed_dir / "config" / "obs-studio" / "global.ini"
+    migrated_user_ini = managed_dir / "config" / "obs-studio" / "user.ini"
     assert (managed_dir / "bin" / "64bit" / "obs64.exe").exists()
     text = migrated_ini.read_text(encoding="utf-8")
     assert "FirstRun=true" in text
     assert "SysTrayEnabled=false" in text
+    user_text = migrated_user_ini.read_text(encoding="utf-8")
+    assert "FirstRun=true" in user_text
+    assert "SysTrayEnabled=false" in user_text
+    assert "SysTrayWhenStarted=false" in user_text
     legacy_text = legacy_ini.read_text(encoding="utf-8")
     assert "FirstRun=true" in legacy_text
     assert "SysTrayEnabled=false" in legacy_text
+    legacy_user_text = (legacy_dir / "config" / "obs-studio" / "user.ini").read_text(encoding="utf-8")
+    assert "FirstRun=true" in legacy_user_text
+    assert "SysTrayEnabled=false" in legacy_user_text
 
 
 def test_launch_obs_refuses_unmanaged_obs_process(monkeypatch):

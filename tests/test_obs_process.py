@@ -147,3 +147,10 @@ def test_process_manager_reports_unmanaged_obs_process(monkeypatch):
     unmanaged = manager.unmanaged_processes()
 
     assert [process.pid for process in unmanaged] == [200]
+
+
+def test_hide_main_windows_noops_outside_windows(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/hide_obs_non_windows").resolve())
+    monkeypatch.setattr("src.obs_process.os.name", "posix")
+
+    assert manager.hide_main_windows(SimpleNamespace(pid=1234), timeout_sec=0) == 0

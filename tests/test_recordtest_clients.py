@@ -445,6 +445,51 @@ def test_preflight_migrates_legacy_obs_studio_to_managed_portable(monkeypatch):
     assert "SysTrayEnabled=false" in legacy_user_text
 
 
+def test_preflight_defers_bootstrap_repair_while_managed_obs_is_running(monkeypatch):
+    root = Path("tests") / "_tmp" / "preflight_defer_running_obs_repair"
+    shutil.rmtree(root, ignore_errors=True)
+    managed_dir = (root / "obs-portable").resolve()
+    obs_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
+    global_ini = managed_dir / "config" / "obs-studio" / "global.ini"
+    obs_exe.parent.mkdir(parents=True, exist_ok=True)
+    global_ini.parent.mkdir(parents=True, exist_ok=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    global_ini.write_text("[General]\nFirstRun=false\n", encoding="utf-8")
+
+    class FakeProcessManager:
+        def __init__(self, obs_dir_arg, logger=None):
+            self.obs_dir = Path(obs_dir_arg)
+
+        def has_managed_process(self):
+            return True
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            raise AssertionError("preflight must not stop a running OBS to repair ini files")
+
+    monkeypatch.setattr(recordtest, "ROOT_DIR", root.resolve())
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", (root / "bin" / "OBS-Studio").resolve())
+    monkeypatch.setattr(recordtest, "OBSProcessManager", FakeProcessManager)
+
+    report = recordtest.run_preflight_checks(
+        {
+            "obs": {"dir": str(managed_dir), "port": 4455, "password": ""},
+            "paths": {
+                "bin_dir": str(root / "bin"),
+                "recordings_dir": str(root / "recordings"),
+                "json_dir": str(root / "recordings" / "json"),
+                "champion_icons_dir": str(root / "assets" / "champions" / "icons"),
+            },
+        },
+        auto_fix=True,
+        ensure_dirs=True,
+    )
+
+    assert report["errors"] == []
+    assert any("起動中" in warning and "延期" in warning for warning in report["warnings"])
+    assert "FirstRun=false" in global_ini.read_text(encoding="utf-8")
+
+
 def test_launch_obs_refuses_unmanaged_obs_process(monkeypatch):
     obs_dir = Path("tests") / "_tmp" / "obs_launch_unmanaged_process" / "obs-portable"
     shutil.rmtree(obs_dir.parent, ignore_errors=True)

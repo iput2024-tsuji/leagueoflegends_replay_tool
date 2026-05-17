@@ -651,6 +651,31 @@ def ensure_obs_websocket_port_free(config: AppConfig, timeout: float = 0.5) -> N
     )
 
 
+def wait_for_owned_obs_connection(
+    config: AppConfig,
+    process_manager: OBSProcessManager | None = None,
+    timeout_sec: float = 8.0,
+    poll_interval: float = 0.5,
+) -> bool:
+    """このアプリが起動済みのOBSがWebSocket接続可能になるまで待つ。"""
+    manager = process_manager or OBSProcessManager(config.obs.obs_dir, logger=LOGGER)
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        if not manager.has_owned_process():
+            return False
+        ok, _detail = test_obs_connection(
+            config.obs.host,
+            config.obs.port,
+            config.obs.password,
+            timeout=min(1.0, max(0.2, poll_interval)),
+        )
+        if ok:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(max(0.05, poll_interval))
+
+
 def _ensure_section_dict(root: dict[str, Any], key: str) -> tuple[dict[str, Any], bool]:
     value = root.get(key)
     if isinstance(value, dict):
@@ -1034,14 +1059,20 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             bootstrap_report = bootstrapper.check()
             if bootstrap_report.needs_repair:
                 if auto_fix:
-                    bootstrap_result = bootstrapper.apply(
-                        port=int(obs_cfg.get("port") or DEFAULT_OBS_PORT),
-                        password=str(obs_cfg.get("password") or ""),
-                    )
-                    report["changed"] = True
-                    report["notes"].append(
-                        f"ポータブルOBS設定を修復しました: {bootstrap_result.get('global_ini_path')}"
-                    )
+                    if bootstrapper.process_manager.has_managed_process():
+                        report["warnings"].append(
+                            "ポータブルOBSが起動中のため、起動前設定の自動修復を延期しました。"
+                            "録画監視を停止してから環境修復を再実行してください。"
+                        )
+                    else:
+                        bootstrap_result = bootstrapper.apply(
+                            port=int(obs_cfg.get("port") or DEFAULT_OBS_PORT),
+                            password=str(obs_cfg.get("password") or ""),
+                        )
+                        report["changed"] = True
+                        report["notes"].append(
+                            f"ポータブルOBS設定を修復しました: {bootstrap_result.get('global_ini_path')}"
+                        )
                 else:
                     report["warnings"].append("OBS Bootstrapper の修復が必要です。")
         except Exception as e:
@@ -1461,6 +1492,7 @@ def setup_obs_sync_elements(
     launched_process = None
     recorder = None
     try:
+        process_manager = OBSProcessManager(config.obs.obs_dir, logger=LOGGER)
         ok, _ = test_obs_connection(
             config.obs.host,
             config.obs.port,
@@ -1468,13 +1500,14 @@ def setup_obs_sync_elements(
             timeout=1.5,
         )
         if ok:
-            process_manager = OBSProcessManager(config.obs.obs_dir, logger=LOGGER)
             if not process_manager.has_owned_process():
                 raise RecorderError(
                     "OBS WebSocketには接続できますが、このアプリが起動した管理対象OBSではありません。\n"
                     f"接続先: {config.obs.host}:{config.obs.port}\n"
                     "既存のOBSを終了してから再実行してください。"
                 )
+        elif wait_for_owned_obs_connection(config, process_manager=process_manager):
+            pass
         elif auto_launch:
             launched_process = launch_obs(config)
 

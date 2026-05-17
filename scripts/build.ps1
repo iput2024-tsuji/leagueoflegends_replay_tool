@@ -71,6 +71,13 @@ foreach ($dll in $bundledMpvDlls) {
   Remove-Item -Path $dll.FullName -Force -ErrorAction SilentlyContinue
 }
 
+$bundledSetupArchives = Get-ChildItem -Path $distBinDir -File -ErrorAction SilentlyContinue | Where-Object {
+  $_.Name -match '^(OBS-Studio|ffmpeg)-.*\.(zip|7z)$'
+}
+foreach ($archive in $bundledSetupArchives) {
+  Remove-Item -Path $archive.FullName -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "Build complete. Portable OBS, mpv DLLs, FFmpeg, and game assets are not bundled."
 Write-Host "OBS and FFmpeg are downloaded automatically on first launch with pinned SHA256 verification."
 Write-Host "Place mpv DLLs under dist\\LoLReplayTool\\bin manually."

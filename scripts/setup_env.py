@@ -193,6 +193,20 @@ def bootstrap_obs_portable_config(obs_dir: Path = OBS_PORTABLE_DIR) -> None:
     OBSBootstrapper(obs_dir).apply()
 
 
+def cleanup_legacy_archives(bin_dir: Path = BIN_DIR) -> list[Path]:
+    removed = []
+    for pattern in ("OBS-Studio-*.zip", "ffmpeg-*.zip", "ffmpeg-*.7z"):
+        for path in bin_dir.glob(pattern):
+            if not path.is_file():
+                continue
+            try:
+                path.unlink()
+                removed.append(path)
+            except FileNotFoundError:
+                continue
+    return removed
+
+
 def migrate_legacy_obs_portable(progress_cb: ProgressCallback | None = None) -> bool:
     if OBS_EXE.exists() or not LEGACY_OBS_EXE.exists():
         return False
@@ -246,6 +260,9 @@ async def ensure_obs_portable(progress_cb: ProgressCallback | None = None) -> Pa
 async def ensure_environment(progress_cb: ProgressCallback | None = None) -> None:
     await ensure_ffmpeg(progress_cb)
     await ensure_obs_portable(progress_cb)
+    removed_archives = await asyncio.to_thread(cleanup_legacy_archives)
+    if removed_archives:
+        report(progress_cb, 99, f"不要なセットアップZIPを削除しました: {len(removed_archives)}件")
     report(progress_cb, 100, "環境構築が完了しました。")
 
 

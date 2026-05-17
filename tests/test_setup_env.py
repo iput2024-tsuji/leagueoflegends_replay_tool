@@ -52,6 +52,25 @@ def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypat
     assert "SysTrayMinimizeToTray=false" in user_text
 
 
+def test_cleanup_legacy_archives_removes_setup_zips():
+    root = runtime_dir("setup_env_cleanup_archives")
+    bin_dir = root / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    obs_zip = bin_dir / "OBS-Studio-32.1.2-Windows-x64.zip"
+    ffmpeg_zip = bin_dir / "ffmpeg-8.1.1-essentials_build.zip"
+    keep_file = bin_dir / "mpv-1.dll"
+    obs_zip.write_bytes(b"obs")
+    ffmpeg_zip.write_bytes(b"ffmpeg")
+    keep_file.write_bytes(b"mpv")
+
+    removed = setup_env.cleanup_legacy_archives(bin_dir)
+
+    assert {path.name for path in removed} == {ffmpeg_zip.name, obs_zip.name}
+    assert not obs_zip.exists()
+    assert not ffmpeg_zip.exists()
+    assert keep_file.exists()
+
+
 def test_environment_ready_requires_bootstrapped_obs_global_ini(monkeypatch):
     root = runtime_dir("setup_env_ready_requires_bootstrap")
     ffmpeg = root / "bin" / "ffmpeg.exe"

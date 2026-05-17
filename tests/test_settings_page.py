@@ -1,13 +1,13 @@
 from src.app import SettingsPage
 
 
-def test_settings_page_initial_audio_refresh_does_not_auto_launch_obs(qtbot):
-    page = SettingsPage(on_back=lambda: None)
-    qtbot.addWidget(page)
-    calls = []
+class FakeSettingsPage:
+    def __init__(self) -> None:
+        self._audio_auto_refreshed_once = False
+        self.calls = []
 
-    def fake_refresh_audio_devices(*, show_message=True, show_error=True, auto_launch=True):
-        calls.append(
+    def refresh_audio_devices(self, *, show_message=True, show_error=True, auto_launch=True):
+        self.calls.append(
             {
                 "show_message": show_message,
                 "show_error": show_error,
@@ -16,9 +16,10 @@ def test_settings_page_initial_audio_refresh_does_not_auto_launch_obs(qtbot):
         )
         return True
 
-    page.refresh_audio_devices = fake_refresh_audio_devices
 
+def test_settings_page_initial_audio_refresh_does_not_auto_launch_obs():
+    page = FakeSettingsPage()
     SettingsPage.on_page_shown(page)
 
     assert page._audio_auto_refreshed_once is True
-    assert calls == [{"show_message": False, "show_error": False, "auto_launch": False}]
+    assert page.calls == [{"show_message": False, "show_error": False, "auto_launch": False}]

@@ -1762,7 +1762,11 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     bootstrapper = OBSBootstrapper(obs_dir_abs)
 
     try:
-        bootstrap_result = bootstrapper.apply(port=config.obs.port, password=config.obs.password)
+        bootstrap_result = bootstrapper.apply(
+            port=config.obs.port,
+            password=config.obs.password,
+            stop_managed_processes=False,
+        )
         global_ini_path = bootstrap_result.get("global_ini_path")
         user_ini_path = bootstrap_result.get("user_ini_path")
         if bootstrap_result.get("global_ini_changed") and global_ini_path:

@@ -236,11 +236,19 @@ class OBSBootstrapper:
             missing_user_startup_settings=tuple(missing_user_startup),
         )
 
-    def apply(self, port: int | None = None, password: str = "") -> dict[str, Any]:
+    def apply(
+        self,
+        port: int | None = None,
+        password: str = "",
+        *,
+        stop_managed_processes: bool = True,
+    ) -> dict[str, Any]:
+        if stop_managed_processes:
+            self.process_manager.kill_stale_managed_processes()
         marker = self.ensure_portable_mode_marker()
         config_dir = self.ensure_config_dir()
-        changed_ini, global_ini_path = self.ensure_global_ini()
-        changed_user_ini, user_ini_path = self.ensure_user_ini()
+        changed_ini, global_ini_path = self.ensure_global_ini(stop_managed_processes=False)
+        changed_user_ini, user_ini_path = self.ensure_user_ini(stop_managed_processes=False)
         websocket_result = None
         if port is not None:
             websocket_result = self.ensure_websocket_config(port, password)
@@ -274,15 +282,17 @@ class OBSBootstrapper:
         config_dir.mkdir(parents=True, exist_ok=True)
         return config_dir
 
-    def ensure_global_ini(self) -> tuple[bool, Path]:
+    def ensure_global_ini(self, *, stop_managed_processes: bool = True) -> tuple[bool, Path]:
         # OBS reads global.ini only at startup and may rewrite it on exit.
         # Stop every process from this managed portable tree before patching.
-        self.process_manager.kill_stale_managed_processes()
+        if stop_managed_processes:
+            self.process_manager.kill_stale_managed_processes()
         return self._ensure_obs_ini(get_obs_global_ini_path(self.base_dir), label="global.ini", regenerate_with_obs=False)
 
-    def ensure_user_ini(self) -> tuple[bool, Path]:
+    def ensure_user_ini(self, *, stop_managed_processes: bool = True) -> tuple[bool, Path]:
         # OBS 32.x reads UI startup and tray flags from user.ini.
-        self.process_manager.kill_stale_managed_processes()
+        if stop_managed_processes:
+            self.process_manager.kill_stale_managed_processes()
         return self._ensure_obs_ini(get_obs_user_ini_path(self.base_dir), label="user.ini", regenerate_with_obs=False)
 
     def _ensure_obs_ini(self, ini_path: Path, label: str, regenerate_with_obs: bool) -> tuple[bool, Path]:

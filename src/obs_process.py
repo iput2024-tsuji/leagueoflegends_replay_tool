@@ -163,9 +163,8 @@ class OBSProcessManager:
             *(extra_args or []),
         ]
         popen_kwargs: dict[str, Any] = {"cwd": str(self.working_dir), "env": env or os.environ.copy()}
-        startupinfo = self._startupinfo_hidden() if hidden else None
-        if startupinfo is not None:
-            popen_kwargs["startupinfo"] = startupinfo
+        if hidden:
+            popen_kwargs.update(self._hidden_subprocess_kwargs())
         process = subprocess.Popen(cmd, **popen_kwargs)
         self.write_process_lease(process)
         return process
@@ -345,7 +344,13 @@ class OBSProcessManager:
             "/format:csv",
         ]
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            completed = self._run_hidden(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
             if completed.returncode == 0 and completed.stdout.strip():
                 return self._parse_wmic_csv(completed.stdout)
         except Exception as e:
@@ -360,7 +365,7 @@ class OBSProcessManager:
             "| Select-Object ProcessId,ExecutablePath,CreationDate | ConvertTo-Json -Compress"
         )
         try:
-            completed = subprocess.run(
+            completed = self._run_hidden(
                 ["powershell", "-NoProfile", "-Command", script],
                 capture_output=True,
                 text=True,
@@ -421,17 +426,34 @@ class OBSProcessManager:
         if force:
             command.append("/f")
         try:
-            subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            self._run_hidden(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             return True
         except Exception as e:
             self.logger.warning("Failed to terminate OBS pid=%s: %s", pid, e, exc_info=True)
             return False
 
-    def _startupinfo_hidden(self) -> subprocess.STARTUPINFO | None:
+    def _run_hidden(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+        run_kwargs = self._hidden_subprocess_kwargs()
+        run_kwargs.update(kwargs)
+        return subprocess.run(command, **run_kwargs)
+
+    def _hidden_subprocess_kwargs(self) -> dict[str, Any]:
         if os.name != "nt":
+            return {}
+        kwargs: dict[str, Any] = {}
+        startupinfo = self._startupinfo_hidden()
+        if startupinfo is not None:
+            kwargs["startupinfo"] = startupinfo
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+        return kwargs
+
+    def _startupinfo_hidden(self) -> subprocess.STARTUPINFO | None:
+        if os.name != "nt" or not hasattr(subprocess, "STARTUPINFO"):
             return None
         startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
         startupinfo.wShowWindow = 0  # SW_HIDE
         return startupinfo
 

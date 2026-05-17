@@ -982,7 +982,7 @@ class SettingsPage(QWidget):
     def on_page_shown(self) -> None:
         if not self._audio_auto_refreshed_once:
             self._audio_auto_refreshed_once = True
-            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
+            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
             return
         self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
 

@@ -154,3 +154,62 @@ def test_hide_main_windows_noops_outside_windows(monkeypatch):
     monkeypatch.setattr("src.obs_process.os.name", "posix")
 
     assert manager.hide_main_windows(SimpleNamespace(pid=1234), timeout_sec=0) == 0
+
+
+def test_windows_process_queries_run_hidden(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/hidden_obs_query").resolve())
+    calls = []
+
+    class FakeStartupInfo:
+        def __init__(self):
+            self.dwFlags = 0
+            self.wShowWindow = None
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Node,CreationDate,ExecutablePath,ProcessId\nhost,,C:/obs/bin/64bit/obs64.exe,123\n",
+        )
+
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    monkeypatch.setattr("src.obs_process.subprocess.STARTUPINFO", FakeStartupInfo, raising=False)
+    monkeypatch.setattr("src.obs_process.subprocess.STARTF_USESHOWWINDOW", 1, raising=False)
+    monkeypatch.setattr("src.obs_process.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr("src.obs_process.subprocess.run", fake_run)
+
+    processes = manager._list_obs_processes_windows()
+
+    assert [process.pid for process in processes] == [123]
+    assert len(calls) == 1
+    _command, kwargs = calls[0]
+    assert kwargs["creationflags"] == 0x08000000
+    assert kwargs["startupinfo"].dwFlags & 1
+    assert kwargs["startupinfo"].wShowWindow == 0
+
+
+def test_taskkill_runs_hidden_on_windows(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/hidden_taskkill").resolve())
+    calls = []
+
+    class FakeStartupInfo:
+        def __init__(self):
+            self.dwFlags = 0
+            self.wShowWindow = None
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    monkeypatch.setattr("src.obs_process.subprocess.STARTUPINFO", FakeStartupInfo, raising=False)
+    monkeypatch.setattr("src.obs_process.subprocess.STARTF_USESHOWWINDOW", 1, raising=False)
+    monkeypatch.setattr("src.obs_process.subprocess.CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr("src.obs_process.subprocess.run", fake_run)
+
+    assert manager._terminate_pid(123, force=True) is True
+
+    command, kwargs = calls[0]
+    assert command == ["taskkill", "/pid", "123", "/f"]
+    assert kwargs["creationflags"] == 0x08000000
+    assert kwargs["startupinfo"].dwFlags & 1

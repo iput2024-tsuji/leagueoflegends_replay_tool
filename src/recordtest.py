@@ -22,7 +22,7 @@ import urllib3
 from obsws_python.error import OBSSDKRequestError
 
 try:
-    from .app_paths import get_app_root
+    from .app_paths import get_app_root, get_user_data_root
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
@@ -38,7 +38,7 @@ try:
     from .recording_state import FinalizeResult, RecordingEndDetector, RecordingOutcome, RecordingPhase
     from .session_log import SessionLogV1, load_session_payload, save_session_payload
 except ImportError:
-    from app_paths import get_app_root
+    from app_paths import get_app_root, get_user_data_root
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
@@ -55,6 +55,7 @@ except ImportError:
     from session_log import SessionLogV1, load_session_payload, save_session_payload
 
 ROOT_DIR = get_app_root()
+DATA_DIR = get_user_data_root()
 CONFIG_REPOSITORY = ConfigRepository(CONFIG_PATH, SAMPLE_CONFIG_PATH)
 
 LIVECLIENT_BASE = "https://127.0.0.1:2999/liveclientdata"
@@ -93,8 +94,10 @@ DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
 DEFAULT_AUDIO_DESKTOP_MUTE = False
 DEFAULT_AUDIO_MIC_MUTE = False
 
-MANAGED_PORTABLE_OBS_DIR = (ROOT_DIR / DEFAULT_OBS_DIR).resolve()
+MANAGED_PORTABLE_OBS_DIR = (DATA_DIR / DEFAULT_OBS_DIR).resolve()
 LEGACY_MANAGED_OBS_DIR = (ROOT_DIR / LEGACY_OBS_DIR).resolve()
+LEGACY_ROOT_OBS_DIR = (ROOT_DIR / DEFAULT_OBS_DIR).resolve()
+LEGACY_DATA_BIN_OBS_DIR = (DATA_DIR / LEGACY_OBS_DIR).resolve()
 PORTABLE_OBS_MARKER_NAME = "obs_portable_mode.txt"
 LEGACY_PORTABLE_OBS_MARKER_NAME = "portable_mode.txt"
 MANAGED_AUDIO_INPUTS = {
@@ -114,7 +117,7 @@ MANAGED_AUDIO_INPUTS = {
     },
 }
 
-LOG_DIR = ROOT_DIR / "logs"
+LOG_DIR = DATA_DIR / "logs"
 LOGGER = logging.getLogger("lol_replay")
 
 
@@ -292,21 +295,21 @@ class AppConfig:
             minimum=0.1,
         )
 
-        recordings_dir = resolve_path(paths_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), ROOT_DIR)
-        json_dir = resolve_path(paths_cfg.get("json_dir", DEFAULT_JSON_DIR), ROOT_DIR)
+        recordings_dir = resolve_path(paths_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), DATA_DIR)
+        json_dir = resolve_path(paths_cfg.get("json_dir", DEFAULT_JSON_DIR), DATA_DIR)
         if json_dir is None and recordings_dir is not None:
             json_dir = recordings_dir / "json"
-        bin_dir = resolve_path(paths_cfg.get("bin_dir", DEFAULT_BIN_DIR), ROOT_DIR)
-        icons_dir = resolve_path(paths_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), ROOT_DIR)
+        bin_dir = resolve_path(paths_cfg.get("bin_dir", DEFAULT_BIN_DIR), DATA_DIR)
+        icons_dir = resolve_path(paths_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), DATA_DIR)
 
         if recordings_dir is None:
-            recordings_dir = (ROOT_DIR / DEFAULT_RECORDINGS_DIR).resolve()
+            recordings_dir = (DATA_DIR / DEFAULT_RECORDINGS_DIR).resolve()
         if json_dir is None:
             json_dir = (recordings_dir / "json").resolve()
         if bin_dir is None:
-            bin_dir = (ROOT_DIR / DEFAULT_BIN_DIR).resolve()
+            bin_dir = (DATA_DIR / DEFAULT_BIN_DIR).resolve()
         if icons_dir is None:
-            icons_dir = (ROOT_DIR / DEFAULT_CHAMPION_ICONS_DIR).resolve()
+            icons_dir = (DATA_DIR / DEFAULT_CHAMPION_ICONS_DIR).resolve()
 
         normalized_storage_cfg = dict(storage_cfg)
         normalized_storage_cfg["max_size_gb"] = max_size_gb
@@ -514,11 +517,28 @@ def is_valid_obs_dir(base_dir: str | Path | None) -> bool:
     return bool(obs_exe and obs_exe.exists())
 
 
+def legacy_managed_obs_dirs() -> tuple[Path, ...]:
+    seen = set()
+    result = []
+    for path in (LEGACY_ROOT_OBS_DIR, LEGACY_MANAGED_OBS_DIR, LEGACY_DATA_BIN_OBS_DIR):
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved).casefold()
+        if key == str(MANAGED_PORTABLE_OBS_DIR).casefold() or key in seen:
+            continue
+        seen.add(key)
+        result.append(resolved)
+    return tuple(result)
+
+
 def detect_obs_dir() -> str | None:
     if is_valid_obs_dir(MANAGED_PORTABLE_OBS_DIR):
         return str(MANAGED_PORTABLE_OBS_DIR)
-    if is_valid_obs_dir(LEGACY_MANAGED_OBS_DIR):
-        return str(LEGACY_MANAGED_OBS_DIR)
+    for legacy_dir in legacy_managed_obs_dirs():
+        if is_valid_obs_dir(legacy_dir):
+            return str(legacy_dir)
     return None
 
 
@@ -537,7 +557,7 @@ def is_legacy_managed_obs_dir(base_dir: str | Path | None) -> bool:
         return False
     try:
         candidate = Path(base_dir).resolve()
-        return candidate == LEGACY_MANAGED_OBS_DIR
+        return any(candidate == legacy_dir for legacy_dir in legacy_managed_obs_dirs())
     except Exception:
         return False
 
@@ -555,26 +575,31 @@ def bootstrap_obs_dir(base_dir: str | Path, port: int | None = None, password: s
 def migrate_legacy_managed_obs_if_needed(port: int | None = None, password: str = "") -> Path | None:
     if is_valid_obs_dir(MANAGED_PORTABLE_OBS_DIR):
         return None
-    if not is_valid_obs_dir(LEGACY_MANAGED_OBS_DIR):
+
+    legacy_dir = next((path for path in legacy_managed_obs_dirs() if is_valid_obs_dir(path)), None)
+    if legacy_dir is None:
         return None
 
-    OBSProcessManager(LEGACY_MANAGED_OBS_DIR, logger=LOGGER).kill_stale_managed_processes()
+    OBSProcessManager(legacy_dir, logger=LOGGER).kill_stale_managed_processes()
     MANAGED_PORTABLE_OBS_DIR.mkdir(parents=True, exist_ok=True)
-    copy_obs_tree_contents(LEGACY_MANAGED_OBS_DIR, MANAGED_PORTABLE_OBS_DIR)
+    copy_obs_tree_contents(legacy_dir, MANAGED_PORTABLE_OBS_DIR)
     bootstrap_obs_dir(MANAGED_PORTABLE_OBS_DIR, port=port, password=password)
     LOGGER.info(
         "旧OBS配置を obs-portable へコピー移行しました: %s -> %s",
-        LEGACY_MANAGED_OBS_DIR,
+        legacy_dir,
         MANAGED_PORTABLE_OBS_DIR,
     )
-    return LEGACY_MANAGED_OBS_DIR
+    return legacy_dir
 
 
 def repair_legacy_managed_obs_if_present(port: int | None = None, password: str = "") -> Path | None:
-    if not is_valid_obs_dir(LEGACY_MANAGED_OBS_DIR):
-        return None
-    bootstrap_obs_dir(LEGACY_MANAGED_OBS_DIR, port=port, password=password)
-    return LEGACY_MANAGED_OBS_DIR
+    repaired = None
+    for legacy_dir in legacy_managed_obs_dirs():
+        if not is_valid_obs_dir(legacy_dir):
+            continue
+        bootstrap_obs_dir(legacy_dir, port=port, password=password)
+        repaired = legacy_dir
+    return repaired
 
 
 def get_obs_websocket_config_path(base_dir: str | Path) -> Path:
@@ -833,7 +858,7 @@ def obs_color_to_hex(color_value: Any) -> str:
 
 
 def _has_mpv_dll(bin_path: str | Path | None) -> bool:
-    return has_mpv_dll(bin_path)
+    return has_mpv_dll(bin_path, ROOT_DIR)
 
 
 def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs: bool = True) -> dict[str, Any]:
@@ -990,10 +1015,10 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             report["changed"] = True
         report["warnings"].append("max_size_gb が不正だったため既定値を使用します。")
 
-    recordings_dir = resolve_path(paths_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), ROOT_DIR)
-    json_dir = resolve_path(paths_cfg.get("json_dir", DEFAULT_JSON_DIR), ROOT_DIR)
-    bin_dir = resolve_path(paths_cfg.get("bin_dir", DEFAULT_BIN_DIR), ROOT_DIR)
-    icons_dir = resolve_path(paths_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), ROOT_DIR)
+    recordings_dir = resolve_path(paths_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), DATA_DIR)
+    json_dir = resolve_path(paths_cfg.get("json_dir", DEFAULT_JSON_DIR), DATA_DIR)
+    bin_dir = resolve_path(paths_cfg.get("bin_dir", DEFAULT_BIN_DIR), DATA_DIR)
+    icons_dir = resolve_path(paths_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), DATA_DIR)
 
     if recordings_dir is None:
         report["errors"].append("recordings_dir の設定が無効です。")
@@ -1041,7 +1066,7 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         except Exception as e:
             report["warnings"].append(f"旧OBS配置の設定修復に失敗しました: {e}")
 
-    current_obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), ROOT_DIR)
+    current_obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), DATA_DIR)
     expected_obs_dir = MANAGED_PORTABLE_OBS_DIR
 
     if not current_obs_dir or not is_managed_portable_obs_dir(current_obs_dir):
@@ -1602,11 +1627,12 @@ def setup_environment(config: AppConfig) -> None:
     if bin_dir:
         os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
 
-        if not has_mpv_dll(bin_dir):
+        if not has_mpv_dll(bin_dir, ROOT_DIR):
             LOGGER.warning(
                 "⚠️ 警告: 'bin' フォルダ内に mpv-1.dll / mpv-2.dll (または libmpv-1.dll / libmpv-2.dll) が見つかりません。"
             )
             LOGGER.warning("探した場所: %s", bin_dir)
+            LOGGER.warning("旧配置も確認しました: %s", ROOT_DIR / "bin")
     else:
         LOGGER.warning("⚠️ 警告: bin_dir が未設定です。")
 

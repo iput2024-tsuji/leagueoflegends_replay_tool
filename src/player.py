@@ -41,25 +41,27 @@ from PyQt6.QtWidgets import (
 
 # --- 1. MPVのパス設定 ---
 try:
-    from .app_paths import get_app_root
-    from .mpv_support import MPV_DLL_NAMES, find_mpv_dll
+    from .app_paths import get_app_root, get_user_data_root
+    from .mpv_support import find_mpv_dll, iter_mpv_search_dirs
     from .qt_lifecycle import request_worker_stop
     from .session_log import load_session_payload
 except ImportError:
-    from app_paths import get_app_root
-    from mpv_support import MPV_DLL_NAMES, find_mpv_dll
+    from app_paths import get_app_root, get_user_data_root
+    from mpv_support import find_mpv_dll, iter_mpv_search_dirs
     from qt_lifecycle import request_worker_stop
     from session_log import load_session_payload
 
 ROOT_DIR = get_app_root()
-CONFIG_PATH = ROOT_DIR / "config" / "setting.json"
-ALIASES_PATH = ROOT_DIR / "config" / "champion_aliases.json"
-BIN_DIR = ROOT_DIR / "bin"
-ICON_DIR = ROOT_DIR / "assets" / "champions" / "icons"
+DATA_DIR = get_user_data_root()
+CONFIG_PATH = DATA_DIR / "config" / "setting.json"
+ALIASES_PATH = DATA_DIR / "config" / "champion_aliases.json"
+INSTALL_ALIASES_PATH = ROOT_DIR / "config" / "champion_aliases.json"
+BIN_DIR = DATA_DIR / "bin"
+ICON_DIR = DATA_DIR / "assets" / "champions" / "icons"
 ICON_INDEX = None
 ICON_ALIASES = None
-DEFAULT_RECORDINGS_DIR = ROOT_DIR / "recordings"
-DEFAULT_JSON_DIR = ROOT_DIR / "recordings" / "json"
+DEFAULT_RECORDINGS_DIR = DATA_DIR / "recordings"
+DEFAULT_JSON_DIR = DATA_DIR / "recordings" / "json"
 LOGGER = logging.getLogger("lol_replay.player")
 
 
@@ -81,7 +83,7 @@ def resolve_config_path(value: str | Path | None, fallback: Path) -> Path:
     if value not in (None, ""):
         path = Path(str(value))
     if not path.is_absolute():
-        path = (ROOT_DIR / path).resolve()
+        path = (DATA_DIR / path).resolve()
     return path
 
 
@@ -128,8 +130,11 @@ def resolve_video_path(json_path: Path, payload: dict[str, Any], recordings_dir:
 
 
 def find_ffmpeg_executable() -> str | None:
-    ffmpeg_path = BIN_DIR / "ffmpeg.exe"
-    return str(ffmpeg_path) if ffmpeg_path.exists() else None
+    for base in iter_mpv_search_dirs(BIN_DIR, ROOT_DIR):
+        ffmpeg_path = base / "ffmpeg.exe"
+        if ffmpeg_path.exists():
+            return str(ffmpeg_path)
+    return None
 
 
 def format_seconds(value: float | int | str | None) -> str:
@@ -143,43 +148,28 @@ def format_seconds(value: float | int | str | None) -> str:
 
 
 def ensure_mpv_dll(bin_dir: Path, root_dir: Path) -> None:
-    candidates = []
-    for base in (bin_dir, root_dir):
+    for base in iter_mpv_search_dirs(bin_dir, root_dir):
         if not base or not base.exists():
             continue
-        for name in MPV_DLL_NAMES:
-            path = base / name
-            if path.exists():
-                candidates.append(path)
 
-    if not candidates:
-        return
+        mpv1 = base / "mpv-1.dll"
+        libmpv1 = base / "libmpv-1.dll"
+        if mpv1.exists() or libmpv1.exists():
+            continue
 
-    try:
-        bin_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        return
-
-    mpv1 = bin_dir / "mpv-1.dll"
-    libmpv1 = bin_dir / "libmpv-1.dll"
-    if mpv1.exists() or libmpv1.exists():
-        return
-
-    for src in candidates:
-        if src.name in ("mpv-1.dll", "libmpv-1.dll"):
+        for src_name in ("mpv-2.dll", "libmpv-2.dll"):
+            src = base / src_name
+            if not src.exists():
+                continue
             try:
                 shutil.copy2(src, mpv1)
             except Exception:
                 pass
             return
 
-    for src in candidates:
-        if src.name in ("mpv-2.dll", "libmpv-2.dll"):
-            try:
-                shutil.copy2(src, mpv1)
-            except Exception:
-                pass
-            return
+
+def format_mpv_search_dirs() -> str:
+    return "\n".join(f"- {path}" for path in iter_mpv_search_dirs(BIN_DIR, ROOT_DIR))
 
 
 mpv_module = None
@@ -222,13 +212,14 @@ def bootstrap_mpv_runtime() -> Any | None:
         MPV_IMPORT_ERROR = FileNotFoundError(f"MPV DLL was not found under {BIN_DIR}")
         return None
 
-    if BIN_DIR.exists():
-        bin_text = str(BIN_DIR)
+    dll_dir = dll_path.parent
+    if dll_dir.exists():
+        bin_text = str(dll_dir)
         path_parts = os.environ.get("PATH", "").split(os.pathsep)
         if bin_text not in path_parts:
             os.environ["PATH"] = bin_text + os.pathsep + os.environ.get("PATH", "")
         try:
-            register_mpv_dll_directory(BIN_DIR)
+            register_mpv_dll_directory(dll_dir)
         except Exception as e:
             MPV_IMPORT_ERROR = e
             return None
@@ -269,14 +260,14 @@ def build_mpv_error_message() -> str:
             "DLLの依存ファイル不足、32/64bit不一致、破損したDLL、または互換性のないDLLが優先検出された可能性があります。\n\n"
             f"検出したDLL: {dll_path}\n"
             f"エラー: {type(MPV_IMPORT_ERROR).__name__}: {MPV_IMPORT_ERROR}\n\n"
-            f"binフォルダ: {BIN_DIR}\n"
+            f"探した場所:\n{format_mpv_search_dirs()}\n"
             "対応DLL: mpv-2.dll / libmpv-2.dll / mpv-1.dll / libmpv-1.dll\n"
             "同じbinフォルダにDLL依存ファイル一式を配置してください。"
         )
     return (
         "binフォルダに mpv-1.dll などのMPVコンポーネントが見つかりません。\n"
         "配置してから起動してください。\n\n"
-        f"探した場所: {BIN_DIR}\n\n"
+        f"探した場所:\n{format_mpv_search_dirs()}\n\n"
         "対応DLL: mpv-1.dll / libmpv-1.dll / mpv-2.dll / libmpv-2.dll"
     )
 
@@ -634,15 +625,17 @@ def build_icon_index() -> None:
 def load_icon_aliases() -> None:
     global ICON_ALIASES
     ICON_ALIASES = {}
-    if not ALIASES_PATH.exists():
-        return
-    try:
-        with open(ALIASES_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict):
-            ICON_ALIASES = data
-    except Exception:
-        ICON_ALIASES = {}
+    for aliases_path in (ALIASES_PATH, INSTALL_ALIASES_PATH):
+        if not aliases_path.exists():
+            continue
+        try:
+            with open(aliases_path, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                ICON_ALIASES = data
+                return
+        except Exception:
+            ICON_ALIASES = {}
 
 
 def find_champion_icon(champion_name: str | None) -> Path | None:

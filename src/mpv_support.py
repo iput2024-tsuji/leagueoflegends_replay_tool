@@ -6,14 +6,31 @@ from pathlib import Path
 MPV_DLL_NAMES = ("mpv-2.dll", "libmpv-2.dll", "mpv-1.dll", "libmpv-1.dll")
 
 
-def find_mpv_dll(bin_dir: str | Path | None, root_dir: str | Path | None = None) -> Path | None:
-    bases = []
+def iter_mpv_search_dirs(bin_dir: str | Path | None, root_dir: str | Path | None = None) -> tuple[Path, ...]:
+    candidates = []
     if bin_dir:
-        bases.append(Path(bin_dir))
+        candidates.append(Path(bin_dir))
     if root_dir:
-        bases.append(Path(root_dir))
+        root = Path(root_dir)
+        candidates.append(root / "bin")
+        candidates.append(root)
 
-    for base in bases:
+    result = []
+    seen = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve()).casefold()
+        except Exception:
+            key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+    return tuple(result)
+
+
+def find_mpv_dll(bin_dir: str | Path | None, root_dir: str | Path | None = None) -> Path | None:
+    for base in iter_mpv_search_dirs(bin_dir, root_dir):
         if not base.exists():
             continue
         for name in MPV_DLL_NAMES:

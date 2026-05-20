@@ -18,15 +18,19 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.app_paths import get_app_root, get_user_data_root
 from src.obs_bootstrap import OBSBootstrapper
 from src.obs_process import OBSProcessManager
 
 ProgressCallback = Callable[[int, str], None]
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-BIN_DIR = ROOT_DIR / "bin"
-OBS_PORTABLE_DIR = ROOT_DIR / "obs-portable"
+ROOT_DIR = get_app_root()
+DATA_DIR = get_user_data_root()
+BIN_DIR = DATA_DIR / "bin"
+OBS_PORTABLE_DIR = DATA_DIR / "obs-portable"
+LEGACY_ROOT_OBS_PORTABLE_DIR = ROOT_DIR / "obs-portable"
 LEGACY_OBS_PORTABLE_DIR = ROOT_DIR / "bin" / "OBS-Studio"
+LEGACY_DATA_BIN_OBS_PORTABLE_DIR = DATA_DIR / "bin" / "OBS-Studio"
 FFMPEG_EXE = BIN_DIR / "ffmpeg.exe"
 OBS_EXE = OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
 LEGACY_OBS_EXE = LEGACY_OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
@@ -88,9 +92,42 @@ def is_environment_ready() -> bool:
         return False
 
 
+def _dedupe_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
+    result = []
+    seen = set()
+    for path in paths:
+        try:
+            key = str(path.resolve()).casefold()
+        except Exception:
+            key = str(path).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return tuple(result)
+
+
+def legacy_obs_portable_dirs() -> tuple[Path, ...]:
+    try:
+        current_obs_dir = str(OBS_PORTABLE_DIR.resolve()).casefold()
+    except Exception:
+        current_obs_dir = str(OBS_PORTABLE_DIR).casefold()
+    return tuple(
+        path
+        for path in _dedupe_paths(
+            (
+                LEGACY_ROOT_OBS_PORTABLE_DIR,
+                LEGACY_OBS_PORTABLE_DIR,
+                LEGACY_DATA_BIN_OBS_PORTABLE_DIR,
+            )
+        )
+        if str(path.resolve()).casefold() != current_obs_dir
+    )
+
+
 @contextmanager
 def temporary_workspace(prefix: str, parent: Path | None = None) -> Iterator[Path]:
-    base_dir = parent or (ROOT_DIR / "downloads" / "_tmp")
+    base_dir = parent or (DATA_DIR / "downloads" / "_tmp")
     base_dir.mkdir(parents=True, exist_ok=True)
     workspace = base_dir / f"{prefix}{uuid.uuid4().hex}"
     workspace.mkdir(parents=True, exist_ok=False)
@@ -207,16 +244,29 @@ def cleanup_legacy_archives(bin_dir: Path = BIN_DIR) -> list[Path]:
     return removed
 
 
+def cleanup_setup_archives() -> list[Path]:
+    removed = []
+    for bin_dir in _dedupe_paths((BIN_DIR, ROOT_DIR / "bin")):
+        removed.extend(cleanup_legacy_archives(bin_dir))
+    return removed
+
+
 def migrate_legacy_obs_portable(progress_cb: ProgressCallback | None = None) -> bool:
-    if OBS_EXE.exists() or not LEGACY_OBS_EXE.exists():
+    if OBS_EXE.exists():
         return False
 
-    report(progress_cb, OBS_PACKAGE.progress_start, "旧OBS配置を obs-portable に移行しています...")
-    OBSProcessManager(LEGACY_OBS_PORTABLE_DIR).kill_stale_managed_processes()
-    _copy_tree_contents(LEGACY_OBS_PORTABLE_DIR, OBS_PORTABLE_DIR)
-    bootstrap_obs_portable_config(OBS_PORTABLE_DIR)
-    report(progress_cb, OBS_PACKAGE.progress_end, f"OBS migrated: {OBS_PORTABLE_DIR}")
-    return True
+    for legacy_dir in legacy_obs_portable_dirs():
+        legacy_exe = legacy_dir / "bin" / "64bit" / "obs64.exe"
+        if not legacy_exe.exists():
+            continue
+        report(progress_cb, OBS_PACKAGE.progress_start, f"旧OBS配置を移行しています: {legacy_dir}")
+        OBSProcessManager(legacy_dir).kill_stale_managed_processes()
+        _copy_tree_contents(legacy_dir, OBS_PORTABLE_DIR)
+        bootstrap_obs_portable_config(OBS_PORTABLE_DIR)
+        report(progress_cb, OBS_PACKAGE.progress_end, f"OBS migrated: {OBS_PORTABLE_DIR}")
+        return True
+
+    return False
 
 
 async def ensure_ffmpeg(progress_cb: ProgressCallback | None = None) -> Path:
@@ -260,7 +310,7 @@ async def ensure_obs_portable(progress_cb: ProgressCallback | None = None) -> Pa
 async def ensure_environment(progress_cb: ProgressCallback | None = None) -> None:
     await ensure_ffmpeg(progress_cb)
     await ensure_obs_portable(progress_cb)
-    removed_archives = await asyncio.to_thread(cleanup_legacy_archives)
+    removed_archives = await asyncio.to_thread(cleanup_setup_archives)
     if removed_archives:
         report(progress_cb, 99, f"不要なセットアップZIPを削除しました: {len(removed_archives)}件")
     report(progress_cb, 100, "環境構築が完了しました。")

@@ -166,10 +166,10 @@ tests/
 
 このリポジトリおよびビルド成果物には、OBS Studio 本体、mpv DLL、Riot Games の画像アセットを同梱しません。
 
-- OBS Studio は初回起動時に固定バージョンを自動取得し、`obs-portable` に配置します。
-- mpv DLL は利用者が正規の配布元から取得し、`bin/` に配置してください。
-- FFmpeg は初回起動時に固定バージョンを自動取得し、`bin/ffmpeg.exe` に配置します。システム PATH 上の FFmpeg には依存しません。
-- チャンピオンアイコンを使う場合は、利用者が `assets/champions/icons` に配置してください。Riot Games のアセットを利用する場合は、Riot Games の規約・ポリシーに従ってください。
+- OBS Studio は初回起動時に固定バージョンを自動取得し、開発実行時は `obs-portable`、配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable` に配置します。
+- mpv DLL は利用者が正規の配布元から取得し、開発実行時は `bin/`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin` または配布フォルダ直下の `bin/` に配置してください。
+- FFmpeg は初回起動時に固定バージョンを自動取得し、開発実行時は `bin/ffmpeg.exe`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe` に配置します。システム PATH 上の FFmpeg には依存しません。
+- チャンピオンアイコンを使う場合は、開発実行時は `assets/champions/icons`、配布版では `%LOCALAPPDATA%\LoLReplayTool\assets\champions\icons` に配置してください。Riot Games のアセットを利用する場合は、Riot Games の規約・ポリシーに従ってください。
 
 ## セットアップ
 
@@ -191,7 +191,7 @@ python main.py
 - 初回セットアップで「環境を自動修復」を実行すると、WebSocket、シーン、同期用色ソースを自動構成します
 - 音声デバイス、録画保存先、FPS、容量制限はアプリの設定画面から変更できます
 
-`config/setting.json` は `.gitignore` 済みです。
+`config/setting.json` は `.gitignore` 済みです。配布版では設定、録画、ログ、OBS/FFmpeg などの可変データを `%LOCALAPPDATA%\LoLReplayTool` に保存します。旧配布フォルダ内の `config/setting.json`、`obs-portable`、`bin/OBS-Studio` は初回起動時に新しい保存先へコピー移行されます。
 
 ## 使い方
 
@@ -209,7 +209,7 @@ python main.py
 
 ### JSON の保存先
 
-JSON は既定で `recordings/json/` に保存されます。
+JSON は既定で、開発実行時は `recordings/json/`、配布版では `%LOCALAPPDATA%\LoLReplayTool\recordings\json\` に保存されます。
 
 ```text
 lol_YYYYMMDD_HHMMSS.json
@@ -239,16 +239,17 @@ dist\LoLReplayTool\
 - mpv DLL はビルド成果物へコピーされません
 - FFmpeg はビルド成果物へコピーされません
 - チャンピオンアイコンはビルド成果物へコピーされません
+- 配布版の可変データは `dist\LoLReplayTool` ではなく `%LOCALAPPDATA%\LoLReplayTool` に作成されます
 - `assets/app/app.ico` が存在する場合、exe アイコンとウィンドウアイコンに反映されます
 
 ## トラブルシュート
 
 - `ポータブルOBSが見つかりません`
-  - `obs-portable/bin/64bit/obs64.exe` が存在するように配置してください。
+  - 配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable\bin\64bit\obs64.exe`、開発実行時は `obs-portable\bin\64bit\obs64.exe` が存在するように配置してください。
 - `mpv DLL が見つかりません`
-  - `bin/` に `mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll` のいずれかを配置してください。
+  - `%LOCALAPPDATA%\LoLReplayTool\bin` または配布フォルダの `bin/` に `mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll` のいずれかを配置してください。
 - `FFmpegが見つかりません`
-  - `bin/ffmpeg.exe` を配置してください。クリップ出力はシステム PATH の FFmpeg を使用しません。
+  - 通常は初回起動時に自動取得します。手動配置する場合、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe`、開発実行時は `bin\ffmpeg.exe` を配置してください。クリップ出力はシステム PATH の FFmpeg を使用しません。
 - `OBS WebSocketポートが既に使用されています`
   - 通常版 OBS や手動起動した OBS が動いている場合は終了してください。このアプリは `obs-portable` 配下の管理対象 OBS だけを起動・制御します。
 - OBS がタスクトレイに表示される

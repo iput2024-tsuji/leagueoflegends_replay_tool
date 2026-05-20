@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (
 
 try:
     from . import recordtest
-    from .app_paths import get_app_root
+    from .app_paths import get_app_root, get_user_data_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController
     from .player import PlayerWidget
     from .qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
@@ -50,7 +50,7 @@ except ImportError:
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
     import recordtest
-    from app_paths import get_app_root
+    from app_paths import get_app_root, get_user_data_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController
     from player import PlayerWidget
     from qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
@@ -58,6 +58,7 @@ except ImportError:
 
 
 ROOT_DIR = get_app_root()
+DATA_DIR = get_user_data_root()
 APP_ICON_CANDIDATES = [
     ROOT_DIR / "assets" / "icon.ico",
     ROOT_DIR / "assets" / "app" / "app.ico",
@@ -95,6 +96,16 @@ def run_preflight(
         auto_fix=auto_fix,
         force_obs_detect=force_obs_detect,
     )
+
+
+def resolve_settings_start_dir(current: str) -> str:
+    if current:
+        path = Path(current)
+        if not path.is_absolute():
+            path = DATA_DIR / path
+    else:
+        path = DATA_DIR
+    return str(path)
 
 
 def run_guided_auto_setup(config_data: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -988,21 +999,21 @@ class SettingsPage(QWidget):
 
     def browse_recordings_dir(self) -> None:
         current = self.fields["paths.recordings_dir"].text().strip()
-        start_dir = current or str(ROOT_DIR)
+        start_dir = resolve_settings_start_dir(current)
         selected = QFileDialog.getExistingDirectory(self, "録画保存ディレクトリを選択", start_dir)
         if selected:
             self.fields["paths.recordings_dir"].setText(selected)
 
     def browse_json_dir(self) -> None:
         current = self.fields["paths.json_dir"].text().strip()
-        start_dir = current or str(ROOT_DIR)
+        start_dir = resolve_settings_start_dir(current)
         selected = QFileDialog.getExistingDirectory(self, "JSONディレクトリを選択", start_dir)
         if selected:
             self.fields["paths.json_dir"].setText(selected)
 
     def browse_icons_dir(self) -> None:
         current = self.fields["paths.champion_icons_dir"].text().strip()
-        start_dir = current or str(ROOT_DIR)
+        start_dir = resolve_settings_start_dir(current)
         selected = QFileDialog.getExistingDirectory(self, "アイコンディレクトリを選択", start_dir)
         if selected:
             self.fields["paths.champion_icons_dir"].setText(selected)

@@ -105,6 +105,19 @@ def test_mpv_dll_detection_matches_python_mpv_preference(tmp_path):
     assert support.find_mpv_dll(tmp_path) == libmpv2
 
 
+def test_mpv_dll_detection_falls_back_to_install_bin(tmp_path):
+    support = importlib.import_module("src.mpv_support")
+    data_bin = tmp_path / "data" / "bin"
+    install_root = tmp_path / "install"
+    install_bin = install_root / "bin"
+    data_bin.mkdir(parents=True)
+    install_bin.mkdir(parents=True)
+    dll_path = install_bin / "mpv-1.dll"
+    dll_path.write_bytes(b"mpv")
+
+    assert support.find_mpv_dll(data_bin, install_root) == dll_path
+
+
 def test_player_runtime_raises_without_exiting(monkeypatch):
     player = importlib.import_module("src.player")
     reset_player_runtime(player, monkeypatch)

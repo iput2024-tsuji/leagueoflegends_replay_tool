@@ -85,8 +85,24 @@ def test_app_config_generates_obs_password_when_missing():
     assert len(config.obs.password) >= 12
 
 
-def test_preflight_generates_and_persists_obs_password():
-    cfg = {"obs": {"password": ""}}
+def test_preflight_generates_and_persists_obs_password(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", (tmp_path / "legacy-root-obs").resolve())
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", (tmp_path / "legacy-bin-obs").resolve())
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", (tmp_path / "legacy-data-bin-obs").resolve())
+    cfg = {
+        "obs": {"password": "", "dir": str(managed_dir)},
+        "paths": {
+            "bin_dir": str(tmp_path / "bin"),
+            "recordings_dir": str(tmp_path / "recordings"),
+            "json_dir": str(tmp_path / "recordings" / "json"),
+            "champion_icons_dir": str(tmp_path / "assets" / "champions" / "icons"),
+        },
+    }
 
     report = recordtest.run_preflight_checks(cfg, auto_fix=True, ensure_dirs=False)
 

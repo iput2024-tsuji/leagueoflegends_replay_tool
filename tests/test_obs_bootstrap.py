@@ -31,3 +31,26 @@ def test_standalone_ini_repairs_still_stop_managed_obs(tmp_path):
     bootstrapper.ensure_user_ini()
 
     assert process_manager.kill_calls == 2
+
+
+def test_websocket_config_requires_password_authentication(tmp_path):
+    bootstrapper = OBSBootstrapper(tmp_path / "obs-portable", process_manager=FakeProcessManager())
+
+    changed, config_path = bootstrapper.ensure_websocket_config(4455, "secret-password")
+
+    text = config_path.read_text(encoding="utf-8")
+    assert changed is True
+    assert '"server_enabled": true' in text
+    assert '"auth_required": true' in text
+    assert '"server_password": "secret-password"' in text
+
+
+def test_websocket_config_rejects_empty_password(tmp_path):
+    bootstrapper = OBSBootstrapper(tmp_path / "obs-portable", process_manager=FakeProcessManager())
+
+    try:
+        bootstrapper.ensure_websocket_config(4455, "")
+    except ValueError as exc:
+        assert "password" in str(exc)
+    else:
+        raise AssertionError("empty obs-websocket password should be rejected")

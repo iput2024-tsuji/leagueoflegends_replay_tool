@@ -4,9 +4,11 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
@@ -63,7 +65,7 @@ ACTIVE_PLAYER_URL = f"{LIVECLIENT_BASE}/activeplayername"
 EVENT_URL = f"{LIVECLIENT_BASE}/eventdata"
 ALL_GAME_URL = f"{LIVECLIENT_BASE}/allgamedata"
 
-DEFAULT_OBS_PASSWORD = "password"
+DEFAULT_OBS_PASSWORD_LENGTH = 24
 DEFAULT_OBS_SCENE_NAME = "lol_seen"
 DEFAULT_OBS_SOURCE_NAME = "color"
 # OBS color_source の color 値は ABGR。赤は 0xFF0000FF。
@@ -119,6 +121,7 @@ MANAGED_AUDIO_INPUTS = {
 
 LOG_DIR = DATA_DIR / "logs"
 LOGGER = logging.getLogger("lol_replay")
+OBS_OPERATION_LOCK = threading.RLock()
 
 
 class StatusCallbackLogHandler(logging.Handler):
@@ -166,6 +169,23 @@ configure_logging()
 
 class RecorderError(RuntimeError):
     pass
+
+
+def generate_obs_password(length: int = DEFAULT_OBS_PASSWORD_LENGTH) -> str:
+    """Generate a local-only obs-websocket password for managed OBS."""
+
+    token = secrets.token_urlsafe(max(18, int(length)))
+    return token[: max(12, int(length))]
+
+
+def is_missing_obs_password(value: Any) -> bool:
+    return str(value or "").strip() in {"", "your_password_here"}
+
+
+def ensure_obs_password_value(value: Any) -> tuple[str, bool]:
+    if is_missing_obs_password(value):
+        return generate_obs_password(), True
+    return str(value).strip(), False
 
 
 class RiotPollStatus(str, Enum):
@@ -318,7 +338,7 @@ class AppConfig:
             obs=OBSSettings(
                 host=str(obs_cfg.get("host") or DEFAULT_OBS_HOST),
                 port=port,
-                password=str(obs_cfg.get("password") or ""),
+                password=ensure_obs_password_value(obs_cfg.get("password"))[0],
                 scene_name=str(obs_cfg.get("scene_name") or DEFAULT_OBS_SCENE_NAME),
                 source_name=str(obs_cfg.get("source_name") or DEFAULT_OBS_SOURCE_NAME),
                 source_color=source_color,
@@ -569,6 +589,8 @@ def bootstrap_obs_dir(base_dir: str | Path, port: int | None = None, password: s
         process_manager=OBSProcessManager(base_path, logger=LOGGER),
         logger=LOGGER,
     )
+    if port is not None:
+        password = ensure_obs_password_value(password)[0]
     return bootstrapper.apply(port=port, password=password)
 
 
@@ -654,7 +676,7 @@ def ensure_portable_obs_websocket_config(base_dir: str | Path, port: int, passwo
     obs-portable に配置されたポータブルOBSのみを対象に、
     WebSocket設定を固定値へ自動補完する。
     """
-    return OBSBootstrapper(base_dir).ensure_websocket_config(port, password)
+    return OBSBootstrapper(base_dir).ensure_websocket_config(port, ensure_obs_password_value(password)[0])
 
 
 def is_tcp_port_open(host: str, port: int, timeout: float = 0.5) -> bool:
@@ -897,7 +919,6 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         "host": DEFAULT_OBS_HOST,
         "port": DEFAULT_OBS_PORT,
         "fps": DEFAULT_OBS_FPS,
-        "password": "",
         "scene_name": DEFAULT_OBS_SCENE_NAME,
         "source_name": DEFAULT_OBS_SOURCE_NAME,
         "source_color": DEFAULT_OBS_SOURCE_COLOR,
@@ -935,13 +956,21 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
     apply_defaults(poll_cfg, poll_defaults)
     apply_defaults(storage_cfg, storage_defaults)
 
-    if str(obs_cfg.get("password", "")).strip() == "your_password_here":
+    password_value, generated_password = ensure_obs_password_value(obs_cfg.get("password"))
+    if generated_password:
         if auto_fix:
-            obs_cfg["password"] = ""
+            obs_cfg["password"] = password_value
             report["changed"] = True
-            report["notes"].append("OBSパスワードのプレースホルダを空欄にしました。")
+            report["notes"].append("OBS WebSocketパスワードを自動生成しました。")
         else:
-            report["warnings"].append("OBSパスワードがプレースホルダのままです。")
+            report["errors"].append("OBS WebSocketパスワードが未設定です。")
+    elif obs_cfg.get("password") != password_value:
+        if auto_fix:
+            obs_cfg["password"] = password_value
+            report["changed"] = True
+            report["notes"].append("OBS WebSocketパスワードの前後空白を削除しました。")
+        else:
+            report["warnings"].append("OBS WebSocketパスワードに前後空白があります。")
 
     port, ok = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
     if not ok:
@@ -1511,8 +1540,15 @@ def apply_audio_profile_from_config(
 def setup_obs_sync_elements(
     cfg: dict[str, Any], status_cb: Callable[[str], None] | None = None, auto_launch: bool = True
 ) -> dict[str, Any]:
+    with OBS_OPERATION_LOCK:
+        return _setup_obs_sync_elements_locked(cfg, status_cb=status_cb, auto_launch=auto_launch)
+
+
+def _setup_obs_sync_elements_locked(
+    cfg: dict[str, Any], status_cb: Callable[[str], None] | None = None, auto_launch: bool = True
+) -> dict[str, Any]:
     config = AppConfig.from_dict(cfg)
-    setup_environment(config)
+    ensure_recording_dirs(config)
 
     launched_process = None
     recorder = None
@@ -1621,12 +1657,21 @@ def save_settings(cfg: dict[str, Any]) -> None:
     CONFIG_REPOSITORY.save(cfg)
 
 
-def setup_environment(config: AppConfig) -> None:
-    """環境変数の設定 (MPVのDLLを読み込めるようにする)"""
-    bin_dir = str(config.paths.bin_dir)
-    if bin_dir:
-        os.environ["PATH"] = bin_dir + os.pathsep + os.environ["PATH"]
+def prepend_env_path(path: str | Path) -> None:
+    path_text = str(path)
+    if not path_text:
+        return
+    path_parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    if path_text not in path_parts:
+        os.environ["PATH"] = path_text + os.pathsep + os.environ.get("PATH", "")
 
+
+def configure_mpv_runtime_path(config: AppConfig) -> None:
+    """MPVのDLLを読み込めるようにPATHを整える。"""
+
+    bin_dir = config.paths.bin_dir
+    if bin_dir:
+        prepend_env_path(bin_dir)
         if not has_mpv_dll(bin_dir, ROOT_DIR):
             LOGGER.warning(
                 "⚠️ 警告: 'bin' フォルダ内に mpv-1.dll / mpv-2.dll (または libmpv-1.dll / libmpv-2.dll) が見つかりません。"
@@ -1636,7 +1681,15 @@ def setup_environment(config: AppConfig) -> None:
     else:
         LOGGER.warning("⚠️ 警告: bin_dir が未設定です。")
 
+
+def ensure_recording_dirs(config: AppConfig) -> None:
     config.paths.json_dir.mkdir(parents=True, exist_ok=True)
+    config.paths.recordings_dir.mkdir(parents=True, exist_ok=True)
+
+
+def setup_environment(config: AppConfig) -> None:
+    configure_mpv_runtime_path(config)
+    ensure_recording_dirs(config)
 
 
 def parse_max_storage_bytes(storage_cfg: dict[str, Any]) -> int | None:

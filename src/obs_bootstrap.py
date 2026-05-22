@@ -374,10 +374,12 @@ class OBSBootstrapper:
 
         port_value = max(1, min(65535, int(port)))
         password_text = str(password or "")
+        if not password_text:
+            raise ValueError("obs-websocket password must not be empty.")
 
         set_if_diff("server_enabled", True)
         set_if_diff("server_port", port_value)
-        set_if_diff("auth_required", bool(password_text))
+        set_if_diff("auth_required", True)
         set_if_diff("server_password", password_text)
 
         if changed:

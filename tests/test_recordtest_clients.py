@@ -79,6 +79,30 @@ def test_app_config_is_immutable():
         config.obs.port = 1234
 
 
+def test_app_config_generates_obs_password_when_missing():
+    config = recordtest.AppConfig.from_dict({"obs": {"password": ""}})
+
+    assert len(config.obs.password) >= 12
+
+
+def test_preflight_generates_and_persists_obs_password():
+    cfg = {"obs": {"password": ""}}
+
+    report = recordtest.run_preflight_checks(cfg, auto_fix=True, ensure_dirs=False)
+
+    assert report["errors"] == []
+    assert len(report["config"]["obs"]["password"]) >= 12
+    assert any("WebSocketパスワード" in note for note in report["notes"])
+
+
+def test_preflight_rejects_missing_obs_password_without_auto_fix():
+    cfg = {"obs": {"password": ""}}
+
+    report = recordtest.run_preflight_checks(cfg, auto_fix=False, ensure_dirs=False)
+
+    assert any("WebSocketパスワード" in error for error in report["errors"])
+
+
 def test_riot_api_fetches_and_parses_live_client_payloads():
     routes = {
         recordtest.ACTIVE_PLAYER_URL: "Summoner#JP1",

@@ -419,7 +419,8 @@ class SetupWizardDialog(QDialog):
 
         data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
         data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
-        data["obs"]["password"] = ""
+        password_value, _ = recordtest.ensure_obs_password_value(data["obs"].get("password"))
+        data["obs"]["password"] = password_value
         data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
         data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
         data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
@@ -1056,7 +1057,7 @@ class SettingsPage(QWidget):
         self._audio_ui_loading = True
         self.fields["obs.host"].setText(recordtest.DEFAULT_OBS_HOST)
         self.fields["obs.dir"].setText(recordtest.DEFAULT_OBS_DIR)
-        self.fields["obs.password"].setText("")
+        self.fields["obs.password"].setText("設定済み" if obs.get("password") else "未設定")
         self.fields["obs.port"].setText(str(recordtest.DEFAULT_OBS_PORT))
         fps_text = str(obs.get("fps", recordtest.DEFAULT_OBS_FPS))
         if self.obs_fps_combo.findText(fps_text) < 0:
@@ -1178,7 +1179,8 @@ class SettingsPage(QWidget):
 
         data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
         data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
-        data["obs"]["password"] = ""
+        password_value, _ = recordtest.ensure_obs_password_value(data["obs"].get("password"))
+        data["obs"]["password"] = password_value
         data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
         try:
             data["obs"]["fps"] = int(self.obs_fps_combo.currentText())
@@ -1604,6 +1606,14 @@ class MainWindow(QMainWindow):
 
     def show_settings(self) -> None:
         self.player_page.on_leave()
+        if self.bg_recorder_worker and self.bg_recorder_worker.isRunning():
+            if not self.stop_background_recorder(wait_ms=5000):
+                QMessageBox.warning(
+                    self,
+                    "設定",
+                    "録画監視の停止が完了していないため、設定画面を開けません。少し待ってから再試行してください。",
+                )
+                return
         self.stack.setCurrentWidget(self.settings_page)
         self.settings_page.on_page_shown()
 

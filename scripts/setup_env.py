@@ -197,6 +197,23 @@ def _copy_tree_contents(src_dir: Path, dest_dir: Path) -> None:
             shutil.copy2(item, target)
 
 
+def cleanup_obs_debug_symbols(obs_dir: Path) -> list[Path]:
+    removed = []
+    if not obs_dir.exists():
+        return removed
+    for path in obs_dir.rglob("*.pdb"):
+        if not path.is_file():
+            continue
+        try:
+            path.unlink()
+            removed.append(path)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+    return removed
+
+
 def _find_obs_root(extract_dir: Path) -> Path:
     matches = list(extract_dir.rglob("bin/64bit/obs64.exe"))
     if not matches:
@@ -218,6 +235,7 @@ def _extract_obs(zip_path: Path, dest_dir: Path) -> Path:
             archive.extractall(extract_dir)
         obs_root = _find_obs_root(extract_dir)
         _copy_tree_contents(obs_root, dest_dir)
+        cleanup_obs_debug_symbols(dest_dir)
 
     obs_exe = dest_dir / "bin" / "64bit" / "obs64.exe"
     if not obs_exe.exists():
@@ -262,6 +280,9 @@ def migrate_legacy_obs_portable(progress_cb: ProgressCallback | None = None) -> 
         report(progress_cb, OBS_PACKAGE.progress_start, f"旧OBS配置を移行しています: {legacy_dir}")
         OBSProcessManager(legacy_dir).kill_stale_managed_processes()
         _copy_tree_contents(legacy_dir, OBS_PORTABLE_DIR)
+        removed_debug_files = cleanup_obs_debug_symbols(OBS_PORTABLE_DIR)
+        if removed_debug_files:
+            report(progress_cb, OBS_PACKAGE.progress_end, f"OBSデバッグファイルを削除しました: {len(removed_debug_files)}件")
         bootstrap_obs_portable_config(OBS_PORTABLE_DIR)
         report(progress_cb, OBS_PACKAGE.progress_end, f"OBS migrated: {OBS_PORTABLE_DIR}")
         return True
@@ -288,7 +309,10 @@ async def ensure_ffmpeg(progress_cb: ProgressCallback | None = None) -> Path:
 
 async def ensure_obs_portable(progress_cb: ProgressCallback | None = None) -> Path:
     if OBS_EXE.exists():
+        removed_debug_files = await asyncio.to_thread(cleanup_obs_debug_symbols, OBS_PORTABLE_DIR)
         bootstrap_obs_portable_config(OBS_PORTABLE_DIR)
+        if removed_debug_files:
+            report(progress_cb, OBS_PACKAGE.progress_end, f"OBSデバッグファイルを削除しました: {len(removed_debug_files)}件")
         report(progress_cb, OBS_PACKAGE.progress_end, f"OBS exists: {OBS_EXE}")
         return OBS_PORTABLE_DIR
 

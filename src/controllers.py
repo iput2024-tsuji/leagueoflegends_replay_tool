@@ -5,19 +5,12 @@ from typing import Any
 
 try:
     from . import recordtest
-    from .analytics import GameDataAnalyzer
-    from .app_paths import get_app_root
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from .obs_runtime import OBSRuntimeManager, RecorderRuntime
 except ImportError:
     import recordtest
-    from analytics import GameDataAnalyzer
-    from app_paths import get_app_root
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from obs_runtime import OBSRuntimeManager, RecorderRuntime
-
-
-ROOT_DIR = get_app_root()
 
 
 class ConfigController:
@@ -58,10 +51,15 @@ class ConfigController:
                 obs[key] = value
                 changed = True
 
-        if str(obs.get("password", "")).strip() == "your_password_here":
-            obs["password"] = ""
+        password_value, generated_password = recordtest.ensure_obs_password_value(obs.get("password"))
+        if generated_password:
+            obs["password"] = password_value
             changed = True
-            notes.append("OBSパスワードのプレースホルダを空欄にしました")
+            notes.append("OBS WebSocketパスワードを自動生成しました")
+        elif obs.get("password") != password_value:
+            obs["password"] = password_value
+            changed = True
+            notes.append("OBS WebSocketパスワードの前後空白を削除しました")
 
         if obs.get("dir") != recordtest.DEFAULT_OBS_DIR:
             obs["dir"] = recordtest.DEFAULT_OBS_DIR
@@ -213,7 +211,7 @@ class AudioSettingsController:
         if report.get("errors"):
             raise recordtest.RecorderError("\n".join(report.get("errors", [])))
         config = recordtest.AppConfig.from_dict(report["config"])
-        recordtest.setup_environment(config)
+        recordtest.ensure_recording_dirs(config)
         return report, config
 
     def _open_recorder(
@@ -231,58 +229,61 @@ class AudioSettingsController:
     def refresh_audio_devices(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=True)
         runtime = None
-        try:
-            runtime = self._open_recorder(config, auto_launch=auto_launch)
-            catalog = runtime.recorder.get_audio_device_catalog(cfg=config)
-            return {
-                "catalog": catalog,
-                "config": report["config"],
-                "obs_launched": runtime.owns_process,
-            }
-        finally:
-            if runtime:
-                runtime.close()
+        with recordtest.OBS_OPERATION_LOCK:
+            try:
+                runtime = self._open_recorder(config, auto_launch=auto_launch)
+                catalog = runtime.recorder.get_audio_device_catalog(cfg=config)
+                return {
+                    "catalog": catalog,
+                    "config": report["config"],
+                    "obs_launched": runtime.owns_process,
+                }
+            finally:
+                if runtime:
+                    runtime.close()
 
     def apply_audio_settings(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
         runtime = None
-        try:
-            runtime = self._open_recorder(config, auto_launch=auto_launch)
-            runtime.recorder.apply_audio_profile(config)
-            self.config_controller.save_config(report["config"])
-            return {"config": report["config"], "obs_launched": runtime.owns_process}
-        finally:
-            if runtime:
-                runtime.close()
+        with recordtest.OBS_OPERATION_LOCK:
+            try:
+                runtime = self._open_recorder(config, auto_launch=auto_launch)
+                runtime.recorder.apply_audio_profile(config)
+                self.config_controller.save_config(report["config"])
+                return {"config": report["config"], "obs_launched": runtime.owns_process}
+            finally:
+                if runtime:
+                    runtime.close()
 
     def apply_runtime_output_settings(self, data: dict[str, Any]) -> bool:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
-        ok, _detail = recordtest.test_obs_connection(
-            config.obs.host,
-            config.obs.port,
-            config.obs.password,
-            timeout=1.0,
-        )
-        if not ok:
-            return False
-        if not recordtest.OBSProcessManager(config.obs.obs_dir).has_owned_process():
-            return False
-
-        runtime = None
-        try:
-            runtime = self.runtime_manager.open_recorder(
-                config,
-                auto_launch=False,
-                auto_setup=False,
-                status_cb=None,
-                max_retries=1,
-                retry_delay=0.0,
+        with recordtest.OBS_OPERATION_LOCK:
+            ok, _detail = recordtest.test_obs_connection(
+                config.obs.host,
+                config.obs.port,
+                config.obs.password,
+                timeout=1.0,
             )
-            runtime.recorder.apply_record_output_settings()
-            return True
-        finally:
-            if runtime:
-                runtime.close()
+            if not ok:
+                return False
+            if not recordtest.OBSProcessManager(config.obs.obs_dir).has_owned_process():
+                return False
+
+            runtime = None
+            try:
+                runtime = self.runtime_manager.open_recorder(
+                    config,
+                    auto_launch=False,
+                    auto_setup=False,
+                    status_cb=None,
+                    max_retries=1,
+                    retry_delay=0.0,
+                )
+                runtime.recorder.apply_record_output_settings()
+                return True
+            finally:
+                if runtime:
+                    runtime.close()
 
 
 class RecordingController:
@@ -295,7 +296,7 @@ class RecordingController:
         self, config_data: dict[str, Any], status_cb: Callable[[str], None] | None = None
     ) -> RecorderRuntime:
         config = recordtest.AppConfig.from_dict(config_data)
-        recordtest.setup_environment(config)
+        recordtest.ensure_recording_dirs(config)
         return self.runtime_manager.open_recorder(
             config,
             force_launch=True,
@@ -316,12 +317,17 @@ class AnalyticsController:
         self.config_controller = config_controller or ConfigController()
 
     def load_summary(self) -> dict[str, Any]:
+        try:
+            from .analytics import GameDataAnalyzer
+        except ImportError:
+            from analytics import GameDataAnalyzer
+
         config_data = self.config_controller.load_config()
         config = recordtest.AppConfig.from_dict(config_data)
         analyzer = GameDataAnalyzer(config=config)
         df = analyzer.load_dataframe()
         horde_result = analyzer.horde_kill_15min_winrate_correlation(df)
-        tactical_insights = analyzer.extract_tactical_insights()
+        tactical_insights = analyzer.extract_tactical_insights(df)
 
         if df.empty:
             return {

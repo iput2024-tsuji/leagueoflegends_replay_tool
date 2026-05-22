@@ -59,8 +59,10 @@ $distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
 $distBinDir = Join-Path $distRootDir "bin"
 $distObsDir = Join-Path $distRootDir "obs-portable"
 New-Item -ItemType Directory -Path $distBinDir -Force | Out-Null
-New-Item -ItemType Directory -Path $distObsDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $distRootDir "assets\\champions\\icons") -Force | Out-Null
+if (Test-Path $distObsDir) {
+  Remove-Item -Path $distObsDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # Keep distribution clean: OBS, mpv DLLs, and third-party game assets must be user-provided.
 $mpvDllPattern = '^(lib)?mpv-\d+\.dll$'

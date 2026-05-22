@@ -71,6 +71,22 @@ def test_cleanup_legacy_archives_removes_setup_zips():
     assert keep_file.exists()
 
 
+def test_cleanup_obs_debug_symbols_removes_pdb_files():
+    root = runtime_dir("setup_env_cleanup_pdb")
+    obs_dir = root / "obs-portable"
+    pdb = obs_dir / "bin" / "64bit" / "obs64.pdb"
+    dll = obs_dir / "bin" / "64bit" / "obs.dll"
+    pdb.parent.mkdir(parents=True, exist_ok=True)
+    pdb.write_bytes(b"debug")
+    dll.write_bytes(b"dll")
+
+    removed = setup_env.cleanup_obs_debug_symbols(obs_dir)
+
+    assert removed == [pdb]
+    assert not pdb.exists()
+    assert dll.exists()
+
+
 def test_environment_ready_requires_bootstrapped_obs_global_ini(monkeypatch):
     root = runtime_dir("setup_env_ready_requires_bootstrap")
     ffmpeg = root / "bin" / "ffmpeg.exe"

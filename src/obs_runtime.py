@@ -50,6 +50,28 @@ class OBSRuntimeManager:
         max_retries: int = 2,
         retry_delay: float = 0.5,
     ) -> RecorderRuntime:
+        with recordtest.OBS_OPERATION_LOCK:
+            return self._open_recorder_locked(
+                config,
+                auto_launch=auto_launch,
+                force_launch=force_launch,
+                auto_setup=auto_setup,
+                status_cb=status_cb,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
+
+    def _open_recorder_locked(
+        self,
+        config: recordtest.AppConfig,
+        *,
+        auto_launch: bool = False,
+        force_launch: bool = False,
+        auto_setup: bool = False,
+        status_cb: Any | None = None,
+        max_retries: int = 2,
+        retry_delay: float = 0.5,
+    ) -> RecorderRuntime:
         launched_process = None
         owns_existing_process = False
         process_manager = recordtest.OBSProcessManager(config.obs.obs_dir)

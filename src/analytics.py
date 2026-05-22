@@ -157,8 +157,8 @@ class GameDataAnalyzer:
         y = matches["is_win"].astype(int).rename("is_win")
         return x, y
 
-    def extract_tactical_insights(self) -> dict[str, Any]:
-        x, y = self.build_feature_matrix()
+    def extract_tactical_insights(self, df: DataFrame | None = None) -> dict[str, Any]:
+        x, y = self.build_feature_matrix(df)
         feature_labels = self._feature_labels(x)
         if x.empty or y.empty:
             return {

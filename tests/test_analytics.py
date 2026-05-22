@@ -119,6 +119,31 @@ def test_extract_tactical_insights_returns_best_and_worst_rules():
     assert any(label in insights["tree_text"] for label in ["15分以内", "ファーストブラッド"])
 
 
+def test_extract_tactical_insights_reuses_loaded_dataframe():
+    tmp_path = runtime_dir("insights_reuses_df")
+    for index in range(4):
+        write_match(
+            tmp_path / f"win_{index}.json",
+            "Win",
+            "Malphite",
+            [{"EventID": index, "EventName": "HordeKill", "EventTime": 500.0}],
+        )
+        write_match(
+            tmp_path / f"loss_{index}.json",
+            "Loss",
+            "Ahri",
+            [],
+        )
+
+    analyzer = GameDataAnalyzer(json_dir=tmp_path)
+    df = analyzer.load_dataframe()
+    analyzer.load_dataframe = lambda: (_ for _ in ()).throw(AssertionError("should reuse provided dataframe"))
+
+    insights = analyzer.extract_tactical_insights(df)
+
+    assert insights["sample_size"] == 8
+
+
 def test_extract_tactical_insights_marks_small_samples_as_insufficient():
     tmp_path = runtime_dir("insights_small_sample")
     write_match(tmp_path / "win.json", "Win", "Malphite", [])

@@ -43,13 +43,17 @@ class ConfigController:
             "scene_name": recordtest.DEFAULT_OBS_SCENE_NAME,
             "source_name": recordtest.DEFAULT_OBS_SOURCE_NAME,
             "source_color": recordtest.DEFAULT_OBS_SOURCE_COLOR,
-            "game_capture_name": recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME,
-            "game_capture_window": recordtest.DEFAULT_OBS_GAME_CAPTURE_WINDOW,
         }
         for key, value in defaults_obs.items():
             if obs.get(key) in (None, ""):
                 obs[key] = value
                 changed = True
+
+        capture_fix = recordtest.normalize_obs_capture_config(obs, auto_fix=True)
+        if capture_fix["changed"]:
+            changed = True
+        notes.extend(capture_fix["notes"])
+        notes.extend(capture_fix["warnings"])
 
         password_value, generated_password = recordtest.ensure_obs_password_value(obs.get("password"))
         if generated_password:

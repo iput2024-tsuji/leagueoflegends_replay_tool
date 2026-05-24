@@ -361,8 +361,8 @@ class SetupWizardDialog(QDialog):
             "obs.scene_name": QLineEdit(),
             "obs.source_name": QLineEdit(),
             "obs.source_color": QLineEdit(),
-            "obs.game_capture_name": QLineEdit(),
-            "obs.game_capture_window": QLineEdit(),
+            "obs.window_capture_name": QLineEdit(),
+            "obs.window_capture_window": QLineEdit(),
             "paths.recordings_dir": QLineEdit(),
             "paths.json_dir": QLineEdit(),
         }
@@ -370,8 +370,8 @@ class SetupWizardDialog(QDialog):
         form.addRow("シーン名", self.fields["obs.scene_name"])
         form.addRow("色ソース名", self.fields["obs.source_name"])
         form.addRow("色ソース色", self.fields["obs.source_color"])
-        form.addRow("ゲームキャプチャ名", self.fields["obs.game_capture_name"])
-        form.addRow("対象ウィンドウ", self.fields["obs.game_capture_window"])
+        form.addRow("ウィンドウキャプチャ名", self.fields["obs.window_capture_name"])
+        form.addRow("対象ウィンドウ", self.fields["obs.window_capture_window"])
         form.addRow("録画ディレクトリ", self.fields["paths.recordings_dir"])
         form.addRow("JSONディレクトリ", self.fields["paths.json_dir"])
         layout.addLayout(form)
@@ -406,8 +406,8 @@ class SetupWizardDialog(QDialog):
         self.fields["obs.scene_name"].setText(str(obs.get("scene_name", "")))
         self.fields["obs.source_name"].setText(str(obs.get("source_name", "")))
         self.fields["obs.source_color"].setText(recordtest.obs_color_to_hex(obs.get("source_color")))
-        self.fields["obs.game_capture_name"].setText(str(obs.get("game_capture_name", "")))
-        self.fields["obs.game_capture_window"].setText(str(obs.get("game_capture_window", "")))
+        self.fields["obs.window_capture_name"].setText(str(obs.get("window_capture_name", "")))
+        self.fields["obs.window_capture_window"].setText(str(obs.get("window_capture_window", "")))
         self.fields["paths.recordings_dir"].setText(str(paths.get("recordings_dir", "")))
         self.fields["paths.json_dir"].setText(str(paths.get("json_dir", "")))
 
@@ -425,8 +425,11 @@ class SetupWizardDialog(QDialog):
         data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
         data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
         data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
-        data["obs"]["game_capture_name"] = self.fields["obs.game_capture_name"].text().strip()
-        data["obs"]["game_capture_window"] = self.fields["obs.game_capture_window"].text().strip()
+        data["obs"]["window_capture_name"] = self.fields["obs.window_capture_name"].text().strip()
+        data["obs"]["window_capture_window"] = self.fields["obs.window_capture_window"].text().strip()
+        data["obs"]["window_capture_method"] = recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
+        data["obs"].pop("game_capture_name", None)
+        data["obs"].pop("game_capture_window", None)
 
         data["paths"]["recordings_dir"] = self.fields["paths.recordings_dir"].text().strip()
         data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
@@ -464,6 +467,7 @@ class SetupWizardDialog(QDialog):
         message = (
             "環境修復が完了しました。\n"
             f"シーン: {info.get('scene_name')}\n"
+            f"ウィンドウキャプチャ: {info.get('window_capture_name')}\n"
             f"色ソース: {info.get('source_name')} ({color_hex})"
         )
         if launch_note:
@@ -840,8 +844,8 @@ class SettingsPage(QWidget):
         self.fields["obs.scene_name"] = QLineEdit()
         self.fields["obs.source_name"] = QLineEdit()
         self.fields["obs.source_color"] = QLineEdit()
-        self.fields["obs.game_capture_name"] = QLineEdit()
-        self.fields["obs.game_capture_window"] = QLineEdit()
+        self.fields["obs.window_capture_name"] = QLineEdit()
+        self.fields["obs.window_capture_window"] = QLineEdit()
 
         self.fields["paths.recordings_dir"] = QLineEdit()
         self.fields["paths.json_dir"] = QLineEdit()
@@ -927,8 +931,8 @@ class SettingsPage(QWidget):
         advanced_form.addRow("シーン名", self.fields["obs.scene_name"])
         advanced_form.addRow("ソース名", self.fields["obs.source_name"])
         advanced_form.addRow("ソース色", self.fields["obs.source_color"])
-        advanced_form.addRow("ゲームキャプチャ名", self.fields["obs.game_capture_name"])
-        advanced_form.addRow("対象ウィンドウ", self.fields["obs.game_capture_window"])
+        advanced_form.addRow("ウィンドウキャプチャ名", self.fields["obs.window_capture_name"])
+        advanced_form.addRow("対象ウィンドウ", self.fields["obs.window_capture_window"])
         advanced_form.addRow("終了検知エラー閾値", self.fields["polling.end_error_limit"])
         advanced_form.addRow("API無応答猶予(秒)", self.fields["polling.end_missing_grace_sec"])
         advanced_form.addRow("終了監視間隔(秒)", self.fields["polling.end_poll_sec"])
@@ -1066,8 +1070,8 @@ class SettingsPage(QWidget):
         self.fields["obs.scene_name"].setText(str(obs.get("scene_name", "")))
         self.fields["obs.source_name"].setText(str(obs.get("source_name", "")))
         self.fields["obs.source_color"].setText(recordtest.obs_color_to_hex(obs.get("source_color")))
-        self.fields["obs.game_capture_name"].setText(str(obs.get("game_capture_name", "")))
-        self.fields["obs.game_capture_window"].setText(str(obs.get("game_capture_window", "")))
+        self.fields["obs.window_capture_name"].setText(str(obs.get("window_capture_name", "")))
+        self.fields["obs.window_capture_window"].setText(str(obs.get("window_capture_window", "")))
         self.fields["paths.recordings_dir"].setText(str(paths.get("recordings_dir", "")))
         self.fields["paths.json_dir"].setText(str(paths.get("json_dir", "")))
         self.fields["paths.champion_icons_dir"].setText(str(paths.get("champion_icons_dir", "")))
@@ -1189,8 +1193,11 @@ class SettingsPage(QWidget):
         data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
         data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
         data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
-        data["obs"]["game_capture_name"] = self.fields["obs.game_capture_name"].text().strip()
-        data["obs"]["game_capture_window"] = self.fields["obs.game_capture_window"].text().strip()
+        data["obs"]["window_capture_name"] = self.fields["obs.window_capture_name"].text().strip()
+        data["obs"]["window_capture_window"] = self.fields["obs.window_capture_window"].text().strip()
+        data["obs"]["window_capture_method"] = recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
+        data["obs"].pop("game_capture_name", None)
+        data["obs"].pop("game_capture_window", None)
 
         data["paths"]["recordings_dir"] = self.fields["paths.recordings_dir"].text().strip()
         data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
@@ -1460,6 +1467,7 @@ class SettingsPage(QWidget):
         message = (
             "環境修復が完了しました。\n"
             f"シーン: {info.get('scene_name')}\n"
+            f"ウィンドウキャプチャ: {info.get('window_capture_name')}\n"
             f"色ソース: {info.get('source_name')} ({color_hex})"
         )
         if launch_note:

@@ -7,8 +7,9 @@
         "scene_name": "lol_seen",
         "source_name": "color",
         "source_color": "#FF0000",
-        "game_capture_name": "lol_game_capture",
-        "game_capture_window": "League of Legends (TM) Client:League of Legends.exe:League of Legends.exe",
+        "window_capture_name": "lol_window_capture",
+        "window_capture_window": "League of Legends (TM) Client:League of Legends.exe:League of Legends.exe",
+        "window_capture_method": 2,
         "dir": "obs-portable"
     },
     "paths": {

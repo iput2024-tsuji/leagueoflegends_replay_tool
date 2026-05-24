@@ -85,6 +85,21 @@ def test_app_config_generates_obs_password_when_missing():
     assert len(config.obs.password) >= 12
 
 
+def test_app_config_reads_legacy_game_capture_settings_as_window_capture():
+    config = recordtest.AppConfig.from_dict(
+        {
+            "obs": {
+                "game_capture_name": "legacy_capture",
+                "game_capture_window": "Legacy Window:LegacyClass:Legacy.exe",
+            }
+        }
+    )
+
+    assert config.obs.window_capture_name == "legacy_capture"
+    assert config.obs.window_capture_window == "Legacy Window:LegacyClass:Legacy.exe"
+    assert config.obs.window_capture_method == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
+
+
 def test_preflight_generates_and_persists_obs_password(monkeypatch, tmp_path):
     managed_dir = (tmp_path / "obs-portable").resolve()
     obs_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
@@ -109,6 +124,41 @@ def test_preflight_generates_and_persists_obs_password(monkeypatch, tmp_path):
     assert report["errors"] == []
     assert len(report["config"]["obs"]["password"]) >= 12
     assert any("WebSocketパスワード" in note for note in report["notes"])
+
+
+def test_preflight_migrates_legacy_game_capture_keys_to_window_capture(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", (tmp_path / "legacy-root-obs").resolve())
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", (tmp_path / "legacy-bin-obs").resolve())
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", (tmp_path / "legacy-data-bin-obs").resolve())
+    cfg = {
+        "obs": {
+            "password": "already-secret",
+            "dir": str(managed_dir),
+            "game_capture_name": "legacy_capture",
+            "game_capture_window": "Legacy Window:LegacyClass:Legacy.exe",
+        },
+        "paths": {
+            "bin_dir": str(tmp_path / "bin"),
+            "recordings_dir": str(tmp_path / "recordings"),
+            "json_dir": str(tmp_path / "recordings" / "json"),
+            "champion_icons_dir": str(tmp_path / "assets" / "champions" / "icons"),
+        },
+    }
+
+    report = recordtest.run_preflight_checks(cfg, auto_fix=True, ensure_dirs=False)
+
+    obs = report["config"]["obs"]
+    assert report["errors"] == []
+    assert obs["window_capture_name"] == "legacy_capture"
+    assert obs["window_capture_window"] == "Legacy Window:LegacyClass:Legacy.exe"
+    assert obs["window_capture_method"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
+    assert "game_capture_name" not in obs
+    assert "game_capture_window" not in obs
 
 
 def test_preflight_rejects_missing_obs_password_without_auto_fix():
@@ -208,21 +258,50 @@ def test_obs_disconnect_clears_raw_client_even_when_socket_errors():
     assert client.raw_client is None
 
 
-def test_setup_sync_elements_creates_game_capture_below_sync_marker():
+def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_removes_empty_initial_scene():
     class FakeObsRawClient:
         def __init__(self):
-            self.scenes = [{"sceneName": recordtest.DEFAULT_OBS_SCENE_NAME}]
-            self.inputs = []
-            self.scene_items = []
+            self.scenes = [{"sceneName": "Scene"}]
+            self.inputs = [{"inputName": recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME, "inputKind": "game_capture"}]
+            self.scene_items_by_scene = {
+                recordtest.DEFAULT_OBS_SCENE_NAME: [
+                    {
+                        "sourceName": recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME,
+                        "sceneItemId": 1,
+                        "sceneItemIndex": 0,
+                    }
+                ],
+            }
             self.created_inputs = []
+            self.removed_inputs = []
+            self.removed_scenes = []
             self.index_calls = []
-            self.next_item_id = 1
+            self.current_scene = None
+            self.next_item_id = 2
 
         def get_scene_list(self):
             return SimpleNamespace(scenes=self.scenes)
 
+        def create_scene(self, scene_name):
+            self.scenes.append({"sceneName": scene_name})
+            self.scene_items_by_scene.setdefault(scene_name, [])
+
+        def set_current_program_scene(self, scene_name):
+            self.current_scene = scene_name
+
+        def remove_scene(self, scene_name):
+            self.removed_scenes.append(scene_name)
+            self.scenes = [scene for scene in self.scenes if scene.get("sceneName") != scene_name]
+            self.scene_items_by_scene.pop(scene_name, None)
+
         def get_input_list(self):
             return SimpleNamespace(inputs=self.inputs)
+
+        def remove_input(self, input_name):
+            self.removed_inputs.append(input_name)
+            self.inputs = [item for item in self.inputs if item.get("inputName") != input_name]
+            for items in self.scene_items_by_scene.values():
+                items[:] = [item for item in items if item.get("sourceName") != input_name]
 
         def create_input(self, scene_name, input_name, input_kind, input_settings, scene_item_enabled):
             self.inputs.append({"inputName": input_name, "inputKind": input_kind})
@@ -235,23 +314,25 @@ def test_setup_sync_elements_creates_game_capture_below_sync_marker():
                     "enabled": scene_item_enabled,
                 }
             )
-            self.scene_items.append(
-                {"sourceName": input_name, "sceneItemId": self.next_item_id, "sceneItemIndex": len(self.scene_items)}
+            scene_items = self.scene_items_by_scene.setdefault(scene_name, [])
+            scene_items.append(
+                {"sourceName": input_name, "sceneItemId": self.next_item_id, "sceneItemIndex": len(scene_items)}
             )
             self.next_item_id += 1
 
         def create_scene_item(self, scene_name, source_name, enabled=None):
-            self.scene_items.append(
-                {"sourceName": source_name, "sceneItemId": self.next_item_id, "sceneItemIndex": len(self.scene_items)}
+            scene_items = self.scene_items_by_scene.setdefault(scene_name, [])
+            scene_items.append(
+                {"sourceName": source_name, "sceneItemId": self.next_item_id, "sceneItemIndex": len(scene_items)}
             )
             self.next_item_id += 1
 
         def get_scene_item_list(self, scene_name):
-            return SimpleNamespace(scene_items=self.scene_items)
+            return SimpleNamespace(scene_items=self.scene_items_by_scene.setdefault(scene_name, []))
 
         def set_scene_item_index(self, scene_name, item_id, item_index):
             self.index_calls.append((scene_name, item_id, item_index))
-            for item in self.scene_items:
+            for item in self.scene_items_by_scene.setdefault(scene_name, []):
                 if item["sceneItemId"] == item_id:
                     item["sceneItemIndex"] = item_index
 
@@ -265,21 +346,35 @@ def test_setup_sync_elements_creates_game_capture_below_sync_marker():
             return None
 
     raw_client = FakeObsRawClient()
-    client = recordtest.ObsWebSocketClient(config=app_config())
+    client = recordtest.ObsWebSocketClient(
+        config=recordtest.AppConfig.from_dict(
+            {
+                "obs": {
+                    "game_capture_name": recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME,
+                    "game_capture_window": recordtest.DEFAULT_OBS_GAME_CAPTURE_WINDOW,
+                }
+            }
+        )
+    )
     client.client = raw_client
 
     client.setup_sync_elements()
 
-    game_capture = raw_client.created_inputs[0]
+    window_capture = raw_client.created_inputs[0]
     sync_marker = raw_client.created_inputs[1]
-    assert game_capture["kind"] == "game_capture"
-    assert game_capture["settings"]["capture_mode"] == "window"
-    assert game_capture["settings"]["window"] == recordtest.DEFAULT_OBS_GAME_CAPTURE_WINDOW
+    assert raw_client.current_scene == recordtest.DEFAULT_OBS_SCENE_NAME
+    assert raw_client.removed_scenes == ["Scene"]
+    assert raw_client.removed_inputs == [recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME]
+    assert window_capture["kind"] == "window_capture"
+    assert window_capture["settings"]["method"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
+    assert window_capture["settings"]["window"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
+    assert window_capture["settings"]["client_area"] is True
     assert sync_marker["name"] == recordtest.DEFAULT_OBS_SOURCE_NAME
 
-    game_item_id = raw_client.scene_items[0]["sceneItemId"]
-    sync_item_id = raw_client.scene_items[1]["sceneItemId"]
-    assert (recordtest.DEFAULT_OBS_SCENE_NAME, game_item_id, 0) in raw_client.index_calls
+    scene_items = raw_client.scene_items_by_scene[recordtest.DEFAULT_OBS_SCENE_NAME]
+    window_item_id = scene_items[0]["sceneItemId"]
+    sync_item_id = scene_items[1]["sceneItemId"]
+    assert (recordtest.DEFAULT_OBS_SCENE_NAME, window_item_id, 0) in raw_client.index_calls
     assert (recordtest.DEFAULT_OBS_SCENE_NAME, sync_item_id, 1) in raw_client.index_calls
 
 

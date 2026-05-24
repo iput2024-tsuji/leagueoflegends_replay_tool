@@ -71,8 +71,13 @@ DEFAULT_OBS_SOURCE_NAME = "color"
 # OBS color_source の color 値は ABGR。赤は 0xFF0000FF。
 DEFAULT_OBS_SOURCE_COLOR = 0xFF0000FF
 LEGACY_OBS_SOURCE_COLOR_BLUE = 0xFFFF0000
+DEFAULT_OBS_WINDOW_CAPTURE_NAME = "lol_window_capture"
+DEFAULT_OBS_WINDOW_CAPTURE_WINDOW = "League of Legends (TM) Client:League of Legends.exe:League of Legends.exe"
+DEFAULT_OBS_WINDOW_CAPTURE_METHOD = 2  # Windows Graphics Capture
+DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY = 2  # Match by executable
+DEFAULT_OBS_INITIAL_SCENE_NAMES = frozenset({"Scene", "シーン"})
 DEFAULT_OBS_GAME_CAPTURE_NAME = "lol_game_capture"
-DEFAULT_OBS_GAME_CAPTURE_WINDOW = "League of Legends (TM) Client:League of Legends.exe:League of Legends.exe"
+DEFAULT_OBS_GAME_CAPTURE_WINDOW = DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
 DEFAULT_OBS_DIR = "obs-portable"
 LEGACY_OBS_DIR = "bin/OBS-Studio"
 DEFAULT_BIN_DIR = "bin"
@@ -209,10 +214,19 @@ class OBSSettings:
     scene_name: str
     source_name: str
     source_color: int
-    game_capture_name: str
-    game_capture_window: str
+    window_capture_name: str
+    window_capture_window: str
+    window_capture_method: int
     fps: int
     obs_dir: Path
+
+    @property
+    def game_capture_name(self) -> str:
+        return self.window_capture_name
+
+    @property
+    def game_capture_window(self) -> str:
+        return self.window_capture_window
 
 
 @dataclass(frozen=True)
@@ -289,6 +303,22 @@ class AppConfig:
         )
         fps, _ = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
         port, _ = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
+        window_capture_method, _ = _safe_int(
+            obs_cfg.get("window_capture_method"),
+            DEFAULT_OBS_WINDOW_CAPTURE_METHOD,
+            minimum=0,
+            maximum=2,
+        )
+        window_capture_name = str(
+            obs_cfg.get("window_capture_name")
+            or obs_cfg.get("game_capture_name")
+            or DEFAULT_OBS_WINDOW_CAPTURE_NAME
+        ).strip() or DEFAULT_OBS_WINDOW_CAPTURE_NAME
+        window_capture_window = str(
+            obs_cfg.get("window_capture_window")
+            or obs_cfg.get("game_capture_window")
+            or DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
+        ).strip() or DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
         end_limit, _ = _safe_int(
             polling_cfg.get("end_error_limit"),
             DEFAULT_END_ERROR_LIMIT,
@@ -342,8 +372,9 @@ class AppConfig:
                 scene_name=str(obs_cfg.get("scene_name") or DEFAULT_OBS_SCENE_NAME),
                 source_name=str(obs_cfg.get("source_name") or DEFAULT_OBS_SOURCE_NAME),
                 source_color=source_color,
-                game_capture_name=str(obs_cfg.get("game_capture_name") or DEFAULT_OBS_GAME_CAPTURE_NAME),
-                game_capture_window=str(obs_cfg.get("game_capture_window") or DEFAULT_OBS_GAME_CAPTURE_WINDOW),
+                window_capture_name=window_capture_name,
+                window_capture_window=window_capture_window,
+                window_capture_method=window_capture_method,
                 fps=fps,
                 obs_dir=MANAGED_PORTABLE_OBS_DIR,
             ),
@@ -879,6 +910,88 @@ def obs_color_to_hex(color_value: Any) -> str:
     return f"#{red:02X}{green:02X}{blue:02X}"
 
 
+def normalize_obs_capture_config(obs_cfg: dict[str, Any], auto_fix: bool = True) -> dict[str, Any]:
+    report = {
+        "changed": False,
+        "notes": [],
+        "warnings": [],
+        "errors": [],
+    }
+    if not isinstance(obs_cfg, dict):
+        report["errors"].append("obs 設定が不正です。")
+        return report
+
+    def empty(value: Any) -> bool:
+        return value is None or str(value).strip() == ""
+
+    def normalize_text(key: str, legacy_key: str, default: str) -> None:
+        current = obs_cfg.get(key)
+        legacy = obs_cfg.get(legacy_key)
+        if empty(current):
+            if not empty(legacy):
+                if auto_fix:
+                    obs_cfg[key] = str(legacy).strip()
+                    report["changed"] = True
+                    report["notes"].append(f"{legacy_key} を {key} へ移行しました。")
+                else:
+                    report["warnings"].append(f"{legacy_key} は旧設定キーです。{key} へ移行してください。")
+            elif auto_fix:
+                obs_cfg[key] = default
+                report["changed"] = True
+                report["notes"].append(f"{key} を既定値で補完しました。")
+            else:
+                report["errors"].append(f"{key} が未設定です。")
+            return
+
+        trimmed = str(current).strip()
+        if current != trimmed and auto_fix:
+            obs_cfg[key] = trimmed
+            report["changed"] = True
+            report["notes"].append(f"{key} の前後空白を削除しました。")
+
+    normalize_text("window_capture_name", "game_capture_name", DEFAULT_OBS_WINDOW_CAPTURE_NAME)
+    normalize_text("window_capture_window", "game_capture_window", DEFAULT_OBS_WINDOW_CAPTURE_WINDOW)
+
+    raw_method = obs_cfg.get("window_capture_method")
+    method, ok = _safe_int(
+        raw_method,
+        DEFAULT_OBS_WINDOW_CAPTURE_METHOD,
+        minimum=0,
+        maximum=2,
+    )
+    if empty(raw_method):
+        if auto_fix:
+            obs_cfg["window_capture_method"] = DEFAULT_OBS_WINDOW_CAPTURE_METHOD
+            report["changed"] = True
+            report["notes"].append("window_capture_method を Windows Graphics Capture で補完しました。")
+        else:
+            report["errors"].append("window_capture_method が未設定です。")
+    elif not ok:
+        if auto_fix:
+            obs_cfg["window_capture_method"] = method
+            report["changed"] = True
+        report["warnings"].append(
+            f"window_capture_method が不正だったため {DEFAULT_OBS_WINDOW_CAPTURE_METHOD} を使用します。"
+        )
+    elif auto_fix and raw_method != method:
+        obs_cfg["window_capture_method"] = method
+        report["changed"] = True
+
+    legacy_removed = False
+    if auto_fix:
+        for key in ("game_capture_name", "game_capture_window"):
+            if key in obs_cfg:
+                obs_cfg.pop(key, None)
+                legacy_removed = True
+        if legacy_removed:
+            report["changed"] = True
+            report["notes"].append("旧Game Capture設定キーを削除しました。")
+    elif any(key in obs_cfg for key in ("game_capture_name", "game_capture_window")):
+        report["warnings"].append("旧Game Capture設定キーが残っています。")
+
+    return report
+
+
 def _has_mpv_dll(bin_path: str | Path | None) -> bool:
     return has_mpv_dll(bin_path, ROOT_DIR)
 
@@ -922,8 +1035,6 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         "scene_name": DEFAULT_OBS_SCENE_NAME,
         "source_name": DEFAULT_OBS_SOURCE_NAME,
         "source_color": DEFAULT_OBS_SOURCE_COLOR,
-        "game_capture_name": DEFAULT_OBS_GAME_CAPTURE_NAME,
-        "game_capture_window": DEFAULT_OBS_GAME_CAPTURE_WINDOW,
         "dir": DEFAULT_OBS_DIR,
     }
     path_defaults = {
@@ -955,6 +1066,13 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
     apply_defaults(paths_cfg, path_defaults)
     apply_defaults(poll_cfg, poll_defaults)
     apply_defaults(storage_cfg, storage_defaults)
+
+    capture_fix = normalize_obs_capture_config(obs_cfg, auto_fix=auto_fix)
+    if capture_fix["changed"]:
+        report["changed"] = True
+    report["notes"].extend(capture_fix["notes"])
+    report["warnings"].extend(capture_fix["warnings"])
+    report["errors"].extend(capture_fix["errors"])
 
     password_value, generated_password = ensure_obs_password_value(obs_cfg.get("password"))
     if generated_password:
@@ -1596,6 +1714,9 @@ def _setup_obs_sync_elements_locked(
             "scene_name": config.obs.scene_name,
             "source_name": config.obs.source_name,
             "source_color": config.obs.source_color,
+            "window_capture_name": config.obs.window_capture_name,
+            "window_capture_window": config.obs.window_capture_window,
+            "window_capture_method": config.obs.window_capture_method,
             "obs_launched": bool(launched_process),
         }
     finally:
@@ -2154,9 +2275,11 @@ class ObsWebSocketClient(OBSClient):
 
     def setup_sync_elements(self) -> None:
         self._ensure_scene_exists()
-        game_capture_item_id = self._ensure_game_capture_exists()
+        self._set_current_scene()
+        self._remove_empty_initial_scenes()
+        window_capture_item_id = self._ensure_window_capture_exists()
         sync_source_item_id = self._ensure_sync_source_exists()
-        self._apply_scene_item_z_order(game_capture_item_id, sync_source_item_id)
+        self._apply_scene_item_z_order(window_capture_item_id, sync_source_item_id)
 
     def _ensure_scene_exists(self) -> None:
         scene_name = self.config.obs.scene_name
@@ -2165,15 +2288,51 @@ class ObsWebSocketClient(OBSClient):
         except Exception as e:
             raise RecorderError(f"シーン '{scene_name}' の自動作成に失敗しました: {e}") from e
 
-    def _ensure_game_capture_exists(self) -> int:
+    def _set_current_scene(self) -> None:
         scene_name = self.config.obs.scene_name
-        source_name = self.config.obs.game_capture_name
+        try:
+            self.client.set_current_program_scene(scene_name)
+        except Exception as e:
+            self.log(f"⚠️ 現在シーンの切り替えに失敗: {e}")
+
+    def _remove_empty_initial_scenes(self) -> None:
+        target_scene = self.config.obs.scene_name
+        try:
+            scene_resp = self.client.get_scene_list()
+            scenes = getattr(scene_resp, "scenes", []) or []
+        except Exception as e:
+            self.log(f"⚠️ 初期シーン一覧の取得に失敗: {e}")
+            return
+
+        for item in scenes:
+            if not isinstance(item, dict):
+                continue
+            scene_name = str(item.get("sceneName") or "")
+            if scene_name == target_scene or scene_name not in DEFAULT_OBS_INITIAL_SCENE_NAMES:
+                continue
+            try:
+                scene_items = getattr(self.client.get_scene_item_list(scene_name), "scene_items", []) or []
+            except Exception as e:
+                self.log(f"⚠️ 初期シーン '{scene_name}' の中身を確認できません: {e}")
+                continue
+            if scene_items:
+                continue
+            try:
+                self.client.remove_scene(scene_name)
+                self.log(f"ℹ️ OBS初期シーン '{scene_name}' を削除しました。")
+            except Exception as e:
+                self.log(f"⚠️ OBS初期シーン '{scene_name}' の削除に失敗: {e}")
+
+    def _ensure_window_capture_exists(self) -> int:
+        scene_name = self.config.obs.scene_name
+        source_name = self.config.obs.window_capture_name
         settings = {
-            "capture_mode": "window",
-            "window": self.config.obs.game_capture_window,
-            "priority": 2,
-            "capture_cursor": False,
-            "capture_overlays": True,
+            "window": self.config.obs.window_capture_window,
+            "method": self.config.obs.window_capture_method,
+            "priority": DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY,
+            "cursor": False,
+            "client_area": True,
+            "force_sdr": False,
         }
 
         input_exists = False
@@ -2185,7 +2344,7 @@ class ObsWebSocketClient(OBSClient):
                 if not isinstance(item, dict) or item.get("inputName") != source_name:
                     continue
                 input_exists = True
-                input_kind_matches = item.get("inputKind") == "game_capture"
+                input_kind_matches = item.get("inputKind") == "window_capture"
                 break
         except Exception:
             input_exists = False
@@ -2196,15 +2355,15 @@ class ObsWebSocketClient(OBSClient):
                 input_exists = False
             except Exception as e:
                 raise RecorderError(
-                    f"ゲームキャプチャ名 '{source_name}' は存在しますが、種別が game_capture ではありません: {e}"
+                    f"ウィンドウキャプチャ名 '{source_name}' は存在しますが、種別が window_capture ではありません: {e}"
                 ) from e
 
         if not input_exists:
-            self.log(f"ℹ️ ゲームキャプチャ '{source_name}' を自動作成します。")
+            self.log(f"ℹ️ ウィンドウキャプチャ '{source_name}' を自動作成します。")
             try:
-                self.client.create_input(scene_name, source_name, "game_capture", settings, True)
+                self.client.create_input(scene_name, source_name, "window_capture", settings, True)
             except Exception as e:
-                raise RecorderError(f"ゲームキャプチャ '{source_name}' の自動作成に失敗しました: {e}") from e
+                raise RecorderError(f"ウィンドウキャプチャ '{source_name}' の自動作成に失敗しました: {e}") from e
         else:
             try:
                 self.client.set_input_settings(source_name, settings, overlay=True)
@@ -2218,12 +2377,12 @@ class ObsWebSocketClient(OBSClient):
                 scene_item_id = self._get_scene_item_id(source_name)
             except Exception as e:
                 raise RecorderError(
-                    f"ゲームキャプチャ '{source_name}' をシーン '{scene_name}' に配置できませんでした: {e}"
+                    f"ウィンドウキャプチャ '{source_name}' をシーン '{scene_name}' に配置できませんでした: {e}"
                 ) from e
 
         if scene_item_id is None:
             raise RecorderError(
-                f"ゲームキャプチャ '{source_name}' は存在しますが、シーン '{scene_name}' で見つかりません。"
+                f"ウィンドウキャプチャ '{source_name}' は存在しますが、シーン '{scene_name}' で見つかりません。"
             )
         return scene_item_id
 
@@ -2295,11 +2454,11 @@ class ObsWebSocketClient(OBSClient):
             self.logger.warning("⚠️ シーンアイテム取得エラー: %s", e)
         return None
 
-    def _apply_scene_item_z_order(self, game_capture_item_id: int, sync_source_item_id: int) -> None:
+    def _apply_scene_item_z_order(self, capture_source_item_id: int, sync_source_item_id: int) -> None:
         scene_name = self.config.obs.scene_name
         try:
             # obs-websocketでは sceneItemIndex=0 が最背面。同期マーカーは最前面に置く。
-            self.client.set_scene_item_index(scene_name, game_capture_item_id, 0)
+            self.client.set_scene_item_index(scene_name, capture_source_item_id, 0)
             items = getattr(self.client.get_scene_item_list(scene_name), "scene_items", []) or []
             self.client.set_scene_item_index(scene_name, sync_source_item_id, max(0, len(items) - 1))
         except Exception as e:

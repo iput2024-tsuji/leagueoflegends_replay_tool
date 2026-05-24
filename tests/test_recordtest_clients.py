@@ -100,6 +100,20 @@ def test_app_config_reads_legacy_game_capture_settings_as_window_capture():
     assert config.obs.window_capture_method == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
 
 
+def test_app_config_upgrades_default_game_capture_values_to_window_capture_defaults():
+    config = recordtest.AppConfig.from_dict(
+        {
+            "obs": {
+                "window_capture_name": recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME,
+                "window_capture_window": recordtest.DEFAULT_OBS_LEGACY_GAME_CAPTURE_WINDOW,
+            }
+        }
+    )
+
+    assert config.obs.window_capture_name == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_NAME
+    assert config.obs.window_capture_window == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
+
+
 def test_preflight_generates_and_persists_obs_password(monkeypatch, tmp_path):
     managed_dir = (tmp_path / "obs-portable").resolve()
     obs_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
@@ -159,6 +173,39 @@ def test_preflight_migrates_legacy_game_capture_keys_to_window_capture(monkeypat
     assert obs["window_capture_method"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
     assert "game_capture_name" not in obs
     assert "game_capture_window" not in obs
+
+
+def test_preflight_repairs_bad_default_window_capture_migration(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", (tmp_path / "legacy-root-obs").resolve())
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", (tmp_path / "legacy-bin-obs").resolve())
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", (tmp_path / "legacy-data-bin-obs").resolve())
+    cfg = {
+        "obs": {
+            "password": "already-secret",
+            "dir": str(managed_dir),
+            "window_capture_name": recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME,
+            "window_capture_window": recordtest.DEFAULT_OBS_LEGACY_GAME_CAPTURE_WINDOW,
+            "window_capture_method": recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD,
+        },
+        "paths": {
+            "bin_dir": str(tmp_path / "bin"),
+            "recordings_dir": str(tmp_path / "recordings"),
+            "json_dir": str(tmp_path / "recordings" / "json"),
+            "champion_icons_dir": str(tmp_path / "assets" / "champions" / "icons"),
+        },
+    }
+
+    report = recordtest.run_preflight_checks(cfg, auto_fix=True, ensure_dirs=False)
+
+    obs = report["config"]["obs"]
+    assert report["errors"] == []
+    assert obs["window_capture_name"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_NAME
+    assert obs["window_capture_window"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
 
 
 def test_preflight_rejects_missing_obs_password_without_auto_fix():
@@ -366,6 +413,7 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     assert raw_client.removed_scenes == ["Scene"]
     assert raw_client.removed_inputs == [recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME]
     assert window_capture["kind"] == "window_capture"
+    assert window_capture["name"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_NAME
     assert window_capture["settings"]["method"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
     assert window_capture["settings"]["window"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
     assert window_capture["settings"]["client_area"] is True
@@ -376,6 +424,48 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     sync_item_id = scene_items[1]["sceneItemId"]
     assert (recordtest.DEFAULT_OBS_SCENE_NAME, window_item_id, 0) in raw_client.index_calls
     assert (recordtest.DEFAULT_OBS_SCENE_NAME, sync_item_id, 1) in raw_client.index_calls
+
+
+def test_setup_sync_elements_keeps_initial_scene_when_window_capture_creation_fails():
+    class FailingObsRawClient:
+        def __init__(self):
+            self.scenes = [{"sceneName": "Scene"}]
+            self.inputs = []
+            self.scene_items_by_scene = {}
+            self.removed_scenes = []
+
+        def get_scene_list(self):
+            return SimpleNamespace(scenes=self.scenes)
+
+        def create_scene(self, scene_name):
+            self.scenes.append({"sceneName": scene_name})
+            self.scene_items_by_scene.setdefault(scene_name, [])
+
+        def set_current_program_scene(self, scene_name):
+            return None
+
+        def remove_scene(self, scene_name):
+            self.removed_scenes.append(scene_name)
+
+        def get_input_list(self):
+            return SimpleNamespace(inputs=self.inputs)
+
+        def create_input(self, scene_name, input_name, input_kind, input_settings, scene_item_enabled):
+            if input_kind == "window_capture":
+                raise RuntimeError("window capture unavailable")
+            raise AssertionError("sync source must not be created after capture setup fails")
+
+        def get_scene_item_list(self, scene_name):
+            return SimpleNamespace(scene_items=self.scene_items_by_scene.setdefault(scene_name, []))
+
+    raw_client = FailingObsRawClient()
+    client = recordtest.ObsWebSocketClient(config=app_config())
+    client.client = raw_client
+
+    with pytest.raises(recordtest.RecorderError, match="ウィンドウキャプチャ"):
+        client.setup_sync_elements()
+
+    assert raw_client.removed_scenes == []
 
 
 def test_obs_bootstrapper_creates_portable_marker_and_tray_disabled_global_ini(monkeypatch):

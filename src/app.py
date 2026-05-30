@@ -595,20 +595,19 @@ class PlayerPage(QWidget):
             self.back_btn.hide()
             self.open_btn.hide()
             if window:
-                window.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
                 window.setStyleSheet("background-color: black;")
                 window.showFullScreen()
         else:
             if window:
-                window.setWindowFlag(Qt.WindowType.FramelessWindowHint, False)
                 window.setStyleSheet("")
                 window.showNormal()
             self.back_btn.show()
             self.open_btn.show()
 
-    def on_leave(self) -> None:
-        self.player_widget.cancel_background_tasks()
-        self.player_widget.stop_playback()
+    def on_leave(self, timeout_ms: int = 3000) -> bool:
+        if self.player_widget.is_fullscreen_mode:
+            self.player_widget.toggle_fullscreen()
+        return self.player_widget.shutdown_player(timeout_ms=timeout_ms)
 
 
 class AnalyticsPage(QWidget):
@@ -1773,12 +1772,12 @@ class MainWindow(QMainWindow):
         self._is_quitting = True
         self._closing = True
         try:
-            self.player_page.on_leave()
+            player_stopped = self.player_page.on_leave()
         except Exception:
-            pass
+            player_stopped = False
         self._shutdown_attempts += 1
         force_shutdown = self._shutdown_attempts > self._shutdown_max_attempts
-        workers_stopped = self._stop_all_background_work(force=force_shutdown)
+        workers_stopped = self._stop_all_background_work(force=force_shutdown) and player_stopped
         if not workers_stopped:
             self.home_page.set_recorder_status(
                 "⚠️ 停止待機中",
@@ -1794,7 +1793,8 @@ class MainWindow(QMainWindow):
                     QMessageBox.StandardButton.No,
                 )
                 if reply == QMessageBox.StandardButton.Yes:
-                    workers_stopped = self._stop_all_background_work(force=True)
+                    player_stopped = self.player_page.on_leave()
+                    workers_stopped = self._stop_all_background_work(force=True) and player_stopped
                 else:
                     self._shutdown_attempts = 0
             if not workers_stopped:

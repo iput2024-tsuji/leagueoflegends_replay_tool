@@ -921,6 +921,7 @@ class PlayerWidget(QWidget):
         self.player = None
         self.player_runtime = PlayerRuntime()
         self._mpv_error_message = None
+        self._player_shutting_down = False
         self._sync_generation = 0
         self.mpv_time_pos_changed.connect(self.apply_time_update)
         self.mpv_duration_changed.connect(self.apply_duration_update)
@@ -1074,30 +1075,70 @@ class PlayerWidget(QWidget):
         self.main_layout.addWidget(video_container, stretch=1)
         self.main_layout.addWidget(self.right_panel)
 
-        # --- MPV初期化 ---
-        self.init_mpv()
-
         # キーショートカット（フォーカスに依存しない）
         self.register_shortcuts()
 
         # リプレイ選択ダイアログ
-        if auto_open and self.player is not None:
+        if auto_open:
             self.open_replay_selector()
 
     def init_mpv(self) -> bool:
+        if self.player is not None:
+            return True
+
+        player = None
         try:
-            self.player = self.player_runtime.create_player(self.video_frame.winId())
-            self.player.observe_property("time-pos", self.on_mpv_time_update)
-            self.player.observe_property("duration", self.on_mpv_duration_update)
+            player = self.player_runtime.create_player(self.video_frame.winId())
+            player.observe_property("time-pos", self.on_mpv_time_update)
+            player.observe_property("duration", self.on_mpv_duration_update)
+            self.player = player
+            self._player_shutting_down = False
             self._mpv_error_message = None
+            LOGGER.info("MPV player initialized: wid=%s", int(self.video_frame.winId()))
             return True
         except Exception as e:
+            self._player_shutting_down = True
+            self._terminate_mpv_player(player)
             self.player = None
             self._mpv_error_message = str(e)
+            LOGGER.warning("MPV player initialization failed: %s", e, exc_info=True)
             self.info_label.setText("MPVを初期化できません。")
             self.info_label.setToolTip(str(e))
             QMessageBox.warning(self, "MPV Init Failed", str(e))
             return False
+
+    def _unobserve_mpv_properties(self, player: Any) -> None:
+        for name, handler in (
+            ("time-pos", self.on_mpv_time_update),
+            ("duration", self.on_mpv_duration_update),
+        ):
+            try:
+                player.unobserve_property(name, handler)
+            except Exception:
+                pass
+
+    def _terminate_mpv_player(self, player: Any) -> None:
+        if player is None:
+            return
+        self._unobserve_mpv_properties(player)
+        try:
+            player.command("stop")
+        except Exception:
+            pass
+        try:
+            player.terminate()
+        except Exception:
+            LOGGER.warning("MPV player termination failed", exc_info=True)
+
+    def shutdown_player(self, timeout_ms: int = 3000) -> bool:
+        self._player_shutting_down = True
+        background_stopped = self.cancel_background_tasks(timeout_ms=timeout_ms)
+        player = self.player
+        self.player = None
+        if player is not None:
+            LOGGER.info("Terminating MPV player")
+            self._terminate_mpv_player(player)
+        return background_stopped
 
     def load_settings(self) -> None:
         global ICON_DIR, ICON_INDEX, ICON_ALIASES, ALIASES_PATH
@@ -1236,13 +1277,6 @@ class PlayerWidget(QWidget):
         return False
 
     def load_data(self, json_path: str | Path) -> bool:
-        if self.player is None:
-            message = self._mpv_error_message or "MPVを初期化できません。binフォルダのDLLを確認してください。"
-            self.info_label.setText("MPVを初期化できません。")
-            self.info_label.setToolTip(message)
-            QMessageBox.warning(self, "MPV Init Failed", message)
-            return False
-
         json_path = Path(json_path)
         try:
             data = load_session_payload(json_path)
@@ -1250,6 +1284,16 @@ class PlayerWidget(QWidget):
             video_path = resolve_video_path(json_path, data, self.recordings_dir)
             if video_path is None:
                 self.info_label.setText("Error: Video file missing")
+                return False
+
+            if not self.cancel_sync_worker(timeout_ms=3000):
+                message = "前のリプレイの同期解析を停止しています。完了後にもう一度開いてください。"
+                LOGGER.warning("Replay load deferred because the previous sync worker is still running")
+                self.info_label.setText(message)
+                QMessageBox.warning(self, "Replay Sync Busy", message)
+                return False
+
+            if not self.init_mpv():
                 return False
 
             self.current_video_path = video_path
@@ -1274,21 +1318,32 @@ class PlayerWidget(QWidget):
             self.video_frame.setFocus()
 
             self.update_video_fps()
-            self.start_sync_worker()
+            if not self.start_sync_worker():
+                message = "同期解析を開始できませんでした。リプレイを開き直してください。"
+                LOGGER.warning("Replay sync worker could not be started")
+                self.info_label.setText(message)
+                QMessageBox.warning(self, "Replay Sync Busy", message)
+                return False
             return True
 
         except Exception as e:
+            LOGGER.warning("Replay load failed: %s", e, exc_info=True)
             QMessageBox.critical(self, "Load Error", str(e))
             return False
 
-    def start_sync_worker(self) -> None:
-        self.cancel_sync_worker()
+    def start_sync_worker(self) -> bool:
+        if not self.cancel_sync_worker():
+            return False
         self._sync_generation += 1
         generation = self._sync_generation
-        self.worker = SyncWorker(self.current_video_path, max_seconds=180)
-        self.worker.progress.connect(lambda s, gen=generation: self.on_sync_progress(gen, s))
-        self.worker.finished.connect(lambda found_time, gen=generation: self.on_sync_finished(gen, found_time))
-        self.worker.start()
+        worker = SyncWorker(self.current_video_path, max_seconds=180)
+        self.worker = worker
+        worker.progress.connect(lambda s, gen=generation: self.on_sync_progress(gen, s))
+        worker.finished.connect(
+            lambda found_time, sync_worker=worker, gen=generation: self.on_sync_finished(sync_worker, gen, found_time)
+        )
+        worker.start()
+        return True
 
     def cancel_sync_worker(self, timeout_ms: int = 1000) -> bool:
         self._sync_generation += 1
@@ -1303,10 +1358,11 @@ class PlayerWidget(QWidget):
             return
         self.info_label.setText(message)
 
-    def on_sync_finished(self, generation: int, found_time: float) -> None:
+    def on_sync_finished(self, worker: SyncWorker, generation: int, found_time: float) -> None:
+        if self.worker is worker:
+            self.worker = None
         if generation != self._sync_generation:
             return
-        self.worker = None
         if found_time < 0:
             self.info_label.setText("⚠️ No Marker Found\nOffset: 0s")
             self.offset = 0
@@ -1624,7 +1680,7 @@ class PlayerWidget(QWidget):
         self.play_btn.setText("Play")
 
     def on_mpv_time_update(self, name: str, time_pos: float | None) -> None:
-        if time_pos is None:
+        if self._player_shutting_down or time_pos is None:
             return
         try:
             self.mpv_time_pos_changed.emit(float(time_pos))
@@ -1641,7 +1697,7 @@ class PlayerWidget(QWidget):
         self.time_label.setText(f"{cm:02d}:{cs:02d} / {dm:02d}:{ds:02d}")
 
     def on_mpv_duration_update(self, name: str, duration: float | None) -> None:
-        if duration:
+        if not self._player_shutting_down and duration:
             try:
                 self.mpv_duration_changed.emit(float(duration))
             except Exception:
@@ -1663,10 +1719,11 @@ class PlayerWidget(QWidget):
             self.player.seek(target, reference="absolute", precision="exact")
 
     def closeEvent(self, event: Any) -> None:
-        self.cancel_background_tasks(timeout_ms=1000)
-        if self.player is not None:
-            self.player.terminate()
-        event.accept()
+        if self.shutdown_player(timeout_ms=3000):
+            event.accept()
+            return
+        LOGGER.warning("Player close deferred because background tasks are still running")
+        event.ignore()
 
 
 class PlayerWindow(QMainWindow):

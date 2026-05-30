@@ -45,6 +45,7 @@ try:
     from .player import PlayerWidget
     from .qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
     from .recording_supervisor import RecordingSupervisor
+    from .single_instance import SingleInstanceGuard
 except ImportError:
     SRC_DIR = Path(__file__).resolve().parent
     if str(SRC_DIR) not in sys.path:
@@ -55,6 +56,7 @@ except ImportError:
     from player import PlayerWidget
     from qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
     from recording_supervisor import RecordingSupervisor
+    from single_instance import SingleInstanceGuard
 
 
 ROOT_DIR = get_app_root()
@@ -293,6 +295,7 @@ def run_environment_bootstrap(parent: QWidget | None = None) -> bool:
         QMessageBox.critical(parent, "環境構築エラー", f"セットアップモジュールを読み込めません。\n{e}")
         return False
 
+    setup_env.cleanup_stale_temporary_workspaces()
     if setup_env.is_environment_ready():
         return True
 
@@ -1815,41 +1818,48 @@ class MainWindow(QMainWindow):
 
 def main() -> None:
     app = QApplication([])
-    icon = get_app_icon()
-    if icon:
-        app.setWindowIcon(icon)
-    if not run_environment_bootstrap():
+    instance_guard = SingleInstanceGuard()
+    if not instance_guard.acquire():
+        QMessageBox.information(None, "LoL Replay Tool", "LoL Replay Tool は既に起動しています。")
         return
-    app.setStyleSheet("""
-        QWidget { background-color: #1e1e1e; color: #e0e0e0; }
-        QLabel { color: #e0e0e0; }
-        QPushButton { background-color: #2b2b2b; color: #e0e0e0; border: 1px solid #3a3a3a; padding: 6px 10px; }
-        QPushButton:hover { background-color: #3a3a3a; }
-        QTabWidget::pane { border: 1px solid #3a3a3a; background-color: #1f1f1f; top: -1px; }
-        QTabBar::tab {
-            background-color: #262626;
-            color: #bdbdbd;
-            border: 1px solid #3a3a3a;
-            border-bottom: 1px solid #3a3a3a;
-            padding: 7px 12px;
-            margin-right: 2px;
-        }
-        QTabBar::tab:hover { background-color: #333333; color: #f0f0f0; }
-        QTabBar::tab:selected {
-            background-color: #2f2f2f;
-            color: #ffffff;
-            font-weight: 700;
-            border-bottom: 2px solid #d32f2f;
-        }
-        QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QDoubleSpinBox {
-            background-color: #242424; color: #e0e0e0; border: 1px solid #3a3a3a;
-        }
-        QSlider::groove:horizontal { height: 6px; background: #3a3a3a; }
-        QSlider::handle:horizontal { background: #e0e0e0; width: 12px; margin: -4px 0; border-radius: 6px; }
-    """)
-    window = MainWindow()
-    window.show()
-    app.exec()
+    try:
+        icon = get_app_icon()
+        if icon:
+            app.setWindowIcon(icon)
+        if not run_environment_bootstrap():
+            return
+        app.setStyleSheet("""
+            QWidget { background-color: #1e1e1e; color: #e0e0e0; }
+            QLabel { color: #e0e0e0; }
+            QPushButton { background-color: #2b2b2b; color: #e0e0e0; border: 1px solid #3a3a3a; padding: 6px 10px; }
+            QPushButton:hover { background-color: #3a3a3a; }
+            QTabWidget::pane { border: 1px solid #3a3a3a; background-color: #1f1f1f; top: -1px; }
+            QTabBar::tab {
+                background-color: #262626;
+                color: #bdbdbd;
+                border: 1px solid #3a3a3a;
+                border-bottom: 1px solid #3a3a3a;
+                padding: 7px 12px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:hover { background-color: #333333; color: #f0f0f0; }
+            QTabBar::tab:selected {
+                background-color: #2f2f2f;
+                color: #ffffff;
+                font-weight: 700;
+                border-bottom: 2px solid #d32f2f;
+            }
+            QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QDoubleSpinBox {
+                background-color: #242424; color: #e0e0e0; border: 1px solid #3a3a3a;
+            }
+            QSlider::groove:horizontal { height: 6px; background: #3a3a3a; }
+            QSlider::handle:horizontal { background: #e0e0e0; width: 12px; margin: -4px 0; border-radius: 6px; }
+        """)
+        window = MainWindow()
+        window.show()
+        app.exec()
+    finally:
+        instance_guard.release()
 
 
 if __name__ == "__main__":

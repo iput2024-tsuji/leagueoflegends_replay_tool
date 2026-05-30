@@ -1,5 +1,7 @@
 from types import MethodType, SimpleNamespace
+from unittest.mock import Mock
 
+from src import player as player_module
 from src.app import PlayerPage
 from src.player import PlayerWidget
 
@@ -61,6 +63,26 @@ class FakeWindow:
 
     def setWindowFlag(self, *args) -> None:
         raise AssertionError("fullscreen transitions must not recreate the native window")
+
+
+class FakeProgress:
+    def __init__(self) -> None:
+        self.value = None
+        self.text = None
+
+    def setValue(self, value: int) -> None:
+        self.value = value
+
+    def setFormat(self, text: str) -> None:
+        self.text = text
+
+
+class FakeLabel:
+    def __init__(self) -> None:
+        self.text = None
+
+    def setText(self, text: str) -> None:
+        self.text = text
 
 
 def test_player_widget_does_not_initialize_mpv_until_replay_is_loaded(qtbot, monkeypatch):
@@ -161,3 +183,56 @@ def test_player_page_leave_exits_fullscreen_and_shuts_down_player():
 
     assert stopped is False
     assert calls == [("fullscreen",), ("shutdown", 123)]
+
+
+def test_export_clip_starts_lazy_ffmpeg_setup_when_binary_is_missing(monkeypatch):
+    widget = SimpleNamespace(
+        ffmpeg_setup_worker=None,
+        clip_worker=None,
+        current_video_path="replay.mp4",
+        clip_start=1.0,
+        clip_end=2.0,
+        start_ffmpeg_setup=Mock(),
+    )
+    monkeypatch.setattr(player_module, "find_ffmpeg_executable", lambda: None)
+
+    PlayerWidget.export_clip(widget)
+
+    widget.start_ffmpeg_setup.assert_called_once_with()
+
+
+def test_ffmpeg_setup_completion_resumes_clip_export():
+    progress = FakeProgress()
+    label = FakeLabel()
+    widget = SimpleNamespace(
+        _pending_clip_export=True,
+        clip_progress=progress,
+        info_label=label,
+        start_clip_export=Mock(),
+    )
+
+    PlayerWidget.on_ffmpeg_setup_installed(widget, "bin/ffmpeg.exe")
+
+    assert widget._pending_clip_export is False
+    assert progress.value == 100
+    assert progress.text == "FFmpegの準備完了"
+    assert label.text == "FFmpegの準備が完了しました。"
+    widget.start_clip_export.assert_called_once_with("bin/ffmpeg.exe")
+
+
+def test_cancel_background_tasks_requests_ffmpeg_setup_stop():
+    ffmpeg_worker = FakeRunningWorker(wait_result=True)
+    widget = SimpleNamespace(
+        _pending_clip_export=True,
+        ffmpeg_setup_worker=ffmpeg_worker,
+        clip_worker=None,
+        cancel_sync_worker=lambda timeout_ms: True,
+    )
+
+    stopped = PlayerWidget.cancel_background_tasks(widget, timeout_ms=50)
+
+    assert stopped is True
+    assert widget._pending_clip_export is False
+    assert widget.ffmpeg_setup_worker is None
+    assert ffmpeg_worker.cancel_called == 1
+    assert ffmpeg_worker.wait_calls == [50]

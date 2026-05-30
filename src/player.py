@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import importlib
 import json
@@ -9,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -567,6 +569,34 @@ class ClipExportWorker(QThread):
             return None
 
 
+class FFmpegSetupWorker(QThread):
+    progress = pyqtSignal(int, str)
+    installed = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cancel_requested = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def run(self) -> None:
+        try:
+            from scripts import setup_env
+
+            path = asyncio.run(
+                setup_env.ensure_ffmpeg(
+                    lambda percent, message: self.progress.emit(percent, message),
+                    cancel_cb=self._cancel_requested.is_set,
+                )
+            )
+            if not self._cancel_requested.is_set():
+                self.installed.emit(str(path))
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
 def normalize_result(result_value: Any, team_value: Any | None = None, winning_team: Any | None = None) -> str:
     if isinstance(result_value, str):
         val = result_value.strip().lower()
@@ -917,6 +947,8 @@ class PlayerWidget(QWidget):
         self.clip_start = None
         self.clip_end = None
         self.clip_worker = None
+        self.ffmpeg_setup_worker = None
+        self._pending_clip_export = False
         self.worker = None
         self.player = None
         self.player_runtime = PlayerRuntime()
@@ -1513,6 +1545,9 @@ class PlayerWidget(QWidget):
         self.clip_label.setText(f"Start: {start_text} / End: {end_text}{duration_text}")
 
     def export_clip(self) -> None:
+        if self.ffmpeg_setup_worker and self.ffmpeg_setup_worker.isRunning():
+            QMessageBox.information(self, "FFmpeg", "FFmpegを取得しています。完了まで待ってください。")
+            return
         if self.clip_worker and self.clip_worker.isRunning():
             QMessageBox.information(self, "Clip", "クリップ出力中です。完了まで待ってください。")
             return
@@ -1528,14 +1563,50 @@ class PlayerWidget(QWidget):
 
         ffmpeg_path = find_ffmpeg_executable()
         if not ffmpeg_path:
-            QMessageBox.critical(
-                self,
-                "FFmpeg Missing",
-                "FFmpegが見つかりません。\n"
-                f"{BIN_DIR / 'ffmpeg.exe'} に配置してください。\n"
-                "システムPATH上のffmpegは使用しません。",
-            )
+            self.start_ffmpeg_setup()
             return
+        self.start_clip_export(ffmpeg_path)
+
+    def start_ffmpeg_setup(self) -> None:
+        if self.ffmpeg_setup_worker and self.ffmpeg_setup_worker.isRunning():
+            return
+        self._pending_clip_export = True
+        self.set_clip_controls_enabled(False)
+        self.clip_progress.setValue(0)
+        self.clip_progress.setFormat("FFmpegを準備しています...")
+        self.info_label.setText("初回クリップ出力用のFFmpegを取得しています...")
+
+        worker = FFmpegSetupWorker()
+        self.ffmpeg_setup_worker = worker
+        worker.progress.connect(self.on_clip_progress)
+        worker.installed.connect(self.on_ffmpeg_setup_installed)
+        worker.failed.connect(self.on_ffmpeg_setup_failed)
+        worker.finished.connect(self.on_ffmpeg_setup_worker_finished)
+        worker.start()
+
+    def on_ffmpeg_setup_installed(self, ffmpeg_path: str) -> None:
+        if not self._pending_clip_export:
+            return
+        self._pending_clip_export = False
+        self.clip_progress.setValue(100)
+        self.clip_progress.setFormat("FFmpegの準備完了")
+        self.info_label.setText("FFmpegの準備が完了しました。")
+        self.start_clip_export(ffmpeg_path)
+
+    def on_ffmpeg_setup_failed(self, message: str) -> None:
+        pending_export = self._pending_clip_export
+        self._pending_clip_export = False
+        self.clip_progress.setFormat("FFmpeg取得失敗")
+        self.set_clip_controls_enabled(True)
+        if pending_export:
+            QMessageBox.critical(self, "FFmpeg Setup Error", message)
+
+    def on_ffmpeg_setup_worker_finished(self) -> None:
+        self.ffmpeg_setup_worker = None
+        if not self.clip_worker or not self.clip_worker.isRunning():
+            self.set_clip_controls_enabled(True)
+
+    def start_clip_export(self, ffmpeg_path: str) -> None:
 
         clips_dir = Path(self.recordings_dir) / "clips"
         clips_dir.mkdir(parents=True, exist_ok=True)
@@ -1548,6 +1619,7 @@ class PlayerWidget(QWidget):
             "MP4 Video (*.mp4)",
         )
         if not output_path:
+            self.set_clip_controls_enabled(True)
             return
         output = Path(output_path)
         if output.suffix.lower() != ".mp4":
@@ -1555,13 +1627,12 @@ class PlayerWidget(QWidget):
         try:
             if output.resolve() == Path(self.current_video_path).resolve():
                 QMessageBox.warning(self, "Clip", "元動画と同じファイルには出力できません。")
+                self.set_clip_controls_enabled(True)
                 return
         except Exception:
             pass
 
-        self.clip_export_btn.setEnabled(False)
-        self.clip_start_btn.setEnabled(False)
-        self.clip_end_btn.setEnabled(False)
+        self.set_clip_controls_enabled(False)
         self.clip_progress.setValue(0)
         self.clip_progress.setFormat("出力準備中...")
 
@@ -1597,17 +1668,24 @@ class PlayerWidget(QWidget):
         QMessageBox.critical(self, "Clip Export Error", message)
 
     def on_clip_worker_finished(self) -> None:
-        self.clip_export_btn.setEnabled(True)
-        self.clip_start_btn.setEnabled(True)
-        self.clip_end_btn.setEnabled(True)
+        self.set_clip_controls_enabled(True)
         self.clip_worker = None
 
+    def set_clip_controls_enabled(self, enabled: bool) -> None:
+        self.clip_export_btn.setEnabled(enabled)
+        self.clip_start_btn.setEnabled(enabled)
+        self.clip_end_btn.setEnabled(enabled)
+
     def cancel_background_tasks(self, timeout_ms: int = 1000) -> bool:
+        self._pending_clip_export = False
         sync_stopped = self.cancel_sync_worker(timeout_ms=timeout_ms)
+        ffmpeg_setup_stopped = request_worker_stop(self.ffmpeg_setup_worker, timeout_ms, cancel_method="cancel")
+        if ffmpeg_setup_stopped:
+            self.ffmpeg_setup_worker = None
         clip_stopped = request_worker_stop(self.clip_worker, timeout_ms, cancel_method="cancel")
         if clip_stopped:
             self.clip_worker = None
-        return sync_stopped and clip_stopped
+        return sync_stopped and ffmpeg_setup_stopped and clip_stopped
 
     def add_event_item(self, text: str, game_time: float, color_hex: str) -> None:
         m, s = divmod(int(game_time), 60)

@@ -81,6 +81,6 @@ foreach ($archive in $bundledSetupArchives) {
 }
 
 Write-Host "Build complete. Portable OBS, mpv DLLs, FFmpeg, and game assets are not bundled."
-Write-Host "OBS and FFmpeg are downloaded automatically on first launch with pinned SHA256 verification."
+Write-Host "OBS is downloaded on first launch. FFmpeg is downloaded on first clip export. Downloads use pinned SHA256 verification."
 Write-Host "Place mpv DLLs under %LOCALAPPDATA%\\LoLReplayTool\\bin or dist\\LoLReplayTool\\bin manually."
 

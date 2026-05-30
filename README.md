@@ -168,7 +168,7 @@ tests/
 
 - OBS Studio は初回起動時に固定バージョンを自動取得し、開発実行時は `obs-portable`、配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable` に配置します。
 - mpv DLL は利用者が正規の配布元から取得し、開発実行時は `bin/`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin` または配布フォルダ直下の `bin/` に配置してください。
-- FFmpeg は初回起動時に固定バージョンを自動取得し、開発実行時は `bin/ffmpeg.exe`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe` に配置します。システム PATH 上の FFmpeg には依存しません。
+- FFmpeg は初回クリップ出力時に固定バージョンを自動取得し、開発実行時は `bin/ffmpeg.exe`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe` に配置します。システム PATH 上の FFmpeg には依存しません。
 - チャンピオンアイコンを使う場合は、開発実行時は `assets/champions/icons`、配布版では `%LOCALAPPDATA%\LoLReplayTool\assets\champions\icons` に配置してください。Riot Games のアセットを利用する場合は、Riot Games の規約・ポリシーに従ってください。
 
 ## セットアップ
@@ -185,7 +185,10 @@ python main.py
 
 - OBS は `obs-portable` に配置されたポータブル版のみ利用します
 - ユーザー環境にインストール済みの OBS は利用しません
-- 初回起動時、メインウィンドウ表示前にGUIブートストラッパーがFFmpeg/OBSを自動取得します
+- 初回起動時、メインウィンドウ表示前にGUIブートストラッパーがOBSを自動取得します
+- FFmpegはクリップ出力を初めて実行した時点で必要な場合のみ取得します
+- 同時起動を抑止し、セットアップ処理もプロセス間ロックで直列化します
+- ダウンロードは接続待ちと全体時間に上限を設け、失敗時はミラーへ切り替えて再試行します
 - ダウンロード対象は固定バージョンで、SHA256ハッシュ検証に失敗したファイルは展開しません
 - 起動時に `obs-portable/obs_portable_mode.txt` と OBS の `global.ini` を自動生成・補正します
 - OBS WebSocket は初回設定時にローカル用パスワードを自動生成し、認証必須で構成します
@@ -250,7 +253,7 @@ dist\LoLReplayTool\
 - `mpv DLL が見つかりません`
   - `%LOCALAPPDATA%\LoLReplayTool\bin` または配布フォルダの `bin/` に `mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll` のいずれかを配置してください。
 - `FFmpegが見つかりません`
-  - 通常は初回起動時に自動取得します。手動配置する場合、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe`、開発実行時は `bin\ffmpeg.exe` を配置してください。クリップ出力はシステム PATH の FFmpeg を使用しません。
+  - 通常は初回クリップ出力時に自動取得します。手動配置する場合、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe`、開発実行時は `bin\ffmpeg.exe` を配置してください。クリップ出力はシステム PATH の FFmpeg を使用しません。
 - `OBS WebSocketポートが既に使用されています`
   - 通常版 OBS や手動起動した OBS が動いている場合は終了してください。このアプリは `obs-portable` 配下の管理対象 OBS だけを起動・制御します。
 - OBS がタスクトレイに表示される

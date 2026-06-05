@@ -24,6 +24,7 @@ import urllib3
 from obsws_python.error import OBSSDKRequestError
 
 try:
+    from . import config_schema
     from .app_paths import get_app_root, get_user_data_root
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from .mpv_support import has_mpv_dll
@@ -40,6 +41,7 @@ try:
     from .recording_state import FinalizeResult, RecordingEndDetector, RecordingOutcome, RecordingPhase
     from .session_log import SessionLogV1, load_session_payload, save_session_payload
 except ImportError:
+    import config_schema
     from app_paths import get_app_root, get_user_data_root
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from mpv_support import has_mpv_dll
@@ -1048,158 +1050,20 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         report["changed"] = True
         report["notes"].append("設定形式が不正だったため初期化しました。")
 
-    obs_cfg, replaced = _ensure_section_dict(data, "obs")
-    if replaced:
-        report["changed"] = True
-    paths_cfg, replaced = _ensure_section_dict(data, "paths")
-    if replaced:
-        report["changed"] = True
-    poll_cfg, replaced = _ensure_section_dict(data, "polling")
-    if replaced:
-        report["changed"] = True
-    storage_cfg, replaced = _ensure_section_dict(data, "storage")
-    if replaced:
-        report["changed"] = True
-    audio_fix = _ensure_audio_config_defaults(data, auto_fix=auto_fix)
-    if audio_fix["changed"]:
-        report["changed"] = True
-    report["notes"].extend(audio_fix["notes"])
-    report["warnings"].extend(audio_fix["warnings"])
-    report["errors"].extend(audio_fix["errors"])
-
-    obs_defaults = {
-        "host": DEFAULT_OBS_HOST,
-        "port": DEFAULT_OBS_PORT,
-        "fps": DEFAULT_OBS_FPS,
-        "scene_name": DEFAULT_OBS_SCENE_NAME,
-        "source_name": DEFAULT_OBS_SOURCE_NAME,
-        "source_color": DEFAULT_OBS_SOURCE_COLOR,
-        "dir": DEFAULT_OBS_DIR,
-    }
-    path_defaults = {
-        "bin_dir": DEFAULT_BIN_DIR,
-        "recordings_dir": DEFAULT_RECORDINGS_DIR,
-        "json_dir": DEFAULT_JSON_DIR,
-        "champion_icons_dir": DEFAULT_CHAMPION_ICONS_DIR,
-        "champion_aliases_path": "config/champion_aliases.json",
-    }
-    poll_defaults = {
-        "end_error_limit": DEFAULT_END_ERROR_LIMIT,
-        "end_missing_grace_sec": DEFAULT_END_MISSING_GRACE_SEC,
-        "end_poll_sec": DEFAULT_END_POLL_SEC,
-        "event_poll_sec": DEFAULT_EVENT_POLL_SEC,
-    }
-    storage_defaults = {"max_size_gb": DEFAULT_MAX_STORAGE_GB}
-
-    def apply_defaults(target: dict[str, Any], defaults: dict[str, Any]) -> None:
-        for key, value in defaults.items():
-            if target.get(key) in (None, ""):
-                if auto_fix:
-                    target[key] = value
-                    report["changed"] = True
-                    report["notes"].append(f"{key} を既定値で補完しました。")
-                else:
-                    report["errors"].append(f"{key} が未設定です。")
-
-    apply_defaults(obs_cfg, obs_defaults)
-    apply_defaults(paths_cfg, path_defaults)
-    apply_defaults(poll_cfg, poll_defaults)
-    apply_defaults(storage_cfg, storage_defaults)
-
-    capture_fix = normalize_obs_capture_config(obs_cfg, auto_fix=auto_fix)
-    if capture_fix["changed"]:
-        report["changed"] = True
-    report["notes"].extend(capture_fix["notes"])
-    report["warnings"].extend(capture_fix["warnings"])
-    report["errors"].extend(capture_fix["errors"])
-
-    password_value, generated_password = ensure_obs_password_value(obs_cfg.get("password"))
-    if generated_password:
-        if auto_fix:
-            obs_cfg["password"] = password_value
-            report["changed"] = True
-            report["notes"].append("OBS WebSocketパスワードを自動生成しました。")
-        else:
-            report["errors"].append("OBS WebSocketパスワードが未設定です。")
-    elif obs_cfg.get("password") != password_value:
-        if auto_fix:
-            obs_cfg["password"] = password_value
-            report["changed"] = True
-            report["notes"].append("OBS WebSocketパスワードの前後空白を削除しました。")
-        else:
-            report["warnings"].append("OBS WebSocketパスワードに前後空白があります。")
-
-    port, ok = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
-    if not ok:
-        if auto_fix:
-            obs_cfg["port"] = port
-            report["changed"] = True
-        report["warnings"].append(f"OBSポートが不正だったため {port} を使用します。")
-
-    fps_value, ok = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
-    if not ok:
-        if auto_fix:
-            obs_cfg["fps"] = fps_value
-            report["changed"] = True
-        report["warnings"].append(f"OBS FPS が不正だったため {fps_value} を使用します。")
-
-    raw_source_color = obs_cfg.get("source_color")
-    source_color, ok = parse_obs_source_color(raw_source_color, default=DEFAULT_OBS_SOURCE_COLOR)
-    if not ok:
-        if auto_fix:
-            obs_cfg["source_color"] = source_color
-            report["changed"] = True
-        report["warnings"].append("source_color が不正だったため赤 (#FF0000) を使用します。")
-    elif source_color == LEGACY_OBS_SOURCE_COLOR_BLUE:
-        raw_text = str(raw_source_color).strip().lower() if raw_source_color is not None else ""
-        legacy_values = {"", "4294901760", "0xffff0000", "#0000ff"}
-        if isinstance(raw_source_color, int):
-            is_legacy = raw_source_color == LEGACY_OBS_SOURCE_COLOR_BLUE
-        else:
-            is_legacy = raw_text in legacy_values
-        if is_legacy and auto_fix:
-            obs_cfg["source_color"] = DEFAULT_OBS_SOURCE_COLOR
-            report["changed"] = True
-            report["notes"].append("旧設定の青色ソースを赤色 (#FF0000) に更新しました。")
-
-    end_error_limit, ok = _safe_int(poll_cfg.get("end_error_limit"), DEFAULT_END_ERROR_LIMIT, minimum=1)
-    if not ok:
-        if auto_fix:
-            poll_cfg["end_error_limit"] = end_error_limit
-            report["changed"] = True
-        report["warnings"].append("end_error_limit が不正だったため既定値を使用します。")
-
-    end_missing_grace_sec, ok = _safe_float(
-        poll_cfg.get("end_missing_grace_sec"),
-        DEFAULT_END_MISSING_GRACE_SEC,
-        minimum=0.0,
+    normalization = config_schema.normalize_config(
+        data,
+        auto_fix=auto_fix,
+        password_factory=generate_obs_password,
     )
-    if not ok:
-        if auto_fix:
-            poll_cfg["end_missing_grace_sec"] = end_missing_grace_sec
-            report["changed"] = True
-        report["warnings"].append("end_missing_grace_sec が不正だったため既定値を使用します。")
+    if normalization.changed:
+        report["changed"] = True
+    report["notes"].extend(normalization.notes)
+    report["warnings"].extend(normalization.warnings)
+    report["errors"].extend(normalization.errors)
 
-    end_poll_sec, ok = _safe_float(poll_cfg.get("end_poll_sec"), DEFAULT_END_POLL_SEC, minimum=0.1)
-    if not ok:
-        if auto_fix:
-            poll_cfg["end_poll_sec"] = end_poll_sec
-            report["changed"] = True
-        report["warnings"].append("end_poll_sec が不正だったため既定値を使用します。")
-
-    event_poll_sec, ok = _safe_float(poll_cfg.get("event_poll_sec"), DEFAULT_EVENT_POLL_SEC, minimum=0.1)
-    if not ok:
-        if auto_fix:
-            poll_cfg["event_poll_sec"] = event_poll_sec
-            report["changed"] = True
-        report["warnings"].append("event_poll_sec が不正だったため既定値を使用します。")
-
-    max_size_gb, ok = _safe_float(storage_cfg.get("max_size_gb"), DEFAULT_MAX_STORAGE_GB, minimum=0.1)
-    if not ok:
-        if auto_fix:
-            storage_cfg["max_size_gb"] = max_size_gb
-            report["changed"] = True
-        report["warnings"].append("max_size_gb が不正だったため既定値を使用します。")
+    obs_cfg = data["obs"]
+    paths_cfg = data["paths"]
+    port, _ = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
 
     recordings_dir = resolve_path(paths_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), DATA_DIR)
     json_dir = resolve_path(paths_cfg.get("json_dir", DEFAULT_JSON_DIR), DATA_DIR)

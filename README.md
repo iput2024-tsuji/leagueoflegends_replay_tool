@@ -159,7 +159,7 @@ tests/
 ## 必要環境
 
 - Windows
-- Python 3.10+ 推奨
+- Python 3.14（CI と配布ビルドの検証対象）
 - OBS Studio ポータブル版
 - mpv DLL
 - FFmpeg (`bin/ffmpeg.exe`)
@@ -248,6 +248,9 @@ dist\LoLReplayTool\
 
 ## トラブルシュート
 
+- 配布版の基本診断を行う
+  - `LoLReplayTool.exe --self-check` を実行してください。GUIを開かずに設定ファイル、保存先の書き込み、OBS/FFmpeg/mpv配置状況を確認します。
+  - OBS、FFmpeg、mpv DLL が未配置でも診断自体は失敗扱いにせず、警告として表示します。
 - `ポータブルOBSが見つかりません`
   - 配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable\bin\64bit\obs64.exe`、開発実行時は `obs-portable\bin\64bit\obs64.exe` が存在するように配置してください。
 - `mpv DLL が見つかりません`

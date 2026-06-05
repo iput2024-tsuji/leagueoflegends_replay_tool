@@ -4,10 +4,11 @@ from collections.abc import Callable
 from typing import Any
 
 try:
-    from . import recordtest
+    from . import config_schema, recordtest
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from .obs_runtime import OBSRuntimeManager, RecorderRuntime
 except ImportError:
+    import config_schema
     import recordtest
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from obs_runtime import OBSRuntimeManager, RecorderRuntime
@@ -22,104 +23,23 @@ class ConfigController:
     def apply_auto_defaults(
         self, data: dict[str, Any] | None, force_obs_detect: bool = False
     ) -> tuple[dict[str, Any], bool, list[str]]:
-        changed = False
-        notes = []
+        normalized = config_schema.normalize_config(
+            data,
+            auto_fix=True,
+            password_factory=recordtest.generate_obs_password,
+        )
+        data = normalized.config
+        changed = normalized.changed
+        notes = list(normalized.notes) + list(normalized.warnings)
 
-        if not isinstance(data, dict):
-            data = {}
-            changed = True
-
-        obs = data.setdefault("obs", {})
-        paths = data.setdefault("paths", {})
-        polling = data.setdefault("polling", {})
-        storage = data.setdefault("storage", {})
         app_cfg = data.setdefault("app", {})
-        audio_cfg = data.setdefault("audio", {})
-
-        defaults_obs = {
-            "host": recordtest.DEFAULT_OBS_HOST,
-            "port": recordtest.DEFAULT_OBS_PORT,
-            "fps": recordtest.DEFAULT_OBS_FPS,
-            "scene_name": recordtest.DEFAULT_OBS_SCENE_NAME,
-            "source_name": recordtest.DEFAULT_OBS_SOURCE_NAME,
-            "source_color": recordtest.DEFAULT_OBS_SOURCE_COLOR,
-        }
-        for key, value in defaults_obs.items():
-            if obs.get(key) in (None, ""):
-                obs[key] = value
-                changed = True
-
-        capture_fix = recordtest.normalize_obs_capture_config(obs, auto_fix=True)
-        if capture_fix["changed"]:
-            changed = True
-        notes.extend(capture_fix["notes"])
-        notes.extend(capture_fix["warnings"])
-
-        password_value, generated_password = recordtest.ensure_obs_password_value(obs.get("password"))
-        if generated_password:
-            obs["password"] = password_value
-            changed = True
-            notes.append("OBS WebSocketパスワードを自動生成しました")
-        elif obs.get("password") != password_value:
-            obs["password"] = password_value
-            changed = True
-            notes.append("OBS WebSocketパスワードの前後空白を削除しました")
-
-        if obs.get("dir") != recordtest.DEFAULT_OBS_DIR:
-            obs["dir"] = recordtest.DEFAULT_OBS_DIR
-            changed = True
-            notes.append(f"OBSフォルダを固定しました: {recordtest.DEFAULT_OBS_DIR}")
-
         has_valid_dir = bool(recordtest.detect_obs_dir())
-
-        defaults_paths = {
-            "bin_dir": recordtest.DEFAULT_BIN_DIR,
-            "recordings_dir": recordtest.DEFAULT_RECORDINGS_DIR,
-            "json_dir": recordtest.DEFAULT_JSON_DIR,
-            "champion_icons_dir": recordtest.DEFAULT_CHAMPION_ICONS_DIR,
-            "champion_aliases_path": "config/champion_aliases.json",
-        }
-        for key, value in defaults_paths.items():
-            if paths.get(key) in (None, ""):
-                paths[key] = value
-                changed = True
-
-        defaults_polling = {
-            "end_error_limit": recordtest.DEFAULT_END_ERROR_LIMIT,
-            "end_missing_grace_sec": recordtest.DEFAULT_END_MISSING_GRACE_SEC,
-            "end_poll_sec": recordtest.DEFAULT_END_POLL_SEC,
-            "event_poll_sec": recordtest.DEFAULT_EVENT_POLL_SEC,
-        }
-        for key, value in defaults_polling.items():
-            if polling.get(key) in (None, ""):
-                polling[key] = value
-                changed = True
-
-        if storage.get("max_size_gb") in (None, ""):
-            storage["max_size_gb"] = recordtest.DEFAULT_MAX_STORAGE_GB
-            changed = True
-
         if app_cfg.get("setup_completed") is None:
             app_cfg["setup_completed"] = bool(has_valid_dir)
             changed = True
         elif not bool(app_cfg.get("setup_completed")) and has_valid_dir:
             app_cfg["setup_completed"] = True
             changed = True
-        if app_cfg.get("minimize_to_tray") is None:
-            app_cfg["minimize_to_tray"] = True
-            changed = True
-
-        audio_defaults = recordtest.get_audio_config_defaults()
-        for key, defaults in audio_defaults.items():
-            slot = audio_cfg.setdefault(key, {})
-            if not isinstance(slot, dict):
-                audio_cfg[key] = {}
-                slot = audio_cfg[key]
-                changed = True
-            for field, value in defaults.items():
-                if slot.get(field) in (None, ""):
-                    slot[field] = value
-                    changed = True
 
         return data, changed, notes
 

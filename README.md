@@ -4,6 +4,12 @@ LoL Replay Tool は、League of Legends の試合を自動録画し、試合イ�
 
 単なる「LoL の自動録画ソフト」ではなく、録画・イベント同期・リプレイ閲覧・データ分析を一体化し、蓄積されたプレイデータから scikit-learn の決定木モデルを使って「勝利の方程式」や「敗北しやすいパターン」を自動抽出することを目指しています。
 
+## ダウンロード
+
+[GitHub Releases](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/releases/latest)から最新版の`LoLReplayTool-Setup-*.exe`をダウンロードできます。
+
+OBSとFFmpegは必要になった時点でアプリが自動取得します。リプレイ再生に必要なmpv DLLは同梱していないため、利用者が別途入手し、`%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。Releaseに添付される`SHA256SUMS.txt`でインストーラーの整合性を確認できます。
+
 ## Riot Games 免責事項
 
 LoL Replay Tool is not endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.
@@ -269,6 +275,17 @@ dist\installer\LoLReplayTool-Setup-0.1.0.exe
 インストール先は`%LOCALAPPDATA%\Programs\LoLReplayTool`です。管理者権限は不要で、スタートメニューのショートカットとアンインストーラーが登録されます。設定、ログ、OBS、FFmpeg、録画は従来どおり`%LOCALAPPDATA%\LoLReplayTool`に保存されるため、アプリ更新で上書きされません。
 
 アンインストール時は、設定、ログ、ダウンロード済みOBS/FFmpegを削除するか確認します。どちらを選んでも`recordings`フォルダと、設定で指定した外部録画保存先は削除しません。
+
+### GitHub Releaseの公開
+
+`VERSION`を更新してコミットした後、同じバージョンの`v`付きタグをプッシュすると、GitHub ActionsがインストーラーをビルドしてReleaseへ自動公開します。
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+タグと`VERSION`が一致しない場合や、テスト・Ruff・ビルドのいずれかが失敗した場合はReleaseを公開しません。
 
 ## トラブルシュート
 

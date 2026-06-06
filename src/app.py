@@ -1530,6 +1530,9 @@ class MainWindow(QMainWindow):
         self.player_page = PlayerPage(on_back=self.show_home)
         self.analytics_page = AnalyticsPage(on_back=self.show_home)
         self.settings_page = SettingsPage(on_back=self.show_home)
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._stop_player_before_app_quit)
 
         self.stack.addWidget(self.home_page)
         self.stack.addWidget(self.player_page)
@@ -1601,8 +1604,18 @@ class MainWindow(QMainWindow):
         except Exception:
             return True
 
+    def _stop_player(self, timeout_ms: int = 3000) -> bool:
+        try:
+            return self.player_page.on_leave(timeout_ms=timeout_ms)
+        except Exception:
+            recordtest.LOGGER.warning("Player shutdown failed", exc_info=True)
+            return False
+
+    def _stop_player_before_app_quit(self) -> None:
+        self._stop_player(timeout_ms=1000)
+
     def show_home(self) -> None:
-        self.player_page.on_leave()
+        self._stop_player()
         self.stack.setCurrentWidget(self.home_page)
         if self._recorder_autostart_enabled and not self._closing:
             self.start_background_recorder()
@@ -1615,7 +1628,7 @@ class MainWindow(QMainWindow):
             self.show_home()
 
     def show_settings(self) -> None:
-        self.player_page.on_leave()
+        self._stop_player()
         if self.bg_recorder_worker and self.bg_recorder_worker.isRunning():
             if not self.stop_background_recorder(wait_ms=5000):
                 QMessageBox.warning(
@@ -1628,7 +1641,7 @@ class MainWindow(QMainWindow):
         self.settings_page.on_page_shown()
 
     def show_analytics(self) -> None:
-        self.player_page.on_leave()
+        self._stop_player()
         self.stack.setCurrentWidget(self.analytics_page)
         self.analytics_page.on_page_shown()
 
@@ -1757,6 +1770,9 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         if (not self._is_quitting) and self.should_minimize_to_tray():
+            # The recorder remains active in the tray, but native MPV playback
+            # must be terminated before hiding the window or audio keeps playing.
+            self._stop_player(timeout_ms=1000)
             event.ignore()
             self.hide()
             if self._tray_icon and not self._tray_notice_shown:
@@ -1774,10 +1790,7 @@ class MainWindow(QMainWindow):
 
         self._is_quitting = True
         self._closing = True
-        try:
-            player_stopped = self.player_page.on_leave()
-        except Exception:
-            player_stopped = False
+        player_stopped = self._stop_player()
         self._shutdown_attempts += 1
         force_shutdown = self._shutdown_attempts > self._shutdown_max_attempts
         workers_stopped = self._stop_all_background_work(force=force_shutdown) and player_stopped
@@ -1796,7 +1809,7 @@ class MainWindow(QMainWindow):
                     QMessageBox.StandardButton.No,
                 )
                 if reply == QMessageBox.StandardButton.Yes:
-                    player_stopped = self.player_page.on_leave()
+                    player_stopped = self._stop_player()
                     workers_stopped = self._stop_all_background_work(force=True) and player_stopped
                 else:
                     self._shutdown_attempts = 0

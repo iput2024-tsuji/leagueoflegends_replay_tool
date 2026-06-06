@@ -416,8 +416,24 @@ class ClipExportWorker(QThread):
         self._cancel_requested = False
 
     ENCODER_PROFILES = [
-        ("h264_nvenc", ["-c:v", "h264_nvenc", "-preset", "fast", "-cq", "23"]),
-        ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]),
+        (
+            "h264_nvenc",
+            [
+                "-c:v",
+                "h264_nvenc",
+                "-preset",
+                "p5",
+                "-tune",
+                "hq",
+                "-rc",
+                "vbr",
+                "-cq",
+                "19",
+                "-b:v",
+                "0",
+            ],
+        ),
+        ("libx264", ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]),
     ]
 
     def cancel(self) -> None:
@@ -484,12 +500,6 @@ class ClipExportWorker(QThread):
             "0:v:0",
             "-map",
             "0:a?",
-            "-vf",
-            "fps=60",
-            "-r",
-            "60",
-            "-fps_mode",
-            "cfr",
             *encoder_args,
             "-pix_fmt",
             "yuv420p",
@@ -1164,13 +1174,12 @@ class PlayerWidget(QWidget):
 
     def shutdown_player(self, timeout_ms: int = 3000) -> bool:
         self._player_shutting_down = True
-        background_stopped = self.cancel_background_tasks(timeout_ms=timeout_ms)
         player = self.player
         self.player = None
         if player is not None:
             LOGGER.info("Terminating MPV player")
             self._terminate_mpv_player(player)
-        return background_stopped
+        return self.cancel_background_tasks(timeout_ms=timeout_ms)
 
     def load_settings(self) -> None:
         global ICON_DIR, ICON_INDEX, ICON_ALIASES, ALIASES_PATH

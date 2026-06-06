@@ -24,6 +24,14 @@ DEFAULT_CHAMPION_ALIASES_PATH = "config/champion_aliases.json"
 DEFAULT_OBS_HOST = "localhost"
 DEFAULT_OBS_PORT = 4455
 DEFAULT_OBS_FPS = 60
+DEFAULT_OBS_BASE_WIDTH = 1920
+DEFAULT_OBS_BASE_HEIGHT = 1080
+DEFAULT_OBS_OUTPUT_WIDTH = 1920
+DEFAULT_OBS_OUTPUT_HEIGHT = 1080
+DEFAULT_OBS_SCALE_TYPE = "lanczos"
+DEFAULT_OBS_RECORDING_QUALITY = "Small"
+VALID_OBS_SCALE_TYPES = frozenset({"bilinear", "bicubic", "lanczos", "area"})
+VALID_OBS_RECORDING_QUALITIES = frozenset({"Stream", "Small", "HQ", "Lossless"})
 DEFAULT_END_ERROR_LIMIT = 3
 DEFAULT_END_MISSING_GRACE_SEC = 60.0
 DEFAULT_END_POLL_SEC = 5
@@ -118,6 +126,12 @@ def normalize_config(
             "host": DEFAULT_OBS_HOST,
             "port": DEFAULT_OBS_PORT,
             "fps": DEFAULT_OBS_FPS,
+            "base_width": DEFAULT_OBS_BASE_WIDTH,
+            "base_height": DEFAULT_OBS_BASE_HEIGHT,
+            "output_width": DEFAULT_OBS_OUTPUT_WIDTH,
+            "output_height": DEFAULT_OBS_OUTPUT_HEIGHT,
+            "scale_type": DEFAULT_OBS_SCALE_TYPE,
+            "recording_quality": DEFAULT_OBS_RECORDING_QUALITY,
             "scene_name": DEFAULT_OBS_SCENE_NAME,
             "source_name": DEFAULT_OBS_SOURCE_NAME,
             "source_color": DEFAULT_OBS_SOURCE_COLOR,
@@ -464,6 +478,44 @@ def _normalize_numeric_values(
             result.changed = True
         result.warnings.append(f"OBS FPS が不正だったため {fps_value} を使用します。")
 
+    for key, default in (
+        ("base_width", DEFAULT_OBS_BASE_WIDTH),
+        ("base_height", DEFAULT_OBS_BASE_HEIGHT),
+        ("output_width", DEFAULT_OBS_OUTPUT_WIDTH),
+        ("output_height", DEFAULT_OBS_OUTPUT_HEIGHT),
+    ):
+        value, value_ok = _safe_int(obs_cfg.get(key), default, minimum=64, maximum=4096)
+        if value % 2:
+            value_ok = False
+            value = default
+        if not value_ok:
+            if auto_fix:
+                obs_cfg[key] = value
+                result.changed = True
+            result.warnings.append(f"OBS {key} が不正だったため {value} を使用します。")
+
+    scale_type = str(obs_cfg.get("scale_type") or "").strip().lower()
+    if scale_type not in VALID_OBS_SCALE_TYPES:
+        if auto_fix:
+            obs_cfg["scale_type"] = DEFAULT_OBS_SCALE_TYPE
+            result.changed = True
+        result.warnings.append(f"OBS scale_type が不正だったため {DEFAULT_OBS_SCALE_TYPE} を使用します。")
+    elif auto_fix and obs_cfg.get("scale_type") != scale_type:
+        obs_cfg["scale_type"] = scale_type
+        result.changed = True
+
+    recording_quality = str(obs_cfg.get("recording_quality") or "").strip()
+    quality_lookup = {value.lower(): value for value in VALID_OBS_RECORDING_QUALITIES}
+    normalized_quality = quality_lookup.get(recording_quality.lower())
+    if normalized_quality is None:
+        if auto_fix:
+            obs_cfg["recording_quality"] = DEFAULT_OBS_RECORDING_QUALITY
+            result.changed = True
+        result.warnings.append(f"OBS recording_quality が不正だったため {DEFAULT_OBS_RECORDING_QUALITY} を使用します。")
+    elif auto_fix and obs_cfg.get("recording_quality") != normalized_quality:
+        obs_cfg["recording_quality"] = normalized_quality
+        result.changed = True
+
     raw_source_color = obs_cfg.get("source_color")
     source_color, ok = parse_obs_source_color(raw_source_color, default=DEFAULT_OBS_SOURCE_COLOR)
     if not ok:
@@ -474,7 +526,11 @@ def _normalize_numeric_values(
     elif source_color == LEGACY_OBS_SOURCE_COLOR_BLUE:
         raw_text = str(raw_source_color).strip().lower() if raw_source_color is not None else ""
         legacy_values = {"", "4294901760", "0xffff0000", "#0000ff"}
-        is_legacy = raw_source_color == LEGACY_OBS_SOURCE_COLOR_BLUE if isinstance(raw_source_color, int) else raw_text in legacy_values
+        is_legacy = (
+            raw_source_color == LEGACY_OBS_SOURCE_COLOR_BLUE
+            if isinstance(raw_source_color, int)
+            else raw_text in legacy_values
+        )
         if is_legacy and auto_fix:
             obs_cfg["source_color"] = DEFAULT_OBS_SOURCE_COLOR
             result.changed = True

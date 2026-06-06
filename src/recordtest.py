@@ -90,6 +90,14 @@ DEFAULT_CHAMPION_ICONS_DIR = "assets/champions/icons"
 DEFAULT_OBS_HOST = "localhost"
 DEFAULT_OBS_PORT = 4455
 DEFAULT_OBS_FPS = 60
+DEFAULT_OBS_BASE_WIDTH = 1920
+DEFAULT_OBS_BASE_HEIGHT = 1080
+DEFAULT_OBS_OUTPUT_WIDTH = 1920
+DEFAULT_OBS_OUTPUT_HEIGHT = 1080
+DEFAULT_OBS_SCALE_TYPE = "lanczos"
+DEFAULT_OBS_RECORDING_QUALITY = "Small"
+VALID_OBS_SCALE_TYPES = frozenset({"bilinear", "bicubic", "lanczos", "area"})
+VALID_OBS_RECORDING_QUALITIES = frozenset({"Stream", "Small", "HQ", "Lossless"})
 DEFAULT_END_ERROR_LIMIT = 3
 DEFAULT_END_MISSING_GRACE_SEC = 60.0
 DEFAULT_END_POLL_SEC = 5
@@ -221,6 +229,12 @@ class OBSSettings:
     window_capture_window: str
     window_capture_method: int
     fps: int
+    base_width: int
+    base_height: int
+    output_width: int
+    output_height: int
+    scale_type: str
+    recording_quality: str
     obs_dir: Path
 
     @property
@@ -305,6 +319,26 @@ class AppConfig:
             default=DEFAULT_OBS_SOURCE_COLOR,
         )
         fps, _ = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
+        base_width, _ = _safe_int(obs_cfg.get("base_width"), DEFAULT_OBS_BASE_WIDTH, minimum=64, maximum=4096)
+        base_height, _ = _safe_int(obs_cfg.get("base_height"), DEFAULT_OBS_BASE_HEIGHT, minimum=64, maximum=4096)
+        output_width, _ = _safe_int(obs_cfg.get("output_width"), DEFAULT_OBS_OUTPUT_WIDTH, minimum=64, maximum=4096)
+        output_height, _ = _safe_int(obs_cfg.get("output_height"), DEFAULT_OBS_OUTPUT_HEIGHT, minimum=64, maximum=4096)
+        if base_width % 2:
+            base_width = DEFAULT_OBS_BASE_WIDTH
+        if base_height % 2:
+            base_height = DEFAULT_OBS_BASE_HEIGHT
+        if output_width % 2:
+            output_width = DEFAULT_OBS_OUTPUT_WIDTH
+        if output_height % 2:
+            output_height = DEFAULT_OBS_OUTPUT_HEIGHT
+        scale_type = str(obs_cfg.get("scale_type") or DEFAULT_OBS_SCALE_TYPE).strip().lower()
+        if scale_type not in VALID_OBS_SCALE_TYPES:
+            scale_type = DEFAULT_OBS_SCALE_TYPE
+        quality_lookup = {value.lower(): value for value in VALID_OBS_RECORDING_QUALITIES}
+        recording_quality = quality_lookup.get(
+            str(obs_cfg.get("recording_quality") or DEFAULT_OBS_RECORDING_QUALITY).strip().lower(),
+            DEFAULT_OBS_RECORDING_QUALITY,
+        )
         port, _ = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
         window_capture_method, _ = _safe_int(
             obs_cfg.get("window_capture_method"),
@@ -377,6 +411,12 @@ class AppConfig:
                 window_capture_window=window_capture_window,
                 window_capture_method=window_capture_method,
                 fps=fps,
+                base_width=base_width,
+                base_height=base_height,
+                output_width=output_width,
+                output_height=output_height,
+                scale_type=scale_type,
+                recording_quality=recording_quality,
                 obs_dir=MANAGED_PORTABLE_OBS_DIR,
             ),
             paths=PathsSettings(
@@ -1102,9 +1142,7 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             migrated_from = migrate_legacy_managed_obs_if_needed(port=port, password=obs_password)
             if migrated_from is not None:
                 report["changed"] = True
-                report["notes"].append(
-                    f"旧OBS配置を obs-portable へコピー移行しました: {migrated_from}"
-                )
+                report["notes"].append(f"旧OBS配置を obs-portable へコピー移行しました: {migrated_from}")
         except Exception as e:
             report["warnings"].append(f"旧OBS配置の移行に失敗しました: {e}")
 
@@ -1337,16 +1375,63 @@ def _obs_raw(client: Any, request_type: str, payload: dict[str, Any] | None = No
         return client.send(request_type, payload or {})
 
 
-def apply_obs_video_settings(client: Any, fps_value: int | str | None = None) -> Any:
+def apply_obs_video_settings(
+    client: Any,
+    fps_value: int | str | None = None,
+    *,
+    base_width: int | str | None = None,
+    base_height: int | str | None = None,
+    output_width: int | str | None = None,
+    output_height: int | str | None = None,
+) -> Any:
     fps_num, _ = _safe_int(fps_value, DEFAULT_OBS_FPS, minimum=1, maximum=240)
+    base_width_value, _ = _safe_int(base_width, DEFAULT_OBS_BASE_WIDTH, minimum=64, maximum=4096)
+    base_height_value, _ = _safe_int(base_height, DEFAULT_OBS_BASE_HEIGHT, minimum=64, maximum=4096)
+    output_width_value, _ = _safe_int(output_width, DEFAULT_OBS_OUTPUT_WIDTH, minimum=64, maximum=4096)
+    output_height_value, _ = _safe_int(output_height, DEFAULT_OBS_OUTPUT_HEIGHT, minimum=64, maximum=4096)
     return _obs_raw(
         client,
         "SetVideoSettings",
         {
             "fpsNumerator": int(fps_num),
             "fpsDenominator": 1,
+            "baseWidth": int(base_width_value),
+            "baseHeight": int(base_height_value),
+            "outputWidth": int(output_width_value),
+            "outputHeight": int(output_height_value),
         },
     )
+
+
+def apply_obs_recording_quality_settings(
+    client: Any,
+    *,
+    scale_type: str = DEFAULT_OBS_SCALE_TYPE,
+    recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
+) -> None:
+    scale_value = str(scale_type or DEFAULT_OBS_SCALE_TYPE).strip().lower()
+    if scale_value not in VALID_OBS_SCALE_TYPES:
+        scale_value = DEFAULT_OBS_SCALE_TYPE
+
+    quality_lookup = {value.lower(): value for value in VALID_OBS_RECORDING_QUALITIES}
+    quality_value = quality_lookup.get(
+        str(recording_quality or DEFAULT_OBS_RECORDING_QUALITY).strip().lower(),
+        DEFAULT_OBS_RECORDING_QUALITY,
+    )
+
+    for category, name, value in (
+        ("Video", "ScaleType", scale_value),
+        ("SimpleOutput", "RecQuality", quality_value),
+    ):
+        _obs_raw(
+            client,
+            "SetProfileParameter",
+            {
+                "parameterCategory": category,
+                "parameterName": name,
+                "parameterValue": value,
+            },
+        )
 
 
 def apply_record_directory_to_obs(client: Any, record_dir: str | Path) -> bool:
@@ -2150,11 +2235,36 @@ class ObsWebSocketClient(OBSClient):
                 pass
 
         try:
-            apply_obs_video_settings(self.client, self.config.obs.fps)
-            self.log(f"🎞️ OBS録画FPSを {self.config.obs.fps} に設定しました。")
+            apply_obs_video_settings(
+                self.client,
+                self.config.obs.fps,
+                base_width=self.config.obs.base_width,
+                base_height=self.config.obs.base_height,
+                output_width=self.config.obs.output_width,
+                output_height=self.config.obs.output_height,
+            )
+            self.log(
+                "🎞️ OBS映像設定を適用しました: "
+                f"{self.config.obs.base_width}x{self.config.obs.base_height} -> "
+                f"{self.config.obs.output_width}x{self.config.obs.output_height} / "
+                f"{self.config.obs.fps} FPS"
+            )
         except Exception as e:
             # 録画は続行可能なので警告のみ
-            self.log(f"⚠️ OBS録画FPS設定の適用に失敗: {e}")
+            self.log(f"⚠️ OBS映像設定の適用に失敗: {e}")
+
+        try:
+            apply_obs_recording_quality_settings(
+                self.client,
+                scale_type=self.config.obs.scale_type,
+                recording_quality=self.config.obs.recording_quality,
+            )
+            self.log(
+                "🎞️ OBS録画品質を適用しました: "
+                f"quality={self.config.obs.recording_quality}, scale={self.config.obs.scale_type}"
+            )
+        except Exception as e:
+            self.log(f"⚠️ OBS録画品質設定の適用に失敗: {e}")
 
     def apply_record_output_settings(self) -> bool:
         self.setup_record_output()
@@ -2181,6 +2291,7 @@ class ObsWebSocketClient(OBSClient):
             self._ensure_scene_exists()
             self._set_current_scene()
             window_capture_item_id = self._ensure_window_capture_exists()
+            self._fit_window_capture_to_canvas(window_capture_item_id)
             sync_source_item_id = self._ensure_sync_source_exists()
             self._remove_legacy_game_capture_sources()
             self._apply_scene_item_z_order(window_capture_item_id, sync_source_item_id)
@@ -2326,6 +2437,24 @@ class ObsWebSocketClient(OBSClient):
                 f"ウィンドウキャプチャ '{source_name}' は存在しますが、シーン '{scene_name}' で見つかりません。"
             )
         return scene_item_id
+
+    def _fit_window_capture_to_canvas(self, scene_item_id: int) -> None:
+        scene_name = self.config.obs.scene_name
+        width = float(self.config.obs.base_width)
+        height = float(self.config.obs.base_height)
+        transform = {
+            "positionX": 0.0,
+            "positionY": 0.0,
+            "alignment": 5,
+            "boundsType": "OBS_BOUNDS_SCALE_INNER",
+            "boundsAlignment": 0,
+            "boundsWidth": width,
+            "boundsHeight": height,
+        }
+        try:
+            self.client.set_scene_item_transform(scene_name, scene_item_id, transform)
+        except Exception as e:
+            self.log(f"⚠️ ウィンドウキャプチャをキャンバスへフィットできませんでした: {e}")
 
     def _ensure_sync_source_exists(self) -> int:
         scene_name = self.config.obs.scene_name

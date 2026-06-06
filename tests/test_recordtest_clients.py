@@ -114,6 +114,76 @@ def test_app_config_upgrades_default_game_capture_values_to_window_capture_defau
     assert config.obs.window_capture_window == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
 
 
+def test_app_config_uses_lossless_resolution_defaults_and_quality_recording():
+    config = recordtest.AppConfig.from_dict({})
+
+    assert config.obs.base_width == 1920
+    assert config.obs.base_height == 1080
+    assert config.obs.output_width == 1920
+    assert config.obs.output_height == 1080
+    assert config.obs.scale_type == "lanczos"
+    assert config.obs.recording_quality == "Small"
+
+
+def test_obs_video_and_quality_settings_are_sent_to_websocket():
+    class RawClient:
+        def __init__(self):
+            self.calls = []
+
+        def send(self, request_type, payload, raw=True):
+            self.calls.append((request_type, payload, raw))
+            return SimpleNamespace()
+
+    client = RawClient()
+
+    recordtest.apply_obs_video_settings(
+        client,
+        60,
+        base_width=1920,
+        base_height=1080,
+        output_width=1920,
+        output_height=1080,
+    )
+    recordtest.apply_obs_recording_quality_settings(
+        client,
+        scale_type="lanczos",
+        recording_quality="Small",
+    )
+
+    assert client.calls == [
+        (
+            "SetVideoSettings",
+            {
+                "fpsNumerator": 60,
+                "fpsDenominator": 1,
+                "baseWidth": 1920,
+                "baseHeight": 1080,
+                "outputWidth": 1920,
+                "outputHeight": 1080,
+            },
+            True,
+        ),
+        (
+            "SetProfileParameter",
+            {
+                "parameterCategory": "Video",
+                "parameterName": "ScaleType",
+                "parameterValue": "lanczos",
+            },
+            True,
+        ),
+        (
+            "SetProfileParameter",
+            {
+                "parameterCategory": "SimpleOutput",
+                "parameterName": "RecQuality",
+                "parameterValue": "Small",
+            },
+            True,
+        ),
+    ]
+
+
 def test_preflight_generates_and_persists_obs_password(monkeypatch, tmp_path):
     managed_dir = (tmp_path / "obs-portable").resolve()
     obs_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
@@ -323,6 +393,7 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
             self.removed_inputs = []
             self.removed_scenes = []
             self.index_calls = []
+            self.transform_calls = []
             self.current_scene = None
             self.next_item_id = 2
 
@@ -387,7 +458,7 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
             return None
 
         def set_scene_item_transform(self, scene_name, item_id, transform):
-            return None
+            self.transform_calls.append((scene_name, item_id, dict(transform)))
 
         def set_scene_item_enabled(self, scene_name, item_id, enabled):
             return None
@@ -424,6 +495,19 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     sync_item_id = scene_items[1]["sceneItemId"]
     assert (recordtest.DEFAULT_OBS_SCENE_NAME, window_item_id, 0) in raw_client.index_calls
     assert (recordtest.DEFAULT_OBS_SCENE_NAME, sync_item_id, 1) in raw_client.index_calls
+    assert (
+        recordtest.DEFAULT_OBS_SCENE_NAME,
+        window_item_id,
+        {
+            "positionX": 0.0,
+            "positionY": 0.0,
+            "alignment": 5,
+            "boundsType": "OBS_BOUNDS_SCALE_INNER",
+            "boundsAlignment": 0,
+            "boundsWidth": 1920.0,
+            "boundsHeight": 1080.0,
+        },
+    ) in raw_client.transform_calls
 
 
 def test_setup_sync_elements_keeps_initial_scene_when_window_capture_creation_fails():
@@ -625,10 +709,7 @@ def test_preflight_migrates_legacy_obs_studio_to_managed_portable(monkeypatch):
     legacy_ini.parent.mkdir(parents=True, exist_ok=True)
     legacy_exe.write_text("fake", encoding="utf-8")
     legacy_ini.write_text(
-        "[General]\n"
-        "FirstRun=false\n\n"
-        "[BasicWindow]\n"
-        "SysTrayEnabled=true\n",
+        "[General]\nFirstRun=false\n\n[BasicWindow]\nSysTrayEnabled=true\n",
         encoding="utf-8",
     )
 

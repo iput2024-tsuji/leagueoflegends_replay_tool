@@ -2,8 +2,8 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 from src import player as player_module
-from src.app import PlayerPage
-from src.player import PlayerWidget
+from src.app import MainWindow, PlayerPage
+from src.player import ClipExportWorker, PlayerWidget
 
 
 class FakeRunningWorker:
@@ -129,12 +129,14 @@ def test_stale_sync_worker_completion_releases_retained_reference():
 
 def test_shutdown_player_unobserves_properties_before_terminating_mpv():
     player = FakeMpvPlayer()
+    calls = []
     widget = SimpleNamespace(player=player, _player_shutting_down=False)
     widget.on_mpv_time_update = lambda *args: None
     widget.on_mpv_duration_update = lambda *args: None
-    widget.cancel_background_tasks = lambda timeout_ms: True
+    widget.cancel_background_tasks = lambda timeout_ms: calls.append(("background", timeout_ms)) or True
     widget._unobserve_mpv_properties = MethodType(PlayerWidget._unobserve_mpv_properties, widget)
-    widget._terminate_mpv_player = MethodType(PlayerWidget._terminate_mpv_player, widget)
+    terminate = MethodType(PlayerWidget._terminate_mpv_player, widget)
+    widget._terminate_mpv_player = lambda mpv_player: (calls.append(("player",)), terminate(mpv_player))[1]
 
     stopped = PlayerWidget.shutdown_player(widget)
 
@@ -147,6 +149,7 @@ def test_shutdown_player_unobserves_properties_before_terminating_mpv():
         ("command", "stop"),
         ("terminate",),
     ]
+    assert calls == [("player",), ("background", 3000)]
 
 
 def test_fullscreen_transition_does_not_change_window_flags():
@@ -183,6 +186,42 @@ def test_player_page_leave_exits_fullscreen_and_shuts_down_player():
 
     assert stopped is False
     assert calls == [("fullscreen",), ("shutdown", 123)]
+
+
+def test_close_to_tray_stops_player_before_hiding_window():
+    calls = []
+    event = SimpleNamespace(ignore=lambda: calls.append(("ignore",)))
+    window = SimpleNamespace(
+        _is_quitting=False,
+        _tray_icon=None,
+        _tray_notice_shown=False,
+        should_minimize_to_tray=lambda: True,
+        _stop_player=lambda timeout_ms: calls.append(("stop_player", timeout_ms)) or True,
+        hide=lambda: calls.append(("hide",)),
+    )
+
+    MainWindow.closeEvent(window, event)
+
+    assert calls == [("stop_player", 1000), ("ignore",), ("hide",)]
+
+
+def test_clip_export_preserves_source_frame_timing_and_uses_quality_encoder_settings():
+    worker = ClipExportWorker(
+        "ffmpeg.exe",
+        "input.mp4",
+        "output.mp4",
+        start_sec=10.0,
+        end_sec=20.0,
+    )
+    encoder_args = dict(ClipExportWorker.ENCODER_PROFILES)["h264_nvenc"]
+
+    command = worker._build_ffmpeg_command(encoder_args)
+
+    assert "-vf" not in command
+    assert "-r" not in command
+    assert "-fps_mode" not in command
+    assert command[command.index("-preset") + 1] == "p5"
+    assert command[command.index("-cq") + 1] == "19"
 
 
 def test_export_clip_starts_lazy_ffmpeg_setup_when_binary_is_missing(monkeypatch):

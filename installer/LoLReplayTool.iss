@@ -45,14 +45,45 @@ Name: "desktopicon"; Description: "デスクトップにショートカットを
 [Files]
 Source: "..\dist\LoLReplayTool\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[Dirs]
+Name: "{localappdata}\LoLReplayTool\bin"
+
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "{#AppName} を起動"; Flags: nowait postinstall skipifsilent
+Filename: "{localappdata}\LoLReplayTool\bin"; Description: "mpv DLL の配置フォルダーを開く"; Flags: shellexec postinstall skipifsilent unchecked
 
 [Code]
+var
+  MpvInfoPage: TOutputMsgWizardPage;
+
+procedure InitializeWizard;
+var
+  MpvDir: String;
+  NewLine: String;
+begin
+  MpvDir := ExpandConstant('{localappdata}\LoLReplayTool\bin');
+  NewLine := #13#10;
+  MpvInfoPage := CreateOutputMsgPage(
+    wpSelectTasks,
+    'リプレイ再生に必要な mpv DLL',
+    'mpv DLL はこのインストーラーに含まれていません。',
+    'リプレイを再生するには、64bit 版の libmpv DLL を利用者が別途入手して配置する必要があります。' +
+    NewLine + NewLine +
+    '配置先:' + NewLine + MpvDir +
+    NewLine + NewLine +
+    '対応ファイル名:' + NewLine +
+    'mpv-2.dll / libmpv-2.dll / mpv-1.dll / libmpv-1.dll' +
+    NewLine + NewLine +
+    'セットアップ完了画面から配置フォルダーを開くこともできます。' +
+    NewLine +
+    'OBS と FFmpeg は必要になった時点でアプリが自動取得します。'
+  );
+end;
+
 procedure DeleteManagedUserData(const DataDir: String);
 begin
   DelTree(AddBackslash(DataDir) + 'config', True, True, True);
@@ -77,7 +108,7 @@ begin
     Exit;
 
   if MsgBox(
-    '設定、ログ、ダウンロード済みの OBS / FFmpeg も削除しますか？' + #13#10 + #13#10 +
+    '設定、ログ、ダウンロード済みの OBS / FFmpeg、手動配置した mpv DLL も削除しますか？' + #13#10 + #13#10 +
     '録画ファイルはこの選択に関係なく削除されません。',
     mbConfirmation,
     MB_YESNO

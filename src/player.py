@@ -43,21 +43,22 @@ from PyQt6.QtWidgets import (
 
 # --- 1. MPVのパス設定 ---
 try:
-    from .app_paths import get_app_root, get_user_data_root
+    from .app_paths import get_app_root, get_resource_root, get_user_data_root
     from .mpv_support import find_mpv_dll, iter_mpv_search_dirs
     from .qt_lifecycle import request_worker_stop
     from .session_log import load_session_payload
 except ImportError:
-    from app_paths import get_app_root, get_user_data_root
+    from app_paths import get_app_root, get_resource_root, get_user_data_root
     from mpv_support import find_mpv_dll, iter_mpv_search_dirs
     from qt_lifecycle import request_worker_stop
     from session_log import load_session_payload
 
 ROOT_DIR = get_app_root()
+RESOURCE_DIR = get_resource_root()
 DATA_DIR = get_user_data_root()
 CONFIG_PATH = DATA_DIR / "config" / "setting.json"
 ALIASES_PATH = DATA_DIR / "config" / "champion_aliases.json"
-INSTALL_ALIASES_PATH = ROOT_DIR / "config" / "champion_aliases.json"
+INSTALL_ALIASES_PATH = RESOURCE_DIR / "config" / "champion_aliases.json"
 BIN_DIR = DATA_DIR / "bin"
 ICON_DIR = DATA_DIR / "assets" / "champions" / "icons"
 ICON_INDEX = None

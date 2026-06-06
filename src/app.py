@@ -40,7 +40,7 @@ from PyQt6.QtWidgets import (
 
 try:
     from . import recordtest
-    from .app_paths import get_app_root, get_user_data_root
+    from .app_paths import get_app_root, get_resource_root, get_user_data_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController
     from .player import PlayerWidget
     from .qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
@@ -51,7 +51,7 @@ except ImportError:
     if str(SRC_DIR) not in sys.path:
         sys.path.insert(0, str(SRC_DIR))
     import recordtest
-    from app_paths import get_app_root, get_user_data_root
+    from app_paths import get_app_root, get_resource_root, get_user_data_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController
     from player import PlayerWidget
     from qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
@@ -60,11 +60,12 @@ except ImportError:
 
 
 ROOT_DIR = get_app_root()
+RESOURCE_DIR = get_resource_root()
 DATA_DIR = get_user_data_root()
 APP_ICON_CANDIDATES = [
-    ROOT_DIR / "assets" / "icon.ico",
-    ROOT_DIR / "assets" / "app" / "app.ico",
-    ROOT_DIR / "assets" / "app" / "app.png",
+    RESOURCE_DIR / "assets" / "icon.ico",
+    RESOURCE_DIR / "assets" / "app" / "app.ico",
+    RESOURCE_DIR / "assets" / "app" / "app.png",
 ]
 
 

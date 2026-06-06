@@ -52,6 +52,7 @@ LoL の振り返りは、動画を見返すだけでは「何が勝敗に効い�
 | pytest | 単体テスト、非同期処理テスト |
 | unittest.mock / AsyncMock | Riot API や OBS WebSocket を起動しないモックテスト |
 | PyInstaller | Windows 向け配布ビルド |
+| Inno Setup | Windows 向けインストーラー、更新、アンインストール |
 
 ## システムアーキテクチャのハイライト
 
@@ -144,12 +145,13 @@ recordings/
   json/              # 試合ログ JSON
 assets/
   app/               # アプリアイコン
-  champions/icons/   # チャンピオンアイコン
 bin/
-  *.dll              # 利用者が配置する mpv DLL
-  ffmpeg.exe         # 利用者が配置するクリップ出力用FFmpeg
+  *.dll              # 開発実行時に利用者が配置する mpv DLL
+  ffmpeg.exe         # 開発実行時のクリップ出力用FFmpeg
 obs-portable/
-  bin/64bit/obs64.exe # 利用者が配置するポータブル OBS
+  bin/64bit/obs64.exe # 開発実行時のポータブル OBS
+installer/
+  LoLReplayTool.iss  # Inno Setup 定義
 tests/
   test_analytics.py
   test_recorder_async.py
@@ -160,16 +162,14 @@ tests/
 
 - Windows
 - Python 3.14（CI と配布ビルドの検証対象）
-- OBS Studio ポータブル版
 - mpv DLL
-- FFmpeg (`bin/ffmpeg.exe`)
 
 このリポジトリおよびビルド成果物には、OBS Studio 本体、mpv DLL、Riot Games の画像アセットを同梱しません。
 
 - OBS Studio は初回起動時に固定バージョンを自動取得し、開発実行時は `obs-portable`、配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable` に配置します。
-- mpv DLL は利用者が正規の配布元から取得し、開発実行時は `bin/`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin` または配布フォルダ直下の `bin/` に配置してください。
+- mpv DLL は利用者が正規の配布元から取得し、開発実行時は `bin/`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin` に配置してください。
 - FFmpeg は初回クリップ出力時に固定バージョンを自動取得し、開発実行時は `bin/ffmpeg.exe`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe` に配置します。システム PATH 上の FFmpeg には依存しません。
-- チャンピオンアイコンを使う場合は、開発実行時は `assets/champions/icons`、配布版では `%LOCALAPPDATA%\LoLReplayTool\assets\champions\icons` に配置してください。Riot Games のアセットを利用する場合は、Riot Games の規約・ポリシーに従ってください。
+- Riot Games のチャンピオンアイコンは同梱せず、自動ダウンロードも行いません。
 
 ## セットアップ
 
@@ -223,7 +223,7 @@ lol_YYYYMMDD_HHMMSS.json
 
 ## 配布用ビルド
 
-Windows 向けに PyInstaller の `onedir` 形式でビルドします。
+Windows 向けにPyInstallerの`onedir`形式でビルドします。依存ファイルは`_internal`へまとめ、配布ルートには実行ファイルと第三者ソフトウェアの注意事項だけを配置します。
 
 ```powershell
 pip install pyinstaller
@@ -234,6 +234,9 @@ pip install pyinstaller
 
 ```text
 dist\LoLReplayTool\
+  LoLReplayTool.exe
+  THIRD_PARTY_NOTICES.md
+  _internal\
 ```
 
 注意点:
@@ -246,6 +249,27 @@ dist\LoLReplayTool\
 - 配布版の可変データは `dist\LoLReplayTool` ではなく `%LOCALAPPDATA%\LoLReplayTool` に作成されます
 - `assets/app/app.ico` が存在する場合、exe アイコンとウィンドウアイコンに反映されます
 
+## インストーラー
+
+Inno Setup 6をインストールしたWindows環境で、テスト、アプリビルド、自己診断、インストーラー生成を一括実行します。
+
+```powershell
+winget install --id JRSoftware.InnoSetup -e
+.\scripts\build_installer.ps1
+```
+
+出力先:
+
+```text
+dist\installer\LoLReplayTool-Setup-0.1.0.exe
+```
+
+バージョンは`VERSION`から読み取ります。明示的に変更する場合は`-Version 1.2.3`を指定します。アプリだけを事前ビルド済みの場合は`-SkipBuild`、テスト済みの場合は`-SkipTests`を利用できます。
+
+インストール先は`%LOCALAPPDATA%\Programs\LoLReplayTool`です。管理者権限は不要で、スタートメニューのショートカットとアンインストーラーが登録されます。設定、ログ、OBS、FFmpeg、録画は従来どおり`%LOCALAPPDATA%\LoLReplayTool`に保存されるため、アプリ更新で上書きされません。
+
+アンインストール時は、設定、ログ、ダウンロード済みOBS/FFmpegを削除するか確認します。どちらを選んでも`recordings`フォルダと、設定で指定した外部録画保存先は削除しません。
+
 ## トラブルシュート
 
 - 配布版の基本診断を行う
@@ -254,7 +278,7 @@ dist\LoLReplayTool\
 - `ポータブルOBSが見つかりません`
   - 配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable\bin\64bit\obs64.exe`、開発実行時は `obs-portable\bin\64bit\obs64.exe` が存在するように配置してください。
 - `mpv DLL が見つかりません`
-  - `%LOCALAPPDATA%\LoLReplayTool\bin` または配布フォルダの `bin/` に `mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll` のいずれかを配置してください。
+  - 配布版では`%LOCALAPPDATA%\LoLReplayTool\bin`、開発実行時はリポジトリの`bin/`に`mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll`のいずれかを配置してください。
 - `FFmpegが見つかりません`
   - 通常は初回クリップ出力時に自動取得します。手動配置する場合、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe`、開発実行時は `bin\ffmpeg.exe` を配置してください。クリップ出力はシステム PATH の FFmpeg を使用しません。
 - `OBS WebSocketポートが既に使用されています`

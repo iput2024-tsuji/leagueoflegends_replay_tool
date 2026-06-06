@@ -11,6 +11,14 @@ def get_app_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def get_resource_root() -> Path:
+    """Return the root containing read-only files bundled with the app."""
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if getattr(sys, "frozen", False) and bundle_root:
+        return Path(bundle_root).resolve()
+    return get_app_root()
+
+
 def get_user_data_root() -> Path:
     override = os.environ.get("LOL_REPLAY_TOOL_DATA_DIR")
     if override:

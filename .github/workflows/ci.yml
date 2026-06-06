@@ -99,6 +99,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
       - name: Build application
         shell: pwsh
         run: .\scripts\build.ps1
@@ -106,6 +110,10 @@ jobs:
       - name: Run packaged self-check
         shell: pwsh
         run: .\dist\LoLReplayTool\LoLReplayTool.exe --self-check
+
+      - name: Build installer
+        shell: pwsh
+        run: .\scripts\build_installer.ps1 -SkipTests -SkipBuild
 
       - name: Package build output
         shell: pwsh
@@ -120,5 +128,13 @@ jobs:
         with:
           name: LoLReplayTool-windows
           path: dist/LoLReplayTool-windows.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: LoLReplayTool-installer
+          path: dist/installer/LoLReplayTool-Setup-*.exe
           if-no-files-found: error
           retention-days: 14

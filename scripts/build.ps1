@@ -18,7 +18,7 @@ $pyArgs = @(
   "-y",
   "--noconsole",
   "--onedir",
-  "--contents-directory", ".",
+  "--contents-directory", "_internal",
   "--name", "LoLReplayTool",
   "--clean",
   "--hidden-import", "mpv",
@@ -56,10 +56,7 @@ if ($buildExitCode -ne 0) {
 }
 
 $distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
-$distBinDir = Join-Path $distRootDir "bin"
 $distObsDir = Join-Path $distRootDir "obs-portable"
-New-Item -ItemType Directory -Path $distBinDir -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $distRootDir "assets\\champions\\icons") -Force | Out-Null
 if (Test-Path $distObsDir) {
   Remove-Item -Path $distObsDir -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -73,14 +70,20 @@ foreach ($dll in $bundledMpvDlls) {
   Remove-Item -Path $dll.FullName -Force -ErrorAction SilentlyContinue
 }
 
-$bundledSetupArchives = Get-ChildItem -Path $distBinDir -File -ErrorAction SilentlyContinue | Where-Object {
+$bundledSetupArchives = Get-ChildItem -Path $distRootDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
   $_.Name -match '^(OBS-Studio|ffmpeg)-.*\.(zip|7z)$'
 }
 foreach ($archive in $bundledSetupArchives) {
   Remove-Item -Path $archive.FullName -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Build complete. Portable OBS, mpv DLLs, FFmpeg, and game assets are not bundled."
+$thirdPartyNotices = Join-Path (Get-Location) "THIRD_PARTY_NOTICES.md"
+if (Test-Path $thirdPartyNotices) {
+  Copy-Item -LiteralPath $thirdPartyNotices -Destination $distRootDir -Force
+}
+
+Write-Host "Build complete. Runtime dependencies are stored under dist\\LoLReplayTool\\_internal."
+Write-Host "Portable OBS, mpv DLLs, FFmpeg, and game assets are not bundled."
 Write-Host "OBS is downloaded on first launch. FFmpeg is downloaded on first clip export. Downloads use pinned SHA256 verification."
-Write-Host "Place mpv DLLs under %LOCALAPPDATA%\\LoLReplayTool\\bin or dist\\LoLReplayTool\\bin manually."
+Write-Host "Place mpv DLLs under %LOCALAPPDATA%\\LoLReplayTool\\bin manually."
 

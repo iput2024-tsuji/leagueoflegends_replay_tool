@@ -8,17 +8,18 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .app_paths import get_app_root, get_user_data_root
+    from .app_paths import get_app_root, get_resource_root, get_user_data_root
 except ImportError:
-    from app_paths import get_app_root, get_user_data_root
+    from app_paths import get_app_root, get_resource_root, get_user_data_root
 
 
 ROOT_DIR = get_app_root()
+RESOURCE_DIR = get_resource_root()
 DATA_DIR = get_user_data_root()
 CONFIG_PATH = DATA_DIR / "config" / "setting.json"
-SAMPLE_CONFIG_PATH = ROOT_DIR / "config" / "setting.sample.json"
+SAMPLE_CONFIG_PATH = RESOURCE_DIR / "config" / "setting.sample.json"
 CHAMPION_ALIASES_PATH = DATA_DIR / "config" / "champion_aliases.json"
-SAMPLE_CHAMPION_ALIASES_PATH = ROOT_DIR / "config" / "champion_aliases.json"
+SAMPLE_CHAMPION_ALIASES_PATH = RESOURCE_DIR / "config" / "champion_aliases.json"
 _CONFIG_LOCK = threading.RLock()
 
 

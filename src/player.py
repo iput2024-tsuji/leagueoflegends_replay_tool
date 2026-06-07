@@ -17,7 +17,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QFile, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -46,11 +47,13 @@ try:
     from .app_paths import get_app_root, get_resource_root, get_user_data_root
     from .mpv_support import find_mpv_dll, iter_mpv_search_dirs
     from .qt_lifecycle import request_worker_stop
+    from .recording_library import RecordingDeletionPlan, RecordingLibrary
     from .session_log import load_session_payload
 except ImportError:
     from app_paths import get_app_root, get_resource_root, get_user_data_root
     from mpv_support import find_mpv_dll, iter_mpv_search_dirs
     from qt_lifecycle import request_worker_stop
+    from recording_library import RecordingDeletionPlan, RecordingLibrary
     from session_log import load_session_payload
 
 ROOT_DIR = get_app_root()
@@ -737,6 +740,7 @@ class ReplaySelectDialog(QDialog):
         parent: QWidget | None = None,
         json_dir: str | Path | None = None,
         recordings_dir: str | Path | None = None,
+        before_delete: Callable[[RecordingDeletionPlan], bool] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Replay Select")
@@ -747,6 +751,8 @@ class ReplaySelectDialog(QDialog):
         self.recordings_dir = (
             resolve_config_path(recordings_dir, cfg_recordings_dir) if recordings_dir else cfg_recordings_dir
         )
+        self.before_delete = before_delete
+        self.recording_library = RecordingLibrary(self.recordings_dir, self.json_dir)
         self.meta_cache = []
 
         layout = QVBoxLayout(self)
@@ -761,6 +767,11 @@ class ReplaySelectDialog(QDialog):
         self.result_filter.addItems(["All", "Win", "Loss"])
         self.result_filter.currentIndexChanged.connect(self.apply_filters)
         filter_row.addWidget(self.result_filter)
+
+        self.match_filter = QComboBox()
+        self.match_filter.addItem("すべてのマッチ")
+        self.match_filter.currentIndexChanged.connect(self.apply_filters)
+        filter_row.addWidget(self.match_filter)
 
         self.sort_filter = QComboBox()
         self.sort_filter.addItems(["新しい順", "古い順"])
@@ -777,6 +788,7 @@ class ReplaySelectDialog(QDialog):
         self.list_widget = QListWidget()
         self.list_widget.setSpacing(6)
         self.list_widget.itemDoubleClicked.connect(self.accept_selected)
+        self.list_widget.currentItemChanged.connect(self.update_delete_button)
         layout.addWidget(self.list_widget)
 
         btn_row = QHBoxLayout()
@@ -787,6 +799,14 @@ class ReplaySelectDialog(QDialog):
         self.open_btn = QPushButton("Open JSON...")
         self.open_btn.clicked.connect(self.open_file_dialog)
         btn_row.addWidget(self.open_btn)
+
+        self.delete_btn = QPushButton()
+        self.delete_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon))
+        self.delete_btn.setToolTip("選択した録画を削除")
+        self.delete_btn.setFixedSize(36, 32)
+        self.delete_btn.setEnabled(False)
+        self.delete_btn.clicked.connect(self.delete_selected)
+        btn_row.addWidget(self.delete_btn)
 
         btn_row.addStretch(1)
 
@@ -804,6 +824,21 @@ class ReplaySelectDialog(QDialog):
             files = sorted(self.json_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
             for path in files:
                 self.meta_cache.append(self.load_meta(path))
+        current_match = self.match_filter.currentText()
+        match_names = sorted(
+            {
+                str(meta.get("match_name"))
+                for meta in self.meta_cache
+                if meta.get("match_name") not in (None, "", "Unknown")
+            }
+        )
+        self.match_filter.blockSignals(True)
+        self.match_filter.clear()
+        self.match_filter.addItem("すべてのマッチ")
+        self.match_filter.addItems(match_names)
+        if current_match in match_names:
+            self.match_filter.setCurrentText(current_match)
+        self.match_filter.blockSignals(False)
         self.apply_filters()
 
         if self.list_widget.count() > 0:
@@ -818,6 +853,7 @@ class ReplaySelectDialog(QDialog):
             "saved_at": path.stem,
             "video_exists": True,
             "video_path": None,
+            "match_name": "Unknown",
         }
         try:
             data = load_session_payload(path)
@@ -828,6 +864,13 @@ class ReplaySelectDialog(QDialog):
             team = data.get("player_team")
             winning = data.get("winning_team")
             meta["result"] = normalize_result(result, team_value=team, winning_team=winning)
+            match = data.get("match") if isinstance(data.get("match"), dict) else {}
+            meta["match_name"] = (
+                match.get("display_name")
+                or match.get("queue_type")
+                or match.get("game_mode")
+                or "Unknown"
+            )
             resolved_video = resolve_video_path(path, data, self.recordings_dir)
             meta["video_path"] = str(resolved_video) if resolved_video else None
             meta["video_exists"] = resolved_video is not None
@@ -872,7 +915,9 @@ class ReplaySelectDialog(QDialog):
         sub_row.setContentsMargins(0, 0, 0, 0)
         sub_row.addWidget(result_label)
 
-        detail_label = QLabel(f"· {meta['summoner']} · {meta['saved_at']}")
+        detail_label = QLabel(
+            f"· {meta['summoner']} · {meta['match_name']} · {meta['saved_at']}"
+        )
         detail_label.setStyleSheet("color: #aaa;")
         sub_row.addWidget(detail_label)
         sub_row.addStretch(1)
@@ -891,6 +936,7 @@ class ReplaySelectDialog(QDialog):
 
         query = self.search_input.text().strip().lower()
         result_filter = self.result_filter.currentText()
+        match_filter = self.match_filter.currentText()
         sort_mode = self.sort_filter.currentText()
         hide_missing = self.missing_filter.isChecked()
 
@@ -899,8 +945,10 @@ class ReplaySelectDialog(QDialog):
                 return False
             if result_filter != "All" and meta["result"] != result_filter:
                 return False
+            if match_filter != "すべてのマッチ" and meta.get("match_name") != match_filter:
+                return False
             if query:
-                hay = f"{meta['champion_name']} {meta['summoner']}".lower()
+                hay = f"{meta['champion_name']} {meta['summoner']} {meta.get('match_name', '')}".lower()
                 return query in hay
             return True
 
@@ -916,6 +964,60 @@ class ReplaySelectDialog(QDialog):
             item.setSizeHint(widget.sizeHint())
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, widget)
+        self.update_delete_button(self.list_widget.currentItem())
+
+    def update_delete_button(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None = None) -> None:
+        self.delete_btn.setEnabled(current is not None)
+
+    @staticmethod
+    def _move_to_trash(path: Path) -> bool:
+        result = QFile.moveToTrash(str(path))
+        if isinstance(result, tuple):
+            return bool(result[0])
+        return bool(result)
+
+    def delete_selected(self) -> None:
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        json_path = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            plan = self.recording_library.plan_deletion(json_path)
+        except Exception as e:
+            QMessageBox.critical(self, "録画削除", str(e))
+            return
+
+        targets = []
+        if plan.video_path is not None:
+            targets.append(f"動画: {plan.video_path.name}")
+        if plan.clip_paths:
+            targets.append(f"関連クリップ: {len(plan.clip_paths)}件")
+        targets.append(f"ログ: {plan.json_path.name}")
+        if plan.metadata_error:
+            targets.append("注意: JSONを読み込めないため、ログファイルだけを削除します。")
+
+        answer = QMessageBox.question(
+            self,
+            "録画削除",
+            "次の録画をWindowsのごみ箱へ移動しますか？\n\n" + "\n".join(targets),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        if self.before_delete and not self.before_delete(plan):
+            QMessageBox.warning(self, "録画削除", "再生処理を停止できなかったため削除を中止しました。")
+            return
+
+        result = self.recording_library.delete(plan, self._move_to_trash)
+        if not result.success:
+            QMessageBox.critical(
+                self,
+                "録画削除",
+                f"一部のファイルを削除できませんでした。\n対象: {result.failed_path}\n詳細: {result.error}",
+            )
+        self.refresh_list()
 
     def accept_selected(self) -> None:
         item = self.list_widget.currentItem()
@@ -1313,10 +1415,30 @@ class PlayerWidget(QWidget):
             dialog_parent,
             json_dir=self.json_dir,
             recordings_dir=self.recordings_dir,
+            before_delete=self.prepare_recording_deletion,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_path:
             return bool(self.load_data(dialog.selected_path))
         return False
+
+    def prepare_recording_deletion(self, plan: RecordingDeletionPlan) -> bool:
+        if plan.video_path is None or self.current_video_path is None:
+            return True
+        try:
+            is_current = Path(self.current_video_path).resolve() == plan.video_path.resolve()
+        except Exception:
+            is_current = str(self.current_video_path) == str(plan.video_path)
+        if not is_current:
+            return True
+
+        stopped = self.shutdown_player(timeout_ms=3000)
+        if stopped:
+            self.current_video_path = None
+            self.events = []
+            self.events_all = []
+            self.event_list.clear()
+            self.info_label.setText("録画を削除しました。")
+        return stopped
 
     def load_data(self, json_path: str | Path) -> bool:
         json_path = Path(json_path)

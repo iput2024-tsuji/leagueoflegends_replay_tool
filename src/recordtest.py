@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -72,6 +73,8 @@ EVENT_URL = f"{LIVECLIENT_BASE}/eventdata"
 ALL_GAME_URL = f"{LIVECLIENT_BASE}/allgamedata"
 LCU_CHAMP_SELECT_PATH = "/lol-champ-select/v1/session"
 LCU_CHAMPION_SUMMARY_PATH = "/lol-game-data/assets/v1/champion-summary.json"
+LCU_GAMEFLOW_SESSION_PATH = "/lol-gameflow/v1/session"
+LCU_GAME_QUEUES_PATH = "/lol-game-queues/v1/queues"
 
 DEFAULT_OBS_PASSWORD_LENGTH = 24
 DEFAULT_OBS_SCENE_NAME = "lol_seen"
@@ -117,6 +120,27 @@ DEFAULT_AUDIO_DESKTOP_VOLUME_DB = 0.0
 DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
 DEFAULT_AUDIO_DESKTOP_MUTE = False
 DEFAULT_AUDIO_MIC_MUTE = False
+DEFAULT_RECORDING_START_TIMEOUT_SEC = 8.0
+DEFAULT_RECORDING_START_POLL_SEC = 0.25
+MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
+
+QUEUE_DISPLAY_NAMES = {
+    0: "カスタム",
+    400: "ノーマル ドラフト",
+    420: "ランク ソロ/デュオ",
+    430: "ノーマル ブラインド",
+    440: "ランク フレックス",
+    450: "ARAM",
+    490: "クイックプレイ",
+    700: "Clash",
+    830: "Co-op vs. AI 入門",
+    840: "Co-op vs. AI 初級",
+    850: "Co-op vs. AI 中級",
+    900: "URF",
+    1020: "One for All",
+    1300: "Nexus Blitz",
+    1700: "Arena",
+}
 
 MANAGED_PORTABLE_OBS_DIR = (DATA_DIR / DEFAULT_OBS_DIR).resolve()
 LEGACY_MANAGED_OBS_DIR = (ROOT_DIR / LEGACY_OBS_DIR).resolve()
@@ -512,6 +536,14 @@ class OBSClient(ABC):
         pass
 
     @abstractmethod
+    def get_record_status_details(self) -> dict[str, Any]:
+        pass
+
+    @abstractmethod
+    def use_software_recording_encoder(self) -> bool:
+        pass
+
+    @abstractmethod
     def shutdown(self) -> None:
         pass
 
@@ -541,6 +573,10 @@ class RiotAPIClient(ABC):
 
     @abstractmethod
     async def get_champion_catalog(self) -> dict[int, str]:
+        pass
+
+    @abstractmethod
+    async def get_match_metadata(self) -> dict[str, Any]:
         pass
 
 
@@ -1474,6 +1510,30 @@ def apply_record_directory_to_obs(client: Any, record_dir: str | Path) -> bool:
     raise RecorderError(f"録画保存ディレクトリをOBSに反映できませんでした。\n対象: {record_path}\n" + "\n".join(errors))
 
 
+def validate_recording_directory(record_dir: str | Path) -> Path:
+    target = Path(record_dir).resolve()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        probe = target / f".lol-replay-write-{secrets.token_hex(6)}.tmp"
+        probe.write_bytes(b"ok")
+        probe.unlink(missing_ok=True)
+    except Exception as e:
+        raise RecorderError(f"録画保存ディレクトリへ書き込めません。\n対象: {target}\n詳細: {e}") from e
+
+    try:
+        free_bytes = shutil.disk_usage(target).free
+    except Exception:
+        free_bytes = None
+    if free_bytes is not None and free_bytes < MIN_RECORDING_FREE_SPACE_BYTES:
+        free_mb = free_bytes / (1024 * 1024)
+        raise RecorderError(
+            "録画保存先の空き容量が不足しています。\n"
+            f"対象: {target}\n"
+            f"空き容量: {free_mb:.1f} MB"
+        )
+    return target
+
+
 def ensure_obs_scene_exists(client: Any, scene_name: str, status_cb: Callable[[str], None] | None = None) -> bool:
     try:
         scene_resp = client.get_scene_list()
@@ -2085,6 +2145,123 @@ def normalize_summoner_name(value: Any) -> str | None:
     return name.strip()
 
 
+def _first_mapping_value(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = mapping.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def build_match_metadata(
+    gameflow_payload: dict[str, Any] | None,
+    queue_catalog: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    payload = gameflow_payload if isinstance(gameflow_payload, dict) else {}
+    game_data = payload.get("gameData") if isinstance(payload.get("gameData"), dict) else {}
+    queue = game_data.get("queue") if isinstance(game_data.get("queue"), dict) else {}
+    map_data = game_data.get("map") if isinstance(game_data.get("map"), dict) else {}
+
+    queue_id = _optional_int(
+        _first_present(
+            _first_mapping_value(queue, "id", "queueId"),
+            _first_mapping_value(game_data, "queueId", "queue_id"),
+            _first_mapping_value(payload, "queueId", "queue_id"),
+        )
+    )
+    queue_definition = {}
+    for item in queue_catalog or []:
+        if not isinstance(item, dict):
+            continue
+        item_id = _optional_int(_first_mapping_value(item, "id", "queueId"))
+        if queue_id is not None and item_id == queue_id:
+            queue_definition = item
+            break
+
+    queue_type = _first_mapping_value(
+        queue,
+        "type",
+        "queueType",
+        "gameTypeConfigId",
+    ) or _first_mapping_value(queue_definition, "type", "queueType", "name")
+    display_name = _first_mapping_value(
+        queue_definition,
+        "name",
+        "shortName",
+        "description",
+    ) or _first_mapping_value(queue, "name", "shortName", "description")
+    if not display_name and queue_id is not None:
+        display_name = QUEUE_DISPLAY_NAMES.get(queue_id, f"Unknown ({queue_id})")
+
+    game_mode = _first_mapping_value(game_data, "gameMode", "game_mode") or _first_mapping_value(
+        payload, "gameMode", "game_mode"
+    )
+    game_type = _first_mapping_value(game_data, "gameType", "game_type") or _first_mapping_value(
+        payload, "gameType", "game_type"
+    )
+    map_id = _optional_int(
+        _first_present(
+            _first_mapping_value(map_data, "id", "mapId"),
+            _first_mapping_value(game_data, "mapId", "map_id"),
+        )
+    )
+    map_name = _first_mapping_value(map_data, "name", "mapString") or _first_mapping_value(
+        game_data, "mapName", "map_name"
+    )
+    game_id = _first_mapping_value(game_data, "gameId", "game_id") or _first_mapping_value(
+        payload, "gameId", "game_id"
+    )
+
+    metadata = {
+        "queue_id": queue_id,
+        "queue_type": str(queue_type) if queue_type not in (None, "") else None,
+        "display_name": str(display_name) if display_name not in (None, "") else None,
+        "game_mode": str(game_mode) if game_mode not in (None, "") else None,
+        "game_type": str(game_type) if game_type not in (None, "") else None,
+        "map_id": map_id,
+        "map_name": str(map_name) if map_name not in (None, "") else None,
+        "game_id": str(game_id) if game_id not in (None, "") else None,
+        "source": "lcu",
+    }
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
+def merge_live_game_metadata(current: dict[str, Any], payload: dict[str, Any] | None) -> dict[str, Any]:
+    result = dict(current)
+    if not isinstance(payload, dict):
+        return result
+    game_data = payload.get("gameData")
+    if not isinstance(game_data, dict):
+        return result
+
+    fallback = {
+        "game_mode": _first_mapping_value(game_data, "gameMode", "game_mode"),
+        "game_type": _first_mapping_value(game_data, "gameType", "game_type"),
+        "map_name": _first_mapping_value(game_data, "mapName", "map_name"),
+        "game_id": _first_mapping_value(game_data, "gameId", "game_id"),
+    }
+    for key, value in fallback.items():
+        if key not in result and value not in (None, ""):
+            result[key] = str(value)
+    if result and "source" not in result:
+        result["source"] = "live_client"
+    return result
+
+
 def build_output_path(config: AppConfig) -> Path:
     """重複回避のため、存在しないファイル名を返す"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -2114,6 +2291,7 @@ class LiveClientRiotAPIClient(RiotAPIClient):
         self.session_factory = session_factory or aiohttp.ClientSession
         self.lcu_connection_provider = lcu_connection_provider or LCUConnectionProvider()
         self._champion_catalog: dict[int, str] = {}
+        self._queue_catalog: list[dict[str, Any]] = []
 
     async def _fetch_result(self, url: str, timeout_sec: float) -> RiotPollResult:
         timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
@@ -2222,6 +2400,20 @@ class LiveClientRiotAPIClient(RiotAPIClient):
             self._champion_catalog = catalog
         return dict(catalog)
 
+    async def get_match_metadata(self) -> dict[str, Any]:
+        session_result = await self._fetch_lcu_result(LCU_GAMEFLOW_SESSION_PATH, timeout_sec=1.5)
+        if session_result.status != RiotPollStatus.IN_GAME or not isinstance(session_result.payload, dict):
+            return {}
+
+        if not self._queue_catalog:
+            queue_result = await self._fetch_lcu_result(LCU_GAME_QUEUES_PATH, timeout_sec=2.0)
+            if queue_result.status == RiotPollStatus.IN_GAME and isinstance(queue_result.payload, dict):
+                value = queue_result.payload.get("value")
+                if isinstance(value, list):
+                    self._queue_catalog = [dict(item) for item in value if isinstance(item, dict)]
+
+        return build_match_metadata(session_result.payload, self._queue_catalog)
+
 
 class ObsWebSocketClient(OBSClient):
     """obs-websocketを使う本番用OBSクライアント。"""
@@ -2297,16 +2489,8 @@ class ObsWebSocketClient(OBSClient):
 
     def setup_record_output(self) -> None:
         if self.config.paths.recordings_dir:
-            try:
-                Path(self.config.paths.recordings_dir).mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-
-            try:
-                apply_record_directory_to_obs(self.client, self.config.paths.recordings_dir)
-            except Exception:
-                # OBSバージョン差異や権限差分で失敗する場合は継続
-                pass
+            record_dir = validate_recording_directory(self.config.paths.recordings_dir)
+            apply_record_directory_to_obs(self.client, record_dir)
 
         try:
             apply_obs_video_settings(
@@ -2630,6 +2814,33 @@ class ObsWebSocketClient(OBSClient):
         status = self.client.get_record_status()
         return getattr(status, "output_active", None)
 
+    def get_record_status_details(self) -> dict[str, Any]:
+        status = self.client.get_record_status()
+        return {
+            "output_active": getattr(status, "output_active", None),
+            "output_paused": getattr(status, "output_paused", None),
+            "output_timecode": getattr(status, "output_timecode", None),
+            "output_duration": getattr(status, "output_duration", None),
+            "output_bytes": getattr(status, "output_bytes", None),
+        }
+
+    def use_software_recording_encoder(self) -> bool:
+        try:
+            _obs_raw(
+                self.client,
+                "SetProfileParameter",
+                {
+                    "parameterCategory": "SimpleOutput",
+                    "parameterName": "RecEncoder",
+                    "parameterValue": "x264",
+                },
+            )
+            self.log("⚠️ OBS録画エンコーダーをx264へ切り替えました。")
+            return True
+        except Exception as e:
+            self.log(f"⚠️ x264への切り替えに失敗しました: {e}")
+            return False
+
     def shutdown(self) -> None:
         if self.obs_process:
             self.log("🧹 OBSを終了しています...")
@@ -2669,6 +2880,8 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.riot_api_client = riot_api_client or LiveClientRiotAPIClient()
         self.obs_process = getattr(self.obs_client, "obs_process", obs_process)
         self.champion_catalog: dict[int, str] = {}
+        self._require_game_clear = False
+        self._last_completed_game_id: str | None = None
         self.reset_session()
 
     def open(self) -> None:
@@ -2742,6 +2955,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.champion_name = None
         self.player_team = None
         self.enemy_champions = []
+        self.match_metadata: dict[str, Any] = {}
         self.champ_select_tracker = ChampSelectTracker()
         self.game_result = None
         self.winning_team = None
@@ -2868,6 +3082,74 @@ class LoLAutoRecorder(RecordingSessionManager):
                 f"(phase {action.get('phase_order')})"
             )
 
+    async def capture_match_metadata_async(self) -> None:
+        get_metadata = getattr(self.riot_api_client, "get_match_metadata", None)
+        if not callable(get_metadata):
+            return
+        try:
+            metadata = get_metadata()
+            if hasattr(metadata, "__await__"):
+                metadata = await metadata
+        except Exception as e:
+            self.logger.debug("Match metadata poll failed: %s", e)
+            return
+        if not isinstance(metadata, dict) or not metadata:
+            return
+
+        previous_name = self.match_metadata.get("display_name")
+        self.match_metadata.update(metadata)
+        current_name = self.match_metadata.get("display_name")
+        if current_name and current_name != previous_name:
+            self.log(f"マッチ種類を検出: {current_name}")
+
+    async def wait_for_previous_game_clear_async(self) -> bool:
+        if not self._require_game_clear:
+            return True
+
+        self.log("前の試合データが終了するまで待機します...")
+        temporary_failure_count = 0
+        while not self.should_stop():
+            result = await self.poll_all_game_data()
+            if result.status == RiotPollStatus.NOT_IN_GAME:
+                self._require_game_clear = False
+                self.log("前の試合データの終了を確認しました。次の試合を監視します。")
+                return True
+            if result.status == RiotPollStatus.TEMPORARY_FAILURE:
+                temporary_failure_count += 1
+                if temporary_failure_count >= self.config.polling.end_error_limit:
+                    self._require_game_clear = False
+                    self.log("LoL試合プロセスの終了を確認しました。次の試合を監視します。")
+                    return True
+            else:
+                temporary_failure_count = 0
+                current_game_id = self._game_id_from_live_payload(result.payload)
+                if (
+                    current_game_id
+                    and self._last_completed_game_id
+                    and current_game_id != self._last_completed_game_id
+                ):
+                    self._require_game_clear = False
+                    self.log("新しい試合IDを検出しました。次の試合として監視を開始します。")
+                    return True
+            if not await self.wait_with_stop_async(1.0):
+                return False
+        return False
+
+    @staticmethod
+    def _game_id_from_live_payload(payload: dict[str, Any] | None) -> str | None:
+        if not isinstance(payload, dict):
+            return None
+        game_data = payload.get("gameData")
+        if not isinstance(game_data, dict):
+            return None
+        value = _first_mapping_value(game_data, "gameId", "game_id")
+        return str(value) if value not in (None, "") else None
+
+    def remember_completed_game_id(self) -> None:
+        game_id = self.match_metadata.get("game_id") or self._game_id_from_live_payload(self.last_game_data)
+        if game_id not in (None, ""):
+            self._last_completed_game_id = str(game_id)
+
     def update_player_info_from_game_data(self, data: dict[str, Any] | None) -> None:
         if not data or not self.my_name:
             return
@@ -2935,12 +3217,16 @@ class LoLAutoRecorder(RecordingSessionManager):
     async def wait_for_game_start_async(self) -> bool:
         """LoLの試合開始を監視"""
         self.session_phase = RecordingPhase.WAITING_FOR_GAME
+        if not await self.wait_for_previous_game_clear_async():
+            self.session_phase = RecordingPhase.CANCELLED
+            return False
         self.log("⚔️  LoLの試合開始を待機中 (API監視)...")
         while True:
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
                 return False
             await self.capture_champ_select_async()
+            await self.capture_match_metadata_async()
             result = await self.poll_all_game_data()
             data = result.payload
             if data:
@@ -2949,6 +3235,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                     self.log(f"🔥 試合開始検知！ GameTime: {game_time:.2f}s")
                     self.output_file = build_output_path(self.config)
                     await self.try_update_player_name_async()
+                    self.match_metadata = merge_live_game_metadata(self.match_metadata, data)
                     self.session_started = True
                     self.session_phase = RecordingPhase.STARTING
                     return True
@@ -2960,6 +3247,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         """録画開始 -> 同期マーカー"""
         self.session_phase = RecordingPhase.STARTING
         self.log("🎥 録画を開始します...")
+        validate_recording_directory(self.config.paths.recordings_dir)
         item_id = self.get_source_id()
         if not item_id:
             raise RecorderError(
@@ -2967,16 +3255,50 @@ class LoLAutoRecorder(RecordingSessionManager):
                 "設定画面の「OBSにシーン/色ソースを作成」を実行してください。"
             )
 
-        try:
-            self.obs_client.start_recording()
-            self.recording_started = True
-            self.session_phase = RecordingPhase.RECORDING
-        except OBSSDKRequestError as e:
-            self.log(f"⚠️ 録画開始エラー: {e}")
-            raise RecorderError(f"OBS録画開始に失敗しました: {e}") from e
-        except Exception as e:
-            self.log(f"⚠️ 録画開始エラー: {e}")
-            raise RecorderError(f"OBS録画開始に失敗しました: {e}") from e
+        errors = []
+        for attempt in range(2):
+            try:
+                self.obs_client.start_recording()
+            except Exception as e:
+                if isinstance(e, OBSSDKRequestError):
+                    try:
+                        if self.obs_client.is_recording_active() is True:
+                            self.log("OBSは既に録画中だったため、その録画を継続します。")
+                            self.recording_started = True
+                            self.session_phase = RecordingPhase.RECORDING
+                            break
+                    except Exception:
+                        pass
+                errors.append(self._format_obs_start_error(e, attempt + 1))
+            else:
+                if await self.wait_for_recording_active_async():
+                    self.recording_started = True
+                    self.session_phase = RecordingPhase.RECORDING
+                    break
+                errors.append(
+                    f"試行{attempt + 1}: OBSは開始要求を受理しましたが、録画状態へ移行しませんでした。"
+                )
+
+            if attempt == 0:
+                self.log("⚠️ OBS録画開始に失敗したため、出力設定を再適用して1回再試行します。")
+                try:
+                    self.obs_client.setup_record_output()
+                except Exception as e:
+                    errors.append(f"出力設定再適用: {type(e).__name__}: {e}")
+                use_software_encoder = getattr(self.obs_client, "use_software_recording_encoder", None)
+                if callable(use_software_encoder):
+                    try:
+                        use_software_encoder()
+                    except Exception as e:
+                        errors.append(f"x264切り替え: {type(e).__name__}: {e}")
+
+        if not self.recording_started:
+            details = self._record_status_summary()
+            message = "OBS録画開始に失敗しました。\n" + "\n".join(errors)
+            if details:
+                message += f"\nOBS状態: {details}"
+            self.log(f"⚠️ {message}")
+            raise RecorderError(message)
         if not await self.wait_with_stop_async(2.0):
             return
 
@@ -3002,6 +3324,44 @@ class LoLAutoRecorder(RecordingSessionManager):
         await self.wait_with_stop_async(0.5)
         self.obs_client.set_sync_marker_enabled(False, item_id)
         self.log("✅ シグナル消灯。録画継続中。")
+
+    async def wait_for_recording_active_async(
+        self,
+        timeout_sec: float = DEFAULT_RECORDING_START_TIMEOUT_SEC,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.1, float(timeout_sec))
+        while loop.time() < deadline:
+            if self.should_stop():
+                return False
+            try:
+                if self.obs_client.is_recording_active() is True:
+                    return True
+            except Exception as e:
+                self.logger.debug("OBS recording status poll failed: %s", e)
+            await asyncio.sleep(DEFAULT_RECORDING_START_POLL_SEC)
+        return False
+
+    def _record_status_summary(self) -> str:
+        get_details = getattr(self.obs_client, "get_record_status_details", None)
+        if not callable(get_details):
+            return ""
+        try:
+            details = get_details()
+        except Exception as e:
+            return f"取得失敗 ({type(e).__name__}: {e})"
+        if not isinstance(details, dict):
+            return ""
+        return ", ".join(f"{key}={value}" for key, value in details.items() if value is not None)
+
+    @staticmethod
+    def _format_obs_start_error(error: BaseException, attempt: int) -> str:
+        if isinstance(error, OBSSDKRequestError):
+            return (
+                f"試行{attempt}: request={getattr(error, 'req_name', 'StartRecord')}, "
+                f"code={getattr(error, 'code', '?')}, detail={error}"
+            )
+        return f"試行{attempt}: {type(error).__name__}: {error}"
 
     async def wait_until_game_start_event_async(self, timeout_sec: float = 180) -> float | None:
         loop = asyncio.get_running_loop()
@@ -3092,6 +3452,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             if not data:
                 decision = end_detector.observe_poll_status(result.status, loop.time())
                 if decision.should_end:
+                    self._require_game_clear = False
                     self.log("🏁 試合終了検知。録画を停止します。")
                     self.session_phase = RecordingPhase.FINALIZING
                     return RecordingOutcome.COMPLETED
@@ -3102,6 +3463,7 @@ class LoLAutoRecorder(RecordingSessionManager):
 
             end_detector.observe_poll_status(result.status, loop.time())
             self.last_game_data = data
+            self.match_metadata = merge_live_game_metadata(self.match_metadata, data)
             if not self.my_name:
                 await self.try_update_player_name_async()
             self.update_player_info_from_game_data(data)
@@ -3113,6 +3475,8 @@ class LoLAutoRecorder(RecordingSessionManager):
                 self.update_result_from_events(events)
                 if any(self.is_game_end_event(event) for event in events):
                     end_detector.observe_game_end_event()
+                    self.remember_completed_game_id()
+                    self._require_game_clear = True
                     self.log("🏁 GameEndイベントを検知。録画を停止します。")
                     self.session_phase = RecordingPhase.FINALIZING
                     return RecordingOutcome.COMPLETED
@@ -3132,6 +3496,9 @@ class LoLAutoRecorder(RecordingSessionManager):
             is_active = self.obs_client.is_recording_active()
             if is_active is False:
                 self.recording_started = False
+                if self.record_path is None:
+                    self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+                    self.failure_reason = "OBS録画が完了処理前に停止しており、動画ファイルを確認できませんでした。"
                 return
         except Exception:
             pass
@@ -3140,14 +3507,23 @@ class LoLAutoRecorder(RecordingSessionManager):
             self.record_path = self.obs_client.stop_recording()
             if self.record_path:
                 self.log(f"💾 保存完了: {self.record_path}")
+            else:
+                self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+                self.failure_reason = "OBSから録画ファイルの保存先が返されませんでした。"
             self.recording_started = False
         except OBSSDKRequestError as e:
             if e.code == 501:
                 self.recording_started = False
+                self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+                self.failure_reason = f"OBS録画は既に停止していました: {e}"
                 return
             self.log(f"⚠️ 録画停止エラー: {e}")
+            self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+            self.failure_reason = f"OBS録画停止に失敗しました: {e}"
         except Exception as e:
             self.log(f"⚠️ 録画停止エラー: {e}")
+            self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+            self.failure_reason = f"OBS録画停止に失敗しました: {e}"
 
     def shutdown_obs(self) -> None:
         self.obs_client.shutdown()
@@ -3201,6 +3577,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             obs_record_path=record_path_for_json,
             recordings_dir=str(self.config.paths.recordings_dir),
             json_path=str(self.output_file),
+            match=dict(self.match_metadata),
             ban_pick=self.champ_select_tracker.to_payload() if self.champ_select_tracker.has_data else {},
             events=list(self.saved_events),
             events_all=list(self.all_events),

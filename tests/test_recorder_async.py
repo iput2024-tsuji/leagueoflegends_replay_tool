@@ -130,6 +130,14 @@ def test_wait_for_game_start_captures_ban_pick_order_and_champions():
     riot_client.get_champion_catalog = AsyncMock(
         return_value={103: "Ahri", 122: "Darius", 266: "Aatrox"}
     )
+    riot_client.get_match_metadata = AsyncMock(
+        return_value={
+            "queue_id": 420,
+            "queue_type": "RANKED_SOLO_5x5",
+            "display_name": "ランク ソロ/デュオ",
+            "source": "lcu",
+        }
+    )
     riot_client.get_all_game_data = AsyncMock(
         return_value={"gameData": {"gameTime": 12.0}, "allPlayers": []}
     )
@@ -145,9 +153,107 @@ def test_wait_for_game_start_captures_ban_pick_order_and_champions():
     assert run(recorder.wait_for_game_start_async()) is True
 
     ban_pick = recorder.build_session_payload()["ban_pick"]
+    match = recorder.build_session_payload()["match"]
     assert [action["type"] for action in ban_pick["actions"]] == ["ban", "pick"]
     assert [action["champion_name"] for action in ban_pick["actions"]] == ["Darius", "Ahri"]
     assert ban_pick["teams"]["enemy"][0]["champion_name"] == "Aatrox"
+    assert match["queue_id"] == 420
+    assert match["display_name"] == "ランク ソロ/デュオ"
+
+
+def test_wait_for_game_start_requires_previous_live_client_session_to_clear():
+    tmp_path = runtime_dir("previous_game_clear")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_all_game_data_result = AsyncMock(
+        side_effect=[
+            recordtest.RiotPollResult(
+                recordtest.RiotPollStatus.IN_GAME,
+                payload={"gameData": {"gameTime": 1500.0}},
+            ),
+            recordtest.RiotPollResult(recordtest.RiotPollStatus.NOT_IN_GAME),
+            recordtest.RiotPollResult(
+                recordtest.RiotPollStatus.IN_GAME,
+                payload={"gameData": {"gameTime": 1.0}, "allPlayers": []},
+            ),
+        ]
+    )
+    riot_client.get_all_game_data = AsyncMock(return_value=None)
+    riot_client.get_active_player_name = AsyncMock(return_value="Tester#JP1")
+    riot_client.get_champ_select_session_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.NOT_IN_GAME)
+    )
+    riot_client.get_match_metadata = AsyncMock(return_value={})
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder._require_game_clear = True
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+
+    assert run(recorder.wait_for_game_start_async()) is True
+    assert riot_client.get_all_game_data_result.await_count == 3
+    assert recorder._require_game_clear is False
+
+
+def test_previous_game_clear_accepts_consecutive_live_client_connection_failures():
+    tmp_path = runtime_dir("previous_game_process_closed")
+    config = config_for(
+        tmp_path,
+        polling={
+            "end_error_limit": 3,
+            "end_missing_grace_sec": 60.0,
+            "end_poll_sec": 0.1,
+            "event_poll_sec": 0.1,
+        },
+    )
+    riot_client = Mock()
+    riot_client.get_all_game_data_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE)
+    )
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder._require_game_clear = True
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+
+    assert run(recorder.wait_for_previous_game_clear_async()) is True
+    assert riot_client.get_all_game_data_result.await_count == 3
+    assert recorder._require_game_clear is False
+
+
+def test_start_recording_waits_until_obs_reports_active():
+    tmp_path = runtime_dir("recording_start_confirmation")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
+    obs_client.is_recording_active.side_effect = [False, True]
+    riot_client = Mock()
+    riot_client.get_event_data = AsyncMock(
+        return_value={"Events": [{"EventName": "GameStart", "EventTime": 0.0}]}
+    )
+    riot_client.get_all_game_data = AsyncMock(
+        return_value={"gameData": {"gameTime": 1.0}, "allPlayers": []}
+    )
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=obs_client,
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+
+    run(recorder.start_recording_async())
+
+    assert recorder.recording_started is True
+    assert obs_client.is_recording_active.call_count == 2
 
 
 def test_recorder_constructor_has_no_obs_side_effects_until_open():

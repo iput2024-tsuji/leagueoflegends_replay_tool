@@ -36,6 +36,7 @@ class SessionLogV1:
     obs_record_path: str | None = None
     recordings_dir: str | None = None
     json_path: str | None = None
+    match: dict[str, Any] = field(default_factory=dict)
     ban_pick: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, Any]] = field(default_factory=list)
     events_all: list[dict[str, Any]] = field(default_factory=list)
@@ -64,6 +65,7 @@ class SessionLogV1:
             obs_record_path=_optional_str(payload.get("obs_record_path")),
             recordings_dir=_optional_str(paths.get("recordings_dir")),
             json_path=_optional_str(paths.get("json_path")),
+            match=_dict_value(payload.get("match")),
             ban_pick=_dict_value(payload.get("ban_pick")),
             events=_event_list(payload.get("events")),
             events_all=_event_list(payload.get("events_all")),
@@ -88,6 +90,7 @@ class SessionLogV1:
                 "recordings_dir": self.recordings_dir,
                 "json_path": self.json_path,
             },
+            "match": dict(self.match),
             "ban_pick": dict(self.ban_pick),
             "events": list(self.events),
             "events_all": list(self.events_all),

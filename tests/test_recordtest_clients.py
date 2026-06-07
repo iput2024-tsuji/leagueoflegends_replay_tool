@@ -308,11 +308,24 @@ def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
     )
     champ_select_url = f"{connection.base_url}{recordtest.LCU_CHAMP_SELECT_PATH}"
     champion_summary_url = f"{connection.base_url}{recordtest.LCU_CHAMPION_SUMMARY_PATH}"
+    gameflow_url = f"{connection.base_url}{recordtest.LCU_GAMEFLOW_SESSION_PATH}"
+    queue_catalog_url = f"{connection.base_url}{recordtest.LCU_GAME_QUEUES_PATH}"
     routes = {
         champ_select_url: {"actions": [], "gameId": 123},
         champion_summary_url: [
             {"id": 103, "name": "Ahri"},
             {"id": 266, "name": "Aatrox"},
+        ],
+        gameflow_url: {
+            "gameData": {
+                "gameId": 456,
+                "gameMode": "CLASSIC",
+                "queue": {"id": 420, "type": "RANKED_SOLO_5x5"},
+                "map": {"id": 11, "name": "Summoner's Rift"},
+            }
+        },
+        queue_catalog_url: [
+            {"id": 420, "name": "ランク ソロ/デュオ", "type": "RANKED_SOLO_5x5"}
         ],
     }
     client = recordtest.LiveClientRiotAPIClient(
@@ -322,10 +335,14 @@ def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
 
     result = run(client.get_champ_select_session_result())
     catalog = run(client.get_champion_catalog())
+    match = run(client.get_match_metadata())
 
     assert result.status == recordtest.RiotPollStatus.IN_GAME
     assert result.payload["gameId"] == 123
     assert catalog == {103: "Ahri", 266: "Aatrox"}
+    assert match["queue_id"] == 420
+    assert match["display_name"] == "ランク ソロ/デュオ"
+    assert match["game_id"] == "456"
 
 
 def test_riot_api_returns_none_when_lcu_server_is_down():

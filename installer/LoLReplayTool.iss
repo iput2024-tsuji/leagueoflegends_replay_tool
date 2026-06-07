@@ -59,6 +59,8 @@ Filename: "{localappdata}\LoLReplayTool\bin"; Description: "mpv DLL の配置フ
 [Code]
 var
   MpvInfoPage: TOutputMsgWizardPage;
+  DeleteManagedDataOnUninstall: Boolean;
+  DeleteRecordingsOnUninstall: Boolean;
 
 procedure InitializeWizard;
 var
@@ -96,6 +98,114 @@ begin
   RemoveDir(DataDir);
 end;
 
+procedure DeleteManagedRecordings(const DataDir: String);
+begin
+  DelTree(AddBackslash(DataDir) + 'recordings', True, True, True);
+  RemoveDir(DataDir);
+end;
+
+function ShowUninstallOptions: Boolean;
+var
+  OptionsForm: TSetupForm;
+  TitleLabel: TNewStaticText;
+  DescriptionLabel: TNewStaticText;
+  ManagedDataCheckBox: TNewCheckBox;
+  RecordingsCheckBox: TNewCheckBox;
+  WarningLabel: TNewStaticText;
+  OkButton: TNewButton;
+  CancelButton: TNewButton;
+begin
+  OptionsForm := CreateCustomForm(ScaleX(520), ScaleY(250), False, False);
+  try
+    OptionsForm.Caption := '{#AppName} アンインストール';
+    OptionsForm.Position := poScreenCenter;
+
+    TitleLabel := TNewStaticText.Create(OptionsForm);
+    TitleLabel.Parent := OptionsForm;
+    TitleLabel.Left := ScaleX(20);
+    TitleLabel.Top := ScaleY(18);
+    TitleLabel.Caption := '追加で削除するデータを選択してください';
+    TitleLabel.Font.Style := [fsBold];
+
+    DescriptionLabel := TNewStaticText.Create(OptionsForm);
+    DescriptionLabel.Parent := OptionsForm;
+    DescriptionLabel.Left := ScaleX(20);
+    DescriptionLabel.Top := ScaleY(48);
+    DescriptionLabel.Width := ScaleX(480);
+    DescriptionLabel.AutoSize := False;
+    DescriptionLabel.WordWrap := True;
+    DescriptionLabel.Caption :=
+      'アプリ本体は常に削除されます。以下は初期状態では保持されます。';
+
+    ManagedDataCheckBox := TNewCheckBox.Create(OptionsForm);
+    ManagedDataCheckBox.Parent := OptionsForm;
+    ManagedDataCheckBox.Left := ScaleX(20);
+    ManagedDataCheckBox.Top := ScaleY(88);
+    ManagedDataCheckBox.Width := ScaleX(480);
+    ManagedDataCheckBox.Caption :=
+      '設定、ログ、OBS、FFmpeg、手動配置した mpv DLL も削除する';
+    ManagedDataCheckBox.Checked := False;
+
+    RecordingsCheckBox := TNewCheckBox.Create(OptionsForm);
+    RecordingsCheckBox.Parent := OptionsForm;
+    RecordingsCheckBox.Left := ScaleX(20);
+    RecordingsCheckBox.Top := ScaleY(122);
+    RecordingsCheckBox.Width := ScaleX(480);
+    RecordingsCheckBox.Caption :=
+      '録画ファイルとセッションログも削除する';
+    RecordingsCheckBox.Checked := False;
+
+    WarningLabel := TNewStaticText.Create(OptionsForm);
+    WarningLabel.Parent := OptionsForm;
+    WarningLabel.Left := ScaleX(40);
+    WarningLabel.Top := ScaleY(151);
+    WarningLabel.Width := ScaleX(450);
+    WarningLabel.AutoSize := False;
+    WarningLabel.WordWrap := True;
+    WarningLabel.Font.Color := clRed;
+    WarningLabel.Caption :=
+      '対象は %LOCALAPPDATA%\LoLReplayTool\recordings のみです。' + #13#10 +
+      '設定で指定した外部保存先は削除しません。';
+
+    OkButton := TNewButton.Create(OptionsForm);
+    OkButton.Parent := OptionsForm;
+    OkButton.Left := OptionsForm.ClientWidth - ScaleX(190);
+    OkButton.Top := OptionsForm.ClientHeight - ScaleY(42);
+    OkButton.Width := ScaleX(80);
+    OkButton.Caption := '続行';
+    OkButton.Default := True;
+    OkButton.ModalResult := mrOk;
+
+    CancelButton := TNewButton.Create(OptionsForm);
+    CancelButton.Parent := OptionsForm;
+    CancelButton.Left := OptionsForm.ClientWidth - ScaleX(100);
+    CancelButton.Top := OptionsForm.ClientHeight - ScaleY(42);
+    CancelButton.Width := ScaleX(80);
+    CancelButton.Caption := 'キャンセル';
+    CancelButton.Cancel := True;
+    CancelButton.ModalResult := mrCancel;
+
+    Result := OptionsForm.ShowModal = mrOk;
+    if Result then
+    begin
+      DeleteManagedDataOnUninstall := ManagedDataCheckBox.Checked;
+      DeleteRecordingsOnUninstall := RecordingsCheckBox.Checked;
+    end;
+  finally
+    OptionsForm.Free;
+  end;
+end;
+
+function InitializeUninstall: Boolean;
+begin
+  DeleteManagedDataOnUninstall := False;
+  DeleteRecordingsOnUninstall := False;
+  if UninstallSilent then
+    Result := True
+  else
+    Result := ShowUninstallOptions;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   DataDir: String;
@@ -107,11 +217,8 @@ begin
   if not DirExists(DataDir) then
     Exit;
 
-  if MsgBox(
-    '設定、ログ、ダウンロード済みの OBS / FFmpeg、手動配置した mpv DLL も削除しますか？' + #13#10 + #13#10 +
-    '録画ファイルはこの選択に関係なく削除されません。',
-    mbConfirmation,
-    MB_YESNO
-  ) = IDYES then
+  if DeleteRecordingsOnUninstall then
+    DeleteManagedRecordings(DataDir);
+  if DeleteManagedDataOnUninstall then
     DeleteManagedUserData(DataDir);
 end;

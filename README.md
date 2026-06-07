@@ -279,7 +279,7 @@ winget install --id JRSoftware.InnoSetup -e
 出力先:
 
 ```text
-dist\installer\LoLReplayTool-Setup-0.1.0.exe
+dist\installer\LoLReplayTool-Setup-0.1.1.exe
 ```
 
 バージョンは`VERSION`から読み取ります。明示的に変更する場合は`-Version 1.2.3`を指定します。アプリだけを事前ビルド済みの場合は`-SkipBuild`、テスト済みの場合は`-SkipTests`を利用できます。
@@ -293,8 +293,8 @@ dist\installer\LoLReplayTool-Setup-0.1.0.exe
 `VERSION`を更新してコミットした後、同じバージョンの`v`付きタグをプッシュすると、GitHub ActionsがインストーラーをビルドしてReleaseへ自動公開します。
 
 ```powershell
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.1.1
+git push origin v0.1.1
 ```
 
 タグと`VERSION`が一致しない場合や、テスト・Ruff・ビルドのいずれかが失敗した場合はReleaseを公開しません。

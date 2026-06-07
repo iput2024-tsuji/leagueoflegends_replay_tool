@@ -16,12 +16,15 @@ LoL Replay Tool is not endorsed by Riot Games and doesn't reflect the views or o
 
 このツールは League of Legends のローカル API を利用しますが、Riot Games 公式の製品・サービスではありません。
 
+Ban/Pick取得にはLeague Client API（LCU）を利用します。LCUはRiot Gamesによる正式なサードパーティ向けサポート対象ではないため、クライアント更新によって取得仕様が変わる可能性があります。
+
 ## バリュープロポジション
 
 LoL の振り返りは、動画を見返すだけでは「何が勝敗に効いていたのか」を定量的に把握しづらいという課題があります。このツールは以下を自動化します。
 
 - LoL の試合開始・終了を検知し、OBS を制御して録画する
 - Riot LCU API から取得したイベントを JSON として保存する
+- チャンピオン選択中のBan/Pick順、チャンピオン、味方・敵、担当位置をJSONへ保存する
 - 動画とイベントを同期し、キル・デス・オブジェクトイベントへジャンプできるプレーヤーを提供する
 - 複数試合の JSON を pandas で集約し、scikit-learn の決定木で勝敗に影響しやすい条件をルール化する
 
@@ -226,6 +229,15 @@ lol_YYYYMMDD_HHMMSS.json
 ```
 
 動画ファイル名は JSON の `obs_record_path` に保存され、プレーヤー側で `paths.recordings_dir` から再解決します。
+
+チャンピオン選択を取得できた試合では、JSONの`ban_pick`に以下を保存します。
+
+- `actions`: 実行順、Ban/Pick種別、味方・敵、チャンピオンID・名称、担当位置
+- `teams`: チャンピオン選択終了時点の味方・敵チーム構成
+- `local_player_cell_id`: 自分のチャンピオン選択スロット
+- `last_phase`: 最後に取得したチャンピオン選択フェーズ
+
+Hover中の未確定チャンピオンは保存せず、確定したアクションだけを記録します。Dodge後に別のチャンピオン選択が始まった場合は、古い履歴を破棄して実際に開始した試合の履歴へ切り替えます。
 
 ## 配布用ビルド
 

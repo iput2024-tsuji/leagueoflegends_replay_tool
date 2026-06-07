@@ -87,6 +87,69 @@ def test_wait_for_game_start_retries_after_timeout_without_real_sleep():
     recorder.wait_with_stop_async.assert_awaited_once()
 
 
+def test_wait_for_game_start_captures_ban_pick_order_and_champions():
+    tmp_path = runtime_dir("ban_pick")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_champ_select_session_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME,
+            payload={
+                "gameId": 123,
+                "localPlayerCellId": 0,
+                "timer": {"phase": "FINALIZATION"},
+                "myTeam": [{"cellId": 0, "championId": 103, "assignedPosition": "middle"}],
+                "theirTeam": [{"cellId": 5, "championId": 266, "assignedPosition": "top"}],
+                "actions": [
+                    [
+                        {
+                            "id": 1,
+                            "actorCellId": 5,
+                            "championId": 122,
+                            "completed": True,
+                            "isAllyAction": False,
+                            "pickTurn": 1,
+                            "type": "ban",
+                        }
+                    ],
+                    [
+                        {
+                            "id": 2,
+                            "actorCellId": 0,
+                            "championId": 103,
+                            "completed": True,
+                            "isAllyAction": True,
+                            "pickTurn": 1,
+                            "type": "pick",
+                        }
+                    ],
+                ],
+            },
+        )
+    )
+    riot_client.get_champion_catalog = AsyncMock(
+        return_value={103: "Ahri", 122: "Darius", 266: "Aatrox"}
+    )
+    riot_client.get_all_game_data = AsyncMock(
+        return_value={"gameData": {"gameTime": 12.0}, "allPlayers": []}
+    )
+    riot_client.get_active_player_name = AsyncMock(return_value="Tester#JP1")
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+
+    assert run(recorder.wait_for_game_start_async()) is True
+
+    ban_pick = recorder.build_session_payload()["ban_pick"]
+    assert [action["type"] for action in ban_pick["actions"]] == ["ban", "pick"]
+    assert [action["champion_name"] for action in ban_pick["actions"]] == ["Darius", "Ahri"]
+    assert ban_pick["teams"]["enemy"][0]["champion_name"] == "Aatrox"
+
+
 def test_recorder_constructor_has_no_obs_side_effects_until_open():
     tmp_path = runtime_dir("constructor_no_side_effects")
     config = config_for(tmp_path)

@@ -26,7 +26,9 @@ from obsws_python.error import OBSSDKRequestError
 try:
     from . import config_schema
     from .app_paths import get_app_root, get_user_data_root
+    from .champ_select import ChampSelectTracker, champion_name_catalog
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from .lcu_client import LCUConnectionProvider
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
@@ -43,7 +45,9 @@ try:
 except ImportError:
     import config_schema
     from app_paths import get_app_root, get_user_data_root
+    from champ_select import ChampSelectTracker, champion_name_catalog
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from lcu_client import LCUConnectionProvider
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
@@ -66,6 +70,8 @@ LIVECLIENT_BASE = "https://127.0.0.1:2999/liveclientdata"
 ACTIVE_PLAYER_URL = f"{LIVECLIENT_BASE}/activeplayername"
 EVENT_URL = f"{LIVECLIENT_BASE}/eventdata"
 ALL_GAME_URL = f"{LIVECLIENT_BASE}/allgamedata"
+LCU_CHAMP_SELECT_PATH = "/lol-champ-select/v1/session"
+LCU_CHAMPION_SUMMARY_PATH = "/lol-game-data/assets/v1/champion-summary.json"
 
 DEFAULT_OBS_PASSWORD_LENGTH = 24
 DEFAULT_OBS_SCENE_NAME = "lol_seen"
@@ -511,7 +517,7 @@ class OBSClient(ABC):
 
 
 class RiotAPIClient(ABC):
-    """LoL Live Client APIの取得とパースだけを担当する抽象インターフェース。"""
+    """LoL Live Client APIとLCU APIの取得・パースを担当する。"""
 
     @abstractmethod
     async def get_active_player_name(self) -> str | None:
@@ -527,6 +533,14 @@ class RiotAPIClient(ABC):
 
     @abstractmethod
     async def get_all_game_data_result(self) -> RiotPollResult:
+        pass
+
+    @abstractmethod
+    async def get_champ_select_session_result(self) -> RiotPollResult:
+        pass
+
+    @abstractmethod
+    async def get_champion_catalog(self) -> dict[int, str]:
         pass
 
 
@@ -2090,10 +2104,16 @@ def save_payload(path: str | Path, payload: dict[str, Any]) -> None:
 
 
 class LiveClientRiotAPIClient(RiotAPIClient):
-    """aiohttpでRiot Live Client APIを取得する本番用クライアント。"""
+    """aiohttpでLive Client APIとLCU APIを取得する本番用クライアント。"""
 
-    def __init__(self, session_factory: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        session_factory: Callable[..., Any] | None = None,
+        lcu_connection_provider: LCUConnectionProvider | None = None,
+    ) -> None:
         self.session_factory = session_factory or aiohttp.ClientSession
+        self.lcu_connection_provider = lcu_connection_provider or LCUConnectionProvider()
+        self._champion_catalog: dict[int, str] = {}
 
     async def _fetch_result(self, url: str, timeout_sec: float) -> RiotPollResult:
         timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
@@ -2147,6 +2167,60 @@ class LiveClientRiotAPIClient(RiotAPIClient):
         if isinstance(result.payload, dict) and "gameData" in result.payload:
             return result
         return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error="Unexpected allgamedata payload")
+
+    async def _fetch_lcu_result(self, path: str, timeout_sec: float = 1.0) -> RiotPollResult:
+        connection = await asyncio.to_thread(self.lcu_connection_provider.get_connection_info)
+        if connection is None:
+            return RiotPollResult(RiotPollStatus.NOT_IN_GAME)
+
+        timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
+        url = f"{connection.base_url}{path}"
+        try:
+            async with self.session_factory(timeout=timeout) as session:
+                async with session.get(
+                    url,
+                    auth=aiohttp.BasicAuth("riot", connection.password),
+                    ssl=False,
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json(content_type=None)
+                    if isinstance(data, dict):
+                        return RiotPollResult(RiotPollStatus.IN_GAME, payload=data)
+                    return RiotPollResult(RiotPollStatus.IN_GAME, payload={"value": data})
+        except aiohttp.ClientResponseError as e:
+            if e.status in {401, 403}:
+                self.lcu_connection_provider.invalidate()
+                return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
+            if e.status in {404, 410}:
+                return RiotPollResult(RiotPollStatus.NOT_IN_GAME, error=str(e))
+            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
+        except (
+            aiohttp.ClientConnectionError,
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OSError,
+        ) as e:
+            self.lcu_connection_provider.invalidate()
+            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
+
+    async def get_champ_select_session_result(self) -> RiotPollResult:
+        result = await self._fetch_lcu_result(LCU_CHAMP_SELECT_PATH)
+        if result.status != RiotPollStatus.IN_GAME:
+            return result
+        if isinstance(result.payload, dict) and "actions" in result.payload:
+            return result
+        return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error="Unexpected champ-select payload")
+
+    async def get_champion_catalog(self) -> dict[int, str]:
+        if self._champion_catalog:
+            return dict(self._champion_catalog)
+        result = await self._fetch_lcu_result(LCU_CHAMPION_SUMMARY_PATH, timeout_sec=2.0)
+        if result.status != RiotPollStatus.IN_GAME or not isinstance(result.payload, dict):
+            return {}
+        catalog = champion_name_catalog(result.payload.get("value"))
+        if catalog:
+            self._champion_catalog = catalog
+        return dict(catalog)
 
 
 class ObsWebSocketClient(OBSClient):
@@ -2594,6 +2668,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         )
         self.riot_api_client = riot_api_client or LiveClientRiotAPIClient()
         self.obs_process = getattr(self.obs_client, "obs_process", obs_process)
+        self.champion_catalog: dict[int, str] = {}
         self.reset_session()
 
     def open(self) -> None:
@@ -2667,6 +2742,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.champion_name = None
         self.player_team = None
         self.enemy_champions = []
+        self.champ_select_tracker = ChampSelectTracker()
         self.game_result = None
         self.winning_team = None
         self.session_finalized = False
@@ -2680,6 +2756,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             or self.sync_game_time > 0.0
             or bool(self.saved_events)
             or bool(self.all_events)
+            or self.champ_select_tracker.has_data
         )
 
     def mark_session_failed(self, reason: str | BaseException | None) -> None:
@@ -2746,6 +2823,50 @@ class LoLAutoRecorder(RecordingSessionManager):
             self.my_name = name
             self.my_name_short = normalize_summoner_name(name)
             self.log(f"プレイヤー名を特定: {self.my_name}")
+
+    async def capture_champ_select_async(self) -> None:
+        get_result = getattr(self.riot_api_client, "get_champ_select_session_result", None)
+        if not callable(get_result):
+            return
+        try:
+            result = get_result()
+            if hasattr(result, "__await__"):
+                result = await result
+        except Exception as e:
+            self.logger.debug("Champion select poll failed: %s", e)
+            return
+        if not isinstance(result, RiotPollResult):
+            return
+        if result.status == RiotPollStatus.NOT_IN_GAME:
+            self.champ_select_tracker.observe_inactive()
+            return
+        if result.status != RiotPollStatus.IN_GAME or not isinstance(result.payload, dict):
+            return
+
+        if not self.champion_catalog:
+            get_catalog = getattr(self.riot_api_client, "get_champion_catalog", None)
+            if callable(get_catalog):
+                try:
+                    catalog = get_catalog()
+                    if hasattr(catalog, "__await__"):
+                        catalog = await catalog
+                    if isinstance(catalog, dict):
+                        self.champion_catalog = {
+                            int(champion_id): str(name)
+                            for champion_id, name in catalog.items()
+                            if name
+                        }
+                except Exception as e:
+                    self.logger.debug("Champion catalog fetch failed: %s", e)
+
+        added = self.champ_select_tracker.observe(result.payload, self.champion_catalog)
+        for action in added:
+            champion = action.get("champion_name") or f"ID {action.get('champion_id')}"
+            self.log(
+                "Ban/Pick記録: "
+                f"{action.get('team')} {action.get('type')} {champion} "
+                f"(phase {action.get('phase_order')})"
+            )
 
     def update_player_info_from_game_data(self, data: dict[str, Any] | None) -> None:
         if not data or not self.my_name:
@@ -2819,6 +2940,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
                 return False
+            await self.capture_champ_select_async()
             result = await self.poll_all_game_data()
             data = result.payload
             if data:
@@ -3079,6 +3201,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             obs_record_path=record_path_for_json,
             recordings_dir=str(self.config.paths.recordings_dir),
             json_path=str(self.output_file),
+            ban_pick=self.champ_select_tracker.to_payload() if self.champ_select_tracker.has_data else {},
             events=list(self.saved_events),
             events_all=list(self.all_events),
         ).to_payload()

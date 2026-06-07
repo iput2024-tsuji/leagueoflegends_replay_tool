@@ -10,6 +10,7 @@ import aiohttp
 import pytest
 
 from src import recordtest
+from src.lcu_client import LCUConnectionInfo
 
 
 class FakeResponse:
@@ -49,7 +50,7 @@ class FakeSession:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    def get(self, url, ssl=False):
+    def get(self, url, ssl=False, **kwargs):
         if self.error:
             raise self.error
         return FakeRequestContext(FakeResponse(self.routes.get(url)))
@@ -297,6 +298,34 @@ def test_riot_api_fetches_and_parses_live_client_payloads():
     assert run(client.get_active_player_name()) == "Summoner#JP1"
     assert run(client.get_event_data())["Events"][0]["EventName"] == "GameStart"
     assert run(client.get_all_game_data())["gameData"]["gameTime"] == 42.0
+
+
+def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
+    connection = LCUConnectionInfo(port=54321, password="secret")
+    provider = SimpleNamespace(
+        get_connection_info=lambda: connection,
+        invalidate=lambda: None,
+    )
+    champ_select_url = f"{connection.base_url}{recordtest.LCU_CHAMP_SELECT_PATH}"
+    champion_summary_url = f"{connection.base_url}{recordtest.LCU_CHAMPION_SUMMARY_PATH}"
+    routes = {
+        champ_select_url: {"actions": [], "gameId": 123},
+        champion_summary_url: [
+            {"id": 103, "name": "Ahri"},
+            {"id": 266, "name": "Aatrox"},
+        ],
+    }
+    client = recordtest.LiveClientRiotAPIClient(
+        session_factory=FakeSessionFactory(routes),
+        lcu_connection_provider=provider,
+    )
+
+    result = run(client.get_champ_select_session_result())
+    catalog = run(client.get_champion_catalog())
+
+    assert result.status == recordtest.RiotPollStatus.IN_GAME
+    assert result.payload["gameId"] == 123
+    assert catalog == {103: "Ahri", 266: "Aatrox"}
 
 
 def test_riot_api_returns_none_when_lcu_server_is_down():

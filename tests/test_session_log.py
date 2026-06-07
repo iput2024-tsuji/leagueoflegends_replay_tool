@@ -26,6 +26,16 @@ def test_session_log_payload_round_trips_with_schema_version(tmp_path):
         obs_record_path="game.mp4",
         recordings_dir="recordings",
         json_path=str(path),
+        ban_pick={
+            "actions": [
+                {
+                    "order": 1,
+                    "type": "ban",
+                    "champion_id": 122,
+                    "champion_name": "Darius",
+                }
+            ]
+        },
         events=[{"EventID": 1, "EventName": "GameStart"}],
         events_all=[{"EventID": 1, "EventName": "GameStart"}],
     )
@@ -39,6 +49,7 @@ def test_session_log_payload_round_trips_with_schema_version(tmp_path):
     assert payload["failure_reason"] is None
     assert payload["summoner_name"] == "Tester#JP1"
     assert payload["enemy_champions"] == ["Darius", "Lux"]
+    assert payload["ban_pick"]["actions"][0]["champion_name"] == "Darius"
     assert payload["counts"] == {"filtered": 1, "all": 1}
 
 
@@ -61,6 +72,7 @@ def test_session_log_loader_accepts_legacy_payload_without_schema_version(tmp_pa
     assert payload["schema_version"] == SESSION_LOG_SCHEMA_VERSION
     assert payload["enemy_champions"] == ["Darius", "Lux"]
     assert payload["sync_game_time"] == 12.5
+    assert payload["ban_pick"] == {}
     assert payload["counts"] == {"filtered": 1, "all": 0}
 
 

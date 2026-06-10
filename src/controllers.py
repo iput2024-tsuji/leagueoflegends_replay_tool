@@ -17,8 +17,13 @@ except ImportError:
 class ConfigController:
     """設定ファイル、補完、プレフライトをUIから分離して扱う。"""
 
-    def __init__(self, repository: ConfigRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: ConfigRepository | None = None,
+        runtime_manager: OBSRuntimeManager | None = None,
+    ) -> None:
         self.repository = repository or ConfigRepository(CONFIG_PATH, SAMPLE_CONFIG_PATH)
+        self.runtime_manager = runtime_manager or OBSRuntimeManager()
 
     def apply_auto_defaults(
         self, data: dict[str, Any] | None, force_obs_detect: bool = False
@@ -99,12 +104,23 @@ class ConfigController:
             return report, False, self.format_report_lines(report.get("errors", []))
 
         config = recordtest.AppConfig.from_dict(report["config"])
-        ok, detail = recordtest.test_obs_connection(
-            config.obs.host,
-            config.obs.port,
-            config.obs.password,
-        )
-        return report, ok, detail
+        runtime = None
+        with recordtest.OBS_OPERATION_LOCK:
+            try:
+                runtime = self.runtime_manager.open_recorder(
+                    config,
+                    auto_launch=True,
+                    auto_setup=False,
+                    status_cb=None,
+                    max_retries=5,
+                    retry_delay=0.5,
+                )
+                return report, True, "接続成功: 管理対象OBS WebSocket"
+            except Exception as e:
+                return report, False, str(e)
+            finally:
+                if runtime:
+                    runtime.close()
 
     def total_storage_size(self, config_data: dict[str, Any] | None = None) -> int:
         config = recordtest.AppConfig.from_dict(config_data or self.load_config())
@@ -182,26 +198,13 @@ class AudioSettingsController:
     def apply_runtime_output_settings(self, data: dict[str, Any]) -> bool:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
         with recordtest.OBS_OPERATION_LOCK:
-            ok, _detail = recordtest.test_obs_connection(
-                config.obs.host,
-                config.obs.port,
-                config.obs.password,
-                timeout=1.0,
-            )
-            if not ok:
-                return False
-            if not recordtest.OBSProcessManager(config.obs.obs_dir).has_owned_process():
-                return False
-
             runtime = None
             try:
-                runtime = self.runtime_manager.open_recorder(
+                runtime = self._open_recorder(
                     config,
-                    auto_launch=False,
-                    auto_setup=False,
-                    status_cb=None,
-                    max_retries=1,
-                    retry_delay=0.0,
+                    auto_launch=True,
+                    max_retries=5,
+                    retry_delay=0.5,
                 )
                 runtime.recorder.apply_record_output_settings()
                 return True

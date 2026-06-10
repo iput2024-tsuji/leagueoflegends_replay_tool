@@ -1001,9 +1001,9 @@ class SettingsPage(QWidget):
     def on_page_shown(self) -> None:
         if not self._audio_auto_refreshed_once:
             self._audio_auto_refreshed_once = True
-            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
+            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
             return
-        self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
+        self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
 
     def browse_recordings_dir(self) -> None:
         current = self.fields["paths.recordings_dir"].text().strip()
@@ -1241,7 +1241,7 @@ class SettingsPage(QWidget):
         self._audio_apply_timer.start(350)
 
     def _apply_audio_settings_auto(self) -> None:
-        self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=False)
+        self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=True)
 
     def _set_audio_controls_enabled(self, enabled: bool) -> None:
         for widget in (
@@ -1354,7 +1354,7 @@ class SettingsPage(QWidget):
             self._audio_apply_worker = None
         if self._audio_apply_pending:
             self._audio_apply_pending = False
-            self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=False)
+            self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=True)
 
     def apply_runtime_output_settings_to_obs(self, cfg: dict[str, Any] | None = None, show_error: bool = False) -> bool:
         if self._runtime_output_worker and self._runtime_output_worker.isRunning():
@@ -1437,7 +1437,7 @@ class SettingsPage(QWidget):
         dialog = SetupWizardDialog(self, startup_mode=False)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.load_settings()
-            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
+            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
 
     def run_quick_setup(self) -> bool:
         if self._quick_setup_worker and self._quick_setup_worker.isRunning():
@@ -1464,7 +1464,7 @@ class SettingsPage(QWidget):
             return
 
         self.load_settings()
-        self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=False)
+        self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
         color_hex = recordtest.obs_color_to_hex(info.get("source_color"))
         launch_note = "（セットアップのためポータブルOBSを自動起動しました）" if info.get("obs_launched") else ""
         message = (

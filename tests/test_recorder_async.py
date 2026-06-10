@@ -358,9 +358,32 @@ def test_start_recording_failure_raises_and_does_not_create_session_data():
     with pytest.raises(recordtest.RecorderError, match="OBS録画開始に失敗"):
         run(recorder.start_recording_async())
 
+    obs_client.start_recording.assert_called_once()
+    obs_client.setup_record_output.assert_not_called()
     assert recorder.recording_started is False
     assert recorder.record_path is None
     assert recorder.has_session_data() is False
+
+
+def test_start_recording_does_not_retry_when_obs_never_becomes_active():
+    tmp_path = runtime_dir("recording_start_inactive")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
+    obs_client.is_recording_active.return_value = False
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=obs_client,
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.wait_for_recording_active_async = AsyncMock(return_value=False)
+
+    with pytest.raises(recordtest.RecorderError, match="録画状態へ移行しませんでした"):
+        run(recorder.start_recording_async())
+
+    obs_client.start_recording.assert_called_once()
+    obs_client.setup_record_output.assert_not_called()
 
 
 def test_start_recording_validates_sync_source_before_obs_recording():

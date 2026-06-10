@@ -182,6 +182,15 @@ def test_obs_video_and_quality_settings_are_sent_to_websocket():
             },
             True,
         ),
+        (
+            "SetProfileParameter",
+            {
+                "parameterCategory": "SimpleOutput",
+                "parameterName": "RecEncoder",
+                "parameterValue": "x264",
+            },
+            True,
+        ),
     ]
 
 

@@ -105,6 +105,7 @@ DEFAULT_OBS_OUTPUT_WIDTH = 1920
 DEFAULT_OBS_OUTPUT_HEIGHT = 1080
 DEFAULT_OBS_SCALE_TYPE = "lanczos"
 DEFAULT_OBS_RECORDING_QUALITY = "Small"
+DEFAULT_OBS_RECORDING_ENCODER = "x264"
 VALID_OBS_SCALE_TYPES = frozenset({"bilinear", "bicubic", "lanczos", "area"})
 VALID_OBS_RECORDING_QUALITIES = frozenset({"Stream", "Small", "HQ", "Lossless"})
 DEFAULT_END_ERROR_LIMIT = 3
@@ -537,10 +538,6 @@ class OBSClient(ABC):
 
     @abstractmethod
     def get_record_status_details(self) -> dict[str, Any]:
-        pass
-
-    @abstractmethod
-    def use_software_recording_encoder(self) -> bool:
         pass
 
     @abstractmethod
@@ -1458,6 +1455,7 @@ def apply_obs_recording_quality_settings(
     *,
     scale_type: str = DEFAULT_OBS_SCALE_TYPE,
     recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
+    recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
 ) -> None:
     scale_value = str(scale_type or DEFAULT_OBS_SCALE_TYPE).strip().lower()
     if scale_value not in VALID_OBS_SCALE_TYPES:
@@ -1472,6 +1470,7 @@ def apply_obs_recording_quality_settings(
     for category, name, value in (
         ("Video", "ScaleType", scale_value),
         ("SimpleOutput", "RecQuality", quality_value),
+        ("SimpleOutput", "RecEncoder", str(recording_encoder or DEFAULT_OBS_RECORDING_ENCODER)),
     ):
         _obs_raw(
             client,
@@ -2519,7 +2518,8 @@ class ObsWebSocketClient(OBSClient):
             )
             self.log(
                 "🎞️ OBS録画品質を適用しました: "
-                f"quality={self.config.obs.recording_quality}, scale={self.config.obs.scale_type}"
+                f"quality={self.config.obs.recording_quality}, scale={self.config.obs.scale_type}, "
+                f"encoder={DEFAULT_OBS_RECORDING_ENCODER}"
             )
         except Exception as e:
             self.log(f"⚠️ OBS録画品質設定の適用に失敗: {e}")
@@ -2823,23 +2823,6 @@ class ObsWebSocketClient(OBSClient):
             "output_duration": getattr(status, "output_duration", None),
             "output_bytes": getattr(status, "output_bytes", None),
         }
-
-    def use_software_recording_encoder(self) -> bool:
-        try:
-            _obs_raw(
-                self.client,
-                "SetProfileParameter",
-                {
-                    "parameterCategory": "SimpleOutput",
-                    "parameterName": "RecEncoder",
-                    "parameterValue": "x264",
-                },
-            )
-            self.log("⚠️ OBS録画エンコーダーをx264へ切り替えました。")
-            return True
-        except Exception as e:
-            self.log(f"⚠️ x264への切り替えに失敗しました: {e}")
-            return False
 
     def shutdown(self) -> None:
         if self.obs_process:
@@ -3256,41 +3239,25 @@ class LoLAutoRecorder(RecordingSessionManager):
             )
 
         errors = []
-        for attempt in range(2):
-            try:
-                self.obs_client.start_recording()
-            except Exception as e:
-                if isinstance(e, OBSSDKRequestError):
-                    try:
-                        if self.obs_client.is_recording_active() is True:
-                            self.log("OBSは既に録画中だったため、その録画を継続します。")
-                            self.recording_started = True
-                            self.session_phase = RecordingPhase.RECORDING
-                            break
-                    except Exception:
-                        pass
-                errors.append(self._format_obs_start_error(e, attempt + 1))
-            else:
-                if await self.wait_for_recording_active_async():
-                    self.recording_started = True
-                    self.session_phase = RecordingPhase.RECORDING
-                    break
-                errors.append(
-                    f"試行{attempt + 1}: OBSは開始要求を受理しましたが、録画状態へ移行しませんでした。"
-                )
-
-            if attempt == 0:
-                self.log("⚠️ OBS録画開始に失敗したため、出力設定を再適用して1回再試行します。")
+        try:
+            self.obs_client.start_recording()
+        except Exception as e:
+            if isinstance(e, OBSSDKRequestError):
                 try:
-                    self.obs_client.setup_record_output()
-                except Exception as e:
-                    errors.append(f"出力設定再適用: {type(e).__name__}: {e}")
-                use_software_encoder = getattr(self.obs_client, "use_software_recording_encoder", None)
-                if callable(use_software_encoder):
-                    try:
-                        use_software_encoder()
-                    except Exception as e:
-                        errors.append(f"x264切り替え: {type(e).__name__}: {e}")
+                    if self.obs_client.is_recording_active() is True:
+                        self.log("OBSは既に録画中だったため、その録画を継続します。")
+                        self.recording_started = True
+                        self.session_phase = RecordingPhase.RECORDING
+                except Exception:
+                    pass
+            if not self.recording_started:
+                errors.append(self._format_obs_start_error(e, 1))
+        else:
+            if await self.wait_for_recording_active_async():
+                self.recording_started = True
+                self.session_phase = RecordingPhase.RECORDING
+            else:
+                errors.append("OBSは開始要求を受理しましたが、録画状態へ移行しませんでした。")
 
         if not self.recording_started:
             details = self._record_status_summary()

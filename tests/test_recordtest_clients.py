@@ -139,7 +139,8 @@ def test_obs_video_and_quality_settings_are_sent_to_websocket():
 
     recordtest.apply_obs_video_settings(
         client,
-        60,
+        240000,
+        fps_denominator=1001,
         base_width=1920,
         base_height=1080,
         output_width=1920,
@@ -155,8 +156,8 @@ def test_obs_video_and_quality_settings_are_sent_to_websocket():
         (
             "SetVideoSettings",
             {
-                "fpsNumerator": 60,
-                "fpsDenominator": 1,
+                "fpsNumerator": 240000,
+                "fpsDenominator": 1001,
                 "baseWidth": 1920,
                 "baseHeight": 1080,
                 "outputWidth": 1920,
@@ -192,6 +193,21 @@ def test_obs_video_and_quality_settings_are_sent_to_websocket():
             True,
         ),
     ]
+
+
+def test_app_config_preserves_fractional_high_fps():
+    config = recordtest.AppConfig.from_dict(
+        {
+            "obs": {
+                "fps_numerator": 240000,
+                "fps_denominator": 1001,
+            }
+        }
+    )
+
+    assert config.obs.fps_numerator == 240000
+    assert config.obs.fps_denominator == 1001
+    assert config.obs.fps == pytest.approx(239.7602397602)
 
 
 def test_preflight_generates_and_persists_obs_password(monkeypatch, tmp_path):

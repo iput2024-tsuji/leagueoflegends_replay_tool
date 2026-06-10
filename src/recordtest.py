@@ -98,7 +98,10 @@ DEFAULT_JSON_DIR = "recordings/json"
 DEFAULT_CHAMPION_ICONS_DIR = "assets/champions/icons"
 DEFAULT_OBS_HOST = "localhost"
 DEFAULT_OBS_PORT = 4455
-DEFAULT_OBS_FPS = 60
+DEFAULT_OBS_FPS_NUMERATOR = 60
+DEFAULT_OBS_FPS_DENOMINATOR = 1
+MAX_OBS_FPS_NUMERATOR = 1_000_000
+MAX_OBS_FPS_DENOMINATOR = 100_000
 DEFAULT_OBS_BASE_WIDTH = 1920
 DEFAULT_OBS_BASE_HEIGHT = 1080
 DEFAULT_OBS_OUTPUT_WIDTH = 1920
@@ -257,7 +260,8 @@ class OBSSettings:
     window_capture_name: str
     window_capture_window: str
     window_capture_method: int
-    fps: int
+    fps_numerator: int
+    fps_denominator: int
     base_width: int
     base_height: int
     output_width: int
@@ -265,6 +269,10 @@ class OBSSettings:
     scale_type: str
     recording_quality: str
     obs_dir: Path
+
+    @property
+    def fps(self) -> float:
+        return self.fps_numerator / self.fps_denominator
 
     @property
     def game_capture_name(self) -> str:
@@ -343,7 +351,19 @@ class AppConfig:
             obs_cfg.get("source_color"),
             default=DEFAULT_OBS_SOURCE_COLOR,
         )
-        fps, _ = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
+        legacy_fps = obs_cfg.get("fps")
+        fps_numerator, _ = _safe_int(
+            obs_cfg.get("fps_numerator", legacy_fps),
+            DEFAULT_OBS_FPS_NUMERATOR,
+            minimum=1,
+            maximum=MAX_OBS_FPS_NUMERATOR,
+        )
+        fps_denominator, _ = _safe_int(
+            obs_cfg.get("fps_denominator"),
+            DEFAULT_OBS_FPS_DENOMINATOR,
+            minimum=1,
+            maximum=MAX_OBS_FPS_DENOMINATOR,
+        )
         base_width, _ = _safe_int(obs_cfg.get("base_width"), DEFAULT_OBS_BASE_WIDTH, minimum=64, maximum=4096)
         base_height, _ = _safe_int(obs_cfg.get("base_height"), DEFAULT_OBS_BASE_HEIGHT, minimum=64, maximum=4096)
         output_width, _ = _safe_int(obs_cfg.get("output_width"), DEFAULT_OBS_OUTPUT_WIDTH, minimum=64, maximum=4096)
@@ -435,7 +455,8 @@ class AppConfig:
                 window_capture_name=window_capture_name,
                 window_capture_window=window_capture_window,
                 window_capture_method=window_capture_method,
-                fps=fps,
+                fps_numerator=fps_numerator,
+                fps_denominator=fps_denominator,
                 base_width=base_width,
                 base_height=base_height,
                 output_width=output_width,
@@ -1459,14 +1480,26 @@ def disable_obs_global_audio_devices(client: Any) -> None:
 
 def apply_obs_video_settings(
     client: Any,
-    fps_value: int | str | None = None,
+    fps_numerator: int | str | None = None,
     *,
+    fps_denominator: int | str | None = None,
     base_width: int | str | None = None,
     base_height: int | str | None = None,
     output_width: int | str | None = None,
     output_height: int | str | None = None,
 ) -> Any:
-    fps_num, _ = _safe_int(fps_value, DEFAULT_OBS_FPS, minimum=1, maximum=240)
+    fps_num, _ = _safe_int(
+        fps_numerator,
+        DEFAULT_OBS_FPS_NUMERATOR,
+        minimum=1,
+        maximum=MAX_OBS_FPS_NUMERATOR,
+    )
+    fps_den, _ = _safe_int(
+        fps_denominator,
+        DEFAULT_OBS_FPS_DENOMINATOR,
+        minimum=1,
+        maximum=MAX_OBS_FPS_DENOMINATOR,
+    )
     base_width_value, _ = _safe_int(base_width, DEFAULT_OBS_BASE_WIDTH, minimum=64, maximum=4096)
     base_height_value, _ = _safe_int(base_height, DEFAULT_OBS_BASE_HEIGHT, minimum=64, maximum=4096)
     output_width_value, _ = _safe_int(output_width, DEFAULT_OBS_OUTPUT_WIDTH, minimum=64, maximum=4096)
@@ -1476,7 +1509,7 @@ def apply_obs_video_settings(
         "SetVideoSettings",
         {
             "fpsNumerator": int(fps_num),
-            "fpsDenominator": 1,
+            "fpsDenominator": int(fps_den),
             "baseWidth": int(base_width_value),
             "baseHeight": int(base_height_value),
             "outputWidth": int(output_width_value),
@@ -2528,7 +2561,8 @@ class ObsWebSocketClient(OBSClient):
         try:
             apply_obs_video_settings(
                 self.client,
-                self.config.obs.fps,
+                self.config.obs.fps_numerator,
+                fps_denominator=self.config.obs.fps_denominator,
                 base_width=self.config.obs.base_width,
                 base_height=self.config.obs.base_height,
                 output_width=self.config.obs.output_width,
@@ -2538,7 +2572,7 @@ class ObsWebSocketClient(OBSClient):
                 "🎞️ OBS映像設定を適用しました: "
                 f"{self.config.obs.base_width}x{self.config.obs.base_height} -> "
                 f"{self.config.obs.output_width}x{self.config.obs.output_height} / "
-                f"{self.config.obs.fps} FPS"
+                f"{self.config.obs.fps_numerator}/{self.config.obs.fps_denominator} FPS"
             )
         except Exception as e:
             # 録画は続行可能なので警告のみ

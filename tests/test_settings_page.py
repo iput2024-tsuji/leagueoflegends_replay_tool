@@ -1,3 +1,4 @@
+from src import app
 from src.app import SettingsPage
 
 
@@ -41,3 +42,33 @@ def test_settings_page_audio_auto_apply_auto_launches_managed_obs():
     SettingsPage._apply_audio_settings_auto(page)
 
     assert page.calls == [{"show_success": False, "show_error": False, "auto_launch": True}]
+
+
+def test_settings_page_supports_fractional_high_fps(qtbot, monkeypatch):
+    config = {
+        "obs": {
+            "password": "secret",
+            "fps_numerator": 240000,
+            "fps_denominator": 1001,
+        },
+        "paths": {},
+        "storage": {},
+        "polling": {},
+        "audio": {},
+        "app": {},
+    }
+    monkeypatch.setattr(app, "load_config", lambda: config)
+
+    page = SettingsPage(lambda: None)
+    qtbot.addWidget(page)
+
+    assert page.obs_fps_numerator.maximum() > 120
+    assert page.obs_fps_numerator.value() == 240000
+    assert page.obs_fps_denominator.value() == 1001
+
+    page.obs_fps_numerator.setValue(300000)
+    page.obs_fps_denominator.setValue(1001)
+    page._write_settings_ui_to_config(config)
+
+    assert config["obs"]["fps_numerator"] == 300000
+    assert config["obs"]["fps_denominator"] == 1001

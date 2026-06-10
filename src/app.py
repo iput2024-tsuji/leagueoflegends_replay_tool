@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QSlider,
+    QSpinBox,
     QStackedWidget,
     QStyle,
     QSystemTrayIcon,
@@ -900,9 +901,18 @@ class SettingsPage(QWidget):
         self.storage_progress.setTextVisible(True)
         self.storage_progress.setFormat("0.0 GB / 0.0 GB (0%)")
         general_form.addRow("ストレージ使用量", self.storage_progress)
-        self.obs_fps_combo = QComboBox()
-        self.obs_fps_combo.addItems(["30", "60", "120"])
-        general_form.addRow("録画FPS", self.obs_fps_combo)
+        self.obs_fps_row = QWidget()
+        obs_fps_layout = QHBoxLayout(self.obs_fps_row)
+        obs_fps_layout.setContentsMargins(0, 0, 0, 0)
+        obs_fps_layout.setSpacing(8)
+        self.obs_fps_numerator = QSpinBox()
+        self.obs_fps_numerator.setRange(1, recordtest.MAX_OBS_FPS_NUMERATOR)
+        self.obs_fps_denominator = QSpinBox()
+        self.obs_fps_denominator.setRange(1, recordtest.MAX_OBS_FPS_DENOMINATOR)
+        obs_fps_layout.addWidget(self.obs_fps_numerator)
+        obs_fps_layout.addWidget(QLabel("/"))
+        obs_fps_layout.addWidget(self.obs_fps_denominator)
+        general_form.addRow("録画FPS (分子 / 分母)", self.obs_fps_row)
         self.minimize_to_tray_check = QCheckBox("ウィンドウを閉じた時にタスクトレイに格納する")
         general_form.addRow("", self.minimize_to_tray_check)
 
@@ -1057,10 +1067,13 @@ class SettingsPage(QWidget):
         self.fields["obs.dir"].setText(recordtest.DEFAULT_OBS_DIR)
         self.fields["obs.password"].setText("設定済み" if obs.get("password") else "未設定")
         self.fields["obs.port"].setText(str(recordtest.DEFAULT_OBS_PORT))
-        fps_text = str(obs.get("fps", recordtest.DEFAULT_OBS_FPS))
-        if self.obs_fps_combo.findText(fps_text) < 0:
-            self.obs_fps_combo.addItem(fps_text)
-        self.obs_fps_combo.setCurrentText(fps_text)
+        legacy_fps = obs.get("fps")
+        self.obs_fps_numerator.setValue(
+            int(obs.get("fps_numerator", legacy_fps or recordtest.DEFAULT_OBS_FPS_NUMERATOR))
+        )
+        self.obs_fps_denominator.setValue(
+            int(obs.get("fps_denominator", recordtest.DEFAULT_OBS_FPS_DENOMINATOR))
+        )
         self.fields["obs.scene_name"].setText(str(obs.get("scene_name", "")))
         self.fields["obs.source_name"].setText(str(obs.get("source_name", "")))
         self.fields["obs.source_color"].setText(recordtest.obs_color_to_hex(obs.get("source_color")))
@@ -1175,10 +1188,9 @@ class SettingsPage(QWidget):
         password_value, _ = recordtest.ensure_obs_password_value(data["obs"].get("password"))
         data["obs"]["password"] = password_value
         data["obs"]["port"] = recordtest.DEFAULT_OBS_PORT
-        try:
-            data["obs"]["fps"] = int(self.obs_fps_combo.currentText())
-        except Exception:
-            data["obs"]["fps"] = recordtest.DEFAULT_OBS_FPS
+        data["obs"]["fps_numerator"] = self.obs_fps_numerator.value()
+        data["obs"]["fps_denominator"] = self.obs_fps_denominator.value()
+        data["obs"].pop("fps", None)
         data["obs"]["scene_name"] = self.fields["obs.scene_name"].text().strip()
         data["obs"]["source_name"] = self.fields["obs.source_name"].text().strip()
         data["obs"]["source_color"] = self.fields["obs.source_color"].text().strip()
@@ -1844,7 +1856,7 @@ def main() -> None:
                 font-weight: 700;
                 border-bottom: 2px solid #d32f2f;
             }
-            QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QDoubleSpinBox {
+            QLineEdit, QPlainTextEdit, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox {
                 background-color: #242424; color: #e0e0e0; border: 1px solid #3a3a3a;
             }
             QSlider::groove:horizontal { height: 6px; background: #3a3a3a; }

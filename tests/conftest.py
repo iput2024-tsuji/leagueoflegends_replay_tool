@@ -7,7 +7,8 @@ TEST_SETTINGS = {
     "obs": {
         "host": "localhost",
         "port": 4455,
-        "fps": 60,
+        "fps_numerator": 60,
+        "fps_denominator": 1,
         "password": "",
         "scene_name": "lol_seen_test",
         "source_name": "sync_marker_test",

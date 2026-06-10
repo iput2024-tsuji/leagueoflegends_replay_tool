@@ -23,7 +23,10 @@ DEFAULT_CHAMPION_ICONS_DIR = "assets/champions/icons"
 DEFAULT_CHAMPION_ALIASES_PATH = "config/champion_aliases.json"
 DEFAULT_OBS_HOST = "localhost"
 DEFAULT_OBS_PORT = 4455
-DEFAULT_OBS_FPS = 60
+DEFAULT_OBS_FPS_NUMERATOR = 60
+DEFAULT_OBS_FPS_DENOMINATOR = 1
+MAX_OBS_FPS_NUMERATOR = 1_000_000
+MAX_OBS_FPS_DENOMINATOR = 100_000
 DEFAULT_OBS_BASE_WIDTH = 1920
 DEFAULT_OBS_BASE_HEIGHT = 1080
 DEFAULT_OBS_OUTPUT_WIDTH = 1920
@@ -108,6 +111,7 @@ def normalize_config(
     storage_cfg = _ensure_section(result, "storage")
     app_cfg = _ensure_section(result, "app")
     _ensure_section(result, "audio")
+    _migrate_obs_fps_config(result, obs_cfg, auto_fix=auto_fix)
 
     _apply_defaults(
         result,
@@ -115,7 +119,8 @@ def normalize_config(
         {
             "host": DEFAULT_OBS_HOST,
             "port": DEFAULT_OBS_PORT,
-            "fps": DEFAULT_OBS_FPS,
+            "fps_numerator": DEFAULT_OBS_FPS_NUMERATOR,
+            "fps_denominator": DEFAULT_OBS_FPS_DENOMINATOR,
             "base_width": DEFAULT_OBS_BASE_WIDTH,
             "base_height": DEFAULT_OBS_BASE_HEIGHT,
             "output_width": DEFAULT_OBS_OUTPUT_WIDTH,
@@ -164,6 +169,27 @@ def normalize_config(
         result.changed = True
 
     return result
+
+
+def _migrate_obs_fps_config(
+    result: ConfigNormalizationResult,
+    obs_cfg: dict[str, Any],
+    *,
+    auto_fix: bool,
+) -> None:
+    if "fps" not in obs_cfg:
+        return
+
+    if auto_fix:
+        if obs_cfg.get("fps_numerator") in (None, ""):
+            obs_cfg["fps_numerator"] = obs_cfg.get("fps")
+        if obs_cfg.get("fps_denominator") in (None, ""):
+            obs_cfg["fps_denominator"] = DEFAULT_OBS_FPS_DENOMINATOR
+        obs_cfg.pop("fps", None)
+        result.changed = True
+        result.notes.append("旧OBS FPS設定を分子・分母形式へ更新しました。")
+    else:
+        result.warnings.append("旧OBS FPS設定が残っています。")
 
 
 def parse_obs_source_color(value: Any, default: int = DEFAULT_OBS_SOURCE_COLOR) -> tuple[int, bool]:
@@ -464,12 +490,26 @@ def _normalize_numeric_values(
             result.changed = True
         result.warnings.append(f"OBSポートが不正だったため {port} を使用します。")
 
-    fps_value, ok = _safe_int(obs_cfg.get("fps"), DEFAULT_OBS_FPS, minimum=1, maximum=240)
-    if not ok:
-        if auto_fix:
-            obs_cfg["fps"] = fps_value
-            result.changed = True
-        result.warnings.append(f"OBS FPS が不正だったため {fps_value} を使用します。")
+    for key, default, maximum, label in (
+        (
+            "fps_numerator",
+            DEFAULT_OBS_FPS_NUMERATOR,
+            MAX_OBS_FPS_NUMERATOR,
+            "OBS FPS分子",
+        ),
+        (
+            "fps_denominator",
+            DEFAULT_OBS_FPS_DENOMINATOR,
+            MAX_OBS_FPS_DENOMINATOR,
+            "OBS FPS分母",
+        ),
+    ):
+        value, value_ok = _safe_int(obs_cfg.get(key), default, minimum=1, maximum=maximum)
+        if not value_ok:
+            if auto_fix:
+                obs_cfg[key] = value
+                result.changed = True
+            result.warnings.append(f"{label}が不正だったため {value} を使用します。")
 
     for key, default in (
         ("base_width", DEFAULT_OBS_BASE_WIDTH),

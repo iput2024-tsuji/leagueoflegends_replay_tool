@@ -24,6 +24,8 @@ def test_normalize_config_migrates_capture_settings_and_generates_password():
     assert obs["output_height"] == 1080
     assert obs["scale_type"] == "lanczos"
     assert obs["recording_quality"] == "Small"
+    assert obs["fps_numerator"] == 60
+    assert obs["fps_denominator"] == 1
     assert "game_capture_name" not in obs
     assert "game_capture_window" not in obs
 
@@ -75,3 +77,33 @@ def test_normalize_config_keeps_only_managed_microphone_audio():
 
     assert set(result.config["audio"]) == {"mic"}
     assert result.config["audio"]["mic"]["input_name"] == config_schema.DEFAULT_AUDIO_MIC_INPUT_NAME
+
+
+def test_normalize_config_migrates_legacy_fps_to_fraction():
+    result = config_schema.normalize_config(
+        {
+            "obs": {
+                "password": "secret",
+                "fps": 144,
+            }
+        }
+    )
+
+    assert result.config["obs"]["fps_numerator"] == 144
+    assert result.config["obs"]["fps_denominator"] == 1
+    assert "fps" not in result.config["obs"]
+
+
+def test_normalize_config_accepts_high_fractional_fps():
+    result = config_schema.normalize_config(
+        {
+            "obs": {
+                "password": "secret",
+                "fps_numerator": 240000,
+                "fps_denominator": 1001,
+            }
+        }
+    )
+
+    assert result.config["obs"]["fps_numerator"] == 240000
+    assert result.config["obs"]["fps_denominator"] == 1001

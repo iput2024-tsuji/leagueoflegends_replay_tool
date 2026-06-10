@@ -113,17 +113,22 @@ DEFAULT_END_MISSING_GRACE_SEC = 60.0
 DEFAULT_END_POLL_SEC = 5
 DEFAULT_EVENT_POLL_SEC = 1
 DEFAULT_MAX_STORAGE_GB = 50
-DEFAULT_AUDIO_DESKTOP_INPUT_NAME = "lol_desktop_audio"
 DEFAULT_AUDIO_MIC_INPUT_NAME = "lol_mic_audio"
 DEFAULT_AUDIO_DEVICE_ID = "default"
 DEFAULT_AUDIO_DEVICE_NAME = "Default"
-DEFAULT_AUDIO_DESKTOP_VOLUME_DB = 0.0
 DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
-DEFAULT_AUDIO_DESKTOP_MUTE = False
 DEFAULT_AUDIO_MIC_MUTE = False
 DEFAULT_RECORDING_START_TIMEOUT_SEC = 8.0
 DEFAULT_RECORDING_START_POLL_SEC = 0.25
 MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
+OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS = (
+    "DesktopDevice1",
+    "DesktopDevice2",
+    "AuxDevice1",
+    "AuxDevice2",
+    "AuxDevice3",
+    "AuxDevice4",
+)
 
 QUEUE_DISPLAY_NAMES = {
     0: "カスタム",
@@ -150,13 +155,6 @@ LEGACY_DATA_BIN_OBS_DIR = (DATA_DIR / LEGACY_OBS_DIR).resolve()
 PORTABLE_OBS_MARKER_NAME = "obs_portable_mode.txt"
 LEGACY_PORTABLE_OBS_MARKER_NAME = "portable_mode.txt"
 MANAGED_AUDIO_INPUTS = {
-    "desktop": {
-        "label": "デスクトップ音声",
-        "input_name": DEFAULT_AUDIO_DESKTOP_INPUT_NAME,
-        "input_kind": "wasapi_output_capture",
-        "default_volume_db": DEFAULT_AUDIO_DESKTOP_VOLUME_DB,
-        "default_mute": DEFAULT_AUDIO_DESKTOP_MUTE,
-    },
     "mic": {
         "label": "マイク入力",
         "input_name": DEFAULT_AUDIO_MIC_INPUT_NAME,
@@ -319,14 +317,10 @@ class AudioSlotSettings:
 
 @dataclass(frozen=True)
 class AudioSettings:
-    desktop: AudioSlotSettings
     mic: AudioSlotSettings
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "desktop": self.desktop.to_dict(),
-            "mic": self.mic.to_dict(),
-        }
+        return {"mic": self.mic.to_dict()}
 
 
 @dataclass(frozen=True)
@@ -467,7 +461,6 @@ class AppConfig:
                 max_size_bytes=parse_max_storage_bytes(normalized_storage_cfg),
             ),
             audio=AudioSettings(
-                desktop=_audio_slot_from_config(source, "desktop"),
                 mic=_audio_slot_from_config(source, "mic"),
             ),
         )
@@ -894,6 +887,9 @@ def _ensure_audio_config_defaults(data: dict[str, Any], auto_fix: bool = True) -
 
     audio_cfg, replaced = _ensure_section_dict(data, "audio")
     if replaced:
+        changed = True
+    if "desktop" in audio_cfg:
+        audio_cfg.pop("desktop")
         changed = True
 
     for key, spec in MANAGED_AUDIO_INPUTS.items():
@@ -1347,13 +1343,6 @@ def connect_obs_client(
 
 def get_audio_config_defaults() -> dict[str, dict[str, Any]]:
     return {
-        "desktop": {
-            "input_name": DEFAULT_AUDIO_DESKTOP_INPUT_NAME,
-            "device_id": DEFAULT_AUDIO_DEVICE_ID,
-            "device_name": DEFAULT_AUDIO_DEVICE_NAME,
-            "volume_db": DEFAULT_AUDIO_DESKTOP_VOLUME_DB,
-            "mute": DEFAULT_AUDIO_DESKTOP_MUTE,
-        },
         "mic": {
             "input_name": DEFAULT_AUDIO_MIC_INPUT_NAME,
             "device_id": DEFAULT_AUDIO_DEVICE_ID,
@@ -1379,9 +1368,10 @@ def normalize_audio_config(cfg: dict[str, Any], auto_fix: bool = True) -> dict[s
 
 
 def _get_audio_slot_config(cfg: dict[str, Any], key: str) -> dict[str, Any]:
+    if key != "mic":
+        raise KeyError(key)
     if isinstance(cfg, AppConfig):
-        slot = cfg.audio.desktop if key == "desktop" else cfg.audio.mic
-        return slot.to_dict()
+        return cfg.audio.mic.to_dict()
 
     defaults = get_audio_config_defaults()
     audio_cfg, _ = normalize_audio_config(cfg, auto_fix=True)
@@ -1420,6 +1410,51 @@ def _obs_raw(client: Any, request_type: str, payload: dict[str, Any] | None = No
         return client.send(request_type, payload or {}, raw=True)
     except TypeError:
         return client.send(request_type, payload or {})
+
+
+def disable_obs_global_audio_devices(client: Any) -> None:
+    for parameter_name in OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS:
+        try:
+            _obs_raw(
+                client,
+                "SetProfileParameter",
+                {
+                    "parameterCategory": "Audio",
+                    "parameterName": parameter_name,
+                    "parameterValue": "disabled",
+                },
+            )
+        except Exception as e:
+            raise RecorderError(f"OBSグローバル音声デバイス '{parameter_name}' の無効化に失敗しました: {e}") from e
+
+    try:
+        special_inputs = _obs_raw(client, "GetSpecialInputs")
+    except Exception as e:
+        raise RecorderError(f"OBSグローバル音声入力の確認に失敗しました: {e}") from e
+
+    if not isinstance(special_inputs, dict):
+        return
+
+    input_names = {
+        str(value).strip()
+        for value in special_inputs.values()
+        if isinstance(value, str) and str(value).strip()
+    }
+    for input_name in input_names:
+        muted = False
+        disabled = False
+        try:
+            client.set_input_mute(input_name, True)
+            muted = True
+        except Exception:
+            pass
+        try:
+            client.set_input_settings(input_name, {"device_id": "disabled"}, overlay=True)
+            disabled = True
+        except Exception:
+            pass
+        if not muted and not disabled:
+            raise RecorderError(f"OBSグローバル音声入力 '{input_name}' を停止できませんでした。")
 
 
 def apply_obs_video_settings(
@@ -1618,7 +1653,7 @@ def ensure_managed_audio_inputs(
 ) -> bool:
     ensure_obs_scene_exists(client, scene_name, status_cb=status_cb)
     created_any = False
-    for key in ("desktop", "mic"):
+    for key in MANAGED_AUDIO_INPUTS:
         slot_cfg = _get_audio_slot_config(cfg or {}, key)
         created = _ensure_single_audio_input(client, scene_name, key, slot_cfg)
         created_any = created_any or created
@@ -1667,12 +1702,8 @@ def get_audio_device_catalog(
 ) -> dict[str, list[dict[str, str]]]:
     scene_name = scene_name or (cfg.obs.scene_name if isinstance(cfg, AppConfig) else DEFAULT_OBS_SCENE_NAME)
     ensure_managed_audio_inputs(client, scene_name, cfg=cfg, status_cb=status_cb)
-    desktop_cfg = _get_audio_slot_config(cfg or {}, "desktop")
     mic_cfg = _get_audio_slot_config(cfg or {}, "mic")
-    return {
-        "desktop": list_audio_devices_for_input(client, desktop_cfg["input_name"]),
-        "mic": list_audio_devices_for_input(client, mic_cfg["input_name"]),
-    }
+    return {"mic": list_audio_devices_for_input(client, mic_cfg["input_name"])}
 
 
 def apply_audio_input_settings(
@@ -1699,7 +1730,7 @@ def apply_audio_profile_from_config(
     scene_name = scene_name or (cfg.obs.scene_name if isinstance(cfg, AppConfig) else DEFAULT_OBS_SCENE_NAME)
     ensure_managed_audio_inputs(client, scene_name, cfg=cfg, status_cb=status_cb)
 
-    for key in ("desktop", "mic"):
+    for key in MANAGED_AUDIO_INPUTS:
         slot_cfg = _get_audio_slot_config(cfg or {}, key)
         input_name = slot_cfg["input_name"]
         try:
@@ -2487,6 +2518,9 @@ class ObsWebSocketClient(OBSClient):
             self._status_handler = None
 
     def setup_record_output(self) -> None:
+        disable_obs_global_audio_devices(self.client)
+        self.log("🔇 OBSのデスクトップ音声とグローバル音声入力を無効化しました。")
+
         if self.config.paths.recordings_dir:
             record_dir = validate_recording_directory(self.config.paths.recordings_dir)
             apply_record_directory_to_obs(self.client, record_dir)
@@ -2635,6 +2669,7 @@ class ObsWebSocketClient(OBSClient):
             "priority": DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY,
             "cursor": False,
             "client_area": True,
+            "capture_audio": True,
             "force_sdr": False,
         }
 
@@ -2667,6 +2702,7 @@ class ObsWebSocketClient(OBSClient):
                     "window": self.config.obs.window_capture_window,
                     "method": self.config.obs.window_capture_method,
                     "priority": DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY,
+                    "capture_audio": True,
                 }
                 try:
                     self.client.create_input(scene_name, source_name, "window_capture", fallback_settings, True)
@@ -2678,7 +2714,18 @@ class ObsWebSocketClient(OBSClient):
             try:
                 self.client.set_input_settings(source_name, settings, overlay=True)
             except Exception:
-                pass
+                fallback_settings = {
+                    "window": self.config.obs.window_capture_window,
+                    "method": self.config.obs.window_capture_method,
+                    "priority": DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY,
+                    "capture_audio": True,
+                }
+                try:
+                    self.client.set_input_settings(source_name, fallback_settings, overlay=True)
+                except Exception as fallback_error:
+                    raise RecorderError(
+                        f"ウィンドウキャプチャ '{source_name}' の設定更新に失敗しました: {fallback_error}"
+                    ) from fallback_error
 
         scene_item_id = self._get_scene_item_id(source_name)
         if scene_item_id is None:

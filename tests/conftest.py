@@ -30,13 +30,6 @@ TEST_SETTINGS = {
         "max_size_gb": 1,
     },
     "audio": {
-        "desktop": {
-            "input_name": "lol_desktop_audio",
-            "device_id": "default",
-            "device_name": "Default",
-            "volume_db": 0.0,
-            "mute": False,
-        },
         "mic": {
             "input_name": "lol_mic_audio",
             "device_id": "default",

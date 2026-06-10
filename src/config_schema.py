@@ -39,21 +39,11 @@ DEFAULT_EVENT_POLL_SEC = 1
 DEFAULT_MAX_STORAGE_GB = 50
 DEFAULT_AUDIO_DEVICE_ID = "default"
 DEFAULT_AUDIO_DEVICE_NAME = "Default"
-DEFAULT_AUDIO_DESKTOP_INPUT_NAME = "lol_desktop_audio"
 DEFAULT_AUDIO_MIC_INPUT_NAME = "lol_mic_audio"
-DEFAULT_AUDIO_DESKTOP_VOLUME_DB = 0.0
 DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
-DEFAULT_AUDIO_DESKTOP_MUTE = False
 DEFAULT_AUDIO_MIC_MUTE = False
 
 MANAGED_AUDIO_INPUTS = {
-    "desktop": {
-        "label": "デスクトップ音声",
-        "input_name": DEFAULT_AUDIO_DESKTOP_INPUT_NAME,
-        "input_kind": "wasapi_output_capture",
-        "default_volume_db": DEFAULT_AUDIO_DESKTOP_VOLUME_DB,
-        "default_mute": DEFAULT_AUDIO_DESKTOP_MUTE,
-    },
     "mic": {
         "label": "マイク入力",
         "input_name": DEFAULT_AUDIO_MIC_INPUT_NAME,
@@ -289,6 +279,9 @@ def _safe_bool(value: Any, default: bool) -> tuple[bool, bool]:
 
 def _ensure_audio_config_defaults(result: ConfigNormalizationResult, *, auto_fix: bool) -> None:
     audio_cfg = _ensure_section(result, "audio")
+    if "desktop" in audio_cfg:
+        audio_cfg.pop("desktop")
+        result.changed = True
 
     for key, spec in MANAGED_AUDIO_INPUTS.items():
         slot = audio_cfg.get(key)

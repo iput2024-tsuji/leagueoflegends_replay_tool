@@ -796,7 +796,7 @@ class SettingsPage(QWidget):
         root_layout.setContentsMargins(12, 12, 12, 12)
         root_layout.setSpacing(10)
         self.fields = {}
-        self.audio_device_cache = {"desktop": [], "mic": []}
+        self.audio_device_cache = {"mic": []}
         self._audio_ui_loading = False
         self._audio_refresh_in_progress = False
         self._audio_auto_refreshed_once = False
@@ -906,24 +906,19 @@ class SettingsPage(QWidget):
         self.minimize_to_tray_check = QCheckBox("ウィンドウを閉じた時にタスクトレイに格納する")
         general_form.addRow("", self.minimize_to_tray_check)
 
-        self.audio_desktop_device = QComboBox()
-        self.audio_desktop_volume_row, self.audio_desktop_volume, self.audio_desktop_volume_label = (
-            self._create_db_slider()
-        )
-        self.audio_desktop_mute = QCheckBox("ミュート")
-
         self.audio_mic_device = QComboBox()
         self.audio_mic_volume_row, self.audio_mic_volume, self.audio_mic_volume_label = self._create_db_slider()
         self.audio_mic_mute = QCheckBox("ミュート")
 
-        audio_form.addRow(QLabel("OBSを開かずに、デスクトップ音声/マイクをこの画面で設定します。"))
+        audio_description = QLabel(
+            "LoLの音声はウィンドウキャプチャから取得します。ここではマイクのみ設定します。"
+        )
+        audio_description.setWordWrap(True)
+        audio_form.addRow(audio_description)
         self.audio_status_label = QLabel("音声デバイスは設定画面表示後にバックグラウンドで取得します。")
         self.audio_status_label.setWordWrap(True)
         self.audio_status_label.setStyleSheet("color: #a8a8a8;")
         audio_form.addRow(self.audio_status_label)
-        audio_form.addRow("デスクトップ音声デバイス", self.audio_desktop_device)
-        audio_form.addRow("デスクトップ音量 (dB)", self.audio_desktop_volume_row)
-        audio_form.addRow("", self.audio_desktop_mute)
         audio_form.addRow("マイク入力デバイス", self.audio_mic_device)
         audio_form.addRow("マイク音量 (dB)", self.audio_mic_volume_row)
         audio_form.addRow("", self.audio_mic_mute)
@@ -962,9 +957,6 @@ class SettingsPage(QWidget):
         buttons.rejected.connect(self.load_settings)
         root_layout.addWidget(buttons)
 
-        self.audio_desktop_device.currentIndexChanged.connect(self.queue_audio_auto_apply)
-        self.audio_desktop_volume.valueChanged.connect(self.queue_audio_auto_apply)
-        self.audio_desktop_mute.stateChanged.connect(self.queue_audio_auto_apply)
         self.audio_mic_device.currentIndexChanged.connect(self.queue_audio_auto_apply)
         self.audio_mic_volume.valueChanged.connect(self.queue_audio_auto_apply)
         self.audio_mic_mute.stateChanged.connect(self.queue_audio_auto_apply)
@@ -1058,7 +1050,6 @@ class SettingsPage(QWidget):
         polling = data.get("polling", {})
         audio = data.get("audio", {})
         app_cfg = data.get("app", {})
-        desktop_audio = audio.get("desktop", {})
         mic_audio = audio.get("mic", {})
 
         self._audio_ui_loading = True
@@ -1083,7 +1074,6 @@ class SettingsPage(QWidget):
         self.fields["polling.end_missing_grace_sec"].setText(str(polling.get("end_missing_grace_sec", "")))
         self.fields["polling.end_poll_sec"].setText(str(polling.get("end_poll_sec", "")))
         self.fields["polling.event_poll_sec"].setText(str(polling.get("event_poll_sec", "")))
-        self._set_audio_ui_from_config("desktop", desktop_audio)
         self._set_audio_ui_from_config("mic", mic_audio)
         self.minimize_to_tray_check.setChecked(bool(app_cfg.get("minimize_to_tray", True)))
         self.update_storage_progress(data)
@@ -1105,8 +1095,6 @@ class SettingsPage(QWidget):
         QMessageBox.information(self, "設定保存", "設定を保存しました。")
 
     def _get_audio_widgets(self, key: str) -> tuple[QComboBox, QSlider, QCheckBox]:
-        if key == "desktop":
-            return self.audio_desktop_device, self.audio_desktop_volume, self.audio_desktop_mute
         if key == "mic":
             return self.audio_mic_device, self.audio_mic_volume, self.audio_mic_mute
         raise KeyError(key)
@@ -1172,9 +1160,7 @@ class SettingsPage(QWidget):
         }
 
     def _write_audio_settings_to_config(self, data: dict[str, Any]) -> None:
-        audio = data.setdefault("audio", {})
-        audio["desktop"] = self._read_audio_slot_from_ui("desktop")
-        audio["mic"] = self._read_audio_slot_from_ui("mic")
+        data["audio"] = {"mic": self._read_audio_slot_from_ui("mic")}
 
     def _write_settings_ui_to_config(self, data: dict[str, Any]) -> None:
         data.setdefault("obs", {})
@@ -1245,9 +1231,6 @@ class SettingsPage(QWidget):
 
     def _set_audio_controls_enabled(self, enabled: bool) -> None:
         for widget in (
-            self.audio_desktop_device,
-            self.audio_desktop_volume,
-            self.audio_desktop_mute,
             self.audio_mic_device,
             self.audio_mic_volume,
             self.audio_mic_mute,
@@ -1283,10 +1266,8 @@ class SettingsPage(QWidget):
     def _on_audio_devices_loaded(self, result: dict[str, Any]) -> None:
         cfg = result["config"]
         catalog = result["catalog"]
-        for key in ("desktop", "mic"):
-            self.audio_device_cache[key] = list(catalog.get(key, []))
+        self.audio_device_cache["mic"] = list(catalog.get("mic", []))
         self._audio_ui_loading = True
-        self._set_audio_ui_from_config("desktop", cfg.get("audio", {}).get("desktop", {}))
         self._set_audio_ui_from_config("mic", cfg.get("audio", {}).get("mic", {}))
         self._audio_ui_loading = False
         save_config(cfg)

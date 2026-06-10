@@ -430,6 +430,52 @@ def test_obs_disconnect_clears_raw_client_even_when_socket_errors():
     assert client.raw_client is None
 
 
+def test_disable_obs_global_audio_devices_disables_profile_and_live_inputs():
+    class FakeObsRawClient:
+        def __init__(self):
+            self.requests = []
+            self.mute_calls = []
+            self.settings_calls = []
+
+        def send(self, request_type, payload, raw=True):
+            self.requests.append((request_type, dict(payload)))
+            if request_type == "GetSpecialInputs":
+                return {
+                    "desktop1": "Desktop Audio",
+                    "desktop2": None,
+                    "mic1": "Mic/Aux",
+                    "mic2": None,
+                }
+            return {}
+
+        def set_input_mute(self, input_name, muted):
+            self.mute_calls.append((input_name, muted))
+
+        def set_input_settings(self, input_name, settings, overlay=True):
+            self.settings_calls.append((input_name, dict(settings), overlay))
+
+    client = FakeObsRawClient()
+
+    recordtest.disable_obs_global_audio_devices(client)
+
+    profile_requests = [
+        payload for request_type, payload in client.requests if request_type == "SetProfileParameter"
+    ]
+    assert {payload["parameterName"] for payload in profile_requests} == set(
+        recordtest.OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS
+    )
+    assert all(payload["parameterCategory"] == "Audio" for payload in profile_requests)
+    assert all(payload["parameterValue"] == "disabled" for payload in profile_requests)
+    assert set(client.mute_calls) == {("Desktop Audio", True), ("Mic/Aux", True)}
+    assert {
+        (input_name, settings["device_id"], overlay)
+        for input_name, settings, overlay in client.settings_calls
+    } == {
+        ("Desktop Audio", "disabled", True),
+        ("Mic/Aux", "disabled", True),
+    }
+
+
 def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_removes_empty_initial_scene():
     class FakeObsRawClient:
         def __init__(self):
@@ -543,6 +589,7 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     assert window_capture["settings"]["method"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
     assert window_capture["settings"]["window"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
     assert window_capture["settings"]["client_area"] is True
+    assert window_capture["settings"]["capture_audio"] is True
     assert sync_marker["name"] == recordtest.DEFAULT_OBS_SOURCE_NAME
 
     scene_items = raw_client.scene_items_by_scene[recordtest.DEFAULT_OBS_SCENE_NAME]

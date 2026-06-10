@@ -58,3 +58,20 @@ def test_normalize_config_repairs_invalid_video_quality_settings():
     assert obs["output_height"] == config_schema.DEFAULT_OBS_OUTPUT_HEIGHT
     assert obs["scale_type"] == config_schema.DEFAULT_OBS_SCALE_TYPE
     assert obs["recording_quality"] == config_schema.DEFAULT_OBS_RECORDING_QUALITY
+
+
+def test_normalize_config_keeps_only_managed_microphone_audio():
+    cfg = {
+        "obs": {"password": "secret"},
+        "audio": {
+            "desktop": {
+                "input_name": "lol_desktop_audio",
+                "device_id": "default",
+            }
+        },
+    }
+
+    result = config_schema.normalize_config(cfg)
+
+    assert set(result.config["audio"]) == {"mic"}
+    assert result.config["audio"]["mic"]["input_name"] == config_schema.DEFAULT_AUDIO_MIC_INPUT_NAME

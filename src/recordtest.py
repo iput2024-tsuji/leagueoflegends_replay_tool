@@ -108,7 +108,7 @@ DEFAULT_OBS_OUTPUT_WIDTH = 1920
 DEFAULT_OBS_OUTPUT_HEIGHT = 1080
 DEFAULT_OBS_SCALE_TYPE = "lanczos"
 DEFAULT_OBS_RECORDING_QUALITY = "Small"
-DEFAULT_OBS_RECORDING_ENCODER = "x264"
+DEFAULT_OBS_RECORDING_ENCODER = "auto"
 VALID_OBS_SCALE_TYPES = frozenset({"bilinear", "bicubic", "lanczos", "area"})
 VALID_OBS_RECORDING_QUALITIES = frozenset({"Stream", "Small", "HQ", "Lossless"})
 DEFAULT_END_ERROR_LIMIT = 3
@@ -323,6 +323,14 @@ class AudioSlotSettings:
             "volume_db": self.volume_db,
             "mute": self.mute,
         }
+
+
+@dataclass(frozen=True)
+class OBSRecordingEncoderSelection:
+    profile_value: str
+    encoder_kind: str
+    display_name: str
+    hardware: bool
 
 
 @dataclass(frozen=True)
@@ -1520,13 +1528,42 @@ def apply_obs_video_settings(
     )
 
 
+def _is_h264_encoder_kind(kind: str) -> bool:
+    normalized = str(kind).strip().lower()
+    return not any(codec in normalized for codec in ("hevc", "av1", "h265"))
+
+
+def select_obs_recording_encoder(encoder_kinds: list[str] | tuple[str, ...]) -> OBSRecordingEncoderSelection:
+    normalized = [(str(kind).strip(), str(kind).strip().lower()) for kind in encoder_kinds if str(kind).strip()]
+    candidates = (
+        ("nvenc", "NVIDIA NVENC H.264", True, lambda value: "nvenc" in value),
+        ("qsv", "Intel Quick Sync H.264", True, lambda value: "qsv" in value or "quicksync" in value),
+        ("amd", "AMD AMF H.264", True, lambda value: "amf" in value or "amd" in value),
+        ("x264", "x264", False, lambda value: "x264" in value),
+    )
+    for profile_value, display_name, hardware, matches in candidates:
+        for original, value in normalized:
+            if _is_h264_encoder_kind(value) and matches(value):
+                return OBSRecordingEncoderSelection(profile_value, original, display_name, hardware)
+    return OBSRecordingEncoderSelection("x264", "obs_x264", "x264 (fallback)", False)
+
+
+def detect_obs_recording_encoder(obs_dir: str | Path | None) -> OBSRecordingEncoderSelection:
+    if obs_dir:
+        encoder_kinds = OBSProcessManager(obs_dir, logger=LOGGER).latest_log_encoder_kinds()
+        if encoder_kinds:
+            return select_obs_recording_encoder(encoder_kinds)
+    return OBSRecordingEncoderSelection("x264", "obs_x264", "x264 (fallback)", False)
+
+
 def apply_obs_recording_quality_settings(
     client: Any,
     *,
     scale_type: str = DEFAULT_OBS_SCALE_TYPE,
     recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
     recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
-) -> None:
+    obs_dir: str | Path | None = None,
+) -> OBSRecordingEncoderSelection:
     scale_value = str(scale_type or DEFAULT_OBS_SCALE_TYPE).strip().lower()
     if scale_value not in VALID_OBS_SCALE_TYPES:
         scale_value = DEFAULT_OBS_SCALE_TYPE
@@ -1536,11 +1573,21 @@ def apply_obs_recording_quality_settings(
         str(recording_quality or DEFAULT_OBS_RECORDING_QUALITY).strip().lower(),
         DEFAULT_OBS_RECORDING_QUALITY,
     )
+    requested_encoder = str(recording_encoder or DEFAULT_OBS_RECORDING_ENCODER).strip().lower()
+    if requested_encoder == "auto":
+        selected_encoder = detect_obs_recording_encoder(obs_dir)
+    else:
+        selected_encoder = OBSRecordingEncoderSelection(
+            requested_encoder,
+            requested_encoder,
+            requested_encoder,
+            requested_encoder != "x264",
+        )
 
     for category, name, value in (
         ("Video", "ScaleType", scale_value),
         ("SimpleOutput", "RecQuality", quality_value),
-        ("SimpleOutput", "RecEncoder", str(recording_encoder or DEFAULT_OBS_RECORDING_ENCODER)),
+        ("SimpleOutput", "RecEncoder", selected_encoder.profile_value),
     ):
         _obs_raw(
             client,
@@ -1551,6 +1598,7 @@ def apply_obs_recording_quality_settings(
                 "parameterValue": value,
             },
         )
+    return selected_encoder
 
 
 def apply_record_directory_to_obs(client: Any, record_dir: str | Path) -> bool:
@@ -2583,15 +2631,16 @@ class ObsWebSocketClient(OBSClient):
             self.log(f"⚠️ OBS映像設定の適用に失敗: {e}")
 
         try:
-            apply_obs_recording_quality_settings(
+            selected_encoder = apply_obs_recording_quality_settings(
                 self.client,
                 scale_type=self.config.obs.scale_type,
                 recording_quality=self.config.obs.recording_quality,
+                obs_dir=self.config.obs.obs_dir,
             )
             self.log(
                 "🎞️ OBS録画品質を適用しました: "
                 f"quality={self.config.obs.recording_quality}, scale={self.config.obs.scale_type}, "
-                f"encoder={DEFAULT_OBS_RECORDING_ENCODER}"
+                f"encoder={selected_encoder.display_name} ({selected_encoder.encoder_kind})"
             )
         except Exception as e:
             self.log(f"⚠️ OBS録画品質設定の適用に失敗: {e}")

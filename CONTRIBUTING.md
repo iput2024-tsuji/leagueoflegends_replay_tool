@@ -25,11 +25,25 @@ git switch -c fix/game-start-detection
 
 - 1つのブランチでは、1つの目的に必要な変更だけを扱います。
 - 挙動を変更した場合は、対応するテストを追加または更新します。
-- コミットメッセージは、変更した内容を命令形の短い英文で記述します。
+- コミットメッセージは、変更した内容が分かる簡潔な日本語で記述します。
 - コミットメッセージに `Codex`、`OpenAI`、`AI generated` などの
   ツール名・生成元表記を付けません。
 - ユーザーに影響する変更は、Release時に `CHANGELOG.md` へ記載します。
 - ビルド成果物、仮想環境、一時ファイルはコミットしません。
+
+## 記述言語
+
+日常の開発管理は日本語、利用者向けの公開文書は日本語と英語で運用します。
+
+- コミットメッセージ、Issue、Pull Requestのタイトルと本文は原則として日本語で記述します。
+- ブランチ名、コード、識別子、コマンド、ファイル名、API名は英語を使用します。
+- `fix:` や `docs:` などの種別を付ける場合、その後の説明は日本語にします。
+- `README.md` を日本語版、`README.en.md` を英語版として同じ変更で更新します。
+- `CHANGELOG.md` を日本語版、`CHANGELOG.en.md` を英語版として同じバージョンを記載します。
+- GitHub Releaseの本文は、日本語を先、英語を後にして両方を掲載します。
+- 外部コントリビューターによる英語のIssueやPull Requestは受け付けます。
+- GitHubや依存関係更新ツールが自動生成する定型文は対象外です。
+- 過去のコミット、Pull Request、Releaseを日本語化するための履歴書き換えは行いません。
 
 ## ローカル検証
 
@@ -65,20 +79,22 @@ PRタイトルは、変更種別と内容が判別できる形式を推奨しま
 作成者と変更履歴はGitHubのメタデータで確認し、PRには変更内容だけを記載します。
 
 ```text
-fix: improve game start detection
-feature: add recording deletion
-docs: document release workflow
+fix: 試合開始検知を改善
+feature: 録画削除機能を追加
+docs: リリース手順を文書化
 ```
 
 ## Release
 
 Releaseは `main` からのみ作成します。作業ブランチへReleaseタグを付けてはいけません。
+Release本文は日本語と英語を併記します。タイトルは製品名とバージョンのみとし、
+どちらの言語でも理解できる形式にします。
 
 1. `VERSION` を公開するバージョンへ更新します。
-2. `CHANGELOG.md` に同じバージョンの変更内容を追加します。
+2. `CHANGELOG.md` と `CHANGELOG.en.md` に同じバージョンの変更内容を追加します。
 3. 通常のPRとしてレビューとCIを通し、`main` へマージします。
 4. `main` の対象コミットに `vX.Y.Z` 形式のタグを作成してpushします。
-5. Release workflowの成功と公開された成果物を確認します。
+5. Release workflowの成功、日英両方のRelease本文、公開された成果物を確認します。
 
 ```powershell
 git switch main

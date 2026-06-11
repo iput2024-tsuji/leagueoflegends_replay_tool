@@ -1,5 +1,7 @@
 # LoL Replay Tool
 
+[日本語](README.md) | [English](README.en.md)
+
 LoL Replay Tool は、League of Legends の試合を自動録画し、試合イベントを JSON として蓄積し、そのデータから戦術インサイトを抽出する Windows 向けの意思決定支援ツールです。
 
 単なる「LoL の自動録画ソフト」ではなく、録画・イベント同期・リプレイ閲覧・データ分析を一体化し、蓄積されたプレイデータから scikit-learn の決定木モデルを使って「勝利の方程式」や「敗北しやすいパターン」を自動抽出することを目指しています。
@@ -301,7 +303,7 @@ dist\installer\LoLReplayTool-Setup-0.1.2.exe
 ### GitHub Releaseの公開
 
 `VERSION`を更新してコミットした後、同じバージョンの`v`付きタグをプッシュすると、GitHub ActionsがインストーラーをビルドしてReleaseへ自動公開します。
-公開するバージョンの更新内容は`CHANGELOG.md`へ記載してください。該当バージョンの節がない場合、Releaseワークフローは公開を中止します。
+公開するバージョンの更新内容は日本語版の`CHANGELOG.md`と英語版の`CHANGELOG.en.md`へ記載してください。どちらかに該当バージョンの節がない場合、Releaseワークフローは公開を中止します。
 
 ```powershell
 git tag v0.1.2

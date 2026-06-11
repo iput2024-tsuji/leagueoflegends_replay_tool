@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0] - 2026-06-11
+
+### Added
+
+- Added configurable Windows notifications for recording start, recording completion, recording failure, and minimizing to the system tray.
+- Added a master notification switch and independent switches for each notification event.
+- Added recording-start notifications only after OBS confirms that recording is active.
+
+### Changed
+
+- Added repository rules that keep branch names, commit messages, and Pull Request titles focused on the change instead of the tool used to create it.
+
 ## [0.1.4] - 2026-06-11
 
 ### Fixed

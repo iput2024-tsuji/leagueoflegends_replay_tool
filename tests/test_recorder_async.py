@@ -87,6 +87,69 @@ def test_wait_for_game_start_retries_after_timeout_without_real_sleep():
     recorder.wait_with_stop_async.assert_awaited_once()
 
 
+def test_wait_for_game_start_accepts_zero_live_client_game_time():
+    tmp_path = runtime_dir("zero_game_time")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_all_game_data_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME,
+            payload={"gameData": {"gameTime": 0.0}, "allPlayers": []},
+        )
+    )
+    riot_client.get_active_player_name = AsyncMock(return_value="Tester#JP1")
+    riot_client.get_champ_select_session_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.NOT_IN_GAME)
+    )
+    riot_client.get_match_metadata = AsyncMock(return_value={})
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+
+    assert run(recorder.wait_for_game_start_async()) is True
+    assert recorder.game_start_detection_source == "live_client"
+    assert recorder.session_started is True
+
+
+def test_wait_for_game_start_falls_back_to_lcu_in_progress_phase():
+    tmp_path = runtime_dir("lcu_gameflow_fallback")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_all_game_data_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.TEMPORARY_FAILURE,
+            error="Live Client API unavailable",
+        )
+    )
+    riot_client.get_active_player_name = AsyncMock(return_value=None)
+    riot_client.get_champ_select_session_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.NOT_IN_GAME)
+    )
+    riot_client.get_match_metadata = AsyncMock(
+        return_value={
+            "gameflow_phase": "InProgress",
+            "queue_id": 420,
+            "display_name": "ランク ソロ/デュオ",
+        }
+    )
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+
+    assert run(recorder.wait_for_game_start_async()) is True
+    assert recorder.game_start_detection_source == "lcu"
+    assert recorder.match_metadata["gameflow_phase"] == "InProgress"
+    assert recorder.session_started is True
+
+
 def test_wait_for_game_start_captures_ban_pick_order_and_champions():
     tmp_path = runtime_dir("ban_pick")
     config = config_for(tmp_path)

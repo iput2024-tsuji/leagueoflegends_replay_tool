@@ -342,6 +342,7 @@ def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
             {"id": 266, "name": "Aatrox"},
         ],
         gameflow_url: {
+            "phase": "InProgress",
             "gameData": {
                 "gameId": 456,
                 "gameMode": "CLASSIC",
@@ -367,6 +368,7 @@ def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
     assert catalog == {103: "Ahri", 266: "Aatrox"}
     assert match["queue_id"] == 420
     assert match["display_name"] == "ランク ソロ/デュオ"
+    assert match["gameflow_phase"] == "InProgress"
     assert match["game_id"] == "456"
 
 

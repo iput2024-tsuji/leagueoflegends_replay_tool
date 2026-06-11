@@ -123,7 +123,9 @@ DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
 DEFAULT_AUDIO_MIC_MUTE = False
 DEFAULT_RECORDING_START_TIMEOUT_SEC = 8.0
 DEFAULT_RECORDING_START_POLL_SEC = 0.25
+DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC = 30.0
 MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
+LCU_GAMEFLOW_START_PHASES = frozenset({"InProgress", "Reconnect"})
 OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS = (
     "DesktopDevice1",
     "DesktopDevice2",
@@ -2288,6 +2290,7 @@ def build_match_metadata(
     game_id = _first_mapping_value(game_data, "gameId", "game_id") or _first_mapping_value(
         payload, "gameId", "game_id"
     )
+    gameflow_phase = _first_mapping_value(payload, "phase", "gameflowPhase", "gameflow_phase")
 
     metadata = {
         "queue_id": queue_id,
@@ -2298,6 +2301,7 @@ def build_match_metadata(
         "map_id": map_id,
         "map_name": str(map_name) if map_name not in (None, "") else None,
         "game_id": str(game_id) if game_id not in (None, "") else None,
+        "gameflow_phase": str(gameflow_phase) if gameflow_phase not in (None, "") else None,
         "source": "lcu",
     }
     return {key: value for key, value in metadata.items() if value is not None}
@@ -3020,6 +3024,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.player_team = None
         self.enemy_champions = []
         self.match_metadata: dict[str, Any] = {}
+        self.game_start_detection_source: str | None = None
         self.champ_select_tracker = ChampSelectTracker()
         self.game_result = None
         self.winning_team = None
@@ -3278,6 +3283,54 @@ class LoLAutoRecorder(RecordingSessionManager):
     def is_game_end_event(event: dict[str, Any] | None) -> bool:
         return bool(event and event.get("EventName") in {"GameEnd", "EndGame", "GameEnded", "GameComplete"})
 
+    @staticmethod
+    def _live_game_time(payload: dict[str, Any] | None) -> float | None:
+        if not isinstance(payload, dict):
+            return None
+        game_data = payload.get("gameData")
+        if not isinstance(game_data, dict):
+            return None
+        raw_value = _first_mapping_value(game_data, "gameTime", "game_time")
+        try:
+            game_time = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+        return game_time if game_time >= 0 else None
+
+    async def _mark_game_started(
+        self,
+        *,
+        source: str,
+        live_data: dict[str, Any] | None = None,
+        game_time: float | None = None,
+    ) -> bool:
+        self.game_start_detection_source = source
+        if source == "live_client":
+            self.log(f"🔥 試合開始検知！ Live Client GameTime: {float(game_time or 0.0):.2f}s")
+        else:
+            phase = self.match_metadata.get("gameflow_phase") or "unknown"
+            self.log(f"🔥 試合開始検知！ LCU Gameflow Phase: {phase}")
+        self.output_file = build_output_path(self.config)
+        await self.try_update_player_name_async()
+        if live_data:
+            self.match_metadata = merge_live_game_metadata(self.match_metadata, live_data)
+        self.session_started = True
+        self.session_phase = RecordingPhase.STARTING
+        return True
+
+    @staticmethod
+    def _game_start_poll_summary(
+        live_result: RiotPollResult,
+        gameflow_phase: str | None,
+    ) -> str:
+        live_status = live_result.status.value
+        if live_result.error:
+            error_text = " ".join(str(live_result.error).split())
+            if len(error_text) > 120:
+                error_text = f"{error_text[:117]}..."
+            live_status = f"{live_status} ({error_text})"
+        return f"Live Client={live_status}, LCU phase={gameflow_phase or 'unknown'}"
+
     async def wait_for_game_start_async(self) -> bool:
         """LoLの試合開始を監視"""
         self.session_phase = RecordingPhase.WAITING_FOR_GAME
@@ -3285,6 +3338,8 @@ class LoLAutoRecorder(RecordingSessionManager):
             self.session_phase = RecordingPhase.CANCELLED
             return False
         self.log("⚔️  LoLの試合開始を待機中 (API監視)...")
+        loop = asyncio.get_running_loop()
+        next_diagnostic_at = loop.time() + DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC
         while True:
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
@@ -3293,16 +3348,21 @@ class LoLAutoRecorder(RecordingSessionManager):
             await self.capture_match_metadata_async()
             result = await self.poll_all_game_data()
             data = result.payload
-            if data:
-                game_time = data.get("gameData", {}).get("gameTime", 0)
-                if game_time > 0:
-                    self.log(f"🔥 試合開始検知！ GameTime: {game_time:.2f}s")
-                    self.output_file = build_output_path(self.config)
-                    await self.try_update_player_name_async()
-                    self.match_metadata = merge_live_game_metadata(self.match_metadata, data)
-                    self.session_started = True
-                    self.session_phase = RecordingPhase.STARTING
-                    return True
+            game_time = self._live_game_time(data)
+            if result.status == RiotPollStatus.IN_GAME and game_time is not None:
+                return await self._mark_game_started(
+                    source="live_client",
+                    live_data=data,
+                    game_time=game_time,
+                )
+
+            gameflow_phase = self.match_metadata.get("gameflow_phase")
+            if gameflow_phase in LCU_GAMEFLOW_START_PHASES:
+                return await self._mark_game_started(source="lcu")
+
+            if loop.time() >= next_diagnostic_at:
+                self.log(f"🔎 試合開始監視中: {self._game_start_poll_summary(result, gameflow_phase)}")
+                next_diagnostic_at = loop.time() + DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC
             if not await self.wait_with_stop_async(1.0):
                 self.session_phase = RecordingPhase.CANCELLED
                 return False

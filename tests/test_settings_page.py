@@ -56,6 +56,13 @@ def test_settings_page_supports_fractional_high_fps(qtbot, monkeypatch):
         "polling": {},
         "audio": {},
         "app": {},
+        "notifications": {
+            "enabled": True,
+            "recording_started": True,
+            "recording_completed": False,
+            "recording_failed": True,
+            "minimized_to_tray": False,
+        },
     }
     monkeypatch.setattr(app, "load_config", lambda: config)
 
@@ -72,3 +79,38 @@ def test_settings_page_supports_fractional_high_fps(qtbot, monkeypatch):
 
     assert config["obs"]["fps_numerator"] == 300000
     assert config["obs"]["fps_denominator"] == 1001
+
+
+def test_settings_page_saves_independent_notification_preferences(qtbot, monkeypatch):
+    config = {
+        "obs": {"password": "secret"},
+        "paths": {},
+        "storage": {},
+        "polling": {},
+        "audio": {},
+        "app": {},
+        "notifications": {},
+    }
+    monkeypatch.setattr(app, "load_config", lambda: config)
+
+    page = SettingsPage(lambda: None)
+    qtbot.addWidget(page)
+
+    page.notifications_enabled_check.setChecked(True)
+    page.notification_recording_started_check.setChecked(False)
+    page.notification_recording_completed_check.setChecked(True)
+    page.notification_recording_failed_check.setChecked(False)
+    page.notification_minimized_to_tray_check.setChecked(True)
+    page._write_settings_ui_to_config(config)
+
+    assert config["notifications"] == {
+        "enabled": True,
+        "recording_started": False,
+        "recording_completed": True,
+        "recording_failed": False,
+        "minimized_to_tray": True,
+    }
+
+    page.notifications_enabled_check.setChecked(False)
+    assert page.notification_recording_started_check.isEnabled() is False
+    assert page.notification_recording_completed_check.isEnabled() is False

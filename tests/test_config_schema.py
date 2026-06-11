@@ -107,3 +107,15 @@ def test_normalize_config_accepts_high_fractional_fps():
 
     assert result.config["obs"]["fps_numerator"] == 240000
     assert result.config["obs"]["fps_denominator"] == 1001
+
+
+def test_normalize_config_adds_independent_notification_defaults():
+    result = config_schema.normalize_config({"obs": {"password": "secret"}})
+
+    assert result.config["notifications"] == {
+        "enabled": True,
+        "recording_started": True,
+        "recording_completed": False,
+        "recording_failed": True,
+        "minimized_to_tray": True,
+    }

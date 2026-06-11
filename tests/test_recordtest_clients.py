@@ -150,6 +150,7 @@ def test_obs_video_and_quality_settings_are_sent_to_websocket():
         client,
         scale_type="lanczos",
         recording_quality="Small",
+        recording_encoder="x264",
     )
 
     assert client.calls == [
@@ -193,6 +194,75 @@ def test_obs_video_and_quality_settings_are_sent_to_websocket():
             True,
         ),
     ]
+
+
+def test_recording_encoder_auto_selection_prefers_h264_hardware_encoders():
+    kinds = [
+        "obs_nvenc_hevc_tex",
+        "ffmpeg_aom_av1",
+        "obs_x264",
+        "obs_nvenc_h264_tex",
+    ]
+
+    selected = recordtest.select_obs_recording_encoder(kinds)
+
+    assert selected.profile_value == "nvenc"
+    assert selected.encoder_kind == "obs_nvenc_h264_tex"
+    assert selected.hardware is True
+
+
+@pytest.mark.parametrize(
+    ("kinds", "expected"),
+    [
+        (["obs_qsv11_v2", "obs_x264"], "qsv"),
+        (["h264_texture_amf", "obs_x264"], "amd"),
+        (["obs_x264"], "x264"),
+        (["obs_nvenc_hevc_tex", "ffmpeg_aom_av1"], "x264"),
+    ],
+)
+def test_recording_encoder_auto_selection_uses_safe_fallback_order(kinds, expected):
+    assert recordtest.select_obs_recording_encoder(kinds).profile_value == expected
+
+
+def test_recording_quality_auto_detects_encoder_from_obs_log(tmp_path):
+    class RawClient:
+        def __init__(self):
+            self.calls = []
+
+        def send(self, request_type, payload, raw=True):
+            self.calls.append((request_type, payload, raw))
+            return {}
+
+    logs_dir = tmp_path / "config" / "obs-studio" / "logs"
+    logs_dir.mkdir(parents=True)
+    (logs_dir / "latest.txt").write_text(
+        "Available Encoders:\n"
+        "  - obs_x264 (x264)\n"
+        "  - obs_nvenc_hevc_tex (NVIDIA NVENC HEVC)\n"
+        "  - obs_nvenc_h264_tex (NVIDIA NVENC H.264)\n",
+        encoding="utf-8",
+    )
+    client = RawClient()
+
+    selected = recordtest.apply_obs_recording_quality_settings(client, obs_dir=tmp_path)
+
+    assert selected.profile_value == "nvenc"
+    assert client.calls[-1][1] == {
+        "parameterCategory": "SimpleOutput",
+        "parameterName": "RecEncoder",
+        "parameterValue": "nvenc",
+    }
+
+
+def test_recording_quality_falls_back_to_x264_without_obs_log(tmp_path):
+    class RawClient:
+        def send(self, request_type, payload, raw=True):
+            return {}
+
+    selected = recordtest.apply_obs_recording_quality_settings(RawClient(), obs_dir=tmp_path)
+
+    assert selected.profile_value == "x264"
+    assert selected.hardware is False
 
 
 def test_app_config_preserves_fractional_high_fps():

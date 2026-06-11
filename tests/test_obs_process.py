@@ -132,6 +132,29 @@ def test_process_manager_reads_latest_portable_mode_log(tmp_path):
     assert manager.latest_log_portable_mode() is True
 
 
+def test_process_manager_reads_available_encoder_kinds_from_latest_log(tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    logs_dir = manager.obs_dir / "config" / "obs-studio" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (logs_dir / "latest.txt").write_text(
+        "12:00:00.001: Available Encoders:\n"
+        "12:00:00.001:   Video Encoders:\n"
+        "12:00:00.001: \t- obs_nvenc_hevc_tex (NVIDIA NVENC HEVC)\n"
+        "12:00:00.001: \t- obs_nvenc_h264_tex (NVIDIA NVENC H.264)\n"
+        "12:00:00.001: \t- obs_x264 (x264)\n"
+        "12:00:00.001:   Audio Encoders:\n"
+        "12:00:00.001: \t- ffmpeg_aac (FFmpeg AAC)\n"
+        "12:00:00.001: Selected encoder: obs_nvenc_h264_tex\n",
+        encoding="utf-8",
+    )
+
+    assert manager.latest_log_encoder_kinds() == [
+        "obs_nvenc_hevc_tex",
+        "obs_nvenc_h264_tex",
+        "obs_x264",
+    ]
+
+
 def test_process_manager_reports_unmanaged_obs_process(monkeypatch):
     manager = OBSProcessManager(Path("tests/_tmp/unmanaged_obs_detect").resolve())
     other_exe = Path("C:/Program Files/obs-studio/bin/64bit/obs64.exe")

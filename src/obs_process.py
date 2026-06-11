@@ -4,6 +4,7 @@ import csv
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -195,6 +196,37 @@ class OBSProcessManager:
         if "Portable mode: false" in text:
             return False
         return None
+
+    def latest_log_encoder_kinds(self, since: float | None = None) -> list[str]:
+        log_path = self.latest_log_path(since=since)
+        if log_path is None:
+            return []
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            self.logger.debug("Failed to read OBS log for encoder detection: %s", e)
+            return []
+
+        _prefix, separator, encoder_section = text.partition("Available Encoders:")
+        if not separator:
+            return []
+        encoder_section = encoder_section.partition("Audio Encoders:")[0]
+        encoder_pattern = re.compile(
+            r"^(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?:\s*)?\s*-\s+([A-Za-z0-9_]+)\b",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        result = []
+        seen = set()
+        for match in encoder_pattern.finditer(encoder_section):
+            encoder_kind = match.group(1)
+            normalized = encoder_kind.casefold()
+            if not any(name in normalized for name in ("nvenc", "qsv", "quicksync", "amf", "x264")):
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(encoder_kind)
+        return result
 
     def hide_main_windows(
         self,

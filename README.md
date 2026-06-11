@@ -42,7 +42,7 @@ LoL の振り返りは、動画を見返すだけでは「何が勝敗に効い�
 - 同期補正 UI
 - リプレイ一覧画面でのチャンピオン・勝敗・マッチ種類表示、絞り込み、録画削除
 - データ分析画面での勝率サマリーと戦術インサイト表示
-- 設定画面からの保存先、FPS、音声デバイス、容量制限の管理
+- 設定画面からの保存先、FPS、音声デバイス、容量制限、Windows通知の管理
 - pytest による非同期処理・外部接続層の単体テスト
 
 ## Tech Stack
@@ -209,7 +209,7 @@ python main.py
 - 起動時に `obs-portable/obs_portable_mode.txt` と OBS の `global.ini` を自動生成・補正します
 - OBS WebSocket は初回設定時にローカル用パスワードを自動生成し、認証必須で構成します
 - 初回セットアップで「環境を自動修復」を実行すると、WebSocket、シーン、同期用色ソースを自動構成します
-- 音声デバイス、録画保存先、FPS、容量制限はアプリの設定画面から変更できます
+- 音声デバイス、録画保存先、FPS、容量制限、Windows通知はアプリの設定画面から変更できます
 
 `config/setting.json` は `.gitignore` 済みです。配布版では設定、録画、ログ、OBS/FFmpeg などの可変データを `%LOCALAPPDATA%\LoLReplayTool` に保存します。旧配布フォルダ内の `config/setting.json`、`obs-portable`、`bin/OBS-Studio` は初回起動時に新しい保存先へコピー移行されます。
 

@@ -43,6 +43,11 @@ try:
     from . import recordtest
     from .app_paths import get_app_root, get_resource_root, get_user_data_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController
+    from .notifications import (
+        DEFAULT_NOTIFICATION_SETTINGS,
+        NotificationEvent,
+        NotificationService,
+    )
     from .player import PlayerWidget
     from .qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
     from .recording_supervisor import RecordingSupervisor
@@ -54,6 +59,7 @@ except ImportError:
     import recordtest
     from app_paths import get_app_root, get_resource_root, get_user_data_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController
+    from notifications import DEFAULT_NOTIFICATION_SETTINGS, NotificationEvent, NotificationService
     from player import PlayerWidget
     from qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
     from recording_supervisor import RecordingSupervisor
@@ -127,6 +133,7 @@ def save_config(data: dict[str, Any]) -> None:
 class RecorderWorker(QThread):
     status = pyqtSignal(str)
     error = pyqtSignal(str)
+    notification = pyqtSignal(str, str, str)
     finished = pyqtSignal()
 
     def __init__(self) -> None:
@@ -165,7 +172,10 @@ class RecorderWorker(QThread):
             self.finished.emit()
 
     async def run_async(self) -> None:
-        self.supervisor = RecordingSupervisor(status_cb=self.status.emit)
+        self.supervisor = RecordingSupervisor(
+            status_cb=self.status.emit,
+            notification_cb=self.notification.emit,
+        )
         await self.supervisor.run(self.stop_event)
 
     def stop(self) -> None:
@@ -835,6 +845,12 @@ class SettingsPage(QWidget):
         audio_form.setSpacing(10)
         self.tabs.addTab(audio_tab, "オーディオ")
 
+        notifications_tab = QWidget()
+        notifications_form = QFormLayout(notifications_tab)
+        notifications_form.setContentsMargins(8, 8, 8, 8)
+        notifications_form.setSpacing(10)
+        self.tabs.addTab(notifications_tab, "通知")
+
         advanced_tab = QWidget()
         advanced_form = QFormLayout(advanced_tab)
         advanced_form.setContentsMargins(8, 8, 8, 8)
@@ -916,6 +932,17 @@ class SettingsPage(QWidget):
         self.minimize_to_tray_check = QCheckBox("ウィンドウを閉じた時にタスクトレイに格納する")
         general_form.addRow("", self.minimize_to_tray_check)
 
+        self.notifications_enabled_check = QCheckBox("Windows通知を有効にする")
+        self.notification_recording_started_check = QCheckBox("録画開始")
+        self.notification_recording_completed_check = QCheckBox("録画完了")
+        self.notification_recording_failed_check = QCheckBox("録画失敗")
+        self.notification_minimized_to_tray_check = QCheckBox("タスクトレイへの格納")
+        notifications_form.addRow("", self.notifications_enabled_check)
+        notifications_form.addRow("通知するイベント", self.notification_recording_started_check)
+        notifications_form.addRow("", self.notification_recording_completed_check)
+        notifications_form.addRow("", self.notification_recording_failed_check)
+        notifications_form.addRow("", self.notification_minimized_to_tray_check)
+
         self.audio_mic_device = QComboBox()
         self.audio_mic_volume_row, self.audio_mic_volume, self.audio_mic_volume_label = self._create_db_slider()
         self.audio_mic_mute = QCheckBox("ミュート")
@@ -970,6 +997,7 @@ class SettingsPage(QWidget):
         self.audio_mic_device.currentIndexChanged.connect(self.queue_audio_auto_apply)
         self.audio_mic_volume.valueChanged.connect(self.queue_audio_auto_apply)
         self.audio_mic_mute.stateChanged.connect(self.queue_audio_auto_apply)
+        self.notifications_enabled_check.toggled.connect(self._update_notification_controls)
 
         self.load_settings()
 
@@ -1060,6 +1088,7 @@ class SettingsPage(QWidget):
         polling = data.get("polling", {})
         audio = data.get("audio", {})
         app_cfg = data.get("app", {})
+        notifications = data.get("notifications", {})
         mic_audio = audio.get("mic", {})
 
         self._audio_ui_loading = True
@@ -1089,6 +1118,42 @@ class SettingsPage(QWidget):
         self.fields["polling.event_poll_sec"].setText(str(polling.get("event_poll_sec", "")))
         self._set_audio_ui_from_config("mic", mic_audio)
         self.minimize_to_tray_check.setChecked(bool(app_cfg.get("minimize_to_tray", True)))
+        self.notifications_enabled_check.setChecked(
+            bool(notifications.get("enabled", DEFAULT_NOTIFICATION_SETTINGS["enabled"]))
+        )
+        self.notification_recording_started_check.setChecked(
+            bool(
+                notifications.get(
+                    NotificationEvent.RECORDING_STARTED.value,
+                    DEFAULT_NOTIFICATION_SETTINGS[NotificationEvent.RECORDING_STARTED.value],
+                )
+            )
+        )
+        self.notification_recording_completed_check.setChecked(
+            bool(
+                notifications.get(
+                    NotificationEvent.RECORDING_COMPLETED.value,
+                    DEFAULT_NOTIFICATION_SETTINGS[NotificationEvent.RECORDING_COMPLETED.value],
+                )
+            )
+        )
+        self.notification_recording_failed_check.setChecked(
+            bool(
+                notifications.get(
+                    NotificationEvent.RECORDING_FAILED.value,
+                    DEFAULT_NOTIFICATION_SETTINGS[NotificationEvent.RECORDING_FAILED.value],
+                )
+            )
+        )
+        self.notification_minimized_to_tray_check.setChecked(
+            bool(
+                notifications.get(
+                    NotificationEvent.MINIMIZED_TO_TRAY.value,
+                    DEFAULT_NOTIFICATION_SETTINGS[NotificationEvent.MINIMIZED_TO_TRAY.value],
+                )
+            )
+        )
+        self._update_notification_controls()
         self.update_storage_progress(data)
         self._audio_ui_loading = False
 
@@ -1182,6 +1247,7 @@ class SettingsPage(QWidget):
         data.setdefault("polling", {})
         data.setdefault("app", {})
         data.setdefault("audio", {})
+        data.setdefault("notifications", {})
 
         data["obs"]["host"] = recordtest.DEFAULT_OBS_HOST
         data["obs"]["dir"] = recordtest.DEFAULT_OBS_DIR
@@ -1226,7 +1292,28 @@ class SettingsPage(QWidget):
         except ValueError:
             pass
         data["app"]["minimize_to_tray"] = bool(self.minimize_to_tray_check.isChecked())
+        data["notifications"] = {
+            "enabled": bool(self.notifications_enabled_check.isChecked()),
+            NotificationEvent.RECORDING_STARTED.value: bool(self.notification_recording_started_check.isChecked()),
+            NotificationEvent.RECORDING_COMPLETED.value: bool(
+                self.notification_recording_completed_check.isChecked()
+            ),
+            NotificationEvent.RECORDING_FAILED.value: bool(self.notification_recording_failed_check.isChecked()),
+            NotificationEvent.MINIMIZED_TO_TRAY.value: bool(
+                self.notification_minimized_to_tray_check.isChecked()
+            ),
+        }
         self._write_audio_settings_to_config(data)
+
+    def _update_notification_controls(self, *_args: Any) -> None:
+        enabled = self.notifications_enabled_check.isChecked()
+        for checkbox in (
+            self.notification_recording_started_check,
+            self.notification_recording_completed_check,
+            self.notification_recording_failed_check,
+            self.notification_minimized_to_tray_check,
+        ):
+            checkbox.setEnabled(enabled)
 
     def _collect_settings_data_from_ui(self) -> dict[str, Any]:
         data = load_config()
@@ -1502,6 +1589,7 @@ class MainWindow(QMainWindow):
         self._closing = False
         self._is_quitting = False
         self._tray_icon = None
+        self.notification_service = NotificationService(load_config, self._show_windows_notification)
         self._tray_notice_shown = False
         self._recorder_autostart_enabled = False
         self._shutdown_attempts = 0
@@ -1597,6 +1685,19 @@ class MainWindow(QMainWindow):
             return bool(data.get("app", {}).get("minimize_to_tray", True))
         except Exception:
             return True
+
+    def _show_windows_notification(self, event: NotificationEvent, title: str, message: str) -> None:
+        if not self._tray_icon or not self._tray_icon.isVisible():
+            return
+        icon = (
+            QSystemTrayIcon.MessageIcon.Warning
+            if event == NotificationEvent.RECORDING_FAILED
+            else QSystemTrayIcon.MessageIcon.Information
+        )
+        try:
+            self._tray_icon.showMessage(title, message, icon, 4000)
+        except Exception:
+            recordtest.LOGGER.warning("Windows notification failed: %s", event.value, exc_info=True)
 
     def _stop_player(self, timeout_ms: int = 3000) -> bool:
         try:
@@ -1697,6 +1798,7 @@ class MainWindow(QMainWindow):
         self.bg_recorder_worker = self.worker_registry.register(RecorderWorker(), cancel_method="stop")
         self.bg_recorder_worker.status.connect(self.on_bg_recorder_status)
         self.bg_recorder_worker.error.connect(self.on_bg_recorder_error)
+        self.bg_recorder_worker.notification.connect(self.on_bg_recorder_notification)
         self.bg_recorder_worker.finished.connect(self.on_bg_recorder_finished)
         self.home_page.set_recorder_status(
             "🟢 起動準備中...", color_hex="#7bd88f", detail_text="バックグラウンド録画監視を起動しています。"
@@ -1749,6 +1851,9 @@ class MainWindow(QMainWindow):
             detail_text=str(message),
         )
 
+    def on_bg_recorder_notification(self, event: str, title: str, message: str) -> None:
+        self.notification_service.notify(event, title, message)
+
     def on_bg_recorder_finished(self) -> None:
         if self._closing:
             self.home_page.set_recorder_status("⚪ 停止", color_hex="#cfcfcf", detail_text="アプリ終了中")
@@ -1771,15 +1876,11 @@ class MainWindow(QMainWindow):
             self.hide()
             if self._tray_icon and not self._tray_notice_shown:
                 self._tray_notice_shown = True
-                try:
-                    self._tray_icon.showMessage(
-                        "LoL Replay Tool",
-                        "バックグラウンドで録画監視を継続しています。",
-                        QSystemTrayIcon.MessageIcon.Information,
-                        3000,
-                    )
-                except Exception:
-                    pass
+                self.notification_service.notify(
+                    NotificationEvent.MINIMIZED_TO_TRAY,
+                    "LoL Replay Tool",
+                    "バックグラウンドで録画監視を継続しています。",
+                )
             return
 
         self._is_quitting = True

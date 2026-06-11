@@ -133,6 +133,7 @@ async def run_supervisor(supervisor):
 
 def test_recording_supervisor_runs_one_session_and_cleans_up():
     statuses = []
+    notifications = []
     recorder = FakeRecorder()
     config_controller = FakeConfigController()
     recording_controller = FakeRecordingController(recorder)
@@ -140,6 +141,7 @@ def test_recording_supervisor_runs_one_session_and_cleans_up():
         config_controller=config_controller,
         recording_controller=recording_controller,
         status_cb=statuses.append,
+        notification_cb=lambda *args: notifications.append(args),
     )
 
     run(run_supervisor(supervisor))
@@ -150,6 +152,7 @@ def test_recording_supervisor_runs_one_session_and_cleans_up():
     assert "⚠️ mpv missing" in statuses
     assert "🔊 音声設定をOBSへ適用しました。" in statuses
     assert "✅ 試合記録完了。次の試合を待機します。" in statuses
+    assert [item[0] for item in notifications] == ["recording_started", "recording_completed"]
     assert recorder.calls == [
         "set_stop_event",
         "apply_audio_profile",
@@ -217,12 +220,14 @@ def test_recording_supervisor_saves_partial_session_when_recording_fails():
             raise RuntimeError("sync marker failed")
 
     statuses = []
+    notifications = []
     recorder = FailingRecorder()
     recording_controller = FakeRecordingController(recorder)
     supervisor = RecordingSupervisor(
         config_controller=FakeConfigController(),
         recording_controller=recording_controller,
         status_cb=statuses.append,
+        notification_cb=lambda *args: notifications.append(args),
     )
 
     with pytest.raises(RuntimeError, match="sync marker failed"):
@@ -235,6 +240,28 @@ def test_recording_supervisor_saves_partial_session_when_recording_fails():
     assert recorder.failure_reason == "sync marker failed"
     assert recorder.calls[-2:] == ["request_stop", "runtime_close"]
     assert recording_controller.runtime.close_calls == [False]
+    assert [item[0] for item in notifications] == ["recording_started", "recording_failed"]
+
+
+def test_recording_supervisor_does_not_emit_started_notification_when_start_fails():
+    class StartFailingRecorder(FakeRecorder):
+        async def start_recording_async(self):
+            self.calls.append("start_recording_async")
+            raise recordtest.RecorderError("OBS busy")
+
+    notifications = []
+    recorder = StartFailingRecorder()
+    recording_controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+        notification_cb=lambda *args: notifications.append(args),
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="OBS busy"):
+        run(run_supervisor(supervisor))
+
+    assert [item[0] for item in notifications] == ["recording_failed"]
 
 
 def test_recording_supervisor_does_not_finalize_twice_when_save_fails():
@@ -245,12 +272,14 @@ def test_recording_supervisor_does_not_finalize_twice_when_save_fails():
             return SimpleNamespace(success=False, error="disk full")
 
     statuses = []
+    notifications = []
     recorder = SaveFailingRecorder()
     recording_controller = FakeRecordingController(recorder)
     supervisor = RecordingSupervisor(
         config_controller=FakeConfigController(),
         recording_controller=recording_controller,
         status_cb=statuses.append,
+        notification_cb=lambda *args: notifications.append(args),
     )
 
     run(run_supervisor(supervisor))
@@ -259,3 +288,4 @@ def test_recording_supervisor_does_not_finalize_twice_when_save_fails():
     assert recorder.calls.count("finalize_session") == 1
     assert recorder.calls[-3:] == ["request_stop", "stop_recording", "runtime_close"]
     assert recording_controller.runtime.close_calls == [False]
+    assert [item[0] for item in notifications] == ["recording_started", "recording_failed"]

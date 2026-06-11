@@ -5,6 +5,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+try:
+    from .notifications import DEFAULT_NOTIFICATION_SETTINGS
+except ImportError:
+    from notifications import DEFAULT_NOTIFICATION_SETTINGS
+
 DEFAULT_OBS_PASSWORD_LENGTH = 24
 DEFAULT_OBS_SCENE_NAME = "lol_seen"
 DEFAULT_OBS_SOURCE_NAME = "color"
@@ -110,6 +115,7 @@ def normalize_config(
     poll_cfg = _ensure_section(result, "polling")
     storage_cfg = _ensure_section(result, "storage")
     app_cfg = _ensure_section(result, "app")
+    notifications_cfg = _ensure_section(result, "notifications")
     _ensure_section(result, "audio")
     _migrate_obs_fps_config(result, obs_cfg, auto_fix=auto_fix)
 
@@ -158,6 +164,7 @@ def normalize_config(
         auto_fix=auto_fix,
     )
     _apply_defaults(result, storage_cfg, {"max_size_gb": DEFAULT_MAX_STORAGE_GB}, auto_fix=auto_fix)
+    _apply_defaults(result, notifications_cfg, DEFAULT_NOTIFICATION_SETTINGS, auto_fix=auto_fix)
 
     _ensure_audio_config_defaults(result, auto_fix=auto_fix)
     _normalize_obs_capture_config(result, obs_cfg, auto_fix=auto_fix)

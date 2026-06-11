@@ -47,5 +47,12 @@
     "app": {
         "setup_completed": false,
         "minimize_to_tray": true
+    },
+    "notifications": {
+        "enabled": true,
+        "recording_started": true,
+        "recording_completed": false,
+        "recording_failed": true,
+        "minimized_to_tray": true
     }
 }

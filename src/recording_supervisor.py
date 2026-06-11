@@ -7,10 +7,12 @@ from typing import Any
 try:
     from . import recordtest
     from .controllers import ConfigController, RecordingController
+    from .notifications import NotificationEvent
     from .recording_state import FinalizeResult, RecordingOutcome
 except ImportError:
     import recordtest
     from controllers import ConfigController, RecordingController
+    from notifications import NotificationEvent
     from recording_state import FinalizeResult, RecordingOutcome
 
 
@@ -22,10 +24,12 @@ class RecordingSupervisor:
         config_controller: ConfigController | None = None,
         recording_controller: RecordingController | None = None,
         status_cb: Callable[[str], None] | None = None,
+        notification_cb: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self.config_controller = config_controller or ConfigController()
         self.recording_controller = recording_controller or RecordingController()
         self.status_cb = status_cb
+        self.notification_cb = notification_cb
         self.recorder: Any | None = None
         self.runtime: Any | None = None
         self.stop_event: asyncio.Event | None = None
@@ -65,6 +69,11 @@ class RecordingSupervisor:
                     break
                 try:
                     await self.recorder.start_recording_async()
+                    self._notify(
+                        NotificationEvent.RECORDING_STARTED,
+                        "録画を開始しました",
+                        "League of Legendsの録画を開始しました。",
+                    )
                     if stop_event.is_set():
                         self._finalize_aborted("stop requested after recording started")
                         break
@@ -77,6 +86,11 @@ class RecordingSupervisor:
                             self._emit("⚠️ 録画セッションを部分保存しました。")
                         else:
                             self._emit(f"⚠️ 部分保存に失敗しました: {self._finalize_error(result)}")
+                    self._notify(
+                        NotificationEvent.RECORDING_FAILED,
+                        "録画に失敗しました",
+                        self._notification_error_message(e),
+                    )
                     raise
                 if outcome != RecordingOutcome.COMPLETED:
                     if self._has_session_data():
@@ -88,8 +102,18 @@ class RecordingSupervisor:
                 result = self._finalize_current_session(RecordingOutcome.COMPLETED)
                 if not self._finalize_success(result):
                     self._emit(f"⚠️ セッション保存に失敗しました: {self._finalize_error(result)}")
+                    self._notify(
+                        NotificationEvent.RECORDING_FAILED,
+                        "録画の保存に失敗しました",
+                        f"録画セッションを保存できませんでした: {self._finalize_error(result)}",
+                    )
                     break
                 self._emit("✅ 試合記録完了。次の試合を待機します。")
+                self._notify(
+                    NotificationEvent.RECORDING_COMPLETED,
+                    "録画が完了しました",
+                    "試合の録画とセッション情報を保存しました。",
+                )
         finally:
             self.shutdown()
 
@@ -162,6 +186,14 @@ class RecordingSupervisor:
     def _emit(self, message: str) -> None:
         if self.status_cb:
             self.status_cb(message)
+
+    def _notify(self, event: NotificationEvent, title: str, message: str) -> None:
+        if self.notification_cb:
+            self.notification_cb(event.value, title, message)
+
+    def _notification_error_message(self, error: BaseException) -> str:
+        detail = str(error).strip().splitlines()[0] if str(error).strip() else type(error).__name__
+        return f"録画処理を継続できませんでした: {detail}"
 
     def _has_session_data(self) -> bool:
         has_session_data = getattr(self.recorder, "has_session_data", None)

@@ -122,6 +122,11 @@ Riot LCU API
 敗北のパターン: ファーストブラッド取得なし AND 敵にAatroxがいる -> WinRate 22% (n=9)
 ```
 
+## 開発フロー
+
+ブランチ、Pull Request、検証、Releaseの運用ルールは
+[`CONTRIBUTING.md`](CONTRIBUTING.md)を参照してください。
+
 ## テスト戦略
 
 このプロジェクトでは、実際の OBS や LoL クライアントを起動しなくても重要なロジックを検証できるようにしています。

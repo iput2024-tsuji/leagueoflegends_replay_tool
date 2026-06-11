@@ -296,6 +296,7 @@ dist\installer\LoLReplayTool-Setup-0.1.2.exe
 ### GitHub Releaseの公開
 
 `VERSION`を更新してコミットした後、同じバージョンの`v`付きタグをプッシュすると、GitHub ActionsがインストーラーをビルドしてReleaseへ自動公開します。
+公開するバージョンの更新内容は`CHANGELOG.md`へ記載してください。該当バージョンの節がない場合、Releaseワークフローは公開を中止します。
 
 ```powershell
 git tag v0.1.2

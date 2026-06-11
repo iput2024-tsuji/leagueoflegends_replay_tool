@@ -85,7 +85,15 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $installer = ".\dist\installer\LoLReplayTool-Setup-$env:APP_VERSION.exe"
           $checksums = ".\dist\installer\SHA256SUMS.txt"
-          $releaseNotes = @'
+          $changelog = Get-Content .\CHANGELOG.md -Raw
+          $escapedVersion = [regex]::Escape($env:APP_VERSION)
+          $sectionPattern = "(?ms)^## \[$escapedVersion\].*?(?=^## \[|\z)"
+          $section = [regex]::Match($changelog, $sectionPattern)
+          if (-not $section.Success) {
+            throw "CHANGELOG.md does not contain a section for $env:APP_VERSION."
+          }
+
+          $installNotes = @'
           ## インストール前の注意
 
           - リプレイ再生には64bit版のmpv DLLが別途必要です。
@@ -93,6 +101,7 @@ jobs:
           - OBSとFFmpegは必要になった時点でアプリが自動取得します。
           - `SHA256SUMS.txt`でインストーラーの整合性を確認できます。
           '@
+          $releaseNotes = "$($section.Value.Trim())`n`n$installNotes"
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {

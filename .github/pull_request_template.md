@@ -30,7 +30,8 @@
 - [ ] Patch相当
 - [ ] Minor相当
 - [ ] Major相当
-- [ ] 必要な `CHANGELOG.md` の更新を行った
+- [ ] 必要な `CHANGELOG.md` と `CHANGELOG.en.md` の更新を行った
+- [ ] READMEを変更した場合、`README.md` と `README.en.md` の内容を同期した
 
 ## 関連Issue
 

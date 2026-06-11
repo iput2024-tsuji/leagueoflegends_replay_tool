@@ -1,32 +1,32 @@
-# Changelog
+# 変更履歴
 
 ## [0.2.0] - 2026-06-11
 
-### Added
+### 追加
 
-- Added configurable Windows notifications for recording start, recording completion, recording failure, and minimizing to the system tray.
-- Added a master notification switch and independent switches for each notification event.
-- Added recording-start notifications only after OBS confirms that recording is active.
+- 録画開始、録画完了、録画失敗、タスクトレイ格納時のWindows通知を追加しました。
+- 通知全体のスイッチと、通知イベントごとの個別スイッチを追加しました。
+- OBSが録画中になったことを確認した後に録画開始通知を送るようにしました。
 
-### Changed
+### 変更
 
-- Added repository rules that keep branch names, commit messages, and Pull Request titles focused on the change instead of the tool used to create it.
+- ブランチ名、コミットメッセージ、Pull Requestタイトルに作業ツール名を含めず、変更内容を記述するリポジトリルールを追加しました。
 
 ## [0.1.4] - 2026-06-11
 
-### Fixed
+### 修正
 
-- Improved game start detection so `gameTime=0` is recognized as a valid start.
-- Added an LCU Gameflow fallback using the `InProgress` and `Reconnect` phases when the Live Client API is unavailable.
-- Added periodic diagnostics showing both Live Client API status and the current LCU phase.
+- `gameTime=0`を有効な開始時刻として認識するよう、試合開始検知を改善しました。
+- Live Client APIを利用できない場合に、LCU Gameflowの`InProgress`と`Reconnect`を使用するフォールバックを追加しました。
+- Live Client APIの状態と現在のLCUフェーズを表示する定期診断ログを追加しました。
 
 ## [0.1.3] - 2026-06-10
 
-### Added
+### 追加
 
-- Added fractional recording frame-rate settings such as `144/1` and `240000/1001`.
-- Enabled LoL application audio capture through the OBS window capture source.
+- `144/1`や`240000/1001`などの分数形式による録画フレームレート設定を追加しました。
+- OBSのウィンドウキャプチャソースを通じたLoLアプリケーション音声の取得を有効にしました。
 
-### Changed
+### 変更
 
-- Disabled OBS desktop audio and limited manual audio configuration to the microphone input.
+- OBSのデスクトップ音声を無効化し、手動音声設定をマイク入力のみに変更しました。

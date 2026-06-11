@@ -86,11 +86,16 @@ jobs:
           $installer = ".\dist\installer\LoLReplayTool-Setup-$env:APP_VERSION.exe"
           $checksums = ".\dist\installer\SHA256SUMS.txt"
           $changelog = Get-Content .\CHANGELOG.md -Raw
+          $englishChangelog = Get-Content .\CHANGELOG.en.md -Raw
           $escapedVersion = [regex]::Escape($env:APP_VERSION)
           $sectionPattern = "(?ms)^## \[$escapedVersion\].*?(?=^## \[|\z)"
           $section = [regex]::Match($changelog, $sectionPattern)
           if (-not $section.Success) {
             throw "CHANGELOG.md does not contain a section for $env:APP_VERSION."
+          }
+          $englishSection = [regex]::Match($englishChangelog, $sectionPattern)
+          if (-not $englishSection.Success) {
+            throw "CHANGELOG.en.md does not contain a section for $env:APP_VERSION."
           }
 
           $installNotes = @'
@@ -101,17 +106,41 @@ jobs:
           - OBSとFFmpegは必要になった時点でアプリが自動取得します。
           - `SHA256SUMS.txt`でインストーラーの整合性を確認できます。
           '@
-          $releaseNotes = "$($section.Value.Trim())`n`n$installNotes"
+          $englishInstallNotes = @'
+          ## Before installation
+
+          - Replay playback requires a separate 64-bit mpv DLL.
+          - Place the mpv DLL in `%LOCALAPPDATA%\LoLReplayTool\bin`.
+          - The application downloads OBS and FFmpeg when they are needed.
+          - Use `SHA256SUMS.txt` to verify the installer.
+          '@
+          $releaseNotes = @"
+          # 日本語
+
+          $($section.Value.Trim())
+
+          $installNotes
+
+          ---
+
+          # English
+
+          $($englishSection.Value.Trim())
+
+          $englishInstallNotes
+          "@
 
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) {
+            gh release edit $tag `
+              --title "LoL Replay Tool $tag" `
+              --notes $releaseNotes
             gh release upload $tag $installer $checksums --clobber
           } else {
             gh release create $tag $installer $checksums `
               --verify-tag `
               --title "LoL Replay Tool $tag" `
-              --notes $releaseNotes `
-              --generate-notes
+              --notes $releaseNotes
           }
 
           if ($LASTEXITCODE -ne 0) {

@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.1] - 2026-06-12
+
+### Added
+
+- Added an English README with links for switching between the Japanese and English documentation.
+- Added automatic bilingual Japanese and English GitHub Release notes.
+
+### Changed
+
+- Added automatic H.264 encoder detection from the managed OBS startup log, with a priority order of NVIDIA NVENC, Intel Quick Sync, AMD AMF, and x264.
+- Excluded HEVC and AV1 from automatic selection and added an x264 fallback when no supported hardware encoder is available.
+
 ## [0.2.0] - 2026-06-11
 
 ### Added

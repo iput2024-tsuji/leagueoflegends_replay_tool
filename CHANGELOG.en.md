@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0] - 2026-06-13
+
+### Added
+
+- Added a Ban/Pick tab to the replay view showing the Ban/Pick sequence and final team compositions.
+- Split replay event filters into kills, deaths, assists, dragons, Rift Herald/Void Grubs, Baron, buildings, and other events.
+- Added player-involved assist events to saved recording sessions.
+
+### Changed
+
+- Classified turret and inhibitor destruction as building events.
+- Unified event classification so recording persistence and replay display use the same logic.
+
 ## [0.2.1] - 2026-06-12
 
 ### Added

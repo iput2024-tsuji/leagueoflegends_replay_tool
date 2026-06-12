@@ -404,6 +404,34 @@ def test_game_end_event_flow_stops_recording_without_real_sleep():
     recorder.wait_with_stop_async.assert_not_awaited()
 
 
+def test_process_events_saves_player_assists():
+    tmp_path = runtime_dir("player_assists")
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path),
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.my_name = "Tester#JP1"
+    recorder.my_name_short = "Tester"
+
+    recorder.process_events(
+        [
+            {
+                "EventID": 1,
+                "EventName": "ChampionKill",
+                "EventTime": 123.0,
+                "KillerName": "Ally",
+                "VictimName": "Enemy",
+                "Assisters": ["Tester", "Support"],
+            }
+        ]
+    )
+
+    assert len(recorder.saved_events) == 1
+    assert recorder.saved_events[0]["Assisters"] == ["Tester", "Support"]
+
+
 def test_start_recording_failure_raises_and_does_not_create_session_data():
     tmp_path = runtime_dir("recording_start_failure")
     config = config_for(tmp_path)

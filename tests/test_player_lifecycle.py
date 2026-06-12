@@ -1,6 +1,8 @@
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
+from PyQt6.QtCore import Qt
+
 from src import player as player_module
 from src.app import MainWindow, PlayerPage
 from src.player import ClipExportWorker, PlayerWidget, build_ban_pick_view_model
@@ -187,6 +189,78 @@ def test_player_widget_displays_ban_pick_tab(qtbot):
     assert widget.ban_pick_enemy_label.text() == "TOP  Aatrox"
     assert widget.ban_pick_list.count() == 1
     assert widget.ban_pick_list.item(0).text() == "01. 敵 BAN: Darius"
+
+
+def test_player_widget_separates_event_filter_categories(qtbot):
+    widget = PlayerWidget(auto_open=False)
+    qtbot.addWidget(widget)
+    widget.my_name = "Tester#JP1"
+    widget.my_name_short = "Tester"
+    widget.events_all = [
+        {
+            "EventID": 1,
+            "EventName": "ChampionKill",
+            "EventTime": 10,
+            "KillerName": "Tester",
+            "VictimName": "Enemy1",
+        },
+        {
+            "EventID": 2,
+            "EventName": "ChampionKill",
+            "EventTime": 20,
+            "KillerName": "Enemy2",
+            "VictimName": "Tester",
+        },
+        {
+            "EventID": 3,
+            "EventName": "ChampionKill",
+            "EventTime": 30,
+            "KillerName": "Ally",
+            "VictimName": "Enemy3",
+            "Assisters": ["Tester"],
+        },
+        {"EventID": 4, "EventName": "DragonKill", "EventTime": 40},
+        {"EventID": 5, "EventName": "HeraldKill", "EventTime": 50},
+        {"EventID": 6, "EventName": "HordeKill", "EventTime": 60},
+        {"EventID": 7, "EventName": "BaronKill", "EventTime": 70},
+        {
+            "EventID": 8,
+            "EventName": "BuildingKill",
+            "EventTime": 80,
+            "BuildingType": "Turret",
+        },
+        {"EventID": 9, "EventName": "MinionsSpawning", "EventTime": 90},
+        {
+            "EventID": 10,
+            "EventName": "ChampionKill",
+            "EventTime": 100,
+            "KillerName": "Enemy4",
+            "VictimName": "Ally2",
+        },
+    ]
+
+    widget.populate_event_list()
+
+    categories = [
+        widget.event_list.item(index).data(Qt.ItemDataRole.UserRole + 1)
+        for index in range(widget.event_list.count())
+    ]
+    assert categories == [
+        None,
+        "kill",
+        "death",
+        "assist",
+        "dragon",
+        "herald_horde",
+        "herald_horde",
+        "baron",
+        "building",
+    ]
+    assert widget.event_filters["other"].isChecked() is False
+
+    widget.event_filters["other"].setChecked(True)
+
+    assert widget.event_list.item(widget.event_list.count() - 1).text() == "[01:30] MinionsSpawning"
 
 
 def test_cancel_sync_worker_retains_reference_after_timeout():

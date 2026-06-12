@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 from src import player as player_module
 from src.app import MainWindow, PlayerPage
-from src.player import ClipExportWorker, PlayerWidget
+from src.player import ClipExportWorker, PlayerWidget, build_ban_pick_view_model
 
 
 class FakeRunningWorker:
@@ -93,6 +93,100 @@ def test_player_widget_does_not_initialize_mpv_until_replay_is_loaded(qtbot, mon
     qtbot.addWidget(widget)
 
     assert calls == []
+
+
+def test_build_ban_pick_view_model_formats_teams_and_action_order():
+    model = build_ban_pick_view_model(
+        {
+            "actions": [
+                {
+                    "order": 2,
+                    "type": "pick",
+                    "team": "ally",
+                    "champion_id": 103,
+                    "champion_name": "Ahri",
+                    "assigned_position": "middle",
+                },
+                {
+                    "order": 1,
+                    "type": "ban",
+                    "team": "enemy",
+                    "champion_id": 122,
+                    "champion_name": "Darius",
+                },
+            ],
+            "teams": {
+                "ally": [
+                    {
+                        "cell_id": 0,
+                        "champion_name": "Ahri",
+                        "assigned_position": "middle",
+                    }
+                ],
+                "enemy": [
+                    {
+                        "cell_id": 5,
+                        "champion_name": "Aatrox",
+                        "assigned_position": "top",
+                    }
+                ],
+            },
+        }
+    )
+
+    assert model["has_data"] is True
+    assert model["ally_lines"] == ["MID  Ahri"]
+    assert model["enemy_lines"] == ["TOP  Aatrox"]
+    assert [action["text"] for action in model["actions"]] == [
+        "01. 敵 BAN: Darius",
+        "02. 味方 PICK: Ahri · MID",
+    ]
+
+
+def test_build_ban_pick_view_model_uses_pick_actions_when_team_snapshot_is_missing():
+    model = build_ban_pick_view_model(
+        {
+            "actions": [
+                {
+                    "order": 1,
+                    "type": "pick",
+                    "team": "ally",
+                    "champion_id": 64,
+                    "assigned_position": "jungle",
+                }
+            ]
+        }
+    )
+
+    assert model["ally_lines"] == ["JUNGLE  Champion #64"]
+    assert model["enemy_lines"] == []
+
+
+def test_player_widget_displays_ban_pick_tab(qtbot):
+    widget = PlayerWidget(auto_open=False)
+    qtbot.addWidget(widget)
+    widget.ban_pick = {
+        "actions": [
+            {
+                "order": 1,
+                "type": "ban",
+                "team": "enemy",
+                "champion_name": "Darius",
+            }
+        ],
+        "teams": {
+            "ally": [{"champion_name": "Ahri", "assigned_position": "middle"}],
+            "enemy": [{"champion_name": "Aatrox", "assigned_position": "top"}],
+        },
+    }
+
+    widget.populate_ban_pick()
+
+    assert widget.side_tabs.tabText(1) == "Ban/Pick"
+    assert widget.ban_pick_ally_label.text() == "MID  Ahri"
+    assert widget.ban_pick_enemy_label.text() == "TOP  Aatrox"
+    assert widget.ban_pick_list.count() == 1
+    assert widget.ban_pick_list.item(0).text() == "01. 敵 BAN: Darius"
 
 
 def test_cancel_sync_worker_retains_reference_after_timeout():

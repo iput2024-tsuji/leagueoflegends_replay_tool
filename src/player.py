@@ -37,7 +37,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
+    QSplitter,
     QStyle,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -69,6 +71,134 @@ ICON_ALIASES = None
 DEFAULT_RECORDINGS_DIR = DATA_DIR / "recordings"
 DEFAULT_JSON_DIR = DATA_DIR / "recordings" / "json"
 LOGGER = logging.getLogger("lol_replay.player")
+BAN_PICK_POSITION_LABELS = {
+    "top": "TOP",
+    "jungle": "JUNGLE",
+    "middle": "MID",
+    "mid": "MID",
+    "bottom": "BOT",
+    "bot": "BOT",
+    "utility": "SUPPORT",
+    "support": "SUPPORT",
+}
+BAN_PICK_POSITION_ORDER = {
+    "TOP": 0,
+    "JUNGLE": 1,
+    "MID": 2,
+    "BOT": 3,
+    "SUPPORT": 4,
+}
+
+
+def _ban_pick_champion_name(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "不明"
+    name = str(value.get("champion_name") or "").strip()
+    if name:
+        return name
+    champion_id = value.get("champion_id")
+    if champion_id not in (None, "", 0, "0"):
+        return f"Champion #{champion_id}"
+    return "不明"
+
+
+def _ban_pick_position(value: Any) -> str:
+    normalized = str(value or "").strip().lower()
+    return BAN_PICK_POSITION_LABELS.get(normalized, normalized.upper())
+
+
+def _ban_pick_team_members(ban_pick: dict[str, Any], team: str) -> list[dict[str, Any]]:
+    teams = ban_pick.get("teams")
+    members = teams.get(team) if isinstance(teams, dict) else None
+    if isinstance(members, list):
+        valid_members = [member for member in members if isinstance(member, dict)]
+        if valid_members:
+            return valid_members
+
+    actions = ban_pick.get("actions")
+    if not isinstance(actions, list):
+        return []
+    result = []
+    seen = set()
+    for action in actions:
+        if not isinstance(action, dict) or action.get("type") != "pick" or action.get("team") != team:
+            continue
+        champion_key = action.get("champion_id") or action.get("champion_name")
+        if champion_key in seen:
+            continue
+        seen.add(champion_key)
+        result.append(action)
+    return result
+
+
+def build_ban_pick_view_model(value: Any) -> dict[str, Any]:
+    ban_pick = value if isinstance(value, dict) else {}
+
+    def team_lines(team: str) -> list[str]:
+        members = _ban_pick_team_members(ban_pick, team)
+        rows = []
+        for index, member in enumerate(members):
+            position = _ban_pick_position(member.get("assigned_position"))
+            rows.append(
+                {
+                    "text": f"{position}  {_ban_pick_champion_name(member)}"
+                    if position
+                    else _ban_pick_champion_name(member),
+                    "position": BAN_PICK_POSITION_ORDER.get(position, 100),
+                    "cell_id": member.get("cell_id") if member.get("cell_id") is not None else index,
+                }
+            )
+        rows.sort(key=lambda row: (row["position"], str(row["cell_id"])))
+        return [row["text"] for row in rows]
+
+    raw_actions = ban_pick.get("actions")
+    actions = [action for action in raw_actions if isinstance(action, dict)] if isinstance(raw_actions, list) else []
+
+    def action_order(action: dict[str, Any]) -> tuple[int, int, int, int]:
+        def numeric(key: str) -> int:
+            try:
+                return int(action.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        return (
+            numeric("order"),
+            numeric("phase_order"),
+            numeric("action_index"),
+            numeric("action_id"),
+        )
+
+    formatted_actions = []
+    for fallback_order, action in enumerate(sorted(actions, key=action_order), start=1):
+        action_type = str(action.get("type") or "").strip().lower()
+        if action_type not in {"ban", "pick"}:
+            continue
+        team = str(action.get("team") or "unknown").strip().lower()
+        team_label = {"ally": "味方", "enemy": "敵"}.get(team, "不明")
+        action_label = action_type.upper()
+        try:
+            order = int(action.get("order") or fallback_order)
+        except (TypeError, ValueError):
+            order = fallback_order
+        position = _ban_pick_position(action.get("assigned_position"))
+        champion = _ban_pick_champion_name(action)
+        suffix = f" · {position}" if position else ""
+        formatted_actions.append(
+            {
+                "text": f"{order:02d}. {team_label} {action_label}: {champion}{suffix}",
+                "team": team,
+                "type": action_type,
+            }
+        )
+
+    ally_lines = team_lines("ally")
+    enemy_lines = team_lines("enemy")
+    return {
+        "has_data": bool(formatted_actions or ally_lines or enemy_lines),
+        "ally_lines": ally_lines,
+        "enemy_lines": enemy_lines,
+        "actions": formatted_actions,
+    }
 
 
 def load_app_config() -> dict[str, Any]:
@@ -1055,6 +1185,7 @@ class PlayerWidget(QWidget):
         self.video_fps = 30.0
         self.events = []
         self.events_all = []
+        self.ban_pick = {}
         self.my_name = None
         self.my_name_short = None
         self.clip_start = None
@@ -1122,9 +1253,26 @@ class PlayerWidget(QWidget):
 
         # --- 右側: イベントリスト (フルスクリーン時に隠すため self にする) ---
         self.right_panel = QWidget()
-        self.right_panel.setFixedWidth(300)
+        self.right_panel.setMinimumWidth(300)
+        self.right_panel.setMaximumWidth(480)
         self.right_panel.setStyleSheet("background-color: #333; color: white;")
         right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
+        self.side_tabs = QTabWidget()
+        self.side_tabs.setDocumentMode(True)
+        self.side_tabs.setStyleSheet(
+            "QTabWidget::pane { border: none; background-color: #333; }"
+            "QTabBar::tab { background-color: #292929; color: #bbb; padding: 8px 14px; }"
+            "QTabBar::tab:selected { background-color: #3a3a3a; color: white; }"
+        )
+        right_layout.addWidget(self.side_tabs)
+
+        event_tab = QWidget()
+        event_layout = QVBoxLayout(event_tab)
+        event_layout.setContentsMargins(8, 8, 8, 8)
+        event_layout.setSpacing(6)
 
         self.info_label = QLabel("Load JSON to start")
         self.info_label.setWordWrap(True)
@@ -1144,8 +1292,8 @@ class PlayerWidget(QWidget):
         self.event_list.itemClicked.connect(self.on_event_clicked)
         self.event_list.setEnabled(False)
 
-        right_layout.addWidget(self.info_label)
-        right_layout.addWidget(self.offset_label)
+        event_layout.addWidget(self.info_label)
+        event_layout.addWidget(self.offset_label)
 
         filter_row = QHBoxLayout()
         self.filter_kill = QCheckBox("Kill")
@@ -1160,7 +1308,7 @@ class PlayerWidget(QWidget):
         filter_row.addWidget(self.filter_kill)
         filter_row.addWidget(self.filter_objective)
         filter_row.addWidget(self.filter_other)
-        right_layout.addLayout(filter_row)
+        event_layout.addLayout(filter_row)
 
         offset_row = QHBoxLayout()
         offset_row.setContentsMargins(8, 0, 8, 2)
@@ -1169,17 +1317,17 @@ class PlayerWidget(QWidget):
             btn.setFixedHeight(26)
             btn.clicked.connect(lambda _, v=value: self.adjust_offset(v))
             offset_row.addWidget(btn)
-        right_layout.addLayout(offset_row)
+        event_layout.addLayout(offset_row)
 
         sync_btn = QPushButton("現在位置で同期")
         sync_btn.setFixedHeight(28)
         sync_btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         sync_btn.clicked.connect(self.sync_to_current_position)
-        right_layout.addWidget(sync_btn)
+        event_layout.addWidget(sync_btn)
 
         clip_title = QLabel("クリップ出力")
         clip_title.setStyleSheet("padding: 8px 10px 0 10px; font-weight: bold; color: #ddd;")
-        right_layout.addWidget(clip_title)
+        event_layout.addWidget(clip_title)
 
         clip_mark_row = QHBoxLayout()
         clip_mark_row.setContentsMargins(8, 0, 8, 0)
@@ -1191,17 +1339,17 @@ class PlayerWidget(QWidget):
         self.clip_end_btn.clicked.connect(self.mark_clip_end)
         clip_mark_row.addWidget(self.clip_start_btn)
         clip_mark_row.addWidget(self.clip_end_btn)
-        right_layout.addLayout(clip_mark_row)
+        event_layout.addLayout(clip_mark_row)
 
         self.clip_label = QLabel("Start: -- / End: --")
         self.clip_label.setWordWrap(True)
         self.clip_label.setStyleSheet("padding: 0 10px; color: #ccc;")
-        right_layout.addWidget(self.clip_label)
+        event_layout.addWidget(self.clip_label)
 
         self.clip_export_btn = QPushButton("クリップ出力")
         self.clip_export_btn.setFixedHeight(30)
         self.clip_export_btn.clicked.connect(self.export_clip)
-        right_layout.addWidget(self.clip_export_btn)
+        event_layout.addWidget(self.clip_export_btn)
 
         self.clip_progress = QProgressBar()
         self.clip_progress.setRange(0, 100)
@@ -1212,13 +1360,71 @@ class PlayerWidget(QWidget):
             "border-radius: 4px; color: #fff; text-align: center; }"
             "QProgressBar::chunk { background-color: #d32f2f; border-radius: 3px; }"
         )
-        right_layout.addWidget(self.clip_progress)
+        event_layout.addWidget(self.clip_progress)
 
-        right_layout.addWidget(self.event_list)
+        event_layout.addWidget(self.event_list, stretch=1)
+        self.side_tabs.addTab(event_tab, "イベント")
+
+        ban_pick_tab = QWidget()
+        ban_pick_layout = QVBoxLayout(ban_pick_tab)
+        ban_pick_layout.setContentsMargins(10, 10, 10, 10)
+        ban_pick_layout.setSpacing(8)
+
+        self.ban_pick_status_label = QLabel("リプレイを読み込むとBan/Pickを表示します。")
+        self.ban_pick_status_label.setWordWrap(True)
+        self.ban_pick_status_label.setStyleSheet("color: #aaa; padding-bottom: 4px;")
+        ban_pick_layout.addWidget(self.ban_pick_status_label)
+
+        composition_title = QLabel("最終構成")
+        composition_title.setStyleSheet("font-weight: bold; color: #eee;")
+        ban_pick_layout.addWidget(composition_title)
+
+        composition_row = QHBoxLayout()
+        composition_row.setSpacing(12)
+        ally_column = QVBoxLayout()
+        ally_title = QLabel("味方")
+        ally_title.setStyleSheet("font-weight: bold; color: #64B5F6;")
+        self.ban_pick_ally_label = QLabel("-")
+        self.ban_pick_ally_label.setWordWrap(True)
+        self.ban_pick_ally_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        ally_column.addWidget(ally_title)
+        ally_column.addWidget(self.ban_pick_ally_label)
+
+        enemy_column = QVBoxLayout()
+        enemy_title = QLabel("敵")
+        enemy_title.setStyleSheet("font-weight: bold; color: #EF9A9A;")
+        self.ban_pick_enemy_label = QLabel("-")
+        self.ban_pick_enemy_label.setWordWrap(True)
+        self.ban_pick_enemy_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        enemy_column.addWidget(enemy_title)
+        enemy_column.addWidget(self.ban_pick_enemy_label)
+
+        composition_row.addLayout(ally_column, stretch=1)
+        composition_row.addLayout(enemy_column, stretch=1)
+        ban_pick_layout.addLayout(composition_row)
+
+        timeline_title = QLabel("選択順")
+        timeline_title.setStyleSheet("font-weight: bold; color: #eee; padding-top: 4px;")
+        ban_pick_layout.addWidget(timeline_title)
+
+        self.ban_pick_list = QListWidget()
+        self.ban_pick_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.ban_pick_list.setStyleSheet(
+            "QListWidget { border: none; background-color: #2b2b2b; }"
+            "QListWidget::item { padding: 8px; border-bottom: 1px solid #444; }"
+        )
+        ban_pick_layout.addWidget(self.ban_pick_list, stretch=1)
+        self.side_tabs.addTab(ban_pick_tab, "Ban/Pick")
 
         # レイアウト統合
-        self.main_layout.addWidget(video_container, stretch=1)
-        self.main_layout.addWidget(self.right_panel)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.addWidget(video_container)
+        self.main_splitter.addWidget(self.right_panel)
+        self.main_splitter.setStretchFactor(0, 1)
+        self.main_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setSizes([940, 340])
+        self.main_layout.addWidget(self.main_splitter)
 
         # キーショートカット（フォーカスに依存しない）
         self.register_shortcuts()
@@ -1226,6 +1432,8 @@ class PlayerWidget(QWidget):
         # リプレイ選択ダイアログ
         if auto_open:
             self.open_replay_selector()
+
+        self.populate_ban_pick()
 
     def init_mpv(self) -> bool:
         if self.player is not None:
@@ -1436,7 +1644,9 @@ class PlayerWidget(QWidget):
             self.current_video_path = None
             self.events = []
             self.events_all = []
+            self.ban_pick = {}
             self.event_list.clear()
+            self.populate_ban_pick()
             self.info_label.setText("録画を削除しました。")
         return stopped
 
@@ -1464,6 +1674,7 @@ class PlayerWidget(QWidget):
             self.sync_game_time = data.get("sync_game_time", 0.0)
             self.events = data.get("events", []) or []
             self.events_all = data.get("events_all", []) or []
+            self.ban_pick = data.get("ban_pick") if isinstance(data.get("ban_pick"), dict) else {}
             self.my_name = data.get("summoner_name", "Unknown")
             self.my_name_short = normalize_summoner_name(self.my_name)
             self.offset = None
@@ -1476,6 +1687,7 @@ class PlayerWidget(QWidget):
 
             self.info_label.setText(f"Player: {self.my_name}\nSyncing...")
             self.populate_event_list()
+            self.populate_ban_pick()
 
             self.player.play(str(self.current_video_path))
             self.player.pause = True
@@ -1609,6 +1821,30 @@ class PlayerWidget(QWidget):
                 color = "#FFFFFF"
 
             self.add_event_item(display, time_sec, color)
+
+    def populate_ban_pick(self) -> None:
+        view_model = build_ban_pick_view_model(self.ban_pick)
+        self.ban_pick_list.clear()
+
+        if not view_model["has_data"]:
+            self.ban_pick_status_label.setText("この試合にはBan/Pick記録がありません。")
+            self.ban_pick_ally_label.setText("-")
+            self.ban_pick_enemy_label.setText("-")
+            return
+
+        self.ban_pick_status_label.setText("チャンピオン選択中に確定した内容です。")
+        self.ban_pick_ally_label.setText("\n".join(view_model["ally_lines"]) or "-")
+        self.ban_pick_enemy_label.setText("\n".join(view_model["enemy_lines"]) or "-")
+
+        colors = {
+            "ally": QColor("#64B5F6"),
+            "enemy": QColor("#EF9A9A"),
+            "unknown": QColor("#BDBDBD"),
+        }
+        for action in view_model["actions"]:
+            item = QListWidgetItem(action["text"])
+            item.setForeground(colors.get(action["team"], colors["unknown"]))
+            self.ban_pick_list.addItem(item)
 
     def update_offset_label(self) -> None:
         if self.offset is None:

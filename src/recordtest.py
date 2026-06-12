@@ -29,6 +29,12 @@ try:
     from .app_paths import get_app_root, get_user_data_root
     from .champ_select import ChampSelectTracker, champion_name_catalog
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from .game_events import (
+        COMBAT_EVENT_NAMES,
+        GLOBAL_OBJECTIVE_EVENT_NAMES,
+        champion_kill_role,
+        normalize_summoner_name,
+    )
     from .lcu_client import LCUConnectionProvider
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
@@ -48,6 +54,12 @@ except ImportError:
     from app_paths import get_app_root, get_user_data_root
     from champ_select import ChampSelectTracker, champion_name_catalog
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from game_events import (
+        COMBAT_EVENT_NAMES,
+        GLOBAL_OBJECTIVE_EVENT_NAMES,
+        champion_kill_role,
+        normalize_summoner_name,
+    )
     from lcu_client import LCUConnectionProvider
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
@@ -1914,18 +1926,10 @@ def _setup_obs_sync_elements_locked(
 
 
 # ▼ 全員分保存する重要なイベント（オブジェクト）
-GLOBAL_OBJECTIVES = [
-    "DragonKill",  # ドラゴン
-    "BaronKill",  # バロン
-    "HeraldKill",  # ヘラルド
-    "HordeKill",  # ヴォイドグラブ（内部名称）
-    "BuildingKill",  # タワー / インヒビターなどの建造物破壊
-]
+GLOBAL_OBJECTIVES = GLOBAL_OBJECTIVE_EVENT_NAMES
 
 # ▼ 自分が関与しているかチェックするイベント
-COMBAT_EVENTS = [
-    "ChampionKill"  # キル / デス（自分が関与したものだけ）
-]
+COMBAT_EVENTS = COMBAT_EVENT_NAMES
 
 # SSL警告の無視
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -2247,15 +2251,6 @@ def kill_stale_obs_processes() -> None:
     通常版OBSやユーザーが別用途で起動したOBSは対象外にする。
     """
     OBSProcessManager(MANAGED_PORTABLE_OBS_DIR, logger=LOGGER).kill_stale_managed_processes()
-
-
-def normalize_summoner_name(value: Any) -> str | None:
-    if not value:
-        return None
-    name = str(value).strip()
-    if "#" in name:
-        name = name.split("#", 1)[0]
-    return name.strip()
 
 
 def _first_mapping_value(mapping: dict[str, Any], *keys: str) -> Any:
@@ -3560,26 +3555,10 @@ class LoLAutoRecorder(RecordingSessionManager):
                 log_message = f"[OBJECTIVE] {event_name}"
 
             elif event_name in COMBAT_EVENTS and self.my_name:
-                killer = event.get("KillerName")
-                victim = event.get("VictimName")
-
-                # 自分が関与したキル or デスのみ
-                is_involved = (
-                    killer == self.my_name
-                    or victim == self.my_name
-                    or killer == self.my_name_short
-                    or victim == self.my_name_short
-                )
-
-                if is_involved:
+                role = champion_kill_role(event, self.my_name)
+                if role:
                     should_save = True
-                    if killer == self.my_name:
-                        role = "KILL"
-                    elif victim == self.my_name:
-                        role = "DEATH"
-                    else:
-                        role = "ASSIST"
-                    log_message = f"[{role}] {event_name}"
+                    log_message = f"[{role.upper()}] {event_name}"
 
             if should_save:
                 try:

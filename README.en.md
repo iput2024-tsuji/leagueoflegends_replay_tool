@@ -29,7 +29,7 @@ Ban/Pick capture uses the League Client API (LCU). LCU is not an officially supp
 - Ban/Pick order, champion, team, and position capture
 - Queue information such as Ranked, Normal, and ARAM
 - mpv-based replay playback
-- Seeking from kill, death, and objective event lists
+- Seeking from events categorized as kills, deaths, assists, objectives, and buildings
 - Ban/Pick order and final team composition in the replay view
 - Synchronization correction UI
 - Replay filtering by champion, result, and match type

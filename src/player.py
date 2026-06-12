@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -47,12 +48,38 @@ from PyQt6.QtWidgets import (
 # --- 1. MPVのパス設定 ---
 try:
     from .app_paths import get_app_root, get_resource_root, get_user_data_root
+    from .game_events import (
+        EVENT_CATEGORY_ASSIST,
+        EVENT_CATEGORY_BARON,
+        EVENT_CATEGORY_BUILDING,
+        EVENT_CATEGORY_DEATH,
+        EVENT_CATEGORY_DRAGON,
+        EVENT_CATEGORY_HERALD_HORDE,
+        EVENT_CATEGORY_KILL,
+        EVENT_CATEGORY_OTHER,
+        champion_kill_role,
+        classify_game_event,
+        normalize_summoner_name,
+    )
     from .mpv_support import find_mpv_dll, iter_mpv_search_dirs
     from .qt_lifecycle import request_worker_stop
     from .recording_library import RecordingDeletionPlan, RecordingLibrary
     from .session_log import load_session_payload
 except ImportError:
     from app_paths import get_app_root, get_resource_root, get_user_data_root
+    from game_events import (
+        EVENT_CATEGORY_ASSIST,
+        EVENT_CATEGORY_BARON,
+        EVENT_CATEGORY_BUILDING,
+        EVENT_CATEGORY_DEATH,
+        EVENT_CATEGORY_DRAGON,
+        EVENT_CATEGORY_HERALD_HORDE,
+        EVENT_CATEGORY_KILL,
+        EVENT_CATEGORY_OTHER,
+        champion_kill_role,
+        classify_game_event,
+        normalize_summoner_name,
+    )
     from mpv_support import find_mpv_dll, iter_mpv_search_dirs
     from qt_lifecycle import request_worker_stop
     from recording_library import RecordingDeletionPlan, RecordingLibrary
@@ -768,15 +795,6 @@ def normalize_result(result_value: Any, team_value: Any | None = None, winning_t
     return "Unknown"
 
 
-def normalize_summoner_name(value: Any) -> str | None:
-    if not value:
-        return None
-    name = str(value).strip()
-    if "#" in name:
-        name = name.split("#", 1)[0]
-    return name.strip()
-
-
 def normalize_icon_key(value: Any) -> str:
     return re.sub(r"[^\w]+", "", str(value or ""), flags=re.UNICODE).lower()
 
@@ -1295,20 +1313,24 @@ class PlayerWidget(QWidget):
         event_layout.addWidget(self.info_label)
         event_layout.addWidget(self.offset_label)
 
-        filter_row = QHBoxLayout()
-        self.filter_kill = QCheckBox("Kill")
-        self.filter_objective = QCheckBox("Objective")
-        self.filter_other = QCheckBox("Other")
-        self.filter_kill.setChecked(True)
-        self.filter_objective.setChecked(True)
-        self.filter_other.setChecked(True)
-        self.filter_kill.stateChanged.connect(self.populate_event_list)
-        self.filter_objective.stateChanged.connect(self.populate_event_list)
-        self.filter_other.stateChanged.connect(self.populate_event_list)
-        filter_row.addWidget(self.filter_kill)
-        filter_row.addWidget(self.filter_objective)
-        filter_row.addWidget(self.filter_other)
-        event_layout.addLayout(filter_row)
+        filter_grid = QGridLayout()
+        filter_grid.setHorizontalSpacing(8)
+        filter_grid.setVerticalSpacing(4)
+        self.event_filters = {
+            EVENT_CATEGORY_KILL: QCheckBox("キル"),
+            EVENT_CATEGORY_DEATH: QCheckBox("デス"),
+            EVENT_CATEGORY_ASSIST: QCheckBox("アシスト"),
+            EVENT_CATEGORY_DRAGON: QCheckBox("ドラゴン"),
+            EVENT_CATEGORY_HERALD_HORDE: QCheckBox("ヘラルド/グラブ"),
+            EVENT_CATEGORY_BARON: QCheckBox("バロン"),
+            EVENT_CATEGORY_BUILDING: QCheckBox("建造物"),
+            EVENT_CATEGORY_OTHER: QCheckBox("その他"),
+        }
+        for index, (category, checkbox) in enumerate(self.event_filters.items()):
+            checkbox.setChecked(category != EVENT_CATEGORY_OTHER)
+            checkbox.stateChanged.connect(self.populate_event_list)
+            filter_grid.addWidget(checkbox, index // 2, index % 2)
+        event_layout.addLayout(filter_grid)
 
         offset_row = QHBoxLayout()
         offset_row.setContentsMargins(8, 0, 8, 2)
@@ -1765,10 +1787,10 @@ class PlayerWidget(QWidget):
 
     def populate_event_list(self) -> None:
         def build_events() -> list[dict[str, Any]]:
-            if self.events:
-                return list(self.events)
             if self.events_all:
                 return list(self.events_all)
+            if self.events:
+                return list(self.events)
             return []
 
         events = build_events()
@@ -1779,48 +1801,47 @@ class PlayerWidget(QWidget):
             time_sec = evt.get("EventTime", 0)
             killer = evt.get("KillerName", "")
             victim = evt.get("VictimName", "")
+            category = classify_game_event(evt, self.my_name or self.my_name_short)
+            if category is None or not self.event_filters[category].isChecked():
+                continue
 
-            if name == "ChampionKill":
-                if self.my_name_short:
-                    if killer not in (self.my_name, self.my_name_short) and victim not in (
-                        self.my_name,
-                        self.my_name_short,
-                    ):
-                        continue
-                if not self.filter_kill.isChecked():
-                    continue
-                display = f"⚔️ {killer} → {victim}" if killer or victim else "⚔️ ChampionKill"
-                if self.my_name and (victim == self.my_name or victim == self.my_name_short):
-                    color = "#FFB74D"
-                else:
-                    color = "#FF5252"
-            elif name == "DragonKill":
-                if not self.filter_objective.isChecked():
-                    continue
-                display = "🐉 Dragon"
+            if category in {EVENT_CATEGORY_KILL, EVENT_CATEGORY_DEATH, EVENT_CATEGORY_ASSIST}:
+                role = champion_kill_role(evt, self.my_name or self.my_name_short)
+                role_label = {
+                    EVENT_CATEGORY_KILL: "キル",
+                    EVENT_CATEGORY_DEATH: "デス",
+                    EVENT_CATEGORY_ASSIST: "アシスト",
+                }[role]
+                display = f"{role_label}: {killer} → {victim}" if killer or victim else role_label
+                color = {
+                    EVENT_CATEGORY_KILL: "#FF5252",
+                    EVENT_CATEGORY_DEATH: "#FFB74D",
+                    EVENT_CATEGORY_ASSIST: "#81C784",
+                }[role]
+            elif category == EVENT_CATEGORY_DRAGON:
+                dragon_type = evt.get("DragonType") or evt.get("dragonType")
+                display = f"ドラゴン: {dragon_type}" if dragon_type else "ドラゴン"
                 color = "#29B6F6"
-            elif name == "BaronKill":
-                if not self.filter_objective.isChecked():
-                    continue
-                display = "🟣 Baron"
-                color = "#8E24AA"
-            elif name == "HeraldKill":
-                if not self.filter_objective.isChecked():
-                    continue
-                display = "👁 Herald"
-                color = "#7CB342"
-            elif name == "HordeKill":
-                if not self.filter_objective.isChecked():
-                    continue
-                display = "🟠 Voidgrub"
-                color = "#FF8A65"
+            elif category == EVENT_CATEGORY_HERALD_HORDE:
+                display = "ヘラルド" if name == "HeraldKill" else "ヴォイドグラブ"
+                color = "#7CB342" if name == "HeraldKill" else "#FF8A65"
+            elif category == EVENT_CATEGORY_BARON:
+                display = "バロン"
+                color = "#AB47BC"
+            elif category == EVENT_CATEGORY_BUILDING:
+                building_type = str(evt.get("BuildingType") or evt.get("buildingType") or "").lower()
+                if name == "TurretKilled" or "turret" in building_type:
+                    display = "タワー破壊"
+                elif name == "InhibKilled" or "inhib" in building_type:
+                    display = "インヒビター破壊"
+                else:
+                    display = "建造物破壊"
+                color = "#FFD54F"
             else:
-                if not self.filter_other.isChecked():
-                    continue
-                display = f"🛡️ {name}"
-                color = "#FFFFFF"
+                display = name or "Event"
+                color = "#BDBDBD"
 
-            self.add_event_item(display, time_sec, color)
+            self.add_event_item(display, time_sec, color, category=category)
 
     def populate_ban_pick(self) -> None:
         view_model = build_ban_pick_view_model(self.ban_pick)
@@ -2055,11 +2076,12 @@ class PlayerWidget(QWidget):
             self.clip_worker = None
         return sync_stopped and ffmpeg_setup_stopped and clip_stopped
 
-    def add_event_item(self, text: str, game_time: float, color_hex: str) -> None:
+    def add_event_item(self, text: str, game_time: float, color_hex: str, category: str | None = None) -> None:
         m, s = divmod(int(game_time), 60)
         item_text = f"[{m:02d}:{s:02d}] {text}"
         item = QListWidgetItem(item_text)
         item.setData(Qt.ItemDataRole.UserRole, game_time)
+        item.setData(Qt.ItemDataRole.UserRole + 1, category)
         color = QColor(str(color_hex))
         if not color.isValid():
             color = QColor("#FFFFFF")

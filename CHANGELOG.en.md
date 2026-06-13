@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1] - 2026-06-13
+
+### Fixed
+
+- Added the dedicated LCU Gameflow phase API to game-start monitoring so recording can start when the Live Client API or Gameflow session API is unavailable.
+- Normalized variations of `GameStart`, `InProgress`, and `Reconnect` to detect game-start states reliably.
+
 ## [0.4.0] - 2026-06-13
 
 ### Added

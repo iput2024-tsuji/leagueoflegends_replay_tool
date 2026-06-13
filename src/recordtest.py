@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -85,6 +86,7 @@ EVENT_URL = f"{LIVECLIENT_BASE}/eventdata"
 ALL_GAME_URL = f"{LIVECLIENT_BASE}/allgamedata"
 LCU_CHAMP_SELECT_PATH = "/lol-champ-select/v1/session"
 LCU_CHAMPION_SUMMARY_PATH = "/lol-game-data/assets/v1/champion-summary.json"
+LCU_GAMEFLOW_PHASE_PATH = "/lol-gameflow/v1/gameflow-phase"
 LCU_GAMEFLOW_SESSION_PATH = "/lol-gameflow/v1/session"
 LCU_GAME_QUEUES_PATH = "/lol-game-queues/v1/queues"
 
@@ -137,7 +139,7 @@ DEFAULT_RECORDING_START_TIMEOUT_SEC = 8.0
 DEFAULT_RECORDING_START_POLL_SEC = 0.25
 DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC = 30.0
 MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
-LCU_GAMEFLOW_START_PHASES = frozenset({"InProgress", "Reconnect"})
+LCU_GAMEFLOW_START_PHASES = frozenset({"gamestart", "inprogress", "reconnect"})
 OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS = (
     "DesktopDevice1",
     "DesktopDevice2",
@@ -606,6 +608,10 @@ class RiotAPIClient(ABC):
 
     @abstractmethod
     async def get_champion_catalog(self) -> dict[int, str]:
+        pass
+
+    @abstractmethod
+    async def get_gameflow_phase_result(self) -> RiotPollResult:
         pass
 
     @abstractmethod
@@ -2510,6 +2516,22 @@ class LiveClientRiotAPIClient(RiotAPIClient):
             self._champion_catalog = catalog
         return dict(catalog)
 
+    async def get_gameflow_phase_result(self) -> RiotPollResult:
+        result = await self._fetch_lcu_result(LCU_GAMEFLOW_PHASE_PATH, timeout_sec=1.0)
+        if result.status != RiotPollStatus.IN_GAME or not isinstance(result.payload, dict):
+            return result
+
+        phase = _first_mapping_value(result.payload, "phase", "value")
+        if phase in (None, ""):
+            return RiotPollResult(
+                RiotPollStatus.TEMPORARY_FAILURE,
+                error="Unexpected gameflow phase payload",
+            )
+        return RiotPollResult(
+            RiotPollStatus.IN_GAME,
+            payload={"phase": str(phase)},
+        )
+
     async def get_match_metadata(self) -> dict[str, Any]:
         session_result = await self._fetch_lcu_result(LCU_GAMEFLOW_SESSION_PATH, timeout_sec=1.5)
         if session_result.status != RiotPollStatus.IN_GAME or not isinstance(session_result.payload, dict):
@@ -3215,6 +3237,34 @@ class LoLAutoRecorder(RecordingSessionManager):
         if current_name and current_name != previous_name:
             self.log(f"マッチ種類を検出: {current_name}")
 
+    @staticmethod
+    def _normalize_gameflow_phase(value: Any) -> str | None:
+        if value in (None, ""):
+            return None
+        normalized = re.sub(r"[\s_-]+", "", str(value)).casefold()
+        return normalized or None
+
+    async def poll_gameflow_phase(self) -> RiotPollResult:
+        get_phase = getattr(self.riot_api_client, "get_gameflow_phase_result", None)
+        if not callable(get_phase):
+            return RiotPollResult(RiotPollStatus.NOT_IN_GAME)
+        try:
+            result = get_phase()
+            if hasattr(result, "__await__"):
+                result = await result
+        except Exception as e:
+            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
+        if not isinstance(result, RiotPollResult):
+            return RiotPollResult(
+                RiotPollStatus.TEMPORARY_FAILURE,
+                error="Unexpected gameflow phase result",
+            )
+        if result.status == RiotPollStatus.IN_GAME and isinstance(result.payload, dict):
+            phase = _first_mapping_value(result.payload, "phase", "value")
+            if phase not in (None, ""):
+                self.match_metadata["gameflow_phase"] = str(phase)
+        return result
+
     async def wait_for_previous_game_clear_async(self) -> bool:
         if not self._require_game_clear:
             return True
@@ -3389,6 +3439,11 @@ class LoLAutoRecorder(RecordingSessionManager):
                 self.session_phase = RecordingPhase.CANCELLED
                 return False
             await self.capture_champ_select_async()
+            await self.poll_gameflow_phase()
+            gameflow_phase = self.match_metadata.get("gameflow_phase")
+            if self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES:
+                return await self._mark_game_started(source="lcu")
+
             await self.capture_match_metadata_async()
             result = await self.poll_all_game_data()
             data = result.payload
@@ -3401,7 +3456,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 )
 
             gameflow_phase = self.match_metadata.get("gameflow_phase")
-            if gameflow_phase in LCU_GAMEFLOW_START_PHASES:
+            if self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES:
                 return await self._mark_game_started(source="lcu")
 
             if loop.time() >= next_diagnostic_at:

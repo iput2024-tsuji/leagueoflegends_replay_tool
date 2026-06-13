@@ -403,6 +403,7 @@ def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
     )
     champ_select_url = f"{connection.base_url}{recordtest.LCU_CHAMP_SELECT_PATH}"
     champion_summary_url = f"{connection.base_url}{recordtest.LCU_CHAMPION_SUMMARY_PATH}"
+    gameflow_phase_url = f"{connection.base_url}{recordtest.LCU_GAMEFLOW_PHASE_PATH}"
     gameflow_url = f"{connection.base_url}{recordtest.LCU_GAMEFLOW_SESSION_PATH}"
     queue_catalog_url = f"{connection.base_url}{recordtest.LCU_GAME_QUEUES_PATH}"
     routes = {
@@ -411,6 +412,7 @@ def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
             {"id": 103, "name": "Ahri"},
             {"id": 266, "name": "Aatrox"},
         ],
+        gameflow_phase_url: "GameStart",
         gameflow_url: {
             "phase": "InProgress",
             "gameData": {
@@ -431,11 +433,14 @@ def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
 
     result = run(client.get_champ_select_session_result())
     catalog = run(client.get_champion_catalog())
+    phase = run(client.get_gameflow_phase_result())
     match = run(client.get_match_metadata())
 
     assert result.status == recordtest.RiotPollStatus.IN_GAME
     assert result.payload["gameId"] == 123
     assert catalog == {103: "Ahri", 266: "Aatrox"}
+    assert phase.status == recordtest.RiotPollStatus.IN_GAME
+    assert phase.payload == {"phase": "GameStart"}
     assert match["queue_id"] == 420
     assert match["display_name"] == "ランク ソロ/デュオ"
     assert match["gameflow_phase"] == "InProgress"

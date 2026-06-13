@@ -150,6 +150,43 @@ def test_wait_for_game_start_falls_back_to_lcu_in_progress_phase():
     assert recorder.session_started is True
 
 
+def test_wait_for_game_start_uses_dedicated_lcu_game_start_phase():
+    tmp_path = runtime_dir("lcu_gameflow_phase")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_gameflow_phase_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME,
+            payload={"phase": "game_start"},
+        )
+    )
+    riot_client.get_all_game_data_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.TEMPORARY_FAILURE,
+            error="Live Client API unavailable",
+        )
+    )
+    riot_client.get_active_player_name = AsyncMock(return_value=None)
+    riot_client.get_champ_select_session_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.NOT_IN_GAME)
+    )
+    riot_client.get_match_metadata = AsyncMock(return_value={})
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+
+    assert run(recorder.wait_for_game_start_async()) is True
+    assert recorder.game_start_detection_source == "lcu"
+    assert recorder.match_metadata["gameflow_phase"] == "game_start"
+    assert recorder.session_started is True
+    riot_client.get_all_game_data_result.assert_not_awaited()
+    riot_client.get_match_metadata.assert_not_awaited()
+
+
 def test_wait_for_game_start_captures_ban_pick_order_and_champions():
     tmp_path = runtime_dir("ban_pick")
     config = config_for(tmp_path)

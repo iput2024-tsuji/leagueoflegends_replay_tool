@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Mapping
 from enum import Enum
 from typing import Any
+
+LOGGER = logging.getLogger("lol_replay.notifications")
 
 
 class NotificationEvent(str, Enum):
@@ -15,7 +18,7 @@ class NotificationEvent(str, Enum):
 DEFAULT_NOTIFICATION_SETTINGS = {
     "enabled": True,
     NotificationEvent.RECORDING_STARTED.value: True,
-    NotificationEvent.RECORDING_COMPLETED.value: False,
+    NotificationEvent.RECORDING_COMPLETED.value: True,
     NotificationEvent.RECORDING_FAILED.value: True,
     NotificationEvent.MINIMIZED_TO_TRAY.value: True,
 }
@@ -38,7 +41,7 @@ class NotificationService:
     def __init__(
         self,
         config_loader: Callable[[], Mapping[str, Any]],
-        sender: Callable[[NotificationEvent, str, str], None],
+        sender: Callable[[NotificationEvent, str, str], bool | None],
     ) -> None:
         self.config_loader = config_loader
         self.sender = sender
@@ -48,8 +51,14 @@ class NotificationService:
             notification_event = event if isinstance(event, NotificationEvent) else NotificationEvent(str(event))
             config = self.config_loader()
             if not notification_is_enabled(config, notification_event):
+                LOGGER.info("Notification suppressed by settings: event=%s", notification_event.value)
                 return False
-            self.sender(notification_event, str(title), str(message))
+            result = self.sender(notification_event, str(title), str(message))
+            if result is False:
+                LOGGER.warning("Notification sender rejected event=%s", notification_event.value)
+                return False
+            LOGGER.info("Notification dispatched: event=%s", notification_event.value)
             return True
         except Exception:
+            LOGGER.warning("Notification dispatch failed: event=%s", event, exc_info=True)
             return False

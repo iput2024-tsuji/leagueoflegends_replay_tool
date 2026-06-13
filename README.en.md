@@ -36,6 +36,7 @@ Ban/Pick capture uses the League Client API (LCU). LCU is not an officially supp
 - Safe deletion of recordings and related data
 - Win-rate summaries and tactical insights
 - Configurable storage, frame rate, microphone, capacity limits, and Windows notifications
+- Recording-completion notifications are sent after the game process clears to avoid in-game notification suppression
 - Automated tests for asynchronous workflows and external integration boundaries
 
 ## Technology Stack

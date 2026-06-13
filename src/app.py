@@ -1686,9 +1686,19 @@ class MainWindow(QMainWindow):
         except Exception:
             return True
 
-    def _show_windows_notification(self, event: NotificationEvent, title: str, message: str) -> None:
+    def _show_windows_notification(self, event: NotificationEvent, title: str, message: str) -> bool:
         if not self._tray_icon or not self._tray_icon.isVisible():
-            return
+            recordtest.LOGGER.warning(
+                "Windows notification skipped because tray icon is unavailable: %s",
+                event.value,
+            )
+            return False
+        if not QSystemTrayIcon.supportsMessages():
+            recordtest.LOGGER.warning(
+                "Windows notification skipped because tray messages are unsupported: %s",
+                event.value,
+            )
+            return False
         icon = (
             QSystemTrayIcon.MessageIcon.Warning
             if event == NotificationEvent.RECORDING_FAILED
@@ -1696,8 +1706,11 @@ class MainWindow(QMainWindow):
         )
         try:
             self._tray_icon.showMessage(title, message, icon, 4000)
+            recordtest.LOGGER.info("Windows notification submitted: %s", event.value)
+            return True
         except Exception:
             recordtest.LOGGER.warning("Windows notification failed: %s", event.value, exc_info=True)
+            return False
 
     def _stop_player(self, timeout_ms: int = 3000) -> bool:
         try:

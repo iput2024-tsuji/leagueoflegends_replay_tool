@@ -139,10 +139,13 @@ def test_build_ban_pick_view_model_formats_teams_and_action_order():
     assert model["has_data"] is True
     assert model["ally_lines"] == ["MID  Ahri"]
     assert model["enemy_lines"] == ["TOP  Aatrox"]
+    assert model["ally_members"][0]["champion_name"] == "Ahri"
+    assert model["enemy_members"][0]["champion_name"] == "Aatrox"
     assert [action["text"] for action in model["actions"]] == [
         "01. 敵 BAN: Darius",
         "02. 味方 PICK: Ahri · MID",
     ]
+    assert [action["champion_name"] for action in model["actions"]] == ["Darius", "Ahri"]
 
 
 def test_build_ban_pick_view_model_uses_pick_actions_when_team_snapshot_is_missing():
@@ -164,7 +167,17 @@ def test_build_ban_pick_view_model_uses_pick_actions_when_team_snapshot_is_missi
     assert model["enemy_lines"] == []
 
 
-def test_player_widget_displays_ban_pick_tab(qtbot):
+def test_player_widget_displays_ban_pick_tab_with_available_icons(qtbot, monkeypatch, tmp_path):
+    icon_path = tmp_path / "Ahri.png"
+    pixmap = player_module.QPixmap(8, 8)
+    pixmap.fill(player_module.QColor("#64B5F6"))
+    assert pixmap.save(str(icon_path))
+    monkeypatch.setattr(
+        player_module,
+        "find_champion_icon",
+        lambda champion_name: icon_path if champion_name in {"Ahri", "Darius"} else None,
+    )
+
     widget = PlayerWidget(auto_open=False)
     qtbot.addWidget(widget)
     widget.ban_pick = {
@@ -185,10 +198,28 @@ def test_player_widget_displays_ban_pick_tab(qtbot):
     widget.populate_ban_pick()
 
     assert widget.side_tabs.tabText(1) == "Ban/Pick"
-    assert widget.ban_pick_ally_label.text() == "MID  Ahri"
-    assert widget.ban_pick_enemy_label.text() == "TOP  Aatrox"
+    assert widget.ban_pick_ally_list.item(0).text() == "MID  Ahri"
+    assert widget.ban_pick_ally_list.item(0).icon().isNull() is False
+    assert widget.ban_pick_enemy_list.item(0).text() == "TOP  Aatrox"
+    assert widget.ban_pick_enemy_list.item(0).icon().isNull() is True
     assert widget.ban_pick_list.count() == 1
     assert widget.ban_pick_list.item(0).text() == "01. 敵 BAN: Darius"
+    assert widget.ban_pick_list.item(0).icon().isNull() is False
+
+
+def test_player_widget_omits_ban_pick_icons_when_files_are_missing(qtbot, monkeypatch):
+    monkeypatch.setattr(player_module, "find_champion_icon", lambda _champion_name: None)
+    widget = PlayerWidget(auto_open=False)
+    qtbot.addWidget(widget)
+    widget.ban_pick = {
+        "actions": [{"order": 1, "type": "ban", "team": "enemy", "champion_name": "Darius"}],
+        "teams": {"ally": [{"champion_name": "Ahri", "assigned_position": "middle"}]},
+    }
+
+    widget.populate_ban_pick()
+
+    assert widget.ban_pick_ally_list.item(0).icon().isNull() is True
+    assert widget.ban_pick_list.item(0).icon().isNull() is True
 
 
 def test_player_widget_separates_event_filter_categories(qtbot):

@@ -1,5 +1,12 @@
 # 変更履歴
 
+## [0.4.1] - 2026-06-13
+
+### 修正
+
+- LCUの専用Gameflow phase APIを試合開始監視へ追加し、Live Client APIやGameflow session APIが利用できない場合でも録画を開始できるようにしました。
+- `GameStart`、`InProgress`、`Reconnect`の表記揺れを正規化し、試合開始状態を安定して判定するようにしました。
+
 ## [0.4.0] - 2026-06-13
 
 ### 追加

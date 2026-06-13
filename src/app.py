@@ -539,12 +539,6 @@ class HomePage(QWidget):
         )
         layout.addWidget(self.status_label)
 
-        self.status_detail_label = QLabel("バックグラウンド監視を開始していません。")
-        self.status_detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_detail_label.setWordWrap(True)
-        self.status_detail_label.setStyleSheet("color: #9a9a9a;")
-        layout.addWidget(self.status_detail_label)
-
         layout.addStretch(1)
 
         btn_layout = QVBoxLayout()
@@ -568,15 +562,12 @@ class HomePage(QWidget):
         layout.addLayout(btn_layout)
         layout.addStretch(1)
 
-    def set_recorder_status(self, badge_text: str, color_hex: str = "#cfcfcf", detail_text: str | None = None) -> None:
+    def set_recorder_status(self, badge_text: str, color_hex: str = "#cfcfcf") -> None:
         self.status_label.setText(badge_text)
         self.status_label.setStyleSheet(
             "padding: 10px 14px; border-radius: 8px; "
             f"background-color: #2d2d2d; color: {color_hex}; border: 1px solid #3a3a3a;"
         )
-        if detail_text is not None:
-            self.status_detail_label.setText(detail_text)
-            self.status_detail_label.setToolTip(detail_text)
 
 
 class PlayerPage(QWidget):
@@ -1630,7 +1621,6 @@ class MainWindow(QMainWindow):
             self.home_page.set_recorder_status(
                 "⚪ セットアップ未完了",
                 color_hex="#cfcfcf",
-                detail_text="初回セットアップが完了するまで録画監視は開始しません。",
             )
 
     def init_tray_icon(self) -> None:
@@ -1779,30 +1769,30 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def _derive_recorder_home_status(self, raw_message: str) -> tuple[str, str, str]:
+    def _derive_recorder_home_status(self, raw_message: str) -> tuple[str, str]:
         text = str(raw_message or "").strip()
         if not text:
-            return "⚪ 停止", "#cfcfcf", "状態情報なし"
+            return "⚪ 停止", "#cfcfcf"
 
         lowered = text.lower()
 
         if text.startswith("❌"):
-            return "⚠️ 録画監視エラー", "#ffb74d", text
+            return "⚠️ 録画監視エラー", "#ffb74d"
         if "録画を開始します" in text or "試合終了を監視中" in text or "録画継続中" in text:
-            return "🔴 録画中", "#ff6b6b", text
+            return "🔴 録画中", "#ff6b6b"
         if "試合開始を待機中" in text or "次の試合を待機" in text:
-            return "🟢 LoLの起動を待機中...", "#7bd88f", text
+            return "🟢 LoLの起動を待機中...", "#7bd88f"
         if "停止リクエスト" in text or "終了しました" in text:
-            return "⚪ 停止", "#cfcfcf", text
+            return "⚪ 停止", "#cfcfcf"
         if text.startswith("⚠️") or "warning" in lowered:
-            return "🟡 監視中（警告あり）", "#ffd166", text
+            return "🟡 監視中（警告あり）", "#ffd166"
         if text.startswith("🛠️"):
-            return "🟢 起動準備中...", "#7bd88f", text
-        return "🟢 監視中", "#7bd88f", text
+            return "🟢 起動準備中...", "#7bd88f"
+        return "🟢 監視中", "#7bd88f"
 
     def _set_home_status_from_worker_message(self, raw_message: str) -> None:
-        badge, color, detail = self._derive_recorder_home_status(raw_message)
-        self.home_page.set_recorder_status(badge, color_hex=color, detail_text=detail)
+        badge, color = self._derive_recorder_home_status(raw_message)
+        self.home_page.set_recorder_status(badge, color_hex=color)
 
     def start_background_recorder(self) -> None:
         if self.bg_recorder_worker and self.bg_recorder_worker.isRunning():
@@ -1813,9 +1803,7 @@ class MainWindow(QMainWindow):
         self.bg_recorder_worker.error.connect(self.on_bg_recorder_error)
         self.bg_recorder_worker.notification.connect(self.on_bg_recorder_notification)
         self.bg_recorder_worker.finished.connect(self.on_bg_recorder_finished)
-        self.home_page.set_recorder_status(
-            "🟢 起動準備中...", color_hex="#7bd88f", detail_text="バックグラウンド録画監視を起動しています。"
-        )
+        self.home_page.set_recorder_status("🟢 起動準備中...", color_hex="#7bd88f")
         self.bg_recorder_worker.start()
 
     def stop_background_recorder(self, wait_ms: int = 5000, force: bool = False) -> bool:
@@ -1832,7 +1820,6 @@ class MainWindow(QMainWindow):
             self.home_page.set_recorder_status(
                 "⚠️ 停止待機中",
                 color_hex="#ffb74d",
-                detail_text="録画監視の停止がタイムアウトしました。停止完了まで終了を待機します。",
             )
             return False
         self.worker_registry.unregister(worker)
@@ -1858,10 +1845,10 @@ class MainWindow(QMainWindow):
         self._set_home_status_from_worker_message(message)
 
     def on_bg_recorder_error(self, message: str) -> None:
+        recordtest.LOGGER.error("Background recorder error: %s", message)
         self.home_page.set_recorder_status(
             "⚠️ 録画監視エラー",
             color_hex="#ffb74d",
-            detail_text=str(message),
         )
 
     def on_bg_recorder_notification(self, event: str, title: str, message: str) -> None:
@@ -1869,13 +1856,9 @@ class MainWindow(QMainWindow):
 
     def on_bg_recorder_finished(self) -> None:
         if self._closing:
-            self.home_page.set_recorder_status("⚪ 停止", color_hex="#cfcfcf", detail_text="アプリ終了中")
+            self.home_page.set_recorder_status("⚪ 停止", color_hex="#cfcfcf")
             return
-        self.home_page.set_recorder_status(
-            "⚪ 停止",
-            color_hex="#cfcfcf",
-            detail_text="バックグラウンド録画監視が停止しました。",
-        )
+        self.home_page.set_recorder_status("⚪ 停止", color_hex="#cfcfcf")
         if self.bg_recorder_worker:
             self.worker_registry.unregister(self.bg_recorder_worker)
             self.bg_recorder_worker = None
@@ -1906,7 +1889,6 @@ class MainWindow(QMainWindow):
             self.home_page.set_recorder_status(
                 "⚠️ 停止待機中",
                 color_hex="#ffb74d",
-                detail_text="一部のバックグラウンド処理が停止完了していません。",
             )
             if force_shutdown:
                 reply = QMessageBox.warning(

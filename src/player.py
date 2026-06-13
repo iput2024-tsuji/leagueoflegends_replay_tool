@@ -17,8 +17,8 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QFile, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtCore import QFile, QSize, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QIcon, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -115,6 +115,7 @@ BAN_PICK_POSITION_ORDER = {
     "BOT": 3,
     "SUPPORT": 4,
 }
+BAN_PICK_ICON_SIZE = 24
 
 
 def _ban_pick_champion_name(value: Any) -> str:
@@ -161,22 +162,22 @@ def _ban_pick_team_members(ban_pick: dict[str, Any], team: str) -> list[dict[str
 def build_ban_pick_view_model(value: Any) -> dict[str, Any]:
     ban_pick = value if isinstance(value, dict) else {}
 
-    def team_lines(team: str) -> list[str]:
+    def team_members(team: str) -> list[dict[str, Any]]:
         members = _ban_pick_team_members(ban_pick, team)
         rows = []
         for index, member in enumerate(members):
             position = _ban_pick_position(member.get("assigned_position"))
+            champion_name = _ban_pick_champion_name(member)
             rows.append(
                 {
-                    "text": f"{position}  {_ban_pick_champion_name(member)}"
-                    if position
-                    else _ban_pick_champion_name(member),
+                    "text": f"{position}  {champion_name}" if position else champion_name,
+                    "champion_name": champion_name,
                     "position": BAN_PICK_POSITION_ORDER.get(position, 100),
                     "cell_id": member.get("cell_id") if member.get("cell_id") is not None else index,
                 }
             )
         rows.sort(key=lambda row: (row["position"], str(row["cell_id"])))
-        return [row["text"] for row in rows]
+        return rows
 
     raw_actions = ban_pick.get("actions")
     actions = [action for action in raw_actions if isinstance(action, dict)] if isinstance(raw_actions, list) else []
@@ -215,15 +216,18 @@ def build_ban_pick_view_model(value: Any) -> dict[str, Any]:
                 "text": f"{order:02d}. {team_label} {action_label}: {champion}{suffix}",
                 "team": team,
                 "type": action_type,
+                "champion_name": champion,
             }
         )
 
-    ally_lines = team_lines("ally")
-    enemy_lines = team_lines("enemy")
+    ally_members = team_members("ally")
+    enemy_members = team_members("enemy")
     return {
-        "has_data": bool(formatted_actions or ally_lines or enemy_lines),
-        "ally_lines": ally_lines,
-        "enemy_lines": enemy_lines,
+        "has_data": bool(formatted_actions or ally_members or enemy_members),
+        "ally_lines": [member["text"] for member in ally_members],
+        "enemy_lines": [member["text"] for member in enemy_members],
+        "ally_members": ally_members,
+        "enemy_members": enemy_members,
         "actions": formatted_actions,
     }
 
@@ -1406,20 +1410,16 @@ class PlayerWidget(QWidget):
         ally_column = QVBoxLayout()
         ally_title = QLabel("味方")
         ally_title.setStyleSheet("font-weight: bold; color: #64B5F6;")
-        self.ban_pick_ally_label = QLabel("-")
-        self.ban_pick_ally_label.setWordWrap(True)
-        self.ban_pick_ally_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.ban_pick_ally_list = self.create_ban_pick_list(maximum_height=136)
         ally_column.addWidget(ally_title)
-        ally_column.addWidget(self.ban_pick_ally_label)
+        ally_column.addWidget(self.ban_pick_ally_list)
 
         enemy_column = QVBoxLayout()
         enemy_title = QLabel("敵")
         enemy_title.setStyleSheet("font-weight: bold; color: #EF9A9A;")
-        self.ban_pick_enemy_label = QLabel("-")
-        self.ban_pick_enemy_label.setWordWrap(True)
-        self.ban_pick_enemy_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.ban_pick_enemy_list = self.create_ban_pick_list(maximum_height=136)
         enemy_column.addWidget(enemy_title)
-        enemy_column.addWidget(self.ban_pick_enemy_label)
+        enemy_column.addWidget(self.ban_pick_enemy_list)
 
         composition_row.addLayout(ally_column, stretch=1)
         composition_row.addLayout(enemy_column, stretch=1)
@@ -1431,6 +1431,8 @@ class PlayerWidget(QWidget):
 
         self.ban_pick_list = QListWidget()
         self.ban_pick_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.ban_pick_list.setIconSize(QSize(BAN_PICK_ICON_SIZE, BAN_PICK_ICON_SIZE))
+        self.ban_pick_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.ban_pick_list.setStyleSheet(
             "QListWidget { border: none; background-color: #2b2b2b; }"
             "QListWidget::item { padding: 8px; border-bottom: 1px solid #444; }"
@@ -1456,6 +1458,19 @@ class PlayerWidget(QWidget):
             self.open_replay_selector()
 
         self.populate_ban_pick()
+
+    def create_ban_pick_list(self, maximum_height: int | None = None) -> QListWidget:
+        list_widget = QListWidget()
+        list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        list_widget.setIconSize(QSize(BAN_PICK_ICON_SIZE, BAN_PICK_ICON_SIZE))
+        list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        list_widget.setStyleSheet(
+            "QListWidget { border: none; background-color: transparent; }"
+            "QListWidget::item { padding: 2px 0; }"
+        )
+        if maximum_height is not None:
+            list_widget.setMaximumHeight(maximum_height)
+        return list_widget
 
     def init_mpv(self) -> bool:
         if self.player is not None:
@@ -1846,16 +1861,18 @@ class PlayerWidget(QWidget):
     def populate_ban_pick(self) -> None:
         view_model = build_ban_pick_view_model(self.ban_pick)
         self.ban_pick_list.clear()
+        self.ban_pick_ally_list.clear()
+        self.ban_pick_enemy_list.clear()
 
         if not view_model["has_data"]:
             self.ban_pick_status_label.setText("この試合にはBan/Pick記録がありません。")
-            self.ban_pick_ally_label.setText("-")
-            self.ban_pick_enemy_label.setText("-")
+            self.ban_pick_ally_list.addItem("-")
+            self.ban_pick_enemy_list.addItem("-")
             return
 
         self.ban_pick_status_label.setText("チャンピオン選択中に確定した内容です。")
-        self.ban_pick_ally_label.setText("\n".join(view_model["ally_lines"]) or "-")
-        self.ban_pick_enemy_label.setText("\n".join(view_model["enemy_lines"]) or "-")
+        self.populate_ban_pick_team(self.ban_pick_ally_list, view_model["ally_members"])
+        self.populate_ban_pick_team(self.ban_pick_enemy_list, view_model["enemy_members"])
 
         colors = {
             "ally": QColor("#64B5F6"),
@@ -1863,9 +1880,27 @@ class PlayerWidget(QWidget):
             "unknown": QColor("#BDBDBD"),
         }
         for action in view_model["actions"]:
-            item = QListWidgetItem(action["text"])
+            item = self.create_ban_pick_item(action["text"], action["champion_name"])
             item.setForeground(colors.get(action["team"], colors["unknown"]))
             self.ban_pick_list.addItem(item)
+
+    def populate_ban_pick_team(self, list_widget: QListWidget, members: list[dict[str, Any]]) -> None:
+        if not members:
+            list_widget.addItem("-")
+            return
+        for member in members:
+            list_widget.addItem(self.create_ban_pick_item(member["text"], member["champion_name"]))
+
+    def create_ban_pick_item(self, text: str, champion_name: str | None) -> QListWidgetItem:
+        item = QListWidgetItem(text)
+        item.setToolTip(text)
+        icon_path = find_champion_icon(champion_name)
+        if icon_path is None:
+            return item
+        pixmap = QPixmap(str(icon_path))
+        if not pixmap.isNull():
+            item.setIcon(QIcon(pixmap))
+        return item
 
     def update_offset_label(self) -> None:
         if self.offset is None:

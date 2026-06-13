@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.0] - 2026-06-13
+
+### Added
+
+- Added locally available champion icons to the Ban/Pick sequence and final team compositions in the replay view.
+- Kept text-only display when a champion icon is unavailable. The application does not download icons automatically.
+
+### Changed
+
+- Removed the internal status-detail line shown below the recording status badge on the home screen.
+- Enabled recording-completion notifications by default for new configurations.
+
+### Fixed
+
+- Delayed recording-completion notifications until the LoL game process clears, reducing interference from Windows in-game notification suppression.
+- Added logs for notification requests, settings-based suppression, tray submission, and delivery failures.
+
 ## [0.3.0] - 2026-06-13
 
 ### Added

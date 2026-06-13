@@ -88,6 +88,10 @@ class FakeRecorder:
         self.calls.append("record_until_end_async")
         return RecordingOutcome.COMPLETED
 
+    async def wait_for_previous_game_clear_async(self):
+        self.calls.append("wait_for_previous_game_clear_async")
+        return True
+
     def stop_recording(self):
         self.calls.append("stop_recording")
 
@@ -162,6 +166,7 @@ def test_recording_supervisor_runs_one_session_and_cleans_up():
         "record_until_end_async",
         "finalize_session",
         "save_json",
+        "wait_for_previous_game_clear_async",
         "reset_session",
         "wait_for_game_start_async",
         "request_stop",
@@ -169,6 +174,22 @@ def test_recording_supervisor_runs_one_session_and_cleans_up():
         "runtime_close",
     ]
     assert recording_controller.runtime.close_calls == [False]
+
+
+def test_recording_supervisor_notifies_completion_after_game_process_clears():
+    notifications = []
+    recorder = FakeRecorder()
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=FakeRecordingController(recorder),
+        notification_cb=lambda *args: notifications.append((args[0], list(recorder.calls))),
+    )
+
+    run(run_supervisor(supervisor))
+
+    completed = next(item for item in notifications if item[0] == "recording_completed")
+    assert "wait_for_previous_game_clear_async" in completed[1]
+    assert completed[1].index("wait_for_previous_game_clear_async") > completed[1].index("save_json")
 
 
 def test_recording_supervisor_raises_preflight_errors_without_creating_recorder():

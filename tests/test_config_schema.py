@@ -115,7 +115,7 @@ def test_normalize_config_adds_independent_notification_defaults():
     assert result.config["notifications"] == {
         "enabled": True,
         "recording_started": True,
-        "recording_completed": False,
+        "recording_completed": True,
         "recording_failed": True,
         "minimized_to_tray": True,
     }

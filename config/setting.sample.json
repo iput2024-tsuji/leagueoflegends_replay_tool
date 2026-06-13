@@ -51,7 +51,7 @@
     "notifications": {
         "enabled": true,
         "recording_started": true,
-        "recording_completed": false,
+        "recording_completed": true,
         "recording_failed": true,
         "minimized_to_tray": true
     }

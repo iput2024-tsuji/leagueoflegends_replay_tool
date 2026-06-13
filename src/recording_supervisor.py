@@ -109,6 +109,7 @@ class RecordingSupervisor:
                     )
                     break
                 self._emit("✅ 試合記録完了。次の試合を待機します。")
+                await self._wait_for_post_game_notification_window()
                 self._notify(
                     NotificationEvent.RECORDING_COMPLETED,
                     "録画が完了しました",
@@ -189,7 +190,25 @@ class RecordingSupervisor:
 
     def _notify(self, event: NotificationEvent, title: str, message: str) -> None:
         if self.notification_cb:
+            recordtest.LOGGER.info("Notification requested: event=%s", event.value)
             self.notification_cb(event.value, title, message)
+
+    async def _wait_for_post_game_notification_window(self) -> None:
+        waiter = getattr(self.recorder, "wait_for_previous_game_clear_async", None)
+        if not callable(waiter):
+            return
+        try:
+            cleared = await waiter()
+        except Exception:
+            recordtest.LOGGER.warning(
+                "Failed while waiting to send recording completion notification",
+                exc_info=True,
+            )
+            return
+        if cleared:
+            recordtest.LOGGER.info("Post-game process cleared before completion notification")
+        else:
+            recordtest.LOGGER.info("Post-game notification wait ended before process clear")
 
     def _notification_error_message(self, error: BaseException) -> str:
         detail = str(error).strip().splitlines()[0] if str(error).strip() else type(error).__name__

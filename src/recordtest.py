@@ -127,6 +127,7 @@ VALID_OBS_SCALE_TYPES = frozenset({"bilinear", "bicubic", "lanczos", "area"})
 VALID_OBS_RECORDING_QUALITIES = frozenset({"Stream", "Small", "HQ", "Lossless"})
 DEFAULT_END_ERROR_LIMIT = 3
 DEFAULT_END_MISSING_GRACE_SEC = 60.0
+DEFAULT_END_TEMPORARY_FAILURE_GRACE_SEC = 180.0
 DEFAULT_END_POLL_SEC = 5
 DEFAULT_EVENT_POLL_SEC = 1
 DEFAULT_MAX_STORAGE_GB = 50
@@ -311,6 +312,7 @@ class PathsSettings:
 class PollingSettings:
     end_error_limit: int
     end_missing_grace_sec: float
+    end_temporary_failure_grace_sec: float
     end_poll_sec: float
     event_poll_sec: float
 
@@ -433,6 +435,11 @@ class AppConfig:
             DEFAULT_END_MISSING_GRACE_SEC,
             minimum=0.0,
         )
+        end_temporary_failure_grace, _ = _safe_float(
+            polling_cfg.get("end_temporary_failure_grace_sec"),
+            DEFAULT_END_TEMPORARY_FAILURE_GRACE_SEC,
+            minimum=0.0,
+        )
         end_poll, _ = _safe_float(
             polling_cfg.get("end_poll_sec"),
             DEFAULT_END_POLL_SEC,
@@ -498,6 +505,7 @@ class AppConfig:
             polling=PollingSettings(
                 end_error_limit=end_limit,
                 end_missing_grace_sec=end_missing_grace,
+                end_temporary_failure_grace_sec=end_temporary_failure_grace,
                 end_poll_sec=end_poll,
                 event_poll_sec=event_poll,
             ),
@@ -3633,6 +3641,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         end_detector = RecordingEndDetector(
             error_limit=self.config.polling.end_error_limit,
             missing_grace_sec=self.config.polling.end_missing_grace_sec,
+            temporary_failure_grace_sec=self.config.polling.end_temporary_failure_grace_sec,
         )
         while True:
             if self.should_stop():

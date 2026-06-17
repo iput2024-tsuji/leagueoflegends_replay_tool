@@ -29,6 +29,7 @@
     "polling": {
         "end_error_limit": 3,
         "end_missing_grace_sec": 60,
+        "end_temporary_failure_grace_sec": 180,
         "end_poll_sec": 5,
         "event_poll_sec": 1
     },

@@ -2102,6 +2102,35 @@ def is_app_owned_video_path(path: str | Path | None, config: AppConfig) -> bool:
     return video_path.suffix.lower() in {".mp4", ".mkv", ".flv", ".mov", ".avi"}
 
 
+def find_app_owned_clip_paths(video_path: str | Path | None, config: AppConfig) -> tuple[Path, ...]:
+    if not video_path:
+        return ()
+    try:
+        source = Path(video_path).resolve()
+        recordings_dir = Path(config.paths.recordings_dir).resolve()
+        clips_dir = (Path(config.paths.recordings_dir) / "clips").resolve()
+    except Exception:
+        return ()
+    if not is_within(source, recordings_dir) or source.suffix.lower() not in {".mp4", ".mkv", ".flv", ".mov", ".avi"}:
+        return ()
+    if not clips_dir.exists():
+        return ()
+
+    matches = []
+    for candidate in clips_dir.glob(f"{source.stem}_clip_*"):
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if (
+            resolved.is_file()
+            and is_within(resolved, clips_dir)
+            and resolved.suffix.lower() in {".mp4", ".mkv", ".flv", ".mov", ".avi"}
+        ):
+            matches.append(resolved)
+    return tuple(sorted(matches))
+
+
 def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str | Path] | None = None) -> None:
     config = config or load_app_config()
     if not config.storage.max_size_bytes:
@@ -2124,6 +2153,7 @@ def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str 
             if json_path.resolve() in keep_paths:
                 continue
             try:
+                clip_paths = find_app_owned_clip_paths(video_path, config)
                 if (
                     video_path
                     and video_path.exists()
@@ -2131,6 +2161,9 @@ def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str 
                     and is_app_owned_video_path(video_path, config)
                 ):
                     video_path.unlink(missing_ok=True)
+                for clip_path in clip_paths:
+                    if clip_path.resolve() not in keep_paths:
+                        clip_path.unlink(missing_ok=True)
             except Exception:
                 pass
             try:

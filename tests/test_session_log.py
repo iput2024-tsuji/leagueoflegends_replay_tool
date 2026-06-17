@@ -9,6 +9,7 @@ from src.session_log import (
     SessionLogV1,
     load_session_payload,
     load_session_payload_result,
+    migrate_session_payload,
 )
 
 
@@ -89,6 +90,29 @@ def test_session_log_loader_rejects_unknown_schema_version(tmp_path):
 
     with pytest.raises(ValueError, match="unsupported session log schema_version"):
         load_session_payload(path)
+
+
+def test_session_log_migration_pipeline_applies_incremental_migrations():
+    def migrate_v1(payload):
+        payload["session_status"] = "completed"
+        payload["match"] = {"queue_id": 420}
+        return payload
+
+    payload = migrate_session_payload(
+        {"schema_version": 1, "summoner_name": "Tester#JP1"},
+        target_version=2,
+        migrations={1: migrate_v1},
+    )
+
+    assert payload["schema_version"] == 2
+    assert payload["session_status"] == "completed"
+    assert payload["match"] == {"queue_id": 420}
+    assert payload["summoner_name"] == "Tester#JP1"
+
+
+def test_session_log_migration_pipeline_requires_explicit_migration():
+    with pytest.raises(ValueError, match="missing session log migration: v1 -> v2"):
+        migrate_session_payload({"schema_version": 1}, target_version=2, migrations={})
 
 
 def test_session_log_result_reports_load_errors(tmp_path):

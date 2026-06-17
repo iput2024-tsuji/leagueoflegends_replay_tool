@@ -376,6 +376,20 @@ def _extract_ffmpeg(zip_path: Path, dest: Path) -> Path:
     return dest
 
 
+def _safe_extractall(archive: zipfile.ZipFile, dest_dir: Path) -> None:
+    root = dest_dir.resolve()
+    for info in archive.infolist():
+        member_name = info.filename.replace("\\", "/")
+        if Path(member_name).is_absolute() or (len(member_name) > 1 and member_name[1] == ":"):
+            raise RuntimeError(f"Unsafe ZIP member path: {info.filename}")
+        target = (root / member_name).resolve()
+        try:
+            target.relative_to(root)
+        except ValueError as e:
+            raise RuntimeError(f"Unsafe ZIP member path: {info.filename}") from e
+    archive.extractall(root)
+
+
 def _copy_tree_contents(src_dir: Path, dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     for item in src_dir.iterdir():
@@ -423,7 +437,7 @@ def _extract_obs(zip_path: Path, dest_dir: Path) -> Path:
     # block executable-looking files during test/build setup.
     with temporary_workspace("lol-replay-obs-extract-", parent=dest_dir.parent) as extract_dir:
         with zipfile.ZipFile(zip_path) as archive:
-            archive.extractall(extract_dir)
+            _safe_extractall(archive, extract_dir)
         obs_root = _find_obs_root(extract_dir)
         _copy_tree_contents(obs_root, dest_dir)
         cleanup_obs_debug_symbols(dest_dir)

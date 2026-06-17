@@ -34,6 +34,36 @@ def test_extract_obs_flattens_top_level_zip_directory(monkeypatch):
     assert not (dest / "OBS-Studio-Portable" / "bin" / "64bit" / "obs64.exe").exists()
 
 
+def test_extract_obs_rejects_zip_member_outside_destination():
+    tmp_path = runtime_dir("setup_env_obs_extract_zip_slip")
+    zip_path = tmp_path / "obs.zip"
+    dest = tmp_path / "obs-portable"
+    outside = tmp_path / "evil.txt"
+
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("OBS-Studio-Portable/bin/64bit/obs64.exe", "fake")
+        archive.writestr("../evil.txt", "must not be written")
+
+    with pytest.raises(RuntimeError, match="Unsafe ZIP member path"):
+        setup_env._extract_obs(zip_path, dest)
+
+    assert not outside.exists()
+    assert not (dest / "bin" / "64bit" / "obs64.exe").exists()
+
+
+def test_safe_extractall_rejects_windows_absolute_member():
+    tmp_path = runtime_dir("setup_env_obs_extract_windows_absolute")
+    zip_path = tmp_path / "obs.zip"
+    dest = tmp_path / "extract"
+
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("C:/Windows/System32/evil.txt", "must not be written")
+
+    with zipfile.ZipFile(zip_path) as archive:
+        with pytest.raises(RuntimeError, match="Unsafe ZIP member path"):
+            setup_env._safe_extractall(archive, dest)
+
+
 def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypatch):
     obs_dir = runtime_dir("setup_env_obs_bootstrap") / "obs-portable"
 

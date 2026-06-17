@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 SESSION_LOG_SCHEMA_VERSION = 1
+SessionLogMigration = Callable[[dict[str, Any]], dict[str, Any]]
+SESSION_LOG_MIGRATIONS: dict[int, SessionLogMigration] = {}
 
 
 @dataclass(frozen=True)
@@ -45,9 +48,7 @@ class SessionLogV1:
     def from_payload(cls, payload: dict[str, Any]) -> SessionLogV1:
         if not isinstance(payload, dict):
             raise ValueError("session log payload must be a JSON object")
-        schema_version = int(payload.get("schema_version") or SESSION_LOG_SCHEMA_VERSION)
-        if schema_version != SESSION_LOG_SCHEMA_VERSION:
-            raise ValueError(f"unsupported session log schema_version: {schema_version}")
+        payload = migrate_session_payload(payload)
 
         paths = payload.get("paths") if isinstance(payload.get("paths"), dict) else {}
         return cls(
@@ -101,6 +102,33 @@ class SessionLogV1:
         }
 
 
+def migrate_session_payload(
+    payload: dict[str, Any],
+    *,
+    target_version: int = SESSION_LOG_SCHEMA_VERSION,
+    migrations: dict[int, SessionLogMigration] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("session log payload must be a JSON object")
+
+    migrations = SESSION_LOG_MIGRATIONS if migrations is None else migrations
+    schema_version = _schema_version(payload)
+    if schema_version > target_version:
+        raise ValueError(f"unsupported session log schema_version: {schema_version}")
+
+    migrated = dict(payload)
+    while schema_version < target_version:
+        migration = migrations.get(schema_version)
+        if migration is None:
+            raise ValueError(f"missing session log migration: v{schema_version} -> v{schema_version + 1}")
+        migrated = migration(dict(migrated))
+        if not isinstance(migrated, dict):
+            raise ValueError(f"session log migration v{schema_version} did not return a JSON object")
+        schema_version += 1
+        migrated["schema_version"] = schema_version
+    return migrated
+
+
 def load_session_payload(path: str | Path) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         payload = json.load(f)
@@ -138,6 +166,13 @@ def _optional_str(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text if text else None
+
+
+def _schema_version(payload: dict[str, Any]) -> int:
+    try:
+        return int(payload.get("schema_version") or SESSION_LOG_SCHEMA_VERSION)
+    except Exception as e:
+        raise ValueError(f"invalid session log schema_version: {payload.get('schema_version')}") from e
 
 
 def _float_value(value: Any, default: float) -> float:

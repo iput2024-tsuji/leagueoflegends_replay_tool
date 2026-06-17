@@ -9,6 +9,7 @@ class RecordingEndReason(str, Enum):
     STILL_ACTIVE = "still_active"
     GAME_END_EVENT = "game_end_event"
     NOT_IN_GAME_CONFIRMED = "not_in_game_confirmed"
+    TEMPORARY_FAILURE_TIMEOUT = "temporary_failure_timeout"
 
 
 class RecordingOutcome(str, Enum):
@@ -56,12 +57,14 @@ class RecordingEndDecision:
 class RecordingEndDetector:
     """LCUポーリング結果から録画終了を判定する状態機械。"""
 
-    def __init__(self, error_limit: int, missing_grace_sec: float) -> None:
+    def __init__(self, error_limit: int, missing_grace_sec: float, temporary_failure_grace_sec: float) -> None:
         self.error_limit = max(1, int(error_limit))
         self.missing_grace_sec = max(0.0, float(missing_grace_sec))
+        self.temporary_failure_grace_sec = max(0.0, float(temporary_failure_grace_sec))
         self.not_in_game_count = 0
         self.not_in_game_started_at: float | None = None
         self.temporary_failure_count = 0
+        self.temporary_failure_started_at: float | None = None
 
     def observe_poll_status(self, status: Any, now: float) -> RecordingEndDecision:
         status_value = getattr(status, "value", status)
@@ -70,10 +73,19 @@ class RecordingEndDetector:
             return RecordingEndDecision(False, RecordingEndReason.STILL_ACTIVE)
 
         if status_value == "temporary_failure":
+            if self.temporary_failure_started_at is None:
+                self.temporary_failure_started_at = now
             self.temporary_failure_count += 1
+            failure_duration = now - self.temporary_failure_started_at
+            if (
+                self.temporary_failure_count >= self.error_limit
+                and failure_duration >= self.temporary_failure_grace_sec
+            ):
+                return RecordingEndDecision(True, RecordingEndReason.TEMPORARY_FAILURE_TIMEOUT)
             return RecordingEndDecision(False, RecordingEndReason.STILL_ACTIVE)
 
         if status_value == "not_in_game":
+            self.reset_temporary_failure()
             if self.not_in_game_started_at is None:
                 self.not_in_game_started_at = now
             self.not_in_game_count += 1
@@ -81,6 +93,7 @@ class RecordingEndDetector:
             if self.not_in_game_count >= self.error_limit and missing_duration >= self.missing_grace_sec:
                 return RecordingEndDecision(True, RecordingEndReason.NOT_IN_GAME_CONFIRMED)
 
+        self.reset_temporary_failure()
         return RecordingEndDecision(False, RecordingEndReason.STILL_ACTIVE)
 
     def observe_game_end_event(self) -> RecordingEndDecision:
@@ -89,4 +102,8 @@ class RecordingEndDetector:
     def reset(self) -> None:
         self.not_in_game_count = 0
         self.not_in_game_started_at = None
+        self.reset_temporary_failure()
+
+    def reset_temporary_failure(self) -> None:
         self.temporary_failure_count = 0
+        self.temporary_failure_started_at = None

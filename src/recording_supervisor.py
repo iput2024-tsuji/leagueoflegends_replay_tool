@@ -79,6 +79,7 @@ class RecordingSupervisor:
                         break
                     outcome = await self.recorder.record_until_end_async()
                 except Exception as e:
+                    should_continue = not stop_event.is_set()
                     if self._has_session_data():
                         self._mark_failed_partial(e)
                         result = self._finalize_current_session(RecordingOutcome.FAILED_PARTIAL, e)
@@ -86,12 +87,16 @@ class RecordingSupervisor:
                             self._emit("⚠️ 録画セッションを部分保存しました。")
                         else:
                             self._emit(f"⚠️ 部分保存に失敗しました: {self._finalize_error(result)}")
+                            should_continue = False
                     self._notify(
                         NotificationEvent.RECORDING_FAILED,
                         "録画に失敗しました",
                         self._notification_error_message(e),
                     )
-                    raise
+                    if should_continue:
+                        self._emit("⚠️ 録画エラー後も次の試合監視を継続します。")
+                        continue
+                    break
                 if outcome != RecordingOutcome.COMPLETED:
                     if self._has_session_data():
                         self._finalize_aborted("recording was cancelled")

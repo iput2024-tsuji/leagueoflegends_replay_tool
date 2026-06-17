@@ -42,6 +42,7 @@ VALID_OBS_SCALE_TYPES = frozenset({"bilinear", "bicubic", "lanczos", "area"})
 VALID_OBS_RECORDING_QUALITIES = frozenset({"Stream", "Small", "HQ", "Lossless"})
 DEFAULT_END_ERROR_LIMIT = 3
 DEFAULT_END_MISSING_GRACE_SEC = 60.0
+DEFAULT_END_TEMPORARY_FAILURE_GRACE_SEC = 180.0
 DEFAULT_END_POLL_SEC = 5
 DEFAULT_EVENT_POLL_SEC = 1
 DEFAULT_MAX_STORAGE_GB = 50
@@ -158,6 +159,7 @@ def normalize_config(
         {
             "end_error_limit": DEFAULT_END_ERROR_LIMIT,
             "end_missing_grace_sec": DEFAULT_END_MISSING_GRACE_SEC,
+            "end_temporary_failure_grace_sec": DEFAULT_END_TEMPORARY_FAILURE_GRACE_SEC,
             "end_poll_sec": DEFAULT_END_POLL_SEC,
             "event_poll_sec": DEFAULT_EVENT_POLL_SEC,
         },
@@ -591,6 +593,15 @@ def _normalize_numeric_values(
         "end_missing_grace_sec",
         DEFAULT_END_MISSING_GRACE_SEC,
         "end_missing_grace_sec が不正だったため既定値を使用します。",
+        auto_fix=auto_fix,
+        minimum=0.0,
+    )
+    _normalize_float_field(
+        result,
+        poll_cfg,
+        "end_temporary_failure_grace_sec",
+        DEFAULT_END_TEMPORARY_FAILURE_GRACE_SEC,
+        "end_temporary_failure_grace_sec が不正だったため既定値を使用します。",
         auto_fix=auto_fix,
         minimum=0.0,
     )

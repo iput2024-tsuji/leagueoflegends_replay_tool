@@ -35,4 +35,4 @@ known-first-party = ["src", "scripts"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-norecursedirs = ["_tmp", ".git", ".ruff_cache", ".pytest_cache", "build", "dist"]
+norecursedirs = ["_tmp", "_pytest*", ".git", ".ruff_cache", ".pytest_cache", ".pytest_tmp*", ".pytest-tmp", "build", "dist"]

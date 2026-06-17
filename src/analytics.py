@@ -16,8 +16,8 @@ except ImportError:
     from session_log import load_session_payload_result
 
 
-MIN_TACTICAL_INSIGHT_MATCHES = 8
-MIN_TACTICAL_INSIGHT_CLASS_MATCHES = 2
+MIN_TACTICAL_INSIGHT_MATCHES = 20
+MIN_TACTICAL_INSIGHT_CLASS_MATCHES = 5
 
 
 class GameDataAnalyzer:
@@ -36,12 +36,17 @@ class GameDataAnalyzer:
     def load_dataframe(self) -> DataFrame:
         rows = []
         self.load_errors = []
-        for match_index, json_path in enumerate(self.iter_json_files()):
+        seen_match_ids: set[str] = set()
+        for json_path in self.iter_json_files():
             payload = self._read_payload(json_path)
             if not payload:
                 continue
 
-            match_id = json_path.stem
+            match_id = self._stable_match_id(payload, json_path)
+            if match_id in seen_match_ids:
+                continue
+            match_index = len(seen_match_ids)
+            seen_match_ids.add(match_id)
             base = self._match_base_row(payload, match_id, json_path, match_index)
             events = payload.get("events_all") or payload.get("events") or []
 
@@ -55,6 +60,19 @@ class GameDataAnalyzer:
                 rows.append({**base, **self._event_row(event)})
 
         return pd.DataFrame(rows)
+
+    def _stable_match_id(self, payload: dict[str, Any], json_path: Path) -> str:
+        match = payload.get("match") if isinstance(payload.get("match"), dict) else {}
+        for value in (
+            match.get("game_id"),
+            match.get("gameId"),
+            payload.get("game_id"),
+            payload.get("gameId"),
+        ):
+            text = str(value or "").strip()
+            if text:
+                return f"game:{text}"
+        return json_path.stem
 
     def correlate_event_with_winrate(
         self,
@@ -244,9 +262,11 @@ class GameDataAnalyzer:
         game_result = payload.get("game_result")
         player_team = payload.get("player_team")
         winning_team = payload.get("winning_team")
+        match = payload.get("match") if isinstance(payload.get("match"), dict) else {}
         return {
             "match_id": match_id,
             "match_index": match_index,
+            "game_id": match.get("game_id") or match.get("gameId") or payload.get("game_id") or payload.get("gameId"),
             "json_path": str(json_path),
             "saved_at": payload.get("saved_at"),
             "summoner_name": payload.get("summoner_name"),
@@ -424,7 +444,7 @@ class GameDataAnalyzer:
     def _format_leaf_rule(self, leaf: dict[str, Any]) -> str:
         rule_text = " AND ".join(leaf["conditions"])
         win_rate = round(leaf["win_rate"] * 100)
-        return f"{rule_text} -> WinRate {win_rate}% (n={leaf['samples']})"
+        return f"{rule_text} -> 観測勝率 {win_rate}% (n={leaf['samples']})"
 
     def _is_win(self, game_result: Any, player_team: Any, winning_team: Any) -> bool | None:
         if isinstance(game_result, bool):

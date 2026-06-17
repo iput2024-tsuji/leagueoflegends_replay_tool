@@ -787,7 +787,7 @@ class AnalyticsPage(QWidget):
             return
 
         self.insight_label.setText(
-            f"対象試合数: {sample_size}\n・勝利の方程式: {best_rule}\n・敗北のパターン: {worst_rule}"
+            f"対象試合数: {sample_size}\n・勝ちやすかった条件: {best_rule}\n・負けやすかった条件: {worst_rule}"
         )
 
 

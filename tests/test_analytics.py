@@ -12,18 +12,21 @@ def runtime_dir(name):
     return path
 
 
-def write_match(path, result, champion, events, enemy_champions=None):
+def write_match(path, result, champion, events, enemy_champions=None, game_id=None):
+    payload = {
+        "summoner_name": "Tester",
+        "champion_name": champion,
+        "enemy_champions": enemy_champions or ["Darius", "Lux"],
+        "player_team": "ORDER",
+        "game_result": result,
+        "saved_at": "2026-01-01 00:00:00",
+        "events_all": events,
+    }
+    if game_id is not None:
+        payload["match"] = {"game_id": str(game_id)}
     path.write_text(
         json.dumps(
-            {
-                "summoner_name": "Tester",
-                "champion_name": champion,
-                "enemy_champions": enemy_champions or ["Darius", "Lux"],
-                "player_team": "ORDER",
-                "game_result": result,
-                "saved_at": "2026-01-01 00:00:00",
-                "events_all": events,
-            },
+            payload,
             ensure_ascii=False,
         ),
         encoding="utf-8",
@@ -82,9 +85,25 @@ def test_analyzer_flattens_events_and_correlates_horde_kill():
     assert y.loc["loss"] == 0
 
 
+def test_analyzer_deduplicates_logs_by_game_id():
+    tmp_path = runtime_dir("analytics_game_id_dedup")
+    events = [{"EventID": 1, "EventName": "HordeKill", "EventTime": 600.0}]
+    write_match(tmp_path / "first.json", "Win", "Malphite", events, game_id=12345)
+    write_match(tmp_path / "duplicate.json", "Win", "Malphite", events, game_id=12345)
+
+    analyzer = GameDataAnalyzer(json_dir=tmp_path)
+    df = analyzer.load_dataframe()
+    result = analyzer.horde_kill_15min_winrate_correlation(df)
+
+    assert df["match_id"].nunique() == 1
+    assert df.iloc[0]["match_id"] == "game:12345"
+    assert result["sample_size"] == 1
+    assert result["winrate_by_event_count"] == {1: 1.0}
+
+
 def test_extract_tactical_insights_returns_best_and_worst_rules():
     tmp_path = runtime_dir("insights")
-    for index in range(4):
+    for index in range(10):
         write_match(
             tmp_path / f"win_{index}.json",
             "Win",
@@ -97,7 +116,7 @@ def test_extract_tactical_insights_returns_best_and_worst_rules():
             ],
         )
 
-    for index in range(4):
+    for index in range(10):
         write_match(
             tmp_path / f"loss_{index}.json",
             "Loss",
@@ -110,18 +129,18 @@ def test_extract_tactical_insights_returns_best_and_worst_rules():
 
     insights = GameDataAnalyzer(json_dir=tmp_path).extract_tactical_insights()
 
-    assert insights["sample_size"] == 8
+    assert insights["sample_size"] == 20
     assert insights["reason"] is None
-    assert "WinRate 100%" in insights["best_rule"]
-    assert "WinRate 0%" in insights["worst_rule"]
-    assert "n=4" in insights["best_rule"]
+    assert "観測勝率 100%" in insights["best_rule"]
+    assert "観測勝率 0%" in insights["worst_rule"]
+    assert "n=10" in insights["best_rule"]
     assert any(label in insights["best_rule"] for label in ["15分以内", "ファーストブラッド"])
     assert any(label in insights["tree_text"] for label in ["15分以内", "ファーストブラッド"])
 
 
 def test_extract_tactical_insights_reuses_loaded_dataframe():
     tmp_path = runtime_dir("insights_reuses_df")
-    for index in range(4):
+    for index in range(10):
         write_match(
             tmp_path / f"win_{index}.json",
             "Win",
@@ -141,7 +160,7 @@ def test_extract_tactical_insights_reuses_loaded_dataframe():
 
     insights = analyzer.extract_tactical_insights(df)
 
-    assert insights["sample_size"] == 8
+    assert insights["sample_size"] == 20
 
 
 def test_extract_tactical_insights_marks_small_samples_as_insufficient():
@@ -155,7 +174,7 @@ def test_extract_tactical_insights_marks_small_samples_as_insufficient():
     assert insights["confidence"] == "insufficient"
     assert insights["best_rule"] is None
     assert insights["worst_rule"] is None
-    assert "8試合以上" in insights["reason"]
+    assert "20試合以上" in insights["reason"]
 
 
 def test_analyzer_reports_invalid_session_logs():
@@ -174,7 +193,7 @@ def test_analyzer_reports_invalid_session_logs():
 
 def test_enemy_champions_are_used_as_readable_decision_tree_features():
     tmp_path = runtime_dir("enemy_insights")
-    for index in range(4):
+    for index in range(10):
         write_match(
             tmp_path / f"win_{index}.json",
             "Win",
@@ -183,7 +202,7 @@ def test_enemy_champions_are_used_as_readable_decision_tree_features():
             enemy_champions=["Darius"],
         )
 
-    for index in range(4):
+    for index in range(10):
         write_match(
             tmp_path / f"loss_{index}.json",
             "Loss",

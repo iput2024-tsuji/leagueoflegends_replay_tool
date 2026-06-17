@@ -1094,3 +1094,50 @@ def test_storage_limit_only_deletes_json_referenced_app_video():
     assert not json_path.exists()
     assert unrelated_video.exists()
     assert unrelated_clip.exists()
+
+
+def test_storage_limit_deletes_session_when_clip_listing_fails(monkeypatch, tmp_path):
+    recordings_dir = tmp_path / "recordings"
+    json_dir = recordings_dir / "json"
+    clips_dir = recordings_dir / "clips"
+    json_dir.mkdir(parents=True)
+    clips_dir.mkdir()
+
+    owned_video = recordings_dir / "owned.mp4"
+    owned_clip = clips_dir / "owned_clip_1000_2000.mp4"
+    json_path = json_dir / "lol_20260101_000000.json"
+    owned_video.write_bytes(b"owned video")
+    owned_clip.write_bytes(b"owned clip")
+    json_path.write_text(
+        json.dumps(
+            {
+                "saved_at": "2026-01-01 00:00:00",
+                "obs_record_path": owned_video.name,
+            }
+        ),
+        encoding="utf-8",
+    )
+    resolved_clips_dir = clips_dir.resolve()
+    original_glob = Path.glob
+
+    def fail_clip_glob(path: Path, pattern: str, *args, **kwargs):
+        if path.resolve() == resolved_clips_dir:
+            raise OSError("access denied")
+        return original_glob(path, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "glob", fail_clip_glob)
+    config = recordtest.AppConfig.from_dict(
+        {
+            "paths": {
+                "recordings_dir": str(recordings_dir),
+                "json_dir": str(json_dir),
+            },
+            "storage": {"max_size_bytes": 1},
+        }
+    )
+
+    recordtest.enforce_storage_limit(config)
+
+    assert not owned_video.exists()
+    assert not json_path.exists()
+    assert owned_clip.exists()

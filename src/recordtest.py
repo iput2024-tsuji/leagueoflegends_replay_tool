@@ -110,6 +110,7 @@ DEFAULT_BIN_DIR = "bin"
 DEFAULT_RECORDINGS_DIR = "recordings"
 DEFAULT_JSON_DIR = "recordings/json"
 DEFAULT_CHAMPION_ICONS_DIR = "assets/champions/icons"
+DEFAULT_CHAMPION_ALIASES_PATH = "config/champion_aliases.json"
 DEFAULT_OBS_HOST = "localhost"
 DEFAULT_OBS_PORT = 4455
 DEFAULT_OBS_FPS_NUMERATOR = 60
@@ -307,6 +308,7 @@ class PathsSettings:
     recordings_dir: Path
     json_dir: Path
     champion_icons_dir: Path
+    champion_aliases_path: Path
 
 
 @dataclass(frozen=True)
@@ -463,6 +465,7 @@ class AppConfig:
             json_dir = recordings_dir / "json"
         bin_dir = resolve_path(paths_cfg.get("bin_dir", DEFAULT_BIN_DIR), DATA_DIR)
         icons_dir = resolve_path(paths_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), DATA_DIR)
+        aliases_path = resolve_path(paths_cfg.get("champion_aliases_path", DEFAULT_CHAMPION_ALIASES_PATH), DATA_DIR)
 
         if recordings_dir is None:
             recordings_dir = (DATA_DIR / DEFAULT_RECORDINGS_DIR).resolve()
@@ -472,6 +475,8 @@ class AppConfig:
             bin_dir = (DATA_DIR / DEFAULT_BIN_DIR).resolve()
         if icons_dir is None:
             icons_dir = (DATA_DIR / DEFAULT_CHAMPION_ICONS_DIR).resolve()
+        if aliases_path is None:
+            aliases_path = (DATA_DIR / DEFAULT_CHAMPION_ALIASES_PATH).resolve()
 
         normalized_storage_cfg = dict(storage_cfg)
         normalized_storage_cfg["max_size_gb"] = max_size_gb
@@ -502,6 +507,7 @@ class AppConfig:
                 recordings_dir=recordings_dir,
                 json_dir=json_dir,
                 champion_icons_dir=icons_dir,
+                champion_aliases_path=aliases_path,
             ),
             polling=PollingSettings(
                 end_error_limit=end_limit,

@@ -42,6 +42,10 @@ class ConfigController:
         if app_cfg.get("setup_completed") is None:
             app_cfg["setup_completed"] = bool(has_valid_dir)
             changed = True
+        elif force_obs_detect and bool(app_cfg.get("setup_completed")) != has_valid_dir:
+            app_cfg["setup_completed"] = has_valid_dir
+            notes.append("OBSフォルダの検出結果に合わせて初期設定状態を更新しました。")
+            changed = True
         elif not bool(app_cfg.get("setup_completed")) and has_valid_dir:
             app_cfg["setup_completed"] = True
             changed = True

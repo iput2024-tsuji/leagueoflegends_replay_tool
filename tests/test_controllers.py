@@ -73,3 +73,29 @@ def test_connection_test_launches_and_closes_managed_obs(monkeypatch):
     assert "接続成功" in detail
     assert runtime_manager.calls[0][1]["auto_launch"] is True
     assert runtime_manager.runtime.closed is True
+
+
+def test_apply_auto_defaults_preserves_setup_completed_without_forced_detection(monkeypatch):
+    controller = ConfigController(repository=SimpleNamespace(), runtime_manager=FakeRuntimeManager())
+    monkeypatch.setattr(recordtest, "detect_obs_dir", lambda: None)
+
+    config, _changed, _notes = controller.apply_auto_defaults(
+        {"app": {"setup_completed": True}},
+        force_obs_detect=False,
+    )
+
+    assert config["app"]["setup_completed"] is True
+
+
+def test_apply_auto_defaults_updates_setup_completed_with_forced_detection(monkeypatch):
+    controller = ConfigController(repository=SimpleNamespace(), runtime_manager=FakeRuntimeManager())
+    monkeypatch.setattr(recordtest, "detect_obs_dir", lambda: None)
+
+    config, changed, notes = controller.apply_auto_defaults(
+        {"app": {"setup_completed": True}},
+        force_obs_detect=True,
+    )
+
+    assert config["app"]["setup_completed"] is False
+    assert changed is True
+    assert "OBSフォルダの検出結果に合わせて初期設定状態を更新しました。" in notes

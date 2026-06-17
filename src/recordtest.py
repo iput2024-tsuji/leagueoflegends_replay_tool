@@ -138,6 +138,7 @@ DEFAULT_AUDIO_MIC_VOLUME_DB = 0.0
 DEFAULT_AUDIO_MIC_MUTE = False
 DEFAULT_RECORDING_START_TIMEOUT_SEC = 8.0
 DEFAULT_RECORDING_START_POLL_SEC = 0.25
+DEFAULT_GAME_START_EVENT_WAIT_SEC = 3.0
 DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC = 30.0
 MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
 LCU_GAMEFLOW_START_PHASES = frozenset({"gamestart", "inprogress", "reconnect"})
@@ -3578,7 +3579,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             )
         return f"試行{attempt}: {type(error).__name__}: {error}"
 
-    async def wait_until_game_start_event_async(self, timeout_sec: float = 180) -> float | None:
+    async def wait_until_game_start_event_async(self, timeout_sec: float = DEFAULT_GAME_START_EVENT_WAIT_SEC) -> float | None:
         loop = asyncio.get_running_loop()
         start = loop.time()
         while loop.time() - start < timeout_sec:

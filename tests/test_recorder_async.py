@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
@@ -355,6 +356,15 @@ def test_start_recording_waits_until_obs_reports_active():
 
     assert recorder.recording_started is True
     assert obs_client.is_recording_active.call_count == 2
+
+
+def test_game_start_event_wait_uses_short_default_timeout():
+    default = inspect.signature(recordtest.LoLAutoRecorder.wait_until_game_start_event_async).parameters[
+        "timeout_sec"
+    ].default
+
+    assert default == recordtest.DEFAULT_GAME_START_EVENT_WAIT_SEC
+    assert recordtest.DEFAULT_GAME_START_EVENT_WAIT_SEC <= 3.0
 
 
 def test_recorder_constructor_has_no_obs_side_effects_until_open():

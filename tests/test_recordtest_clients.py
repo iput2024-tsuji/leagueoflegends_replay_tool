@@ -1035,11 +1035,17 @@ def test_storage_limit_only_deletes_json_referenced_app_video():
     recordings_dir = root / "recordings"
     json_dir = recordings_dir / "json"
     json_dir.mkdir(parents=True, exist_ok=True)
+    clips_dir = recordings_dir / "clips"
+    clips_dir.mkdir()
 
     owned_video = recordings_dir / "owned.mp4"
     unrelated_video = recordings_dir / "unrelated.mp4"
+    owned_clip = clips_dir / "owned_clip_1000_2000.mp4"
+    unrelated_clip = clips_dir / "unrelated_clip_1000_2000.mp4"
     owned_video.write_bytes(b"owned video")
     unrelated_video.write_bytes(b"unrelated video that must remain")
+    owned_clip.write_bytes(b"owned clip")
+    unrelated_clip.write_bytes(b"unrelated clip that must remain")
     json_path = json_dir / "lol_20260101_000000.json"
     json_path.write_text(
         json.dumps(
@@ -1064,5 +1070,7 @@ def test_storage_limit_only_deletes_json_referenced_app_video():
     recordtest.enforce_storage_limit(config)
 
     assert not owned_video.exists()
+    assert not owned_clip.exists()
     assert not json_path.exists()
     assert unrelated_video.exists()
+    assert unrelated_clip.exists()

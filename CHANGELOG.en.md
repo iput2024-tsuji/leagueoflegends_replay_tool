@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.2] - 2026-06-17
+
+### Changed
+
+- Aligned shared default configuration values between the schema and runtime settings to reduce the risk of one side drifting from the other.
+- Exposed the champion aliases file path through `AppConfig.paths`.
+
+### Fixed
+
+- Avoided duplicate tactical insight samples from the same match and only shows conditions when enough observations are available.
+- Changed tactical insight wording to "observed win rate" to make it clear that results come from accumulated observations.
+- Allowed MPV initialization to be retried in the same process after the MPV DLL is added later.
+- Rejected unsafe paths while extracting the OBS ZIP archive to prevent unintended overwrites from archive member paths.
+- Made recording deletion plan creation less likely to stop entirely when temporary I/O errors occur.
+- Made automatic storage-limit cleanup continue processing other owned sessions when files are locked, deleted, or inaccessible.
+
 ## [0.4.1] - 2026-06-13
 
 ### Fixed

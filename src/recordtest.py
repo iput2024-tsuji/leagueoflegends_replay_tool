@@ -2025,11 +2025,47 @@ def is_within(child: str | Path, parent: str | Path) -> bool:
         return False
 
 
+def _safe_path_exists(path: str | Path) -> bool:
+    try:
+        return Path(path).exists()
+    except Exception:
+        return False
+
+
+def _safe_path_is_file(path: str | Path) -> bool:
+    try:
+        return Path(path).is_file()
+    except Exception:
+        return False
+
+
+def _safe_path_resolve(path: str | Path) -> Path | None:
+    try:
+        return Path(path).resolve()
+    except Exception:
+        return None
+
+
+def _safe_path_mtime(path: str | Path) -> float | None:
+    try:
+        return Path(path).stat().st_mtime
+    except Exception:
+        return None
+
+
+def _safe_glob(path: str | Path, pattern: str) -> tuple[Path, ...]:
+    try:
+        return tuple(Path(path).glob(pattern))
+    except Exception:
+        return ()
+
+
 def get_dir_size(path: str | Path) -> int:
+    path = Path(path)
     total = 0
     try:
         for item in path.rglob("*"):
-            if item.is_file():
+            if _safe_path_is_file(item):
                 try:
                     total += item.stat().st_size
                 except Exception:
@@ -2046,7 +2082,7 @@ def total_storage_size(config: AppConfig | None = None) -> int:
     json_path = Path(config.paths.json_dir)
     if not roots or not is_within(json_path, roots[0]):
         roots.append(json_path)
-    return sum(get_dir_size(root) for root in roots if root.exists())
+    return sum(get_dir_size(root) for root in roots if _safe_path_exists(root))
 
 
 def parse_saved_at(value: Any) -> float | None:
@@ -2077,7 +2113,7 @@ def load_json_metadata(path: str | Path, config: AppConfig | None = None) -> tup
             candidates.append(Path(config.paths.recordings_dir) / raw_path.name)
 
         for candidate in candidates:
-            if candidate.exists():
+            if _safe_path_exists(candidate):
                 return saved_at, candidate
         if candidates:
             return saved_at, candidates[-1]
@@ -2110,17 +2146,17 @@ def find_app_owned_clip_paths(video_path: str | Path | None, config: AppConfig) 
         return ()
     if not is_within(source, recordings_dir) or source.suffix.lower() not in {".mp4", ".mkv", ".flv", ".mov", ".avi"}:
         return ()
-    if not clips_dir.exists():
+    if not _safe_path_exists(clips_dir):
         return ()
 
     matches = []
-    for candidate in clips_dir.glob(f"{source.stem}_clip_*"):
+    for candidate in _safe_glob(clips_dir, f"{source.stem}_clip_*"):
         try:
             resolved = candidate.resolve()
         except Exception:
             continue
         if (
-            resolved.is_file()
+            _safe_path_is_file(resolved)
             and is_within(resolved, clips_dir)
             and resolved.suffix.lower() in {".mp4", ".mkv", ".flv", ".mov", ".avi"}
         ):
@@ -2133,33 +2169,36 @@ def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str 
     if not config.storage.max_size_bytes:
         return
 
-    keep_paths = {Path(p).resolve() for p in keep_paths or [] if p}
+    keep_paths = {resolved for path in keep_paths or [] if path and (resolved := _safe_path_resolve(path))}
     total = total_storage_size(config)
     if total <= config.storage.max_size_bytes:
         return
 
-    if Path(config.paths.json_dir).exists():
+    if _safe_path_exists(config.paths.json_dir):
         entries = []
-        for json_path in Path(config.paths.json_dir).glob("*.json"):
+        for json_path in _safe_glob(config.paths.json_dir, "*.json"):
             saved_at, video_path = load_json_metadata(json_path, config)
-            ts = saved_at if saved_at else json_path.stat().st_mtime
+            ts = saved_at if saved_at else (_safe_path_mtime(json_path) or 0.0)
             entries.append((ts, json_path, video_path))
         entries.sort(key=lambda item: item[0])
 
         for _, json_path, video_path in entries:
-            if json_path.resolve() in keep_paths:
+            resolved_json_path = _safe_path_resolve(json_path)
+            if resolved_json_path in keep_paths:
                 continue
             try:
                 clip_paths = find_app_owned_clip_paths(video_path, config)
+                resolved_video_path = _safe_path_resolve(video_path) if video_path else None
                 if (
                     video_path
-                    and video_path.exists()
-                    and video_path.resolve() not in keep_paths
+                    and _safe_path_exists(video_path)
+                    and resolved_video_path not in keep_paths
                     and is_app_owned_video_path(video_path, config)
                 ):
                     video_path.unlink(missing_ok=True)
                 for clip_path in clip_paths:
-                    if clip_path.resolve() not in keep_paths:
+                    resolved_clip_path = _safe_path_resolve(clip_path)
+                    if resolved_clip_path not in keep_paths:
                         clip_path.unlink(missing_ok=True)
             except Exception:
                 pass

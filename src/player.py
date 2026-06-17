@@ -369,8 +369,6 @@ def bootstrap_mpv_runtime() -> Any | None:
     global MPV_DLL_LOAD_HANDLE, MPV_BOOTSTRAPPED, MPV_IMPORT_ERROR, mpv_module
     if mpv_module is not None:
         return mpv_module
-    if MPV_BOOTSTRAPPED and MPV_IMPORT_ERROR is not None:
-        return None
 
     MPV_BOOTSTRAPPED = True
     ensure_mpv_dll(BIN_DIR, ROOT_DIR)

@@ -36,6 +36,26 @@ def test_mpv_runtime_bootstrap_uses_existing_bin_dll(monkeypatch, tmp_path):
     assert registered == [tmp_path]
 
 
+def test_mpv_runtime_bootstrap_retries_after_missing_dll(monkeypatch, tmp_path):
+    player = importlib.import_module("src.player")
+    reset_player_runtime(player, monkeypatch)
+    runtime = object()
+
+    monkeypatch.setattr(player, "BIN_DIR", tmp_path)
+    monkeypatch.setattr(player, "ROOT_DIR", tmp_path.parent)
+
+    assert player.bootstrap_mpv_runtime() is None
+    assert isinstance(player.MPV_IMPORT_ERROR, FileNotFoundError)
+
+    (tmp_path / "mpv-1.dll").write_bytes(b"fake")
+    monkeypatch.setattr(player, "register_mpv_dll_directory", lambda path: None)
+    monkeypatch.setattr(player, "load_mpv_dll", lambda path: object())
+    monkeypatch.setattr(player.importlib, "import_module", lambda name: runtime)
+
+    assert player.bootstrap_mpv_runtime() is runtime
+    assert player.MPV_IMPORT_ERROR is None
+
+
 def test_mpv_error_message_distinguishes_import_failure_from_missing_dll(monkeypatch, tmp_path):
     player = importlib.import_module("src.player")
     reset_player_runtime(player, monkeypatch)

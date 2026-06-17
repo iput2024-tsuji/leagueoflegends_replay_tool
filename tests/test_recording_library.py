@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from src.recording_library import RecordingDeletionError, RecordingLibrary
+from src.recording_library import RecordingDeletionError, RecordingDeletionPlan, RecordingLibrary
 
 
 def test_recording_library_deletes_owned_video_clips_and_json(tmp_path):
@@ -71,3 +71,52 @@ def test_recording_library_rejects_json_outside_configured_directory(tmp_path):
 
     with pytest.raises(RecordingDeletionError, match="ディレクトリ外"):
         library.plan_deletion(external_json)
+
+
+def test_recording_library_keeps_delete_plan_when_clip_listing_fails(monkeypatch, tmp_path):
+    recordings_dir = tmp_path / "recordings"
+    json_dir = recordings_dir / "json"
+    clips_dir = recordings_dir / "clips"
+    json_dir.mkdir(parents=True)
+    clips_dir.mkdir()
+
+    video = recordings_dir / "game.mp4"
+    session = json_dir / "session.json"
+    video.write_bytes(b"video")
+    session.write_text(json.dumps({"obs_record_path": video.name}), encoding="utf-8")
+    resolved_clips_dir = clips_dir.resolve()
+    original_glob = Path.glob
+
+    def fail_clip_glob(path: Path, pattern: str):
+        if path.resolve() == resolved_clips_dir:
+            raise OSError("access denied")
+        return original_glob(path, pattern)
+
+    monkeypatch.setattr(Path, "glob", fail_clip_glob)
+
+    library = RecordingLibrary(recordings_dir, json_dir)
+    plan = library.plan_deletion(session)
+
+    assert plan.video_path == video.resolve()
+    assert plan.clip_paths == ()
+    assert plan.paths == (video.resolve(), session.resolve())
+
+
+def test_recording_deletion_plan_skips_paths_that_cannot_be_checked(monkeypatch, tmp_path):
+    video = tmp_path / "game.mp4"
+    session = tmp_path / "session.json"
+    video.write_bytes(b"video")
+    session.write_text("{}", encoding="utf-8")
+    resolved_video = video.resolve()
+    original_exists = Path.exists
+
+    def fail_video_exists(path: Path):
+        if path.resolve() == resolved_video:
+            raise OSError("access denied")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", fail_video_exists)
+
+    plan = RecordingDeletionPlan(json_path=session.resolve(), video_path=resolved_video)
+
+    assert plan.paths == (session.resolve(),)

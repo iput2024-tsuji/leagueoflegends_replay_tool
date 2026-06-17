@@ -12,6 +12,20 @@ except ImportError:
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mkv", ".flv", ".mov", ".avi"})
 
 
+def _safe_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _safe_is_file(path: Path) -> bool:
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 class RecordingDeletionError(RuntimeError):
     pass
 
@@ -26,10 +40,10 @@ class RecordingDeletionPlan:
     @property
     def paths(self) -> tuple[Path, ...]:
         paths = []
-        if self.video_path is not None and self.video_path.exists():
+        if self.video_path is not None and _safe_exists(self.video_path):
             paths.append(self.video_path)
-        paths.extend(path for path in self.clip_paths if path.exists())
-        if self.json_path.exists():
+        paths.extend(path for path in self.clip_paths if _safe_exists(path))
+        if _safe_exists(self.json_path):
             paths.append(self.json_path)
         return tuple(paths)
 
@@ -121,31 +135,41 @@ class RecordingLibrary:
             )
 
         for candidate in candidates:
-            resolved = candidate.resolve()
-            if (
-                resolved.exists()
-                and resolved.is_file()
-                and is_within(resolved, self.recordings_dir)
-                and resolved.suffix.lower() in VIDEO_EXTENSIONS
-            ):
-                return resolved
+            try:
+                resolved = candidate.resolve()
+                if (
+                    _safe_exists(resolved)
+                    and _safe_is_file(resolved)
+                    and is_within(resolved, self.recordings_dir)
+                    and resolved.suffix.lower() in VIDEO_EXTENSIONS
+                ):
+                    return resolved
+            except OSError:
+                continue
         return None
 
     def _find_owned_clips(self, video_path: Path | None) -> tuple[Path, ...]:
         if video_path is None:
             return ()
         clips_dir = (self.recordings_dir / "clips").resolve()
-        if not clips_dir.exists():
+        if not _safe_exists(clips_dir):
             return ()
 
         matches = []
         pattern = f"{video_path.stem}_clip_*"
-        for candidate in clips_dir.glob(pattern):
-            resolved = candidate.resolve()
-            if (
-                resolved.is_file()
-                and is_within(resolved, clips_dir)
-                and resolved.suffix.lower() in VIDEO_EXTENSIONS
-            ):
-                matches.append(resolved)
+        try:
+            candidates = clips_dir.glob(pattern)
+            for candidate in candidates:
+                try:
+                    resolved = candidate.resolve()
+                    if (
+                        _safe_is_file(resolved)
+                        and is_within(resolved, clips_dir)
+                        and resolved.suffix.lower() in VIDEO_EXTENSIONS
+                    ):
+                        matches.append(resolved)
+                except OSError:
+                    continue
+        except OSError:
+            return ()
         return tuple(sorted(matches))

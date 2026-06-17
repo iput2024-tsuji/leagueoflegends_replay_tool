@@ -280,6 +280,26 @@ def test_app_config_preserves_fractional_high_fps():
     assert config.obs.fps == pytest.approx(239.7602397602)
 
 
+def test_app_config_exposes_champion_aliases_path(tmp_path):
+    config = recordtest.AppConfig.from_dict(
+        {
+            "paths": {
+                "champion_aliases_path": str(tmp_path / "config" / "champion_aliases.json"),
+            }
+        }
+    )
+
+    assert config.paths.champion_aliases_path == (tmp_path / "config" / "champion_aliases.json").resolve()
+
+
+def test_app_config_defaults_champion_aliases_path_to_user_data():
+    config = recordtest.AppConfig.from_dict({})
+
+    assert config.paths.champion_aliases_path == (
+        recordtest.DATA_DIR / recordtest.DEFAULT_CHAMPION_ALIASES_PATH
+    ).resolve()
+
+
 def test_preflight_generates_and_persists_obs_password(monkeypatch, tmp_path):
     managed_dir = (tmp_path / "obs-portable").resolve()
     obs_exe = managed_dir / "bin" / "64bit" / "obs64.exe"

@@ -4,7 +4,7 @@
 
 LoL Replay Tool is a Windows decision-support application that automatically records League of Legends matches, stores match events as JSON, and extracts tactical insights from accumulated play data.
 
-It combines recording, event synchronization, replay review, and data analysis. The project aims to identify winning and losing patterns with decision-tree models built with scikit-learn.
+It combines recording, event synchronization, replay review, and data analysis. The project aims to identify observed conditions associated with higher or lower win rates using decision-tree models built with scikit-learn.
 
 ## Download
 
@@ -82,7 +82,7 @@ Riot local APIs
   -> early-game feature generation
   -> enemy champion encoding with MultiLabelBinarizer
   -> DecisionTreeClassifier training
-  -> human-readable winning and losing patterns
+  -> human-readable observed high- and low-win-rate conditions
   -> PyQt6 analytics view
 ```
 

@@ -137,6 +137,8 @@ DEFAULT_AUDIO_DEVICE_NAME = config_schema.DEFAULT_AUDIO_DEVICE_NAME
 DEFAULT_AUDIO_MIC_VOLUME_DB = config_schema.DEFAULT_AUDIO_MIC_VOLUME_DB
 DEFAULT_AUDIO_MIC_MUTE = config_schema.DEFAULT_AUDIO_MIC_MUTE
 DEFAULT_RECORDING_START_TIMEOUT_SEC = 15.0
+DEFAULT_RECORDING_START_PRIMARY_TIMEOUT_SEC = 5.0
+DEFAULT_RECORDING_START_RECOVERY_TIMEOUT_SEC = 12.0
 DEFAULT_RECORDING_START_POLL_SEC = 0.25
 DEFAULT_GAME_START_EVENT_WAIT_SEC = 3.0
 DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC = 30.0
@@ -3037,6 +3039,26 @@ class ObsWebSocketClient(OBSClient):
     def start_recording(self) -> None:
         self.client.start_record()
 
+    def toggle_recording(self) -> None:
+        _obs_raw(self.client, "ToggleRecord")
+
+    def prepare_recording_start(self) -> None:
+        self.setup_record_output()
+
+    def set_recording_encoder(self, recording_encoder: str) -> OBSRecordingEncoderSelection:
+        selected_encoder = apply_obs_recording_quality_settings(
+            self.client,
+            scale_type=self.config.obs.scale_type,
+            recording_quality=self.config.obs.recording_quality,
+            recording_encoder=recording_encoder,
+            obs_dir=self.config.obs.obs_dir,
+        )
+        self.log(
+            "🎞️ OBS録画エンコーダを切り替えました: "
+            f"encoder={selected_encoder.display_name} ({selected_encoder.encoder_kind})"
+        )
+        return selected_encoder
+
     def stop_recording(self) -> str | None:
         res = self.client.stop_record()
         return getattr(res, "output_path", None)
@@ -3599,7 +3621,9 @@ class LoLAutoRecorder(RecordingSessionManager):
             )
 
         errors = []
+        self._prepare_recording_output_for_start()
         request_started_at = time.time()
+        start_request_accepted = False
         try:
             self.obs_client.start_recording()
         except Exception as e:
@@ -3614,11 +3638,15 @@ class LoLAutoRecorder(RecordingSessionManager):
             if not self.recording_started:
                 errors.append(self._format_obs_start_error(e, 1))
         else:
-            if await self.wait_for_recording_active_async():
+            start_request_accepted = True
+            if await self.wait_for_recording_active_async(DEFAULT_RECORDING_START_PRIMARY_TIMEOUT_SEC):
                 self.recording_started = True
                 self.session_phase = RecordingPhase.RECORDING
             else:
-                errors.append("OBSは開始要求を受理しましたが、録画状態へ移行しませんでした。")
+                errors.append("試行1: OBSは開始要求を受理しましたが、録画状態へ移行しませんでした。")
+
+        if not self.recording_started and start_request_accepted:
+            await self._recover_recording_start_async(errors)
 
         if not self.recording_started:
             details = self._record_status_summary()
@@ -3655,6 +3683,51 @@ class LoLAutoRecorder(RecordingSessionManager):
         await self.wait_with_stop_async(0.5)
         self.obs_client.set_sync_marker_enabled(False, item_id)
         self.log("✅ シグナル消灯。録画継続中。")
+
+    def _prepare_recording_output_for_start(self) -> None:
+        preparer = getattr(self.obs_client, "prepare_recording_start", None)
+        if not callable(preparer):
+            return
+        try:
+            preparer()
+        except Exception as e:
+            self.log(f"⚠️ 録画開始前のOBS出力設定再適用に失敗: {e}")
+
+    async def _recover_recording_start_async(self, errors: list[str]) -> None:
+        if self.should_stop():
+            return
+        self.log("⚠️ OBS録画が開始状態へ移行しないため、出力設定を再適用して再試行します。")
+        self._prepare_recording_output_for_start()
+        set_encoder = getattr(self.obs_client, "set_recording_encoder", None)
+        if callable(set_encoder):
+            try:
+                set_encoder("x264")
+            except Exception as e:
+                errors.append(f"復旧準備: x264への切り替えに失敗しました ({type(e).__name__}: {e})")
+        if not await self.wait_with_stop_async(0.5):
+            return
+
+        retry_started_at = time.time()
+        try:
+            toggler = getattr(self.obs_client, "toggle_recording", None)
+            if callable(toggler):
+                toggler()
+            else:
+                self.obs_client.start_recording()
+        except Exception as e:
+            errors.append(f"復旧試行: {type(e).__name__}: {e}")
+            return
+
+        if await self.wait_for_recording_active_async(DEFAULT_RECORDING_START_RECOVERY_TIMEOUT_SEC):
+            self.recording_started = True
+            self.session_phase = RecordingPhase.RECORDING
+            self.log("✅ OBS録画を復旧試行で開始しました。")
+            return
+
+        errors.append("復旧試行: OBSは再試行要求後も録画状態へ移行しませんでした。")
+        diagnostics = self._obs_recording_diagnostics(retry_started_at)
+        if diagnostics:
+            errors.append(diagnostics)
 
     async def wait_for_recording_active_async(
         self,

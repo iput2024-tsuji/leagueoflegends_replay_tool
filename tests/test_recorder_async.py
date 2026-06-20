@@ -22,7 +22,12 @@ class FakeOBSClient:
         self.get_audio_device_catalog = Mock(return_value={})
         self.get_sync_source_id = Mock(return_value=1)
         self.set_sync_marker_enabled = Mock()
+        self.prepare_recording_start = Mock()
+        self.set_recording_encoder = Mock(
+            return_value=recordtest.OBSRecordingEncoderSelection("x264", "obs_x264", "x264", False)
+        )
         self.start_recording = Mock()
+        self.toggle_recording = Mock()
         self.stop_recording = Mock(return_value="game.mp4")
         self.is_recording_active = Mock(return_value=True)
         self.shutdown = Mock()
@@ -400,6 +405,7 @@ def test_start_recording_waits_until_obs_reports_active():
     run(recorder.start_recording_async())
 
     assert recorder.recording_started is True
+    obs_client.prepare_recording_start.assert_called_once()
     assert obs_client.is_recording_active.call_count == 2
 
 
@@ -542,6 +548,7 @@ def test_start_recording_failure_raises_and_does_not_create_session_data():
     with pytest.raises(recordtest.RecorderError, match="OBS録画開始に失敗"):
         run(recorder.start_recording_async())
 
+    obs_client.prepare_recording_start.assert_called_once()
     obs_client.start_recording.assert_called_once()
     obs_client.setup_record_output.assert_not_called()
     assert recorder.recording_started is False
@@ -549,11 +556,42 @@ def test_start_recording_failure_raises_and_does_not_create_session_data():
     assert recorder.has_session_data() is False
 
 
-def test_start_recording_does_not_retry_when_obs_never_becomes_active():
+def test_start_recording_recovers_with_toggle_and_x264_when_start_record_never_becomes_active():
     tmp_path = runtime_dir("recording_start_inactive")
     config = config_for(tmp_path)
     obs_client = FakeOBSClient()
-    obs_client.is_recording_active.return_value = False
+    riot_client = Mock()
+    riot_client.get_event_data = AsyncMock(
+        return_value={"Events": [{"EventName": "GameStart", "EventTime": 0.0}]}
+    )
+    riot_client.get_all_game_data = AsyncMock(
+        return_value={"gameData": {"gameTime": 2.0}, "allPlayers": []}
+    )
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=obs_client,
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+    recorder.wait_for_recording_active_async = AsyncMock(side_effect=[False, True])
+
+    run(recorder.start_recording_async())
+
+    assert recorder.recording_started is True
+    obs_client.start_recording.assert_called_once()
+    obs_client.toggle_recording.assert_called_once()
+    obs_client.set_recording_encoder.assert_called_once_with("x264")
+    assert obs_client.prepare_recording_start.call_count == 2
+    assert recorder.wait_for_recording_active_async.await_count == 2
+    obs_client.setup_record_output.assert_not_called()
+
+
+def test_start_recording_reports_recovery_failure_when_recording_stays_inactive():
+    tmp_path = runtime_dir("recording_start_recovery_failure")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
 
     recorder = recordtest.LoLAutoRecorder(
         config=config,
@@ -561,13 +599,15 @@ def test_start_recording_does_not_retry_when_obs_never_becomes_active():
         riot_api_client=Mock(),
         auto_setup=False,
     )
-    recorder.wait_for_recording_active_async = AsyncMock(return_value=False)
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+    recorder.wait_for_recording_active_async = AsyncMock(side_effect=[False, False])
 
-    with pytest.raises(recordtest.RecorderError, match="録画状態へ移行しませんでした"):
+    with pytest.raises(recordtest.RecorderError, match="復旧試行"):
         run(recorder.start_recording_async())
 
     obs_client.start_recording.assert_called_once()
-    obs_client.setup_record_output.assert_not_called()
+    obs_client.toggle_recording.assert_called_once()
+    obs_client.set_recording_encoder.assert_called_once_with("x264")
 
 
 def test_start_recording_validates_sync_source_before_obs_recording():

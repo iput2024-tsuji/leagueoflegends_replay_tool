@@ -145,6 +145,7 @@ def test_wait_for_game_start_falls_back_to_lcu_in_progress_phase():
         riot_api_client=riot_client,
         auto_setup=False,
     )
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
 
     assert run(recorder.wait_for_game_start_async()) is True
     assert recorder.game_start_detection_source == "lcu"
@@ -180,13 +181,57 @@ def test_wait_for_game_start_uses_dedicated_lcu_game_start_phase():
         riot_api_client=riot_client,
         auto_setup=False,
     )
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
 
     assert run(recorder.wait_for_game_start_async()) is True
     assert recorder.game_start_detection_source == "lcu"
     assert recorder.match_metadata["gameflow_phase"] == "game_start"
     assert recorder.session_started is True
-    riot_client.get_all_game_data_result.assert_not_awaited()
-    riot_client.get_match_metadata.assert_not_awaited()
+    riot_client.get_all_game_data_result.assert_awaited()
+    riot_client.get_match_metadata.assert_awaited_once()
+
+
+def test_lcu_game_start_waits_for_live_client_before_starting():
+    tmp_path = runtime_dir("lcu_waits_for_live_client")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_gameflow_phase_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME,
+            payload={"phase": "InProgress"},
+        )
+    )
+    riot_client.get_all_game_data_result = AsyncMock(
+        side_effect=[
+            recordtest.RiotPollResult(
+                recordtest.RiotPollStatus.TEMPORARY_FAILURE,
+                error="Live Client API unavailable",
+            ),
+            recordtest.RiotPollResult(
+                recordtest.RiotPollStatus.IN_GAME,
+                payload={"gameData": {"gameTime": 3.5}, "allPlayers": []},
+            ),
+        ]
+    )
+    riot_client.get_active_player_name = AsyncMock(return_value="Tester#JP1")
+    riot_client.get_champ_select_session_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.NOT_IN_GAME)
+    )
+    riot_client.get_match_metadata = AsyncMock(return_value={})
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+
+    assert run(recorder.wait_for_game_start_async()) is True
+    assert recorder.game_start_detection_source == "live_client"
+    assert recorder.sync_game_time == 0.0
+    assert riot_client.get_all_game_data_result.await_count == 2
+    recorder.wait_with_stop_async.assert_awaited_once_with(recordtest.DEFAULT_LCU_START_LIVE_CLIENT_POLL_SEC)
 
 
 def test_wait_for_game_start_captures_ban_pick_order_and_champions():

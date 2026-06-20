@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -152,6 +153,29 @@ def test_process_manager_reads_available_encoder_kinds_from_latest_log(tmp_path)
         "obs_nvenc_hevc_tex",
         "obs_nvenc_h264_tex",
         "obs_x264",
+    ]
+
+
+def test_process_manager_reads_recording_diagnostics_after_timestamp(tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    logs_dir = manager.obs_dir / "config" / "obs-studio" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "2026-06-20 14-25-44.txt"
+    log_path.write_text(
+        "14:25:48.901: Available Encoders:\n"
+        "14:25:48.901: \t- obs_nvenc_h264_tex (NVIDIA NVENC H.264)\n"
+        "14:30:12.000: ==== Recording Start ===============================================\n"
+        "14:30:13.000: [jim-nvenc: 'simple_video_recording'] failed to start\n",
+        encoding="utf-8",
+    )
+
+    diagnostics = manager.latest_log_recording_diagnostics(
+        since=datetime(2026, 6, 20, 14, 30, 11).timestamp()
+    )
+
+    assert diagnostics == [
+        "14:30:12.000: ==== Recording Start ===============================================",
+        "14:30:13.000: [jim-nvenc: 'simple_video_recording'] failed to start",
     ]
 
 

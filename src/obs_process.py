@@ -8,6 +8,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -227,6 +228,89 @@ class OBSProcessManager:
             seen.add(normalized)
             result.append(encoder_kind)
         return result
+
+    def latest_log_recording_diagnostics(
+        self,
+        since: float | None = None,
+        max_lines: int = 8,
+        tail_lines: int = 500,
+    ) -> list[str]:
+        log_path = self.latest_log_path()
+        if log_path is None:
+            return []
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception as e:
+            self.logger.debug("Failed to read OBS log for recording diagnostics: %s", e)
+            return []
+
+        relevant_tokens = (
+            "record",
+            "recording",
+            "output",
+            "encoder",
+            "nvenc",
+            "x264",
+            "ffmpeg",
+            "failed",
+            "error",
+            "could not",
+        )
+        noisy_tokens = (
+            "available encoders",
+            "video encoders",
+            "audio encoders",
+            "game dvr background recording",
+            "loaded modules",
+            "output resolution",
+            "output 0:",
+            "output 1:",
+            "decklink",
+            "aja",
+            "nvidia audio effects",
+            "nvidia video fx",
+        )
+
+        diagnostics: list[str] = []
+        for line in lines[-max(1, int(tail_lines)) :]:
+            if since is not None and not self._is_log_line_at_or_after(log_path, line, since):
+                continue
+            normalized = line.casefold()
+            if not any(token in normalized for token in relevant_tokens):
+                continue
+            if any(token in normalized for token in noisy_tokens):
+                continue
+            diagnostics.append(line.strip())
+        return diagnostics[-max(1, int(max_lines)) :]
+
+    def _is_log_line_at_or_after(self, log_path: Path, line: str, since: float) -> bool:
+        timestamp = self._parse_obs_log_line_timestamp(log_path, line)
+        if timestamp is None:
+            return False
+        return timestamp >= since
+
+    @staticmethod
+    def _parse_obs_log_line_timestamp(log_path: Path, line: str) -> float | None:
+        match = re.match(r"^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?:", line)
+        if not match:
+            return None
+        date_match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", log_path.stem)
+        if not date_match:
+            return None
+        microsecond_text = (match.group(4) or "0")[:6].ljust(6, "0")
+        try:
+            value = datetime(
+                int(date_match.group(1)),
+                int(date_match.group(2)),
+                int(date_match.group(3)),
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                int(microsecond_text),
+            )
+        except ValueError:
+            return None
+        return value.timestamp()
 
     def hide_main_windows(
         self,

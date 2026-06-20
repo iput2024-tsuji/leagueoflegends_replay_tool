@@ -94,6 +94,11 @@ class RecordingSupervisor:
                         self._notification_error_message(e),
                     )
                     if should_continue:
+                        self._defer_current_game_after_failure()
+                        self._emit("⚠️ 録画エラーが発生したため、この試合中の再試行を停止します。")
+                        await self._wait_for_post_game_notification_window()
+                        if stop_event.is_set():
+                            break
                         self._emit("⚠️ 録画エラー後も次の試合監視を継続します。")
                         continue
                     break
@@ -232,3 +237,8 @@ class RecordingSupervisor:
         marker = getattr(self.recorder, "mark_session_failed", None)
         if callable(marker):
             marker(error)
+
+    def _defer_current_game_after_failure(self) -> None:
+        defer = getattr(self.recorder, "defer_current_game_until_clear", None)
+        if callable(defer):
+            defer()

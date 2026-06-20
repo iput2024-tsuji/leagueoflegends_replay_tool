@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.3] - 2026-06-20
+
+### Fixed
+
+- Wait for the LoL Live Client connection for a short period after LCU game-start detection before starting OBS recording.
+- Extended the OBS recording-start confirmation timeout to reduce failures caused by startup-time initialization delays.
+- Suppressed repeated recording-start retries during the same match after a failure and included OBS log diagnostics in the failure message.
+
 ## [0.4.2] - 2026-06-17
 
 ### Changed

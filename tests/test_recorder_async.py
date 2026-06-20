@@ -544,6 +544,7 @@ def test_start_recording_failure_raises_and_does_not_create_session_data():
         auto_setup=False,
     )
     recorder.session_started = True
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
 
     with pytest.raises(recordtest.RecorderError, match="OBS録画開始に失敗"):
         run(recorder.start_recording_async())

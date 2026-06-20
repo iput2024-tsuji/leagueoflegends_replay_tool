@@ -196,6 +196,40 @@ def test_obs_video_and_quality_settings_are_sent_to_websocket():
     ]
 
 
+def test_prepare_recording_start_does_not_reset_video_settings(tmp_path):
+    class RawClient:
+        def __init__(self):
+            self.calls = []
+
+        def send(self, request_type, payload, raw=True):
+            self.calls.append((request_type, payload, raw))
+            if request_type == "GetSpecialInputs":
+                return {}
+            return {}
+
+        def set_record_directory(self, record_path):
+            self.calls.append(("set_record_directory", record_path, None))
+
+    config = recordtest.AppConfig.from_dict(
+        {
+            "paths": {
+                "recordings_dir": str(tmp_path),
+                "json_dir": str(tmp_path / "json"),
+            }
+        }
+    )
+    client = RawClient()
+    obs_client = recordtest.ObsWebSocketClient(config=config)
+    obs_client.client = client
+
+    obs_client.prepare_recording_start()
+
+    request_names = [call[0] for call in client.calls]
+    assert "SetVideoSettings" not in request_names
+    assert "set_record_directory" in request_names
+    assert request_names.count("SetProfileParameter") >= 3
+
+
 def test_recording_encoder_auto_selection_prefers_h264_hardware_encoders():
     kinds = [
         "obs_nvenc_hevc_tex",

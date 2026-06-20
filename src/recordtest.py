@@ -140,6 +140,7 @@ DEFAULT_RECORDING_START_TIMEOUT_SEC = 15.0
 DEFAULT_RECORDING_START_PRIMARY_TIMEOUT_SEC = 5.0
 DEFAULT_RECORDING_START_RECOVERY_TIMEOUT_SEC = 12.0
 DEFAULT_RECORDING_START_POLL_SEC = 0.25
+DEFAULT_RECORDING_START_SETTLE_SEC = 0.75
 DEFAULT_GAME_START_EVENT_WAIT_SEC = 3.0
 DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC = 30.0
 DEFAULT_LCU_START_LIVE_CLIENT_GRACE_SEC = 20.0
@@ -2702,12 +2703,7 @@ class ObsWebSocketClient(OBSClient):
             self._status_handler = None
 
     def setup_record_output(self) -> None:
-        disable_obs_global_audio_devices(self.client)
-        self.log("🔇 OBSのデスクトップ音声とグローバル音声入力を無効化しました。")
-
-        if self.config.paths.recordings_dir:
-            record_dir = validate_recording_directory(self.config.paths.recordings_dir)
-            apply_record_directory_to_obs(self.client, record_dir)
+        self._apply_record_output_basics()
 
         try:
             apply_obs_video_settings(
@@ -2729,11 +2725,28 @@ class ObsWebSocketClient(OBSClient):
             # 録画は続行可能なので警告のみ
             self.log(f"⚠️ OBS映像設定の適用に失敗: {e}")
 
+        self._apply_recording_quality_settings()
+
+    def _apply_record_output_basics(self) -> None:
+        disable_obs_global_audio_devices(self.client)
+        self.log("🔇 OBSのデスクトップ音声とグローバル音声入力を無効化しました。")
+
+        if self.config.paths.recordings_dir:
+            record_dir = validate_recording_directory(self.config.paths.recordings_dir)
+            apply_record_directory_to_obs(self.client, record_dir)
+
+    def _apply_recording_quality_settings(
+        self,
+        recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
+        *,
+        raise_on_error: bool = False,
+    ) -> OBSRecordingEncoderSelection | None:
         try:
             selected_encoder = apply_obs_recording_quality_settings(
                 self.client,
                 scale_type=self.config.obs.scale_type,
                 recording_quality=self.config.obs.recording_quality,
+                recording_encoder=recording_encoder,
                 obs_dir=self.config.obs.obs_dir,
             )
             self.log(
@@ -2741,8 +2754,12 @@ class ObsWebSocketClient(OBSClient):
                 f"quality={self.config.obs.recording_quality}, scale={self.config.obs.scale_type}, "
                 f"encoder={selected_encoder.display_name} ({selected_encoder.encoder_kind})"
             )
+            return selected_encoder
         except Exception as e:
             self.log(f"⚠️ OBS録画品質設定の適用に失敗: {e}")
+            if raise_on_error:
+                raise
+            return None
 
     def apply_record_output_settings(self) -> bool:
         self.setup_record_output()
@@ -3043,16 +3060,16 @@ class ObsWebSocketClient(OBSClient):
         _obs_raw(self.client, "ToggleRecord")
 
     def prepare_recording_start(self) -> None:
-        self.setup_record_output()
+        self._apply_record_output_basics()
+        self._apply_recording_quality_settings()
 
     def set_recording_encoder(self, recording_encoder: str) -> OBSRecordingEncoderSelection:
-        selected_encoder = apply_obs_recording_quality_settings(
-            self.client,
-            scale_type=self.config.obs.scale_type,
-            recording_quality=self.config.obs.recording_quality,
+        selected_encoder = self._apply_recording_quality_settings(
             recording_encoder=recording_encoder,
-            obs_dir=self.config.obs.obs_dir,
+            raise_on_error=True,
         )
+        if selected_encoder is None:
+            raise RecorderError("OBS録画エンコーダの切り替えに失敗しました。")
         self.log(
             "🎞️ OBS録画エンコーダを切り替えました: "
             f"encoder={selected_encoder.display_name} ({selected_encoder.encoder_kind})"
@@ -3622,6 +3639,8 @@ class LoLAutoRecorder(RecordingSessionManager):
 
         errors = []
         self._prepare_recording_output_for_start()
+        if not await self.wait_with_stop_async(DEFAULT_RECORDING_START_SETTLE_SEC, step=0.1):
+            return
         request_started_at = time.time()
         start_request_accepted = False
         try:
@@ -3704,7 +3723,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 set_encoder("x264")
             except Exception as e:
                 errors.append(f"復旧準備: x264への切り替えに失敗しました ({type(e).__name__}: {e})")
-        if not await self.wait_with_stop_async(0.5):
+        if not await self.wait_with_stop_async(DEFAULT_RECORDING_START_SETTLE_SEC, step=0.1):
             return
 
         retry_started_at = time.time()

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.4] - 2026-06-20
+
+### Fixed
+
+- Reapplies OBS output settings when OBS WebSocket accepts a recording-start request but OBS does not transition into recording state.
+- Switches to x264 and retries recording once with `ToggleRecord` during recovery.
+- Includes recovery failure details and OBS log diagnostics in the recording failure message when recovery does not start recording.
+
 ## [0.4.3] - 2026-06-20
 
 ### Fixed

@@ -136,10 +136,12 @@ DEFAULT_AUDIO_DEVICE_ID = config_schema.DEFAULT_AUDIO_DEVICE_ID
 DEFAULT_AUDIO_DEVICE_NAME = config_schema.DEFAULT_AUDIO_DEVICE_NAME
 DEFAULT_AUDIO_MIC_VOLUME_DB = config_schema.DEFAULT_AUDIO_MIC_VOLUME_DB
 DEFAULT_AUDIO_MIC_MUTE = config_schema.DEFAULT_AUDIO_MIC_MUTE
-DEFAULT_RECORDING_START_TIMEOUT_SEC = 8.0
+DEFAULT_RECORDING_START_TIMEOUT_SEC = 15.0
 DEFAULT_RECORDING_START_POLL_SEC = 0.25
 DEFAULT_GAME_START_EVENT_WAIT_SEC = 3.0
 DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC = 30.0
+DEFAULT_LCU_START_LIVE_CLIENT_GRACE_SEC = 20.0
+DEFAULT_LCU_START_LIVE_CLIENT_POLL_SEC = 1.0
 MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
 LCU_GAMEFLOW_START_PHASES = frozenset({"gamestart", "inprogress", "reconnect"})
 OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS = (
@@ -3391,6 +3393,12 @@ class LoLAutoRecorder(RecordingSessionManager):
         if game_id not in (None, ""):
             self._last_completed_game_id = str(game_id)
 
+    def defer_current_game_until_clear(self) -> None:
+        game_id = self.match_metadata.get("game_id") or self._game_id_from_live_payload(self.last_game_data)
+        if game_id not in (None, ""):
+            self._last_completed_game_id = str(game_id)
+        self._require_game_clear = True
+
     def update_player_info_from_game_data(self, data: dict[str, Any] | None) -> None:
         if not data or not self.my_name:
             return
@@ -3518,10 +3526,6 @@ class LoLAutoRecorder(RecordingSessionManager):
                 return False
             await self.capture_champ_select_async()
             await self.poll_gameflow_phase()
-            gameflow_phase = self.match_metadata.get("gameflow_phase")
-            if self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES:
-                return await self._mark_game_started(source="lcu")
-
             await self.capture_match_metadata_async()
             result = await self.poll_all_game_data()
             data = result.payload
@@ -3535,7 +3539,19 @@ class LoLAutoRecorder(RecordingSessionManager):
 
             gameflow_phase = self.match_metadata.get("gameflow_phase")
             if self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES:
-                return await self._mark_game_started(source="lcu")
+                live_result = await self.wait_for_live_client_after_lcu_start_async(initial_result=result)
+                if live_result is None:
+                    if self.should_stop():
+                        self.session_phase = RecordingPhase.CANCELLED
+                        return False
+                    self.log("⚠️ Live Clientを確認できないため、LCU Gameflow Phaseで録画開始します。")
+                    return await self._mark_game_started(source="lcu")
+                live_data, live_game_time = live_result
+                return await self._mark_game_started(
+                    source="live_client",
+                    live_data=live_data,
+                    game_time=live_game_time,
+                )
 
             if loop.time() >= next_diagnostic_at:
                 self.log(f"🔎 試合開始監視中: {self._game_start_poll_summary(result, gameflow_phase)}")
@@ -3543,6 +3559,32 @@ class LoLAutoRecorder(RecordingSessionManager):
             if not await self.wait_with_stop_async(1.0):
                 self.session_phase = RecordingPhase.CANCELLED
                 return False
+
+    async def wait_for_live_client_after_lcu_start_async(
+        self,
+        initial_result: RiotPollResult | None = None,
+        timeout_sec: float = DEFAULT_LCU_START_LIVE_CLIENT_GRACE_SEC,
+        poll_sec: float = DEFAULT_LCU_START_LIVE_CLIENT_POLL_SEC,
+    ) -> tuple[dict[str, Any], float] | None:
+        """LCUの開始検知が早すぎる場合に、LoL本体のLive Client起動を短時間待つ。"""
+        attempts = max(1, int(max(0.1, float(timeout_sec)) / max(0.1, float(poll_sec))))
+        results: list[RiotPollResult] = []
+        if initial_result is not None:
+            results.append(initial_result)
+        self.log("LCUで試合開始を検知しました。LoL本体のLive Client接続を待機します...")
+
+        for attempt in range(attempts):
+            if self.should_stop():
+                return None
+            result = results.pop(0) if results else await self.poll_all_game_data()
+            data = result.payload
+            game_time = self._live_game_time(data)
+            if result.status == RiotPollStatus.IN_GAME and data is not None and game_time is not None:
+                self.log(f"Live Client接続を確認しました。GameTime: {float(game_time):.2f}s")
+                return data, float(game_time)
+            if attempt < attempts - 1 and not await self.wait_with_stop_async(poll_sec):
+                return None
+        return None
 
     async def start_recording_async(self) -> None:
         """録画開始 -> 同期マーカー"""
@@ -3557,6 +3599,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             )
 
         errors = []
+        request_started_at = time.time()
         try:
             self.obs_client.start_recording()
         except Exception as e:
@@ -3582,6 +3625,9 @@ class LoLAutoRecorder(RecordingSessionManager):
             message = "OBS録画開始に失敗しました。\n" + "\n".join(errors)
             if details:
                 message += f"\nOBS状態: {details}"
+            diagnostics = self._obs_recording_diagnostics(request_started_at)
+            if diagnostics:
+                message += f"\n{diagnostics}"
             self.log(f"⚠️ {message}")
             raise RecorderError(message)
         if not await self.wait_with_stop_async(2.0):
@@ -3638,6 +3684,18 @@ class LoLAutoRecorder(RecordingSessionManager):
         if not isinstance(details, dict):
             return ""
         return ", ".join(f"{key}={value}" for key, value in details.items() if value is not None)
+
+    def _obs_recording_diagnostics(self, since: float) -> str:
+        try:
+            lines = OBSProcessManager(self.config.obs.obs_dir, logger=self.logger).latest_log_recording_diagnostics(
+                since=since
+            )
+        except Exception as e:
+            self.logger.debug("OBS recording diagnostics failed: %s", e)
+            return ""
+        if lines:
+            return "OBSログ:\n" + "\n".join(f"- {line}" for line in lines)
+        return "OBSログ: 録画開始要求後にOBS側の録画出力ログが見つかりませんでした。"
 
     @staticmethod
     def _format_obs_start_error(error: BaseException, attempt: int) -> str:

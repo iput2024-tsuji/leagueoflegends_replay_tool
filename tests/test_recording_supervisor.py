@@ -120,6 +120,9 @@ class FakeRecorder:
         self.calls.append("mark_session_aborted")
         self.failure_reason = str(reason)
 
+    def defer_current_game_until_clear(self):
+        self.calls.append("defer_current_game_until_clear")
+
     def request_stop(self):
         self.calls.append("request_stop")
 
@@ -254,8 +257,11 @@ def test_recording_supervisor_saves_partial_session_when_recording_fails():
     run(run_supervisor(supervisor))
 
     assert "⚠️ 録画セッションを部分保存しました。" in statuses
+    assert "⚠️ 録画エラーが発生したため、この試合中の再試行を停止します。" in statuses
     assert "⚠️ 録画エラー後も次の試合監視を継続します。" in statuses
     assert "mark_session_failed" in recorder.calls
+    assert "defer_current_game_until_clear" in recorder.calls
+    assert "wait_for_previous_game_clear_async" in recorder.calls
     assert "save_json" in recorder.calls
     assert recorder.finalize_outcomes == [RecordingOutcome.FAILED_PARTIAL]
     assert recorder.failure_reason == "sync marker failed"
@@ -284,6 +290,8 @@ def test_recording_supervisor_does_not_emit_started_notification_when_start_fail
 
     assert [item[0] for item in notifications] == ["recording_failed"]
     assert recorder.calls.count("wait_for_game_start_async") == 2
+    assert "defer_current_game_until_clear" in recorder.calls
+    assert "wait_for_previous_game_clear_async" in recorder.calls
 
 
 def test_recording_supervisor_does_not_finalize_twice_when_save_fails():

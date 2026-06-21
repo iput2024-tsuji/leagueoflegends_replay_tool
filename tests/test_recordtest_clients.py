@@ -228,6 +228,11 @@ def test_prepare_recording_start_does_not_reset_video_settings(tmp_path):
     assert "SetVideoSettings" not in request_names
     assert "set_record_directory" in request_names
     assert request_names.count("SetProfileParameter") >= 3
+    assert client.calls[-1][1] == {
+        "parameterCategory": "SimpleOutput",
+        "parameterName": "RecEncoder",
+        "parameterValue": "x264",
+    }
 
 
 def test_recording_encoder_auto_selection_prefers_h264_hardware_encoders():
@@ -258,7 +263,37 @@ def test_recording_encoder_auto_selection_uses_safe_fallback_order(kinds, expect
     assert recordtest.select_obs_recording_encoder(kinds).profile_value == expected
 
 
-def test_recording_quality_auto_detects_encoder_from_obs_log(tmp_path):
+def test_recording_quality_defaults_to_x264_even_when_hardware_encoder_exists(tmp_path):
+    class RawClient:
+        def __init__(self):
+            self.calls = []
+
+        def send(self, request_type, payload, raw=True):
+            self.calls.append((request_type, payload, raw))
+            return {}
+
+    logs_dir = tmp_path / "config" / "obs-studio" / "logs"
+    logs_dir.mkdir(parents=True)
+    (logs_dir / "latest.txt").write_text(
+        "Available Encoders:\n"
+        "  - obs_x264 (x264)\n"
+        "  - obs_nvenc_h264_tex (NVIDIA NVENC H.264)\n",
+        encoding="utf-8",
+    )
+    client = RawClient()
+
+    selected = recordtest.apply_obs_recording_quality_settings(client, obs_dir=tmp_path)
+
+    assert selected.profile_value == "x264"
+    assert selected.hardware is False
+    assert client.calls[-1][1] == {
+        "parameterCategory": "SimpleOutput",
+        "parameterName": "RecEncoder",
+        "parameterValue": "x264",
+    }
+
+
+def test_recording_quality_auto_detects_encoder_from_obs_log_when_requested(tmp_path):
     class RawClient:
         def __init__(self):
             self.calls = []
@@ -278,7 +313,11 @@ def test_recording_quality_auto_detects_encoder_from_obs_log(tmp_path):
     )
     client = RawClient()
 
-    selected = recordtest.apply_obs_recording_quality_settings(client, obs_dir=tmp_path)
+    selected = recordtest.apply_obs_recording_quality_settings(
+        client,
+        recording_encoder="auto",
+        obs_dir=tmp_path,
+    )
 
     assert selected.profile_value == "nvenc"
     assert client.calls[-1][1] == {
@@ -736,7 +775,7 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     assert window_capture["settings"]["method"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
     assert window_capture["settings"]["window"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
     assert window_capture["settings"]["client_area"] is True
-    assert window_capture["settings"]["capture_audio"] is True
+    assert window_capture["settings"]["capture_audio"] is False
     assert sync_marker["name"] == recordtest.DEFAULT_OBS_SOURCE_NAME
 
     scene_items = raw_client.scene_items_by_scene[recordtest.DEFAULT_OBS_SCENE_NAME]
@@ -757,6 +796,49 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
             "boundsHeight": 1080.0,
         },
     ) in raw_client.transform_calls
+
+
+def test_existing_window_capture_disables_embedded_audio_capture():
+    class FakeObsRawClient:
+        def __init__(self):
+            self.inputs = [
+                {
+                    "inputName": recordtest.DEFAULT_OBS_WINDOW_CAPTURE_NAME,
+                    "inputKind": "window_capture",
+                }
+            ]
+            self.scene_items_by_scene = {
+                recordtest.DEFAULT_OBS_SCENE_NAME: [
+                    {
+                        "sourceName": recordtest.DEFAULT_OBS_WINDOW_CAPTURE_NAME,
+                        "sceneItemId": 5,
+                        "sceneItemIndex": 0,
+                    }
+                ]
+            }
+            self.settings_calls = []
+
+        def get_input_list(self):
+            return SimpleNamespace(inputs=self.inputs)
+
+        def set_input_settings(self, input_name, settings, overlay=True):
+            self.settings_calls.append((input_name, dict(settings), overlay))
+
+        def get_scene_item_list(self, scene_name):
+            return SimpleNamespace(scene_items=self.scene_items_by_scene.setdefault(scene_name, []))
+
+    raw_client = FakeObsRawClient()
+    client = recordtest.ObsWebSocketClient(config=app_config())
+    client.client = raw_client
+
+    scene_item_id = client._ensure_window_capture_exists()
+
+    assert scene_item_id == 5
+    assert raw_client.settings_calls
+    input_name, settings, overlay = raw_client.settings_calls[-1]
+    assert input_name == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_NAME
+    assert overlay is True
+    assert settings["capture_audio"] is False
 
 
 def test_setup_sync_elements_keeps_initial_scene_when_window_capture_creation_fails():

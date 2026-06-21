@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.6] - 2026-06-21
+
+### Fixed
+
+- Changed the default OBS recording encoder to x264 to reduce recording-start failures caused by NVENC initialization.
+- Disabled process audio capture on the LoL window capture source so LoL window transitions are less likely to block recording startup.
+
 ## [0.4.5] - 2026-06-21
 
 ### Fixed

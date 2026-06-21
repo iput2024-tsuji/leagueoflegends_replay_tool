@@ -99,6 +99,8 @@ DEFAULT_OBS_WINDOW_CAPTURE_NAME = config_schema.DEFAULT_OBS_WINDOW_CAPTURE_NAME
 DEFAULT_OBS_WINDOW_CAPTURE_WINDOW = config_schema.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
 DEFAULT_OBS_WINDOW_CAPTURE_METHOD = config_schema.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
 DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY = 2  # Match by executable
+# OBS process-loopback audio tied to WGC can lose the LoL window during load transitions.
+DEFAULT_OBS_WINDOW_CAPTURE_AUDIO = False
 DEFAULT_OBS_INITIAL_SCENE_NAMES = frozenset({"Scene", "シーン"})
 DEFAULT_OBS_GAME_CAPTURE_NAME = config_schema.DEFAULT_OBS_GAME_CAPTURE_NAME
 DEFAULT_OBS_LEGACY_GAME_CAPTURE_WINDOW = config_schema.DEFAULT_OBS_LEGACY_GAME_CAPTURE_WINDOW
@@ -122,7 +124,7 @@ DEFAULT_OBS_OUTPUT_WIDTH = config_schema.DEFAULT_OBS_OUTPUT_WIDTH
 DEFAULT_OBS_OUTPUT_HEIGHT = config_schema.DEFAULT_OBS_OUTPUT_HEIGHT
 DEFAULT_OBS_SCALE_TYPE = config_schema.DEFAULT_OBS_SCALE_TYPE
 DEFAULT_OBS_RECORDING_QUALITY = config_schema.DEFAULT_OBS_RECORDING_QUALITY
-DEFAULT_OBS_RECORDING_ENCODER = "auto"
+DEFAULT_OBS_RECORDING_ENCODER = "x264"
 VALID_OBS_SCALE_TYPES = config_schema.VALID_OBS_SCALE_TYPES
 VALID_OBS_RECORDING_QUALITIES = config_schema.VALID_OBS_RECORDING_QUALITIES
 DEFAULT_END_ERROR_LIMIT = config_schema.DEFAULT_END_ERROR_LIMIT
@@ -2872,7 +2874,7 @@ class ObsWebSocketClient(OBSClient):
             "priority": DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY,
             "cursor": False,
             "client_area": True,
-            "capture_audio": True,
+            "capture_audio": DEFAULT_OBS_WINDOW_CAPTURE_AUDIO,
             "force_sdr": False,
         }
 
@@ -2905,7 +2907,7 @@ class ObsWebSocketClient(OBSClient):
                     "window": self.config.obs.window_capture_window,
                     "method": self.config.obs.window_capture_method,
                     "priority": DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY,
-                    "capture_audio": True,
+                    "capture_audio": DEFAULT_OBS_WINDOW_CAPTURE_AUDIO,
                 }
                 try:
                     self.client.create_input(scene_name, source_name, "window_capture", fallback_settings, True)
@@ -2921,7 +2923,7 @@ class ObsWebSocketClient(OBSClient):
                     "window": self.config.obs.window_capture_window,
                     "method": self.config.obs.window_capture_method,
                     "priority": DEFAULT_OBS_WINDOW_CAPTURE_PRIORITY,
-                    "capture_audio": True,
+                    "capture_audio": DEFAULT_OBS_WINDOW_CAPTURE_AUDIO,
                 }
                 try:
                     self.client.set_input_settings(source_name, fallback_settings, overlay=True)

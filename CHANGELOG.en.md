@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.5] - 2026-06-21
+
+### Fixed
+
+- Avoided reapplying OBS video settings immediately before recording starts, reducing OBS output-start failures.
+- Added a short settling delay before the first recording-start request and before the recovery retry to avoid starting recording immediately after settings are applied.
+
 ## [0.4.4] - 2026-06-20
 
 ### Fixed

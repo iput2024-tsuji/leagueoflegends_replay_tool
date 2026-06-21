@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.7] - 2026-06-22
+
+### Fixed
+
+- Normalized the managed OBS recording profile to `Simple / x264 / mkv` before startup and at runtime, reducing recording-start failures when stale Advanced/NVENC settings remain.
+- Treat failed raw OBS recording requests as explicit errors and include output mode, recording format, encoder, and output path in recording-start diagnostics.
+
 ## [0.4.6] - 2026-06-21
 
 ### Fixed

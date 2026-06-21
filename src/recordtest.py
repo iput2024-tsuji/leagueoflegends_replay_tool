@@ -46,6 +46,8 @@ try:
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
+        new_obs_ini_parser as shared_new_obs_ini_parser,
+        read_obs_ini_parser as shared_read_obs_ini_parser,
     )
     from .obs_process import OBSProcessManager
     from .recording_state import FinalizeResult, RecordingEndDetector, RecordingOutcome, RecordingPhase
@@ -71,6 +73,8 @@ except ImportError:
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
+        new_obs_ini_parser as shared_new_obs_ini_parser,
+        read_obs_ini_parser as shared_read_obs_ini_parser,
     )
     from obs_process import OBSProcessManager
     from recording_state import FinalizeResult, RecordingEndDetector, RecordingOutcome, RecordingPhase
@@ -125,6 +129,14 @@ DEFAULT_OBS_OUTPUT_HEIGHT = config_schema.DEFAULT_OBS_OUTPUT_HEIGHT
 DEFAULT_OBS_SCALE_TYPE = config_schema.DEFAULT_OBS_SCALE_TYPE
 DEFAULT_OBS_RECORDING_QUALITY = config_schema.DEFAULT_OBS_RECORDING_QUALITY
 DEFAULT_OBS_RECORDING_ENCODER = "x264"
+DEFAULT_OBS_OUTPUT_MODE = "Simple"
+DEFAULT_OBS_RECORDING_FORMAT = "mkv"
+DEFAULT_OBS_RECORDING_TRACKS = "1"
+DEFAULT_OBS_SIMPLE_AUDIO_ENCODER = "aac"
+DEFAULT_OBS_ADVANCED_AUDIO_ENCODER = "ffmpeg_aac"
+DEFAULT_OBS_SIMPLE_X264_PRESET = "veryfast"
+MANAGED_OBS_PROFILE_DIR_NAME = "LoLReplayTool"
+MANAGED_OBS_PROFILE_NAME = "LoL Replay Tool"
 VALID_OBS_SCALE_TYPES = config_schema.VALID_OBS_SCALE_TYPES
 VALID_OBS_RECORDING_QUALITIES = config_schema.VALID_OBS_RECORDING_QUALITIES
 DEFAULT_END_ERROR_LIMIT = config_schema.DEFAULT_END_ERROR_LIMIT
@@ -818,6 +830,162 @@ def get_obs_portable_marker_path(base_dir: str | Path) -> Path:
     return shared_get_portable_marker_path(base_dir)
 
 
+def _read_or_new_obs_ini(path: Path) -> tuple[Any, bool]:
+    if not path.exists():
+        return shared_new_obs_ini_parser(), True
+    try:
+        parser, normalized_encoding = shared_read_obs_ini_parser(path)
+        return parser, bool(normalized_encoding)
+    except Exception:
+        return shared_new_obs_ini_parser(), True
+
+
+def _set_obs_ini_value(parser: Any, section: str, key: str, value: str) -> bool:
+    value_text = str(value)
+    if not parser.has_section(section):
+        parser.add_section(section)
+        parser.set(section, key, value_text)
+        return True
+    current = parser.get(section, key, fallback=None)
+    if current != value_text:
+        parser.set(section, key, value_text)
+        return True
+    return False
+
+
+def _obs_current_profile_dir_name(base_dir: str | Path) -> str | None:
+    user_ini = get_obs_user_ini_path(base_dir)
+    if not user_ini.exists():
+        return None
+    try:
+        parser, _normalized = shared_read_obs_ini_parser(user_ini)
+    except Exception:
+        return None
+    if not parser.has_section("Basic"):
+        return None
+    for key in ("ProfileDir", "Profile"):
+        value = parser.get("Basic", key, fallback="")
+        value_text = str(value or "").strip()
+        if value_text:
+            return Path(value_text).name
+    return None
+
+
+def _obs_profile_basic_ini_paths(base_dir: str | Path) -> tuple[Path, ...]:
+    profiles_root = get_obs_config_dir(base_dir) / "basic" / "profiles"
+    names: list[str] = []
+    current_name = _obs_current_profile_dir_name(base_dir)
+    if current_name:
+        names.append(current_name)
+    if profiles_root.exists():
+        for profile_dir in profiles_root.iterdir():
+            if profile_dir.is_dir() and (profile_dir / "basic.ini").exists():
+                names.append(profile_dir.name)
+    if not names:
+        names.append(MANAGED_OBS_PROFILE_DIR_NAME)
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for name in names:
+        safe_name = Path(str(name)).name.strip()
+        if not safe_name or safe_name in seen:
+            continue
+        seen.add(safe_name)
+        result.append(profiles_root / safe_name / "basic.ini")
+    return tuple(result)
+
+
+def _ensure_obs_user_profile_selection(base_dir: str | Path, profile_dir_name: str) -> Path | None:
+    if _obs_current_profile_dir_name(base_dir):
+        return None
+    user_ini = get_obs_user_ini_path(base_dir)
+    parser, changed = _read_or_new_obs_ini(user_ini)
+    changed = _set_obs_ini_value(parser, "Basic", "Profile", MANAGED_OBS_PROFILE_NAME) or changed
+    changed = _set_obs_ini_value(parser, "Basic", "ProfileDir", profile_dir_name) or changed
+    if changed or not user_ini.exists():
+        user_ini.parent.mkdir(parents=True, exist_ok=True)
+        with open(user_ini, "w", encoding="utf-8") as f:
+            parser.write(f, space_around_delimiters=False)
+        return user_ini
+    return None
+
+
+def _select_requested_obs_recording_encoder(
+    recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
+    *,
+    obs_dir: str | Path | None = None,
+) -> OBSRecordingEncoderSelection:
+    requested_encoder = str(recording_encoder or DEFAULT_OBS_RECORDING_ENCODER).strip().lower()
+    if requested_encoder == "auto":
+        return detect_obs_recording_encoder(obs_dir)
+    return OBSRecordingEncoderSelection(
+        requested_encoder,
+        requested_encoder,
+        requested_encoder,
+        requested_encoder != "x264",
+    )
+
+
+def _apply_obs_recording_profile_ini(
+    ini_path: Path,
+    *,
+    record_dir: str | Path,
+    scale_type: str = DEFAULT_OBS_SCALE_TYPE,
+    recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
+    recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
+    obs_dir: str | Path | None = None,
+) -> bool:
+    parser, changed = _read_or_new_obs_ini(ini_path)
+    if not parser.has_section("General"):
+        parser.add_section("General")
+        changed = True
+    if parser.get("General", "Name", fallback="") == "":
+        parser.set("General", "Name", ini_path.parent.name)
+        changed = True
+
+    selected_encoder = _select_requested_obs_recording_encoder(recording_encoder, obs_dir=obs_dir)
+    for section, key, value in _obs_recording_profile_parameter_updates(
+        scale_type=scale_type,
+        recording_quality=recording_quality,
+        selected_encoder=selected_encoder,
+        record_dir=record_dir,
+    ):
+        changed = _set_obs_ini_value(parser, section, key, value) or changed
+
+    if changed or not ini_path.exists():
+        ini_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(ini_path, "w", encoding="utf-8") as f:
+            parser.write(f, space_around_delimiters=False)
+    return changed
+
+
+def ensure_obs_recording_profile_ini(
+    base_dir: str | Path,
+    *,
+    record_dir: str | Path,
+    scale_type: str = DEFAULT_OBS_SCALE_TYPE,
+    recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
+    recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
+) -> tuple[Path, ...]:
+    changed_paths: list[Path] = []
+    profile_paths = _obs_profile_basic_ini_paths(base_dir)
+    for ini_path in profile_paths:
+        if _apply_obs_recording_profile_ini(
+            ini_path,
+            record_dir=record_dir,
+            scale_type=scale_type,
+            recording_quality=recording_quality,
+            recording_encoder=recording_encoder,
+            obs_dir=base_dir,
+        ):
+            changed_paths.append(ini_path.resolve())
+    if profile_paths:
+        selection_path = _ensure_obs_user_profile_selection(base_dir, profile_paths[0].parent.name)
+        if selection_path is not None:
+            changed_paths.append(selection_path.resolve())
+    return tuple(changed_paths)
+
+
 class OBSBootstrapper(SharedOBSBootstrapper):
     """アプリ管理のポータブルOBSを初期化するBootstrapper。"""
 
@@ -1296,6 +1464,31 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         except Exception as e:
             report["warnings"].append(f"OBS Bootstrapper の検査/修復に失敗しました: {e}")
 
+        if auto_fix and recordings_dir is not None and is_valid_obs_dir(current_obs_dir):
+            try:
+                process_manager = OBSProcessManager(current_obs_dir, logger=LOGGER)
+                if process_manager.has_managed_process():
+                    report["warnings"].append(
+                        "ポータブルOBSが起動中のため、録画プロファイル修復を延期しました。"
+                        "録画監視を停止してから環境修復を再実行してください。"
+                    )
+                else:
+                    changed_profiles = ensure_obs_recording_profile_ini(
+                        current_obs_dir,
+                        record_dir=recordings_dir,
+                        scale_type=str(obs_cfg.get("scale_type") or DEFAULT_OBS_SCALE_TYPE),
+                        recording_quality=str(obs_cfg.get("recording_quality") or DEFAULT_OBS_RECORDING_QUALITY),
+                        recording_encoder=DEFAULT_OBS_RECORDING_ENCODER,
+                    )
+                    if changed_profiles:
+                        report["changed"] = True
+                        report["notes"].append(
+                            "OBS録画プロファイルをSimple/x264/mkv設定へ修復しました: "
+                            + ", ".join(str(path) for path in changed_profiles)
+                        )
+            except Exception as e:
+                report["warnings"].append(f"OBS録画プロファイルの検査/修復に失敗しました: {e}")
+
     has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
     if not has_valid_obs:
         report["errors"].append(
@@ -1587,6 +1780,127 @@ def detect_obs_recording_encoder(obs_dir: str | Path | None) -> OBSRecordingEnco
     return OBSRecordingEncoderSelection("x264", "obs_x264", "x264 (fallback)", False)
 
 
+def _normalized_obs_scale_type(scale_type: str | None) -> str:
+    scale_value = str(scale_type or DEFAULT_OBS_SCALE_TYPE).strip().lower()
+    if scale_value not in VALID_OBS_SCALE_TYPES:
+        return DEFAULT_OBS_SCALE_TYPE
+    return scale_value
+
+
+def _normalized_obs_recording_quality(recording_quality: str | None) -> str:
+    quality_lookup = {value.lower(): value for value in VALID_OBS_RECORDING_QUALITIES}
+    return quality_lookup.get(
+        str(recording_quality or DEFAULT_OBS_RECORDING_QUALITY).strip().lower(),
+        DEFAULT_OBS_RECORDING_QUALITY,
+    )
+
+
+def _obs_advanced_encoder_value(selected_encoder: OBSRecordingEncoderSelection) -> str:
+    encoder_kind = str(selected_encoder.encoder_kind or "").strip()
+    normalized_kind = encoder_kind.lower()
+    if normalized_kind.startswith(("obs_", "ffmpeg_")):
+        return encoder_kind
+    if selected_encoder.profile_value == "x264":
+        return "obs_x264"
+    if selected_encoder.profile_value == "nvenc":
+        return "obs_nvenc_h264_tex"
+    if selected_encoder.profile_value == "qsv":
+        return "obs_qsv11_v2"
+    if selected_encoder.profile_value == "amd":
+        return "h264_texture_amf"
+    return str(selected_encoder.profile_value or "obs_x264")
+
+
+def _obs_recording_profile_parameter_updates(
+    *,
+    scale_type: str = DEFAULT_OBS_SCALE_TYPE,
+    recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
+    selected_encoder: OBSRecordingEncoderSelection,
+    record_dir: str | Path | None = None,
+) -> list[tuple[str, str, str]]:
+    scale_value = _normalized_obs_scale_type(scale_type)
+    quality_value = _normalized_obs_recording_quality(recording_quality)
+    advanced_encoder = _obs_advanced_encoder_value(selected_encoder)
+    updates: list[tuple[str, str, str]] = [
+        ("Output", "Mode", DEFAULT_OBS_OUTPUT_MODE),
+        ("Video", "ScaleType", scale_value),
+        ("AdvOut", "RecType", "Standard"),
+        ("AdvOut", "RecFormat2", DEFAULT_OBS_RECORDING_FORMAT),
+        ("AdvOut", "RecUseRescale", "false"),
+        ("AdvOut", "RecTracks", DEFAULT_OBS_RECORDING_TRACKS),
+        ("AdvOut", "RecAudioEncoder", DEFAULT_OBS_ADVANCED_AUDIO_ENCODER),
+        ("AdvOut", "Encoder", advanced_encoder),
+        ("AdvOut", "RecEncoder", advanced_encoder),
+        ("SimpleOutput", "RecFormat2", DEFAULT_OBS_RECORDING_FORMAT),
+        ("SimpleOutput", "UseAdvanced", "false"),
+        ("SimpleOutput", "RecTracks", DEFAULT_OBS_RECORDING_TRACKS),
+        ("SimpleOutput", "RecRB", "false"),
+        ("SimpleOutput", "StreamEncoder", "x264"),
+        ("SimpleOutput", "StreamAudioEncoder", DEFAULT_OBS_SIMPLE_AUDIO_ENCODER),
+        ("SimpleOutput", "RecAudioEncoder", DEFAULT_OBS_SIMPLE_AUDIO_ENCODER),
+        ("SimpleOutput", "Preset", DEFAULT_OBS_SIMPLE_X264_PRESET),
+        ("SimpleOutput", "RecQuality", quality_value),
+    ]
+    if record_dir:
+        record_path = str(Path(record_dir))
+        updates.extend(
+            [
+                ("SimpleOutput", "FilePath", record_path),
+                ("AdvOut", "RecFilePath", record_path),
+                ("AdvOut", "FFFilePath", record_path),
+            ]
+        )
+    updates.append(("SimpleOutput", "RecEncoder", selected_encoder.profile_value))
+    return updates
+
+
+def _set_obs_profile_parameter(client: Any, category: str, name: str, value: str) -> None:
+    _obs_raw(
+        client,
+        "SetProfileParameter",
+        {
+            "parameterCategory": category,
+            "parameterName": name,
+            "parameterValue": value,
+        },
+    )
+
+
+def get_obs_profile_parameter_value(client: Any, category: str, name: str) -> str | None:
+    try:
+        response = _obs_raw(
+            client,
+            "GetProfileParameter",
+            {
+                "parameterCategory": category,
+                "parameterName": name,
+            },
+        )
+    except Exception:
+        return None
+    if isinstance(response, dict):
+        for key in ("parameterValue", "parameter_value", "value"):
+            value = response.get(key)
+            if value is not None:
+                return str(value)
+    for attr in ("parameter_value", "parameterValue", "value"):
+        value = getattr(response, attr, None)
+        if value is not None:
+            return str(value)
+    return None
+
+
+def _raise_for_obs_request_status(response: Any, request_type: str) -> None:
+    if not isinstance(response, dict):
+        return
+    status = response.get("requestStatus")
+    if not isinstance(status, dict) or status.get("result") is not False:
+        return
+    code = status.get("code", "?")
+    comment = status.get("comment") or status.get("message") or response
+    raise RecorderError(f"OBS request failed: request={request_type}, code={code}, detail={comment}")
+
+
 def apply_obs_recording_quality_settings(
     client: Any,
     *,
@@ -1594,41 +1908,17 @@ def apply_obs_recording_quality_settings(
     recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
     recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
     obs_dir: str | Path | None = None,
+    record_dir: str | Path | None = None,
 ) -> OBSRecordingEncoderSelection:
-    scale_value = str(scale_type or DEFAULT_OBS_SCALE_TYPE).strip().lower()
-    if scale_value not in VALID_OBS_SCALE_TYPES:
-        scale_value = DEFAULT_OBS_SCALE_TYPE
+    selected_encoder = _select_requested_obs_recording_encoder(recording_encoder, obs_dir=obs_dir)
 
-    quality_lookup = {value.lower(): value for value in VALID_OBS_RECORDING_QUALITIES}
-    quality_value = quality_lookup.get(
-        str(recording_quality or DEFAULT_OBS_RECORDING_QUALITY).strip().lower(),
-        DEFAULT_OBS_RECORDING_QUALITY,
-    )
-    requested_encoder = str(recording_encoder or DEFAULT_OBS_RECORDING_ENCODER).strip().lower()
-    if requested_encoder == "auto":
-        selected_encoder = detect_obs_recording_encoder(obs_dir)
-    else:
-        selected_encoder = OBSRecordingEncoderSelection(
-            requested_encoder,
-            requested_encoder,
-            requested_encoder,
-            requested_encoder != "x264",
-        )
-
-    for category, name, value in (
-        ("Video", "ScaleType", scale_value),
-        ("SimpleOutput", "RecQuality", quality_value),
-        ("SimpleOutput", "RecEncoder", selected_encoder.profile_value),
+    for category, name, value in _obs_recording_profile_parameter_updates(
+        scale_type=scale_type,
+        recording_quality=recording_quality,
+        selected_encoder=selected_encoder,
+        record_dir=record_dir,
     ):
-        _obs_raw(
-            client,
-            "SetProfileParameter",
-            {
-                "parameterCategory": category,
-                "parameterName": name,
-                "parameterValue": value,
-            },
-        )
+        _set_obs_profile_parameter(client, category, name, value)
     return selected_encoder
 
 
@@ -2287,6 +2577,20 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     except Exception as e:
         raise RecorderError(f"ポータブルOBS起動前設定の更新に失敗しました: {e}") from e
 
+    try:
+        record_dir = validate_recording_directory(config.paths.recordings_dir)
+        changed_profiles = ensure_obs_recording_profile_ini(
+            obs_dir_abs,
+            record_dir=record_dir,
+            scale_type=config.obs.scale_type,
+            recording_quality=config.obs.recording_quality,
+            recording_encoder=DEFAULT_OBS_RECORDING_ENCODER,
+        )
+        if changed_profiles:
+            LOGGER.info("ℹ️ OBS録画プロファイルを修復しました: %s", ", ".join(str(path) for path in changed_profiles))
+    except Exception as e:
+        raise RecorderError(f"OBS録画プロファイルの起動前修復に失敗しました: {e}") from e
+
     ensure_obs_websocket_port_free(config)
 
     LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
@@ -2744,17 +3048,22 @@ class ObsWebSocketClient(OBSClient):
         raise_on_error: bool = False,
     ) -> OBSRecordingEncoderSelection | None:
         try:
+            record_dir = None
+            if self.config.paths.recordings_dir:
+                record_dir = validate_recording_directory(self.config.paths.recordings_dir)
             selected_encoder = apply_obs_recording_quality_settings(
                 self.client,
                 scale_type=self.config.obs.scale_type,
                 recording_quality=self.config.obs.recording_quality,
                 recording_encoder=recording_encoder,
                 obs_dir=self.config.obs.obs_dir,
+                record_dir=record_dir,
             )
             self.log(
                 "🎞️ OBS録画品質を適用しました: "
                 f"quality={self.config.obs.recording_quality}, scale={self.config.obs.scale_type}, "
-                f"encoder={selected_encoder.display_name} ({selected_encoder.encoder_kind})"
+                f"encoder={selected_encoder.display_name} ({selected_encoder.encoder_kind}), "
+                f"format={DEFAULT_OBS_RECORDING_FORMAT}, mode={DEFAULT_OBS_OUTPUT_MODE}"
             )
             return selected_encoder
         except Exception as e:
@@ -3056,10 +3365,12 @@ class ObsWebSocketClient(OBSClient):
         self.client.set_scene_item_enabled(self.config.obs.scene_name, item_id, bool(enabled))
 
     def start_recording(self) -> None:
-        self.client.start_record()
+        response = _obs_raw(self.client, "StartRecord")
+        _raise_for_obs_request_status(response, "StartRecord")
 
     def toggle_recording(self) -> None:
-        _obs_raw(self.client, "ToggleRecord")
+        response = _obs_raw(self.client, "ToggleRecord")
+        _raise_for_obs_request_status(response, "ToggleRecord")
 
     def prepare_recording_start(self) -> None:
         self._apply_record_output_basics()
@@ -3088,13 +3399,25 @@ class ObsWebSocketClient(OBSClient):
 
     def get_record_status_details(self) -> dict[str, Any]:
         status = self.client.get_record_status()
-        return {
+        details = {
             "output_active": getattr(status, "output_active", None),
             "output_paused": getattr(status, "output_paused", None),
             "output_timecode": getattr(status, "output_timecode", None),
             "output_duration": getattr(status, "output_duration", None),
             "output_bytes": getattr(status, "output_bytes", None),
         }
+        for category, name in (
+            ("Output", "Mode"),
+            ("SimpleOutput", "FilePath"),
+            ("SimpleOutput", "RecFormat2"),
+            ("SimpleOutput", "RecQuality"),
+            ("SimpleOutput", "RecEncoder"),
+            ("AdvOut", "RecEncoder"),
+        ):
+            value = get_obs_profile_parameter_value(self.client, category, name)
+            if value is not None:
+                details[f"{category}.{name}"] = value
+        return details
 
     def shutdown(self) -> None:
         if self.obs_process:

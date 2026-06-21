@@ -1,4 +1,5 @@
 import asyncio
+import configparser
 import json
 import shutil
 from dataclasses import FrozenInstanceError
@@ -153,47 +154,54 @@ def test_obs_video_and_quality_settings_are_sent_to_websocket():
         recording_encoder="x264",
     )
 
-    assert client.calls == [
-        (
-            "SetVideoSettings",
-            {
-                "fpsNumerator": 240000,
-                "fpsDenominator": 1001,
-                "baseWidth": 1920,
-                "baseHeight": 1080,
-                "outputWidth": 1920,
-                "outputHeight": 1080,
-            },
-            True,
-        ),
-        (
-            "SetProfileParameter",
-            {
-                "parameterCategory": "Video",
-                "parameterName": "ScaleType",
-                "parameterValue": "lanczos",
-            },
-            True,
-        ),
-        (
-            "SetProfileParameter",
-            {
-                "parameterCategory": "SimpleOutput",
-                "parameterName": "RecQuality",
-                "parameterValue": "Small",
-            },
-            True,
-        ),
-        (
-            "SetProfileParameter",
-            {
-                "parameterCategory": "SimpleOutput",
-                "parameterName": "RecEncoder",
-                "parameterValue": "x264",
-            },
-            True,
-        ),
-    ]
+    assert client.calls[0] == (
+        "SetVideoSettings",
+        {
+            "fpsNumerator": 240000,
+            "fpsDenominator": 1001,
+            "baseWidth": 1920,
+            "baseHeight": 1080,
+            "outputWidth": 1920,
+            "outputHeight": 1080,
+        },
+        True,
+    )
+    assert (
+        "SetProfileParameter",
+        {
+            "parameterCategory": "Output",
+            "parameterName": "Mode",
+            "parameterValue": "Simple",
+        },
+        True,
+    ) in client.calls
+    assert (
+        "SetProfileParameter",
+        {
+            "parameterCategory": "SimpleOutput",
+            "parameterName": "RecFormat2",
+            "parameterValue": "mkv",
+        },
+        True,
+    ) in client.calls
+    assert (
+        "SetProfileParameter",
+        {
+            "parameterCategory": "AdvOut",
+            "parameterName": "RecEncoder",
+            "parameterValue": "obs_x264",
+        },
+        True,
+    ) in client.calls
+    assert client.calls[-1] == (
+        "SetProfileParameter",
+        {
+            "parameterCategory": "SimpleOutput",
+            "parameterName": "RecEncoder",
+            "parameterValue": "x264",
+        },
+        True,
+    )
 
 
 def test_prepare_recording_start_does_not_reset_video_settings(tmp_path):
@@ -227,7 +235,25 @@ def test_prepare_recording_start_does_not_reset_video_settings(tmp_path):
     request_names = [call[0] for call in client.calls]
     assert "SetVideoSettings" not in request_names
     assert "set_record_directory" in request_names
-    assert request_names.count("SetProfileParameter") >= 3
+    assert request_names.count("SetProfileParameter") >= 12
+    assert (
+        "SetProfileParameter",
+        {
+            "parameterCategory": "Output",
+            "parameterName": "Mode",
+            "parameterValue": "Simple",
+        },
+        True,
+    ) in client.calls
+    assert (
+        "SetProfileParameter",
+        {
+            "parameterCategory": "SimpleOutput",
+            "parameterName": "FilePath",
+            "parameterValue": str(tmp_path),
+        },
+        True,
+    ) in client.calls
     assert client.calls[-1][1] == {
         "parameterCategory": "SimpleOutput",
         "parameterName": "RecEncoder",
@@ -336,6 +362,91 @@ def test_recording_quality_falls_back_to_x264_without_obs_log(tmp_path):
 
     assert selected.profile_value == "x264"
     assert selected.hardware is False
+
+
+def test_recording_profile_ini_repairs_existing_advanced_output(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profile_dir = obs_dir / "config" / "obs-studio" / "basic" / "profiles" / "bad_profile"
+    profile_dir.mkdir(parents=True)
+    basic_ini = profile_dir / "basic.ini"
+    basic_ini.write_text(
+        "[General]\n"
+        "Name=bad_profile\n\n"
+        "[Output]\n"
+        "Mode=Advanced\n\n"
+        "[SimpleOutput]\n"
+        "FilePath=F:\\old\n"
+        "RecFormat2=hybrid_mp4\n"
+        "UseAdvanced=true\n"
+        "RecEncoder=nvenc\n\n"
+        "[AdvOut]\n"
+        "RecType=FFmpeg\n"
+        "RecFilePath=F:\\old\n"
+        "RecFormat2=hybrid_mp4\n"
+        "RecEncoder=obs_nvenc_h264_tex\n",
+        encoding="utf-8",
+    )
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
+    user_ini.write_text("[Basic]\nProfile=bad_profile\nProfileDir=bad_profile\n", encoding="utf-8")
+    record_dir = tmp_path / "recordings"
+
+    changed = recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=record_dir)
+
+    assert basic_ini.resolve() in changed
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    parser.read(basic_ini, encoding="utf-8")
+    assert parser.get("Output", "Mode") == "Simple"
+    assert parser.get("SimpleOutput", "FilePath") == str(record_dir)
+    assert parser.get("SimpleOutput", "RecFormat2") == "mkv"
+    assert parser.get("SimpleOutput", "UseAdvanced") == "false"
+    assert parser.get("SimpleOutput", "RecEncoder") == "x264"
+    assert parser.get("AdvOut", "RecType") == "Standard"
+    assert parser.get("AdvOut", "RecFilePath") == str(record_dir)
+    assert parser.get("AdvOut", "RecFormat2") == "mkv"
+    assert parser.get("AdvOut", "RecEncoder") == "obs_x264"
+
+
+def test_recording_profile_ini_creates_managed_profile_when_missing(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    record_dir = tmp_path / "recordings"
+
+    changed = recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=record_dir)
+
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
+    assert profile_ini.resolve() in changed
+    assert user_ini.resolve() in changed
+    assert profile_ini.exists()
+    assert user_ini.exists()
+    assert "ProfileDir=LoLReplayTool" in user_ini.read_text(encoding="utf-8")
+
+
+def test_start_recording_raises_when_raw_obs_response_reports_failure():
+    class RawClient:
+        def send(self, request_type, payload, raw=True):
+            assert request_type == "StartRecord"
+            return {
+                "requestStatus": {
+                    "result": False,
+                    "code": 500,
+                    "comment": "Output start failed",
+                }
+            }
+
+    obs_client = recordtest.ObsWebSocketClient(config=app_config())
+    obs_client.client = RawClient()
+
+    with pytest.raises(recordtest.RecorderError, match="Output start failed"):
+        obs_client.start_recording()
 
 
 def test_app_config_preserves_fractional_high_fps():

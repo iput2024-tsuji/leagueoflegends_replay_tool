@@ -136,7 +136,7 @@ DEFAULT_OBS_SIMPLE_AUDIO_ENCODER = "aac"
 DEFAULT_OBS_ADVANCED_AUDIO_ENCODER = "ffmpeg_aac"
 DEFAULT_OBS_SIMPLE_X264_PRESET = "veryfast"
 MANAGED_OBS_PROFILE_DIR_NAME = "LoLReplayTool"
-MANAGED_OBS_PROFILE_NAME = "LoL Replay Tool"
+MANAGED_OBS_PROFILE_NAME = MANAGED_OBS_PROFILE_DIR_NAME
 VALID_OBS_SCALE_TYPES = config_schema.VALID_OBS_SCALE_TYPES
 VALID_OBS_RECORDING_QUALITIES = config_schema.VALID_OBS_RECORDING_QUALITIES
 DEFAULT_END_ERROR_LIMIT = config_schema.DEFAULT_END_ERROR_LIMIT
@@ -873,16 +873,14 @@ def _obs_current_profile_dir_name(base_dir: str | Path) -> str | None:
 
 def _obs_profile_basic_ini_paths(base_dir: str | Path) -> tuple[Path, ...]:
     profiles_root = get_obs_config_dir(base_dir) / "basic" / "profiles"
-    names: list[str] = []
+    names: list[str] = [MANAGED_OBS_PROFILE_DIR_NAME]
     current_name = _obs_current_profile_dir_name(base_dir)
-    if current_name:
+    if current_name and current_name != MANAGED_OBS_PROFILE_DIR_NAME:
         names.append(current_name)
     if profiles_root.exists():
         for profile_dir in profiles_root.iterdir():
             if profile_dir.is_dir() and (profile_dir / "basic.ini").exists():
                 names.append(profile_dir.name)
-    if not names:
-        names.append(MANAGED_OBS_PROFILE_DIR_NAME)
 
     result: list[Path] = []
     seen: set[str] = set()
@@ -896,8 +894,6 @@ def _obs_profile_basic_ini_paths(base_dir: str | Path) -> tuple[Path, ...]:
 
 
 def _ensure_obs_user_profile_selection(base_dir: str | Path, profile_dir_name: str) -> Path | None:
-    if _obs_current_profile_dir_name(base_dir):
-        return None
     user_ini = get_obs_user_ini_path(base_dir)
     parser, changed = _read_or_new_obs_ini(user_ini)
     changed = _set_obs_ini_value(parser, "Basic", "Profile", MANAGED_OBS_PROFILE_NAME) or changed
@@ -939,8 +935,11 @@ def _apply_obs_recording_profile_ini(
     if not parser.has_section("General"):
         parser.add_section("General")
         changed = True
-    if parser.get("General", "Name", fallback="") == "":
-        parser.set("General", "Name", ini_path.parent.name)
+    current_name = parser.get("General", "Name", fallback="")
+    is_managed_profile = ini_path.parent.name == MANAGED_OBS_PROFILE_DIR_NAME
+    expected_name = MANAGED_OBS_PROFILE_NAME if is_managed_profile else ini_path.parent.name
+    if current_name == "" or (is_managed_profile and current_name != expected_name):
+        parser.set("General", "Name", expected_name)
         changed = True
 
     selected_encoder = _select_requested_obs_recording_encoder(recording_encoder, obs_dir=obs_dir)
@@ -1665,6 +1664,21 @@ def _obs_raw(client: Any, request_type: str, payload: dict[str, Any] | None = No
         return client.send(request_type, payload or {}, raw=True)
     except TypeError:
         return client.send(request_type, payload or {})
+
+
+def _obs_response_value(response: Any, *keys: str) -> Any:
+    if isinstance(response, dict):
+        for key in keys:
+            if key in response:
+                return response[key]
+    for key in keys:
+        if hasattr(response, key):
+            return getattr(response, key)
+    return None
+
+
+def _camel_to_snake(value: str) -> str:
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", value).lower()
 
 
 def disable_obs_global_audio_devices(client: Any) -> None:
@@ -3417,6 +3431,68 @@ class ObsWebSocketClient(OBSClient):
             value = get_obs_profile_parameter_value(self.client, category, name)
             if value is not None:
                 details[f"{category}.{name}"] = value
+
+        try:
+            profile_list = _obs_raw(self.client, "GetProfileList")
+            details["OBS.current_profile"] = _obs_response_value(
+                profile_list,
+                "currentProfileName",
+                "current_profile_name",
+            )
+        except Exception as e:
+            details["OBS.current_profile_error"] = f"{type(e).__name__}: {e}"
+
+        try:
+            scene_collections = _obs_raw(self.client, "GetSceneCollectionList")
+            details["OBS.current_scene_collection"] = _obs_response_value(
+                scene_collections,
+                "currentSceneCollectionName",
+                "current_scene_collection_name",
+            )
+        except Exception as e:
+            details["OBS.current_scene_collection_error"] = f"{type(e).__name__}: {e}"
+
+        try:
+            output_list = _obs_raw(self.client, "GetOutputList")
+            outputs = _obs_response_value(output_list, "outputs") or []
+            output_summaries = []
+            for item in outputs:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("outputName") or item.get("output_name")
+                kind = item.get("outputKind") or item.get("output_kind")
+                active = item.get("outputActive") if "outputActive" in item else item.get("output_active")
+                if name:
+                    output_summaries.append(f"{name}({kind}, active={active})")
+            if output_summaries:
+                details["OBS.outputs"] = "; ".join(output_summaries)
+        except Exception as e:
+            details["OBS.outputs_error"] = f"{type(e).__name__}: {e}"
+
+        try:
+            simple_status = _obs_raw(self.client, "GetOutputStatus", {"outputName": "simple_file_output"})
+            for key, label in (
+                ("outputActive", "active"),
+                ("outputBytes", "bytes"),
+                ("outputDuration", "duration"),
+                ("outputSkippedFrames", "skipped_frames"),
+                ("outputTotalFrames", "total_frames"),
+            ):
+                value = _obs_response_value(simple_status, key, _camel_to_snake(key))
+                if value is not None:
+                    details[f"simple_file_output.{label}"] = value
+        except Exception as e:
+            details["simple_file_output.status_error"] = f"{type(e).__name__}: {e}"
+
+        try:
+            simple_settings = _obs_raw(self.client, "GetOutputSettings", {"outputName": "simple_file_output"})
+            output_settings = _obs_response_value(simple_settings, "outputSettings", "output_settings")
+            if isinstance(output_settings, dict):
+                for key in ("path", "muxer_settings"):
+                    if output_settings.get(key) not in (None, ""):
+                        details[f"simple_file_output.{key}"] = output_settings.get(key)
+        except Exception as e:
+            details["simple_file_output.settings_error"] = f"{type(e).__name__}: {e}"
         return details
 
     def shutdown(self) -> None:

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.8] - 2026-06-23
+
+### Fixed
+
+- Unified the managed OBS profile as `LoLReplayTool` so installed first-run environments do not keep using OBS-generated `LoL_Replay_Tool` profiles.
+- Force the OBS `user.ini` profile selection to `LoLReplayTool` before launch so `Simple / x264 / mkv` settings are loaded when OBS initializes recording output.
+- Added recording-start diagnostics for the active OBS profile, scene collection, output list, and `simple_file_output` status and path.
+
 ## [0.4.7] - 2026-06-22
 
 ### Fixed

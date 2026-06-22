@@ -405,6 +405,54 @@ def test_recording_profile_ini_repairs_existing_advanced_output(tmp_path):
     assert parser.get("AdvOut", "RecFilePath") == str(record_dir)
     assert parser.get("AdvOut", "RecFormat2") == "mkv"
     assert parser.get("AdvOut", "RecEncoder") == "obs_x264"
+    assert "Profile=LoLReplayTool" in user_ini.read_text(encoding="utf-8")
+    assert "ProfileDir=LoLReplayTool" in user_ini.read_text(encoding="utf-8")
+
+
+def test_recording_profile_ini_forces_managed_profile_over_obs_generated_name(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profiles_root = obs_dir / "config" / "obs-studio" / "basic" / "profiles"
+    legacy_profile = profiles_root / "LoL_Replay_Tool" / "basic.ini"
+    legacy_profile.parent.mkdir(parents=True)
+    legacy_profile.write_text(
+        "[General]\n"
+        "Name=LoL Replay Tool\n\n"
+        "[Output]\n"
+        "Mode=Advanced\n\n"
+        "[SimpleOutput]\n"
+        "FilePath=F:\\old\n"
+        "RecFormat2=hybrid_mp4\n"
+        "UseAdvanced=true\n"
+        "RecEncoder=nvenc\n",
+        encoding="utf-8",
+    )
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
+    user_ini.parent.mkdir(parents=True, exist_ok=True)
+    user_ini.write_text(
+        "[Basic]\n"
+        "Profile=LoL Replay Tool\n"
+        "ProfileDir=LoL_Replay_Tool\n"
+        "SceneCollection=無題\n",
+        encoding="utf-8",
+    )
+    record_dir = tmp_path / "recordings"
+
+    changed = recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=record_dir)
+
+    managed_profile = profiles_root / recordtest.MANAGED_OBS_PROFILE_DIR_NAME / "basic.ini"
+    assert managed_profile.resolve() in changed
+    assert legacy_profile.resolve() in changed
+    assert user_ini.resolve() in changed
+    assert managed_profile.exists()
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    parser.read(user_ini, encoding="utf-8")
+    assert parser.get("Basic", "Profile") == "LoLReplayTool"
+    assert parser.get("Basic", "ProfileDir") == "LoLReplayTool"
+    parser.read(managed_profile, encoding="utf-8")
+    assert parser.get("General", "Name") == "LoLReplayTool"
+    assert parser.get("Output", "Mode") == "Simple"
+    assert parser.get("SimpleOutput", "RecEncoder") == "x264"
 
 
 def test_recording_profile_ini_creates_managed_profile_when_missing(tmp_path):
@@ -427,7 +475,66 @@ def test_recording_profile_ini_creates_managed_profile_when_missing(tmp_path):
     assert user_ini.resolve() in changed
     assert profile_ini.exists()
     assert user_ini.exists()
+    assert "Profile=LoLReplayTool" in user_ini.read_text(encoding="utf-8")
     assert "ProfileDir=LoLReplayTool" in user_ini.read_text(encoding="utf-8")
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    parser.read(profile_ini, encoding="utf-8")
+    assert parser.get("General", "Name") == "LoLReplayTool"
+
+
+def test_record_status_details_include_obs_profile_and_output_diagnostics():
+    class RawClient:
+        def get_record_status(self):
+            return SimpleNamespace(
+                output_active=False,
+                output_paused=False,
+                output_timecode="00:00:00.000",
+                output_duration=0,
+                output_bytes=0,
+            )
+
+        def send(self, request_type, payload, raw=True):
+            if request_type == "GetProfileParameter":
+                key = (payload["parameterCategory"], payload["parameterName"])
+                values = {
+                    ("Output", "Mode"): "Simple",
+                    ("SimpleOutput", "RecEncoder"): "x264",
+                    ("AdvOut", "RecEncoder"): "obs_x264",
+                }
+                return {"parameterValue": values.get(key, "")}
+            if request_type == "GetProfileList":
+                return {"currentProfileName": "LoLReplayTool", "profiles": ["LoLReplayTool"]}
+            if request_type == "GetSceneCollectionList":
+                return {"currentSceneCollectionName": "LoLReplayTool", "sceneCollections": ["LoLReplayTool"]}
+            if request_type == "GetOutputList":
+                return {
+                    "outputs": [
+                        {
+                            "outputName": "simple_file_output",
+                            "outputKind": "mp4_output",
+                            "outputActive": False,
+                        }
+                    ]
+                }
+            if request_type == "GetOutputStatus":
+                assert payload == {"outputName": "simple_file_output"}
+                return {"outputActive": False, "outputBytes": 0, "outputDuration": 0}
+            if request_type == "GetOutputSettings":
+                assert payload == {"outputName": "simple_file_output"}
+                return {"outputSettings": {"path": "C:/recordings/game.mkv", "muxer_settings": ""}}
+            raise AssertionError(request_type)
+
+    obs_client = recordtest.ObsWebSocketClient(config=app_config())
+    obs_client.client = RawClient()
+
+    details = obs_client.get_record_status_details()
+
+    assert details["OBS.current_profile"] == "LoLReplayTool"
+    assert details["OBS.current_scene_collection"] == "LoLReplayTool"
+    assert details["OBS.outputs"] == "simple_file_output(mp4_output, active=False)"
+    assert details["simple_file_output.active"] is False
+    assert details["simple_file_output.path"] == "C:/recordings/game.mkv"
 
 
 def test_start_recording_raises_when_raw_obs_response_reports_failure():

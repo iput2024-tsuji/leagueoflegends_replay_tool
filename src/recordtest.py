@@ -50,7 +50,14 @@ try:
         read_obs_ini_parser as shared_read_obs_ini_parser,
     )
     from .obs_process import OBSProcessManager
-    from .recording_state import FinalizeResult, RecordingEndDetector, RecordingOutcome, RecordingPhase
+    from .recording_state import (
+        FinalizeResult,
+        RecordingEndDecision,
+        RecordingEndDetector,
+        RecordingEndReason,
+        RecordingOutcome,
+        RecordingPhase,
+    )
     from .session_log import SessionLogV1, load_session_payload, save_session_payload
 except ImportError:
     import config_schema
@@ -77,7 +84,14 @@ except ImportError:
         read_obs_ini_parser as shared_read_obs_ini_parser,
     )
     from obs_process import OBSProcessManager
-    from recording_state import FinalizeResult, RecordingEndDetector, RecordingOutcome, RecordingPhase
+    from recording_state import (
+        FinalizeResult,
+        RecordingEndDecision,
+        RecordingEndDetector,
+        RecordingEndReason,
+        RecordingOutcome,
+        RecordingPhase,
+    )
     from session_log import SessionLogV1, load_session_payload, save_session_payload
 
 ROOT_DIR = get_app_root()
@@ -159,6 +173,9 @@ DEFAULT_GAME_START_EVENT_WAIT_SEC = 3.0
 DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC = 30.0
 DEFAULT_LCU_START_LIVE_CLIENT_GRACE_SEC = 20.0
 DEFAULT_LCU_START_LIVE_CLIENT_POLL_SEC = 1.0
+DEFAULT_GAMEFLOW_INACTIVE_GRACE_SEC = 10.0
+DEFAULT_GAME_PROCESS_MISSING_GRACE_SEC = 10.0
+LOL_GAME_PROCESS_NAME = "League of Legends.exe"
 MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
 LCU_GAMEFLOW_START_PHASES = frozenset({"gamestart", "inprogress", "reconnect"})
 OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS = (
@@ -246,6 +263,49 @@ configure_logging()
 
 class RecorderError(RuntimeError):
     pass
+
+
+def is_lol_game_process_running() -> bool | None:
+    """Return whether the LoL game process is currently alive on Windows."""
+
+    if os.name != "nt":
+        return None
+
+    command = (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+        f"Get-CimInstance Win32_Process -Filter \"Name='{LOL_GAME_PROCESS_NAME}'\" "
+        "| Select-Object -First 1 -ExpandProperty ProcessId"
+    )
+    kwargs: dict[str, object] = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "timeout": 3,
+        "check": False,
+    }
+    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    if create_no_window:
+        kwargs["creationflags"] = create_no_window
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                command,
+            ],
+            **kwargs,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return bool(str(completed.stdout or "").strip())
 
 
 def generate_obs_password(length: int = DEFAULT_OBS_PASSWORD_LENGTH) -> str:
@@ -2925,14 +2985,14 @@ class LiveClientRiotAPIClient(RiotAPIClient):
             return result
 
         phase = _first_mapping_value(result.payload, "phase", "value")
-        if phase in (None, ""):
+        if phase == "":
             return RiotPollResult(
                 RiotPollStatus.TEMPORARY_FAILURE,
                 error="Unexpected gameflow phase payload",
             )
         return RiotPollResult(
             RiotPollStatus.IN_GAME,
-            payload={"phase": str(phase)},
+            payload={"phase": str(phase) if phase is not None else "None"},
         )
 
     async def get_match_metadata(self) -> dict[str, Any]:
@@ -3513,6 +3573,9 @@ class LoLAutoRecorder(RecordingSessionManager):
         obs_client: OBSClient | None = None,
         riot_api_client: RiotAPIClient | None = None,
         stop_event: asyncio.Event | None = None,
+        game_process_checker: Callable[[], bool | None] | None = None,
+        gameflow_inactive_grace_sec: float = DEFAULT_GAMEFLOW_INACTIVE_GRACE_SEC,
+        game_process_missing_grace_sec: float = DEFAULT_GAME_PROCESS_MISSING_GRACE_SEC,
     ) -> None:
         self.config = config or load_app_config()
         self.my_name = None
@@ -3533,6 +3596,9 @@ class LoLAutoRecorder(RecordingSessionManager):
         )
         self.riot_api_client = riot_api_client or LiveClientRiotAPIClient()
         self.obs_process = getattr(self.obs_client, "obs_process", obs_process)
+        self.game_process_checker = game_process_checker or is_lol_game_process_running
+        self.gameflow_inactive_grace_sec = max(0.0, float(gameflow_inactive_grace_sec))
+        self.game_process_missing_grace_sec = max(0.0, float(game_process_missing_grace_sec))
         self.champion_catalog: dict[int, str] = {}
         self._require_game_clear = False
         self._last_completed_game_id: str | None = None
@@ -3784,6 +3850,81 @@ class LoLAutoRecorder(RecordingSessionManager):
             if phase not in (None, ""):
                 self.match_metadata["gameflow_phase"] = str(phase)
         return result
+
+    async def is_lol_game_process_running_async(self) -> bool | None:
+        try:
+            result = await asyncio.to_thread(self.game_process_checker)
+            if hasattr(result, "__await__"):
+                result = await result
+        except Exception as e:
+            self.logger.debug("LoL game process check failed: %s", e)
+            return None
+        if result is None:
+            return None
+        return bool(result)
+
+    def _gameflow_phase_from_poll_result(self, result: RiotPollResult) -> tuple[str | None, bool]:
+        if result.status != RiotPollStatus.IN_GAME or not isinstance(result.payload, dict):
+            return None, False
+        phase = _first_mapping_value(result.payload, "phase", "value")
+        if phase in (None, ""):
+            return None, True
+        return str(phase), True
+
+    async def _observe_recording_context_end_async(
+        self,
+        end_detector: RecordingEndDetector,
+        live_result: RiotPollResult,
+        now: float,
+    ) -> RecordingEndDecision:
+        gameflow_result = await self.poll_gameflow_phase()
+        gameflow_phase, has_gameflow_phase = self._gameflow_phase_from_poll_result(gameflow_result)
+        if has_gameflow_phase:
+            normalized_phase = self._normalize_gameflow_phase(gameflow_phase)
+            gameflow_decision = end_detector.observe_gameflow_phase(
+                normalized_phase,
+                now,
+                active_phases=LCU_GAMEFLOW_START_PHASES,
+                detail=gameflow_phase or "None",
+            )
+            if gameflow_decision.should_end:
+                return gameflow_decision
+
+        if live_result.status == RiotPollStatus.IN_GAME:
+            return RecordingEndDecision(False, RecordingEndReason.STILL_ACTIVE)
+
+        process_running = await self.is_lol_game_process_running_async()
+        process_decision = end_detector.observe_game_process_running(process_running, now)
+        if process_decision.should_end:
+            return process_decision
+        return RecordingEndDecision(False, RecordingEndReason.STILL_ACTIVE)
+
+    def _recording_end_message(self, decision: RecordingEndDecision) -> str:
+        if decision.reason == RecordingEndReason.GAME_END_EVENT:
+            return "🏁 GameEndイベントを検知。録画を停止します。"
+        if decision.reason == RecordingEndReason.NOT_IN_GAME_CONFIRMED:
+            return "🏁 Live Clientが試合外になったため録画を停止します。"
+        if decision.reason == RecordingEndReason.TEMPORARY_FAILURE_TIMEOUT:
+            return "🏁 Live Clientの応答が長時間復旧しないため録画を停止します。"
+        if decision.reason == RecordingEndReason.GAMEFLOW_INACTIVE_CONFIRMED:
+            phase = decision.detail or "None"
+            return f"🏁 LCU Gameflowが{phase}になったため録画を停止します。"
+        if decision.reason == RecordingEndReason.GAME_PROCESS_MISSING_CONFIRMED:
+            return "🏁 LoLゲームプロセスが終了したため録画を停止します。"
+        return "🏁 試合終了検知。録画を停止します。"
+
+    def _complete_recording_end(self, decision: RecordingEndDecision) -> RecordingOutcome:
+        if decision.reason == RecordingEndReason.GAME_END_EVENT:
+            self.remember_completed_game_id()
+            self._require_game_clear = True
+        else:
+            self._require_game_clear = False
+        self.match_metadata["recording_end_reason"] = decision.reason.value
+        if decision.detail:
+            self.match_metadata["recording_end_detail"] = decision.detail
+        self.log(self._recording_end_message(decision))
+        self.session_phase = RecordingPhase.FINALIZING
+        return RecordingOutcome.COMPLETED
 
     async def wait_for_previous_game_clear_async(self) -> bool:
         if not self._require_game_clear:
@@ -4263,26 +4404,32 @@ class LoLAutoRecorder(RecordingSessionManager):
             error_limit=self.config.polling.end_error_limit,
             missing_grace_sec=self.config.polling.end_missing_grace_sec,
             temporary_failure_grace_sec=self.config.polling.end_temporary_failure_grace_sec,
+            gameflow_inactive_grace_sec=self.gameflow_inactive_grace_sec,
+            game_process_missing_grace_sec=self.game_process_missing_grace_sec,
         )
         while True:
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
                 return RecordingOutcome.CANCELLED
             result = await self.poll_all_game_data()
+            now = loop.time()
             data = result.payload
             if not data:
-                decision = end_detector.observe_poll_status(result.status, loop.time())
+                decision = end_detector.observe_poll_status(result.status, now)
                 if decision.should_end:
-                    self._require_game_clear = False
-                    self.log("🏁 試合終了検知。録画を停止します。")
-                    self.session_phase = RecordingPhase.FINALIZING
-                    return RecordingOutcome.COMPLETED
+                    return self._complete_recording_end(decision)
+                decision = await self._observe_recording_context_end_async(end_detector, result, now)
+                if decision.should_end:
+                    return self._complete_recording_end(decision)
                 if not await self.wait_with_stop_async(self.config.polling.end_poll_sec):
                     self.session_phase = RecordingPhase.CANCELLED
                     return RecordingOutcome.CANCELLED
                 continue
 
-            end_detector.observe_poll_status(result.status, loop.time())
+            end_detector.observe_poll_status(result.status, now)
+            decision = await self._observe_recording_context_end_async(end_detector, result, now)
+            if decision.should_end:
+                return self._complete_recording_end(decision)
             self.last_game_data = data
             self.match_metadata = merge_live_game_metadata(self.match_metadata, data)
             if not self.my_name:
@@ -4295,12 +4442,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 self.process_events(events)
                 self.update_result_from_events(events)
                 if any(self.is_game_end_event(event) for event in events):
-                    end_detector.observe_game_end_event()
-                    self.remember_completed_game_id()
-                    self._require_game_clear = True
-                    self.log("🏁 GameEndイベントを検知。録画を停止します。")
-                    self.session_phase = RecordingPhase.FINALIZING
-                    return RecordingOutcome.COMPLETED
+                    return self._complete_recording_end(end_detector.observe_game_end_event())
 
             if not await self.wait_with_stop_async(self.config.polling.event_poll_sec):
                 self.session_phase = RecordingPhase.CANCELLED

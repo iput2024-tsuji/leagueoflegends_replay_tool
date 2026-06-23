@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.9] - 2026-06-23
+
+### Fixed
+
+- Stop recording when the LoL game process crashes or practice mode is closed without the normal end-match flow.
+- Added LCU Gameflow phase and LoL game-process monitoring to recording-end detection, covering cases where the Live Client API does not emit `GameEnd`.
+- Added recording-stop logs that identify whether Live Client, LCU Gameflow, or LoL process disappearance ended the recording.
+
 ## [0.4.8] - 2026-06-23
 
 ### Fixed

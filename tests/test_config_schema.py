@@ -29,8 +29,10 @@ SHARED_RECORDTEST_DEFAULTS = (
     "DEFAULT_OBS_OUTPUT_HEIGHT",
     "DEFAULT_OBS_SCALE_TYPE",
     "DEFAULT_OBS_RECORDING_QUALITY",
+    "DEFAULT_OBS_RECORDING_ENCODER",
     "VALID_OBS_SCALE_TYPES",
     "VALID_OBS_RECORDING_QUALITIES",
+    "VALID_OBS_RECORDING_ENCODERS",
     "DEFAULT_END_ERROR_LIMIT",
     "DEFAULT_END_MISSING_GRACE_SEC",
     "DEFAULT_END_TEMPORARY_FAILURE_GRACE_SEC",
@@ -75,6 +77,7 @@ def test_normalize_config_migrates_capture_settings_and_generates_password():
     assert obs["output_height"] == 1080
     assert obs["scale_type"] == "lanczos"
     assert obs["recording_quality"] == "Small"
+    assert obs["recording_encoder"] == "auto"
     assert obs["fps_numerator"] == 60
     assert obs["fps_denominator"] == 1
     assert "game_capture_name" not in obs
@@ -99,6 +102,7 @@ def test_normalize_config_repairs_invalid_video_quality_settings():
             "output_height": "invalid",
             "scale_type": "nearest",
             "recording_quality": "unknown",
+            "recording_encoder": "nvenc",
         }
     }
 
@@ -111,6 +115,7 @@ def test_normalize_config_repairs_invalid_video_quality_settings():
     assert obs["output_height"] == config_schema.DEFAULT_OBS_OUTPUT_HEIGHT
     assert obs["scale_type"] == config_schema.DEFAULT_OBS_SCALE_TYPE
     assert obs["recording_quality"] == config_schema.DEFAULT_OBS_RECORDING_QUALITY
+    assert obs["recording_encoder"] == config_schema.DEFAULT_OBS_RECORDING_ENCODER
 
 
 def test_normalize_config_keeps_only_managed_microphone_audio():

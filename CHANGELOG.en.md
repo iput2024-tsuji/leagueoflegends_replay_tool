@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.0] - 2026-06-25
+
+### Added
+
+- Added a recording encoder setting with "Auto (GPU priority)" and "CPU stable (x264)" choices.
+
+### Changed
+
+- Changed the default OBS recording encoder back to GPU-priority automatic selection, choosing H.264 encoders in the order NVIDIA NVENC, Intel Quick Sync, AMD AMF, then x264.
+- Excluded HEVC and AV1 from automatic selection, falling back to x264 when no supported H.264 hardware encoder is available.
+
+### Fixed
+
+- Retry recording once with x264 when recording fails to start with a GPU encoder.
+- Fixed the recording-start preparation path so choosing "CPU stable (x264)" does not switch back to GPU-priority automatic selection.
+
 ## [0.4.9] - 2026-06-23
 
 ### Fixed

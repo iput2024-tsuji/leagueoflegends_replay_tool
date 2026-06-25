@@ -38,8 +38,10 @@ DEFAULT_OBS_OUTPUT_WIDTH = 1920
 DEFAULT_OBS_OUTPUT_HEIGHT = 1080
 DEFAULT_OBS_SCALE_TYPE = "lanczos"
 DEFAULT_OBS_RECORDING_QUALITY = "Small"
+DEFAULT_OBS_RECORDING_ENCODER = "auto"
 VALID_OBS_SCALE_TYPES = frozenset({"bilinear", "bicubic", "lanczos", "area"})
 VALID_OBS_RECORDING_QUALITIES = frozenset({"Stream", "Small", "HQ", "Lossless"})
+VALID_OBS_RECORDING_ENCODERS = frozenset({"auto", "x264"})
 DEFAULT_END_ERROR_LIMIT = 3
 DEFAULT_END_MISSING_GRACE_SEC = 60.0
 DEFAULT_END_TEMPORARY_FAILURE_GRACE_SEC = 180.0
@@ -134,6 +136,7 @@ def normalize_config(
             "output_height": DEFAULT_OBS_OUTPUT_HEIGHT,
             "scale_type": DEFAULT_OBS_SCALE_TYPE,
             "recording_quality": DEFAULT_OBS_RECORDING_QUALITY,
+            "recording_encoder": DEFAULT_OBS_RECORDING_ENCODER,
             "scene_name": DEFAULT_OBS_SCENE_NAME,
             "source_name": DEFAULT_OBS_SOURCE_NAME,
             "source_color": DEFAULT_OBS_SOURCE_COLOR,
@@ -556,6 +559,18 @@ def _normalize_numeric_values(
         result.warnings.append(f"OBS recording_quality が不正だったため {DEFAULT_OBS_RECORDING_QUALITY} を使用します。")
     elif auto_fix and obs_cfg.get("recording_quality") != normalized_quality:
         obs_cfg["recording_quality"] = normalized_quality
+        result.changed = True
+
+    recording_encoder = str(obs_cfg.get("recording_encoder") or "").strip().lower()
+    if recording_encoder not in VALID_OBS_RECORDING_ENCODERS:
+        if auto_fix:
+            obs_cfg["recording_encoder"] = DEFAULT_OBS_RECORDING_ENCODER
+            result.changed = True
+        result.warnings.append(
+            f"OBS recording_encoder が不正だったため {DEFAULT_OBS_RECORDING_ENCODER} を使用します。"
+        )
+    elif auto_fix and obs_cfg.get("recording_encoder") != recording_encoder:
+        obs_cfg["recording_encoder"] = recording_encoder
         result.changed = True
 
     raw_source_color = obs_cfg.get("source_color")

@@ -920,6 +920,10 @@ class SettingsPage(QWidget):
         obs_fps_layout.addWidget(QLabel("/"))
         obs_fps_layout.addWidget(self.obs_fps_denominator)
         general_form.addRow("録画FPS (分子 / 分母)", self.obs_fps_row)
+        self.recording_encoder_combo = QComboBox()
+        self.recording_encoder_combo.addItem("自動（GPU優先）", "auto")
+        self.recording_encoder_combo.addItem("CPU安定（x264）", "x264")
+        general_form.addRow("録画エンコーダ", self.recording_encoder_combo)
         self.minimize_to_tray_check = QCheckBox("ウィンドウを閉じた時にタスクトレイに格納する")
         general_form.addRow("", self.minimize_to_tray_check)
 
@@ -1099,6 +1103,11 @@ class SettingsPage(QWidget):
         self.fields["obs.source_color"].setText(recordtest.obs_color_to_hex(obs.get("source_color")))
         self.fields["obs.window_capture_name"].setText(str(obs.get("window_capture_name", "")))
         self.fields["obs.window_capture_window"].setText(str(obs.get("window_capture_window", "")))
+        if not self._select_combo_by_data(
+            self.recording_encoder_combo,
+            obs.get("recording_encoder", recordtest.DEFAULT_OBS_RECORDING_ENCODER),
+        ):
+            self._select_combo_by_data(self.recording_encoder_combo, recordtest.DEFAULT_OBS_RECORDING_ENCODER)
         self.fields["paths.recordings_dir"].setText(str(paths.get("recordings_dir", "")))
         self.fields["paths.json_dir"].setText(str(paths.get("json_dir", "")))
         self.fields["paths.champion_icons_dir"].setText(str(paths.get("champion_icons_dir", "")))
@@ -1254,6 +1263,9 @@ class SettingsPage(QWidget):
         data["obs"]["window_capture_name"] = self.fields["obs.window_capture_name"].text().strip()
         data["obs"]["window_capture_window"] = self.fields["obs.window_capture_window"].text().strip()
         data["obs"]["window_capture_method"] = recordtest.DEFAULT_OBS_WINDOW_CAPTURE_METHOD
+        data["obs"]["recording_encoder"] = str(
+            self.recording_encoder_combo.currentData() or recordtest.DEFAULT_OBS_RECORDING_ENCODER
+        )
         data["obs"].pop("game_capture_name", None)
         data["obs"].pop("game_capture_window", None)
 

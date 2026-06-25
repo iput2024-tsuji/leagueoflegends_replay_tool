@@ -171,6 +171,7 @@ python main.py
 
 - Match monitoring starts with the main screen.
 - OBS recording starts after match-start detection.
+- The recording encoder defaults to GPU-priority automatic selection and falls back to x264 if recording cannot start.
 - Recording stops and JSON is saved after the match ends.
 - Previous matches can be opened from the replay screen.
 - The trash button moves the video, JSON, and related clips to the Windows Recycle Bin.

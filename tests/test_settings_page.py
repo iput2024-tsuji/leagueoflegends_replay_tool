@@ -81,6 +81,32 @@ def test_settings_page_supports_fractional_high_fps(qtbot, monkeypatch):
     assert config["obs"]["fps_denominator"] == 1001
 
 
+def test_settings_page_saves_recording_encoder_preference(qtbot, monkeypatch):
+    config = {
+        "obs": {
+            "password": "secret",
+            "recording_encoder": "x264",
+        },
+        "paths": {},
+        "storage": {},
+        "polling": {},
+        "audio": {},
+        "app": {},
+        "notifications": {},
+    }
+    monkeypatch.setattr(app, "load_config", lambda: config)
+
+    page = SettingsPage(lambda: None)
+    qtbot.addWidget(page)
+
+    assert page.recording_encoder_combo.currentData() == "x264"
+
+    assert page._select_combo_by_data(page.recording_encoder_combo, "auto") is True
+    page._write_settings_ui_to_config(config)
+
+    assert config["obs"]["recording_encoder"] == "auto"
+
+
 def test_settings_page_saves_independent_notification_preferences(qtbot, monkeypatch):
     config = {
         "obs": {"password": "secret"},

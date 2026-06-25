@@ -10,6 +10,7 @@
         "output_height": 1080,
         "scale_type": "lanczos",
         "recording_quality": "Small",
+        "recording_encoder": "auto",
         "password": "",
         "scene_name": "lol_seen",
         "source_name": "color",

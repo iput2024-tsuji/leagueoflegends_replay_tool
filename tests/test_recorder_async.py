@@ -26,6 +26,7 @@ class FakeOBSClient:
         self.set_recording_encoder = Mock(
             return_value=recordtest.OBSRecordingEncoderSelection("x264", "obs_x264", "x264", False)
         )
+        self.last_recording_encoder_selection = None
         self.start_recording = Mock()
         self.toggle_recording = Mock()
         self.stop_recording = Mock(return_value="game.mp4")
@@ -531,8 +532,47 @@ def test_process_events_saves_player_assists():
     assert recorder.saved_events[0]["Assisters"] == ["Tester", "Support"]
 
 
-def test_start_recording_failure_raises_and_does_not_create_session_data():
+def test_start_recording_immediate_failure_recovers_with_x264():
     tmp_path = runtime_dir("recording_start_failure")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
+    obs_client.last_recording_encoder_selection = recordtest.OBSRecordingEncoderSelection(
+        "nvenc",
+        "obs_nvenc_h264_tex",
+        "NVIDIA NVENC H.264",
+        True,
+    )
+    obs_client.start_recording.side_effect = RuntimeError("OBS busy")
+    riot_client = Mock()
+    riot_client.get_event_data = AsyncMock(
+        return_value={"Events": [{"EventName": "GameStart", "EventTime": 0.0}]}
+    )
+    riot_client.get_all_game_data = AsyncMock(
+        return_value={"gameData": {"gameTime": 2.0}, "allPlayers": []}
+    )
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=obs_client,
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder.session_started = True
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+    recorder.wait_for_recording_active_async = AsyncMock(return_value=True)
+
+    run(recorder.start_recording_async())
+
+    assert recorder.recording_started is True
+    assert obs_client.prepare_recording_start.call_count == 2
+    obs_client.start_recording.assert_called_once()
+    obs_client.set_recording_encoder.assert_called_once_with("x264")
+    obs_client.toggle_recording.assert_called_once()
+    obs_client.setup_record_output.assert_not_called()
+
+
+def test_start_recording_failure_raises_when_x264_recovery_also_fails():
+    tmp_path = runtime_dir("recording_start_failure_recovery_failed")
     config = config_for(tmp_path)
     obs_client = FakeOBSClient()
     obs_client.start_recording.side_effect = RuntimeError("OBS busy")
@@ -545,13 +585,15 @@ def test_start_recording_failure_raises_and_does_not_create_session_data():
     )
     recorder.session_started = True
     recorder.wait_with_stop_async = AsyncMock(return_value=True)
+    recorder.wait_for_recording_active_async = AsyncMock(return_value=False)
 
     with pytest.raises(recordtest.RecorderError, match="OBS録画開始に失敗"):
         run(recorder.start_recording_async())
 
-    obs_client.prepare_recording_start.assert_called_once()
+    assert obs_client.prepare_recording_start.call_count == 2
     obs_client.start_recording.assert_called_once()
-    obs_client.setup_record_output.assert_not_called()
+    obs_client.toggle_recording.assert_called_once()
+    obs_client.set_recording_encoder.assert_called_once_with("x264")
     assert recorder.recording_started is False
     assert recorder.record_path is None
     assert recorder.has_session_data() is False

@@ -142,7 +142,8 @@ DEFAULT_OBS_OUTPUT_WIDTH = config_schema.DEFAULT_OBS_OUTPUT_WIDTH
 DEFAULT_OBS_OUTPUT_HEIGHT = config_schema.DEFAULT_OBS_OUTPUT_HEIGHT
 DEFAULT_OBS_SCALE_TYPE = config_schema.DEFAULT_OBS_SCALE_TYPE
 DEFAULT_OBS_RECORDING_QUALITY = config_schema.DEFAULT_OBS_RECORDING_QUALITY
-DEFAULT_OBS_RECORDING_ENCODER = "x264"
+DEFAULT_OBS_RECORDING_ENCODER = config_schema.DEFAULT_OBS_RECORDING_ENCODER
+VALID_OBS_RECORDING_ENCODERS = config_schema.VALID_OBS_RECORDING_ENCODERS
 DEFAULT_OBS_OUTPUT_MODE = "Simple"
 DEFAULT_OBS_RECORDING_FORMAT = "mkv"
 DEFAULT_OBS_RECORDING_TRACKS = "1"
@@ -357,6 +358,7 @@ class OBSSettings:
     output_height: int
     scale_type: str
     recording_quality: str
+    recording_encoder: str
     obs_dir: Path
 
     @property
@@ -483,6 +485,9 @@ class AppConfig:
             str(obs_cfg.get("recording_quality") or DEFAULT_OBS_RECORDING_QUALITY).strip().lower(),
             DEFAULT_OBS_RECORDING_QUALITY,
         )
+        recording_encoder = str(obs_cfg.get("recording_encoder") or DEFAULT_OBS_RECORDING_ENCODER).strip().lower()
+        if recording_encoder not in VALID_OBS_RECORDING_ENCODERS:
+            recording_encoder = DEFAULT_OBS_RECORDING_ENCODER
         port, _ = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
         window_capture_method, _ = _safe_int(
             obs_cfg.get("window_capture_method"),
@@ -570,6 +575,7 @@ class AppConfig:
                 output_height=output_height,
                 scale_type=scale_type,
                 recording_quality=recording_quality,
+                recording_encoder=recording_encoder,
                 obs_dir=MANAGED_PORTABLE_OBS_DIR,
             ),
             paths=PathsSettings(
@@ -974,6 +980,8 @@ def _select_requested_obs_recording_encoder(
     requested_encoder = str(recording_encoder or DEFAULT_OBS_RECORDING_ENCODER).strip().lower()
     if requested_encoder == "auto":
         return detect_obs_recording_encoder(obs_dir)
+    if requested_encoder not in VALID_OBS_RECORDING_ENCODERS:
+        requested_encoder = "x264"
     return OBSRecordingEncoderSelection(
         requested_encoder,
         requested_encoder,
@@ -1537,12 +1545,12 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
                         record_dir=recordings_dir,
                         scale_type=str(obs_cfg.get("scale_type") or DEFAULT_OBS_SCALE_TYPE),
                         recording_quality=str(obs_cfg.get("recording_quality") or DEFAULT_OBS_RECORDING_QUALITY),
-                        recording_encoder=DEFAULT_OBS_RECORDING_ENCODER,
+                        recording_encoder=str(obs_cfg.get("recording_encoder") or DEFAULT_OBS_RECORDING_ENCODER),
                     )
                     if changed_profiles:
                         report["changed"] = True
                         report["notes"].append(
-                            "OBS録画プロファイルをSimple/x264/mkv設定へ修復しました: "
+                            "OBS録画プロファイルをSimple/H.264/mkv設定へ修復しました: "
                             + ", ".join(str(path) for path in changed_profiles)
                         )
             except Exception as e:
@@ -1848,9 +1856,14 @@ def select_obs_recording_encoder(encoder_kinds: list[str] | tuple[str, ...]) -> 
 
 def detect_obs_recording_encoder(obs_dir: str | Path | None) -> OBSRecordingEncoderSelection:
     if obs_dir:
-        encoder_kinds = OBSProcessManager(obs_dir, logger=LOGGER).latest_log_encoder_kinds()
-        if encoder_kinds:
-            return select_obs_recording_encoder(encoder_kinds)
+        try:
+            process_manager = OBSProcessManager(obs_dir, logger=LOGGER)
+            latest_log_encoder_kinds = getattr(process_manager, "latest_log_encoder_kinds", None)
+            encoder_kinds = latest_log_encoder_kinds() if callable(latest_log_encoder_kinds) else []
+            if encoder_kinds:
+                return select_obs_recording_encoder(encoder_kinds)
+        except Exception as e:
+            LOGGER.warning("OBSログから録画エンコーダを検出できないためx264を使用します: %s", e)
     return OBSRecordingEncoderSelection("x264", "obs_x264", "x264 (fallback)", False)
 
 
@@ -2658,7 +2671,7 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
             record_dir=record_dir,
             scale_type=config.obs.scale_type,
             recording_quality=config.obs.recording_quality,
-            recording_encoder=DEFAULT_OBS_RECORDING_ENCODER,
+            recording_encoder=config.obs.recording_encoder,
         )
         if changed_profiles:
             LOGGER.info("ℹ️ OBS録画プロファイルを修復しました: %s", ", ".join(str(path) for path in changed_profiles))
@@ -3029,6 +3042,7 @@ class ObsWebSocketClient(OBSClient):
         self.retry_delay = float(retry_delay)
         self.logger = logging.getLogger(f"lol_replay.obs.{id(self)}")
         self._status_handler = StatusCallbackLogHandler(status_cb) if status_cb else None
+        self.last_recording_encoder_selection: OBSRecordingEncoderSelection | None = None
         if self._status_handler:
             self.logger.addHandler(self._status_handler)
         self.logger.propagate = True
@@ -3117,11 +3131,12 @@ class ObsWebSocketClient(OBSClient):
 
     def _apply_recording_quality_settings(
         self,
-        recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
+        recording_encoder: str | None = None,
         *,
         raise_on_error: bool = False,
     ) -> OBSRecordingEncoderSelection | None:
         try:
+            requested_encoder = self.config.obs.recording_encoder if recording_encoder is None else recording_encoder
             record_dir = None
             if self.config.paths.recordings_dir:
                 record_dir = validate_recording_directory(self.config.paths.recordings_dir)
@@ -3129,10 +3144,11 @@ class ObsWebSocketClient(OBSClient):
                 self.client,
                 scale_type=self.config.obs.scale_type,
                 recording_quality=self.config.obs.recording_quality,
-                recording_encoder=recording_encoder,
+                recording_encoder=requested_encoder,
                 obs_dir=self.config.obs.obs_dir,
                 record_dir=record_dir,
             )
+            self.last_recording_encoder_selection = selected_encoder
             self.log(
                 "🎞️ OBS録画品質を適用しました: "
                 f"quality={self.config.obs.recording_quality}, scale={self.config.obs.scale_type}, "
@@ -4184,7 +4200,6 @@ class LoLAutoRecorder(RecordingSessionManager):
         if not await self.wait_with_stop_async(DEFAULT_RECORDING_START_SETTLE_SEC, step=0.1):
             return
         request_started_at = time.time()
-        start_request_accepted = False
         try:
             self.obs_client.start_recording()
         except Exception as e:
@@ -4199,14 +4214,13 @@ class LoLAutoRecorder(RecordingSessionManager):
             if not self.recording_started:
                 errors.append(self._format_obs_start_error(e, 1))
         else:
-            start_request_accepted = True
             if await self.wait_for_recording_active_async(DEFAULT_RECORDING_START_PRIMARY_TIMEOUT_SEC):
                 self.recording_started = True
                 self.session_phase = RecordingPhase.RECORDING
             else:
                 errors.append("試行1: OBSは開始要求を受理しましたが、録画状態へ移行しませんでした。")
 
-        if not self.recording_started and start_request_accepted:
+        if not self.recording_started:
             await self._recover_recording_start_async(errors)
 
         if not self.recording_started:
@@ -4254,6 +4268,10 @@ class LoLAutoRecorder(RecordingSessionManager):
         except Exception as e:
             self.log(f"⚠️ 録画開始前のOBS出力設定再適用に失敗: {e}")
 
+    def _selected_recording_encoder_is_hardware(self) -> bool:
+        selected_encoder = getattr(self.obs_client, "last_recording_encoder_selection", None)
+        return bool(getattr(selected_encoder, "hardware", False))
+
     async def _recover_recording_start_async(self, errors: list[str]) -> None:
         if self.should_stop():
             return
@@ -4262,6 +4280,8 @@ class LoLAutoRecorder(RecordingSessionManager):
         set_encoder = getattr(self.obs_client, "set_recording_encoder", None)
         if callable(set_encoder):
             try:
+                if self._selected_recording_encoder_is_hardware():
+                    self.log("⚠️ GPUエンコーダ失敗のためx264へ切り替えて再試行します。")
                 set_encoder("x264")
             except Exception as e:
                 errors.append(f"復旧準備: x264への切り替えに失敗しました ({type(e).__name__}: {e})")

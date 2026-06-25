@@ -125,6 +125,7 @@ def test_app_config_uses_lossless_resolution_defaults_and_quality_recording():
     assert config.obs.output_height == 1080
     assert config.obs.scale_type == "lanczos"
     assert config.obs.recording_quality == "Small"
+    assert config.obs.recording_encoder == "auto"
 
 
 def test_obs_video_and_quality_settings_are_sent_to_websocket():
@@ -220,6 +221,9 @@ def test_prepare_recording_start_does_not_reset_video_settings(tmp_path):
 
     config = recordtest.AppConfig.from_dict(
         {
+            "obs": {
+                "recording_encoder": "x264",
+            },
             "paths": {
                 "recordings_dir": str(tmp_path),
                 "json_dir": str(tmp_path / "json"),
@@ -289,7 +293,7 @@ def test_recording_encoder_auto_selection_uses_safe_fallback_order(kinds, expect
     assert recordtest.select_obs_recording_encoder(kinds).profile_value == expected
 
 
-def test_recording_quality_defaults_to_x264_even_when_hardware_encoder_exists(tmp_path):
+def test_recording_quality_defaults_to_auto_gpu_when_hardware_encoder_exists(tmp_path):
     class RawClient:
         def __init__(self):
             self.calls = []
@@ -310,12 +314,12 @@ def test_recording_quality_defaults_to_x264_even_when_hardware_encoder_exists(tm
 
     selected = recordtest.apply_obs_recording_quality_settings(client, obs_dir=tmp_path)
 
-    assert selected.profile_value == "x264"
-    assert selected.hardware is False
+    assert selected.profile_value == "nvenc"
+    assert selected.hardware is True
     assert client.calls[-1][1] == {
         "parameterCategory": "SimpleOutput",
         "parameterName": "RecEncoder",
-        "parameterValue": "x264",
+        "parameterValue": "nvenc",
     }
 
 

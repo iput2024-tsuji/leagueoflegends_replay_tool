@@ -1219,6 +1219,219 @@ def test_user_ini_is_primary_source_for_first_run_and_tray(monkeypatch):
     assert "SysTrayMinimizeToTray=false" in text
 
 
+def _read_obs_profile_ini(path):
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str
+    parser.read(path, encoding="utf-8")
+    return parser
+
+
+def _fake_launch_config(root, recording_encoder="auto"):
+    return recordtest.AppConfig.from_dict(
+        {
+            "obs": {
+                "password": "secret",
+                "recording_encoder": recording_encoder,
+            },
+            "paths": {
+                "recordings_dir": str(root / "recordings"),
+                "json_dir": str(root / "recordings" / "json"),
+            },
+        }
+    )
+
+
+def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_encoder_kinds=()):
+    class FakeProcessManager:
+        start_count = 0
+        encoder_log_calls = 0
+        terminated_pids = []
+
+        def __init__(self, obs_dir_arg, logger=None):
+            self.obs_dir = Path(obs_dir_arg)
+            self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            return []
+
+        def unmanaged_processes(self):
+            return []
+
+        def isolated_env(self):
+            return {}
+
+        def start_obs(self, *args, **kwargs):
+            type(self).start_count += 1
+            return SimpleNamespace(pid=100 + type(self).start_count, poll=lambda: None)
+
+        def hide_main_windows(self, *args, **kwargs):
+            return 0
+
+        def latest_log_portable_mode(self, since=None):
+            return True
+
+        def latest_log_encoder_kinds(self, since=None):
+            type(self).encoder_log_calls += 1
+            if type(self).start_count <= 0:
+                return list(before_encoder_kinds)
+            return list(after_encoder_kinds)
+
+        def terminate_process(self, process, timeout_sec=3.0):
+            type(self).terminated_pids.append(process.pid)
+
+    class FakeBootstrapper:
+        def __init__(self, base_dir):
+            self.base_dir = Path(base_dir)
+
+        def apply(self, *args, **kwargs):
+            return {
+                "global_ini_changed": False,
+                "global_ini_path": self.base_dir / "config" / "obs-studio" / "global.ini",
+                "user_ini_changed": False,
+                "user_ini_path": self.base_dir / "config" / "obs-studio" / "user.ini",
+                "websocket": (
+                    False,
+                    self.base_dir
+                    / "config"
+                    / "obs-studio"
+                    / "plugin_config"
+                    / "obs-websocket"
+                    / "config.json",
+                ),
+            }
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", FakeProcessManager)
+    monkeypatch.setattr(recordtest, "OBSBootstrapper", FakeBootstrapper)
+    monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest.time, "sleep", lambda *args, **kwargs: None)
+    return FakeProcessManager
+
+
+def test_launch_obs_uses_startup_log_gpu_encoder_without_restart(monkeypatch, tmp_path):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+
+    process = recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert process.pid == 101
+    assert manager.start_count == 1
+    assert manager.terminated_pids == []
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+    parser = _read_obs_profile_ini(profile_ini)
+    assert parser.get("SimpleOutput", "RecEncoder") == "nvenc"
+    assert parser.get("AdvOut", "RecEncoder") == "obs_nvenc_h264_tex"
+
+
+def test_launch_obs_restarts_once_when_gpu_encoder_is_discovered_after_start(monkeypatch, tmp_path):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+
+    process = recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert process.pid == 102
+    assert manager.start_count == 2
+    assert manager.terminated_pids == [101]
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+    parser = _read_obs_profile_ini(profile_ini)
+    assert parser.get("SimpleOutput", "RecEncoder") == "nvenc"
+    assert parser.get("AdvOut", "RecEncoder") == "obs_nvenc_h264_tex"
+
+
+def test_launch_obs_does_not_restart_for_hevc_only_encoder_detection(monkeypatch, tmp_path):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_hevc_tex"],
+    )
+
+    process = recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert process.pid == 101
+    assert manager.start_count == 1
+    assert manager.terminated_pids == []
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+    parser = _read_obs_profile_ini(profile_ini)
+    assert parser.get("SimpleOutput", "RecEncoder") == "x264"
+    assert parser.get("AdvOut", "RecEncoder") == "obs_x264"
+
+
+def test_launch_obs_does_not_probe_gpu_when_x264_is_configured(monkeypatch, tmp_path):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+
+    process = recordtest.launch_obs(_fake_launch_config(tmp_path, recording_encoder="x264"))
+
+    assert process.pid == 101
+    assert manager.start_count == 1
+    assert manager.encoder_log_calls == 0
+    assert manager.terminated_pids == []
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+    parser = _read_obs_profile_ini(profile_ini)
+    assert parser.get("SimpleOutput", "RecEncoder") == "x264"
+    assert parser.get("AdvOut", "RecEncoder") == "obs_x264"
+
+
 def test_launch_obs_refuses_external_websocket_port(monkeypatch):
     obs_dir = Path("tests") / "_tmp" / "obs_launch_port_conflict" / "obs-portable"
     shutil.rmtree(obs_dir.parent, ignore_errors=True)

@@ -170,6 +170,8 @@ DEFAULT_RECORDING_START_PRIMARY_TIMEOUT_SEC = 5.0
 DEFAULT_RECORDING_START_RECOVERY_TIMEOUT_SEC = 12.0
 DEFAULT_RECORDING_START_POLL_SEC = 0.25
 DEFAULT_RECORDING_START_SETTLE_SEC = 0.75
+DEFAULT_OBS_ENCODER_LOG_WAIT_SEC = 4.0
+DEFAULT_OBS_ENCODER_LOG_POLL_SEC = 0.25
 DEFAULT_GAME_START_EVENT_WAIT_SEC = 3.0
 DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC = 30.0
 DEFAULT_LCU_START_LIVE_CLIENT_GRACE_SEC = 20.0
@@ -998,6 +1000,7 @@ def _apply_obs_recording_profile_ini(
     recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
     recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
     obs_dir: str | Path | None = None,
+    selected_encoder: OBSRecordingEncoderSelection | None = None,
 ) -> bool:
     parser, changed = _read_or_new_obs_ini(ini_path)
     if not parser.has_section("General"):
@@ -1010,11 +1013,11 @@ def _apply_obs_recording_profile_ini(
         parser.set("General", "Name", expected_name)
         changed = True
 
-    selected_encoder = _select_requested_obs_recording_encoder(recording_encoder, obs_dir=obs_dir)
+    encoder_selection = selected_encoder or _select_requested_obs_recording_encoder(recording_encoder, obs_dir=obs_dir)
     for section, key, value in _obs_recording_profile_parameter_updates(
         scale_type=scale_type,
         recording_quality=recording_quality,
-        selected_encoder=selected_encoder,
+        selected_encoder=encoder_selection,
         record_dir=record_dir,
     ):
         changed = _set_obs_ini_value(parser, section, key, value) or changed
@@ -1033,6 +1036,7 @@ def ensure_obs_recording_profile_ini(
     scale_type: str = DEFAULT_OBS_SCALE_TYPE,
     recording_quality: str = DEFAULT_OBS_RECORDING_QUALITY,
     recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
+    selected_encoder: OBSRecordingEncoderSelection | None = None,
 ) -> tuple[Path, ...]:
     changed_paths: list[Path] = []
     profile_paths = _obs_profile_basic_ini_paths(base_dir)
@@ -1044,6 +1048,7 @@ def ensure_obs_recording_profile_ini(
             recording_quality=recording_quality,
             recording_encoder=recording_encoder,
             obs_dir=base_dir,
+            selected_encoder=selected_encoder,
         ):
             changed_paths.append(ini_path.resolve())
     if profile_paths:
@@ -1051,6 +1056,59 @@ def ensure_obs_recording_profile_ini(
         if selection_path is not None:
             changed_paths.append(selection_path.resolve())
     return tuple(changed_paths)
+
+
+def _obs_encoder_log_label(selected_encoder: OBSRecordingEncoderSelection) -> str:
+    return f"{selected_encoder.display_name} ({selected_encoder.encoder_kind})"
+
+
+def _wait_for_obs_startup_encoder_selection(
+    process_manager: OBSProcessManager,
+    *,
+    since: float,
+    timeout_sec: float = DEFAULT_OBS_ENCODER_LOG_WAIT_SEC,
+) -> OBSRecordingEncoderSelection | None:
+    deadline = time.monotonic() + max(0.0, timeout_sec)
+    while True:
+        try:
+            encoder_kinds = process_manager.latest_log_encoder_kinds(since=since)
+        except Exception as e:
+            LOGGER.warning("OBS起動後ログから録画エンコーダを検出できませんでした: %s", e)
+            return None
+        if encoder_kinds:
+            return select_obs_recording_encoder(encoder_kinds)
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(DEFAULT_OBS_ENCODER_LOG_POLL_SEC)
+
+
+def _start_hidden_obs_and_verify_portable(
+    process_manager: OBSProcessManager,
+    *,
+    obs_dir_abs: str,
+    obs_exe: str,
+) -> tuple[subprocess.Popen[Any], float]:
+    LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
+    started_at = time.time()
+    process = process_manager.start_obs(env=process_manager.isolated_env(), hidden=True)
+    hidden_windows = process_manager.hide_main_windows(process, timeout_sec=3.0)
+    if hidden_windows:
+        LOGGER.info("OBSウィンドウを非表示にしました: pid=%s windows=%s", process.pid, hidden_windows)
+    # WebSocketとOBS起動ログの出力待ち。
+    time.sleep(2)
+    process_manager.hide_main_windows(process, timeout_sec=0.5)
+    portable_mode = process_manager.latest_log_portable_mode(since=started_at - 1.0)
+    if portable_mode is False:
+        process_manager.terminate_process(process)
+        raise RecorderError(
+            "OBSがポータブルモードではなく通常モードで起動しました。\n"
+            f"起動対象: {obs_exe}\n"
+            "この状態では obs-portable の global.ini が読まれないため、"
+            "自動構成ウィザードやタスクトレイ設定を抑止できません。"
+        )
+    if portable_mode is None:
+        LOGGER.warning("OBSログから Portable mode を確認できませんでした: %s", obs_dir_abs)
+    return process, started_at
 
 
 class OBSBootstrapper(SharedOBSBootstrapper):
@@ -2666,42 +2724,63 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
 
     try:
         record_dir = validate_recording_directory(config.paths.recordings_dir)
+        startup_encoder = _select_requested_obs_recording_encoder(config.obs.recording_encoder, obs_dir=obs_dir_abs)
         changed_profiles = ensure_obs_recording_profile_ini(
             obs_dir_abs,
             record_dir=record_dir,
             scale_type=config.obs.scale_type,
             recording_quality=config.obs.recording_quality,
             recording_encoder=config.obs.recording_encoder,
+            selected_encoder=startup_encoder,
         )
         if changed_profiles:
             LOGGER.info("ℹ️ OBS録画プロファイルを修復しました: %s", ", ".join(str(path) for path in changed_profiles))
+        LOGGER.info("OBS起動時録画エンコーダ: %s", _obs_encoder_log_label(startup_encoder))
     except Exception as e:
         raise RecorderError(f"OBS録画プロファイルの起動前修復に失敗しました: {e}") from e
 
     ensure_obs_websocket_port_free(config)
 
-    LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
-
     try:
-        started_at = time.time()
-        process = process_manager.start_obs(env=process_manager.isolated_env(), hidden=True)
-        hidden_windows = process_manager.hide_main_windows(process, timeout_sec=3.0)
-        if hidden_windows:
-            LOGGER.info("OBSウィンドウを非表示にしました: pid=%s windows=%s", process.pid, hidden_windows)
-        # WebSocketの起動待ち
-        time.sleep(2)
-        process_manager.hide_main_windows(process, timeout_sec=0.5)
-        portable_mode = process_manager.latest_log_portable_mode(since=started_at - 1.0)
-        if portable_mode is False:
-            process_manager.terminate_process(process)
-            raise RecorderError(
-                "OBSがポータブルモードではなく通常モードで起動しました。\n"
-                f"起動対象: {obs_exe}\n"
-                "この状態では obs-portable の global.ini が読まれないため、"
-                "自動構成ウィザードやタスクトレイ設定を抑止できません。"
+        process, started_at = _start_hidden_obs_and_verify_portable(
+            process_manager,
+            obs_dir_abs=obs_dir_abs,
+            obs_exe=obs_exe,
+        )
+        requested_encoder = str(config.obs.recording_encoder or DEFAULT_OBS_RECORDING_ENCODER).strip().lower()
+        if requested_encoder == "auto" and not startup_encoder.hardware:
+            detected_encoder = _wait_for_obs_startup_encoder_selection(
+                process_manager,
+                since=started_at - 1.0,
             )
-        if portable_mode is None:
-            LOGGER.warning("OBSログから Portable mode を確認できませんでした: %s", obs_dir_abs)
+            if detected_encoder is None:
+                LOGGER.warning("OBS起動後ログからGPUエンコーダを確認できないためx264で録画します。")
+            elif detected_encoder.hardware:
+                LOGGER.info(
+                    "OBS起動後にGPUエンコーダを検出したため、録画設定反映のためOBSを再起動します。"
+                )
+                process_manager.terminate_process(process)
+                changed_profiles = ensure_obs_recording_profile_ini(
+                    obs_dir_abs,
+                    record_dir=record_dir,
+                    scale_type=config.obs.scale_type,
+                    recording_quality=config.obs.recording_quality,
+                    recording_encoder=config.obs.recording_encoder,
+                    selected_encoder=detected_encoder,
+                )
+                if changed_profiles:
+                    LOGGER.info(
+                        "ℹ️ OBS録画プロファイルをGPUエンコーダへ更新しました: %s",
+                        ", ".join(str(path) for path in changed_profiles),
+                    )
+                LOGGER.info("OBS起動時録画エンコーダ: %s", _obs_encoder_log_label(detected_encoder))
+                process, _started_at = _start_hidden_obs_and_verify_portable(
+                    process_manager,
+                    obs_dir_abs=obs_dir_abs,
+                    obs_exe=obs_exe,
+                )
+            else:
+                LOGGER.info("OBS起動後にGPUエンコーダが見つからないためx264で録画します。")
         return process
     except RecorderError:
         raise

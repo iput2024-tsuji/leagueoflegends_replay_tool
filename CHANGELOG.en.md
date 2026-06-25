@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1] - 2026-06-26
+
+### Fixed
+
+- When `auto` first discovers a GPU encoder after OBS starts, restart the managed OBS instance once before monitoring begins so the GPU encoder is loaded from the startup profile.
+- Log the recording encoder used at OBS startup and explicitly report when x264 remains in use because no GPU encoder is available.
+- Preserve the stable x264 path by skipping GPU probing and automatic restart when `x264` is configured.
+
 ## [0.5.0] - 2026-06-25
 
 ### Added

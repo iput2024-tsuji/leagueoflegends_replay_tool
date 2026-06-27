@@ -107,6 +107,8 @@ LCU_CHAMPION_SUMMARY_PATH = "/lol-game-data/assets/v1/champion-summary.json"
 LCU_GAMEFLOW_PHASE_PATH = "/lol-gameflow/v1/gameflow-phase"
 LCU_GAMEFLOW_SESSION_PATH = "/lol-gameflow/v1/session"
 LCU_GAME_QUEUES_PATH = "/lol-game-queues/v1/queues"
+LCU_END_OF_GAME_STATS_PATH = "/lol-end-of-game/v1/eog-stats-block"
+LCU_GAMECLIENT_END_OF_GAME_STATS_PATH = "/lol-end-of-game/v1/gameclient-eog-stats-block"
 
 DEFAULT_OBS_PASSWORD_LENGTH = config_schema.DEFAULT_OBS_PASSWORD_LENGTH
 DEFAULT_OBS_SCENE_NAME = config_schema.DEFAULT_OBS_SCENE_NAME
@@ -178,9 +180,13 @@ DEFAULT_LCU_START_LIVE_CLIENT_GRACE_SEC = 20.0
 DEFAULT_LCU_START_LIVE_CLIENT_POLL_SEC = 1.0
 DEFAULT_GAMEFLOW_INACTIVE_GRACE_SEC = 10.0
 DEFAULT_GAME_PROCESS_MISSING_GRACE_SEC = 10.0
+DEFAULT_POST_GAME_RESULT_WAIT_SEC = 12.0
+DEFAULT_POST_GAME_RESULT_POLL_SEC = 1.0
+DEFAULT_SYNC_STALE_GAME_TIME_TOLERANCE_SEC = 1.0
 LOL_GAME_PROCESS_NAME = "League of Legends.exe"
 MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
 LCU_GAMEFLOW_START_PHASES = frozenset({"gamestart", "inprogress", "reconnect"})
+LCU_POST_GAME_RESULT_WAIT_PHASES = frozenset({"preendofgame", "waitingforstats", "endofgame"})
 OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS = (
     "DesktopDevice1",
     "DesktopDevice2",
@@ -339,6 +345,26 @@ class RiotPollResult:
     status: RiotPollStatus
     payload: dict[str, Any] | None = None
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class PostGameResult:
+    game_result: str | None = None
+    winning_team: str | None = None
+    player_team: str | None = None
+    source: str = "unavailable"
+
+    @property
+    def has_result(self) -> bool:
+        return any(value not in (None, "") for value in (self.game_result, self.winning_team))
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "game_result": self.game_result,
+            "winning_team": self.winning_team,
+            "player_team": self.player_team,
+            "source": self.source,
+        }
 
 
 @dataclass(frozen=True)
@@ -709,6 +735,14 @@ class RiotAPIClient(ABC):
 
     @abstractmethod
     async def get_match_metadata(self) -> dict[str, Any]:
+        pass
+
+    @abstractmethod
+    async def get_post_game_result(
+        self,
+        player_name: str | None = None,
+        player_team: Any | None = None,
+    ) -> RiotPollResult:
         pass
 
 
@@ -2933,6 +2967,197 @@ def merge_live_game_metadata(current: dict[str, Any], payload: dict[str, Any] | 
     return result
 
 
+def normalize_lcu_team(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return "ORDER" if value == 100 else "CHAOS" if value == 200 else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if lowered in {"100", "1", "order", "blue", "teamone", "team1"}:
+        return "ORDER"
+    if lowered in {"200", "2", "chaos", "red", "teamtwo", "team2"}:
+        return "CHAOS"
+    upper = text.upper()
+    if upper in {"ORDER", "CHAOS"}:
+        return upper
+    return None
+
+
+def normalize_game_result_value(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "Win" if value else "Loss"
+    text = str(value or "").strip().lower()
+    if not text:
+        return None
+    if text in {"win", "won", "winner", "victory", "true", "1", "success"}:
+        return "Win"
+    if text in {"loss", "lose", "lost", "defeat", "false", "0", "fail", "failed"}:
+        return "Loss"
+    return None
+
+
+def _walk_mappings(value: Any) -> list[dict[str, Any]]:
+    mappings: list[dict[str, Any]] = []
+    if isinstance(value, dict):
+        mappings.append(value)
+        for child in value.values():
+            mappings.extend(_walk_mappings(child))
+    elif isinstance(value, list):
+        for item in value:
+            mappings.extend(_walk_mappings(item))
+    return mappings
+
+
+def _post_game_team_from_mapping(mapping: dict[str, Any]) -> str | None:
+    return normalize_lcu_team(
+        _first_mapping_value(
+            mapping,
+            "teamId",
+            "teamID",
+            "team_id",
+            "team",
+            "teamNumber",
+            "teamIndex",
+            "id",
+        )
+    )
+
+
+def _post_game_player_name_from_mapping(mapping: dict[str, Any]) -> str | None:
+    value = _first_mapping_value(
+        mapping,
+        "summonerName",
+        "summoner_name",
+        "riotIdGameName",
+        "gameName",
+        "displayName",
+        "name",
+    )
+    return str(value).strip() if value not in (None, "") else None
+
+
+def _post_game_player_team(
+    payload: dict[str, Any],
+    player_name: str | None,
+    fallback_team: Any | None,
+) -> str | None:
+    for key in ("localPlayer", "localPlayerStats", "localPlayerInfo", "player"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            team = _post_game_team_from_mapping(value)
+            if team:
+                return team
+
+    lookup_name = normalize_summoner_name(player_name) if player_name else None
+    if lookup_name:
+        for mapping in _walk_mappings(payload):
+            candidate_name = _post_game_player_name_from_mapping(mapping)
+            if not candidate_name:
+                continue
+            if candidate_name == player_name or normalize_summoner_name(candidate_name) == lookup_name:
+                team = _post_game_team_from_mapping(mapping)
+                if team:
+                    return team
+
+    return normalize_lcu_team(fallback_team)
+
+
+def _post_game_winning_team(payload: dict[str, Any]) -> str | None:
+    direct = normalize_lcu_team(
+        _first_mapping_value(
+            payload,
+            "winningTeam",
+            "winning_team",
+            "winningTeamId",
+            "winningTeamID",
+            "winning_team_id",
+        )
+    )
+    if direct:
+        return direct
+
+    for mapping in _walk_mappings(payload):
+        team = _post_game_team_from_mapping(mapping)
+        if not team:
+            continue
+        for key in ("isWinningTeam", "winner", "isWinner", "win", "result", "teamStatus"):
+            if key in mapping and normalize_game_result_value(mapping.get(key)) == "Win":
+                return team
+    return None
+
+
+def _post_game_local_result(payload: dict[str, Any], player_name: str | None) -> str | None:
+    local_mappings = []
+    for key in ("localPlayer", "localPlayerStats", "localPlayerInfo", "player"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            local_mappings.append(value)
+
+    lookup_name = normalize_summoner_name(player_name) if player_name else None
+    if lookup_name:
+        for mapping in _walk_mappings(payload):
+            candidate_name = _post_game_player_name_from_mapping(mapping)
+            if candidate_name and normalize_summoner_name(candidate_name) == lookup_name:
+                local_mappings.append(mapping)
+
+    local_mappings.extend([payload, payload.get("gameData") if isinstance(payload.get("gameData"), dict) else {}])
+    for mapping in local_mappings:
+        result = normalize_game_result_value(
+            _first_mapping_value(
+                mapping,
+                "gameResult",
+                "result",
+                "win",
+                "isWin",
+                "victory",
+                "outcome",
+            )
+        )
+        if result:
+            return result
+    return None
+
+
+def _opposing_lcu_team(team: str | None) -> str | None:
+    if team == "ORDER":
+        return "CHAOS"
+    if team == "CHAOS":
+        return "ORDER"
+    return None
+
+
+def build_post_game_result(
+    payload: dict[str, Any] | None,
+    *,
+    player_name: str | None = None,
+    player_team: Any | None = None,
+    source: str = "lcu_end_of_game",
+) -> PostGameResult:
+    if not isinstance(payload, dict):
+        return PostGameResult(source=source)
+
+    normalized_player_team = _post_game_player_team(payload, player_name, player_team)
+    winning_team = _post_game_winning_team(payload)
+    game_result = _post_game_local_result(payload, player_name)
+
+    if game_result is None and normalized_player_team and winning_team:
+        game_result = "Win" if normalized_player_team == winning_team else "Loss"
+    if winning_team is None and normalized_player_team and game_result == "Win":
+        winning_team = normalized_player_team
+    if winning_team is None and normalized_player_team and game_result == "Loss":
+        winning_team = _opposing_lcu_team(normalized_player_team)
+
+    return PostGameResult(
+        game_result=game_result,
+        winning_team=winning_team,
+        player_team=normalized_player_team,
+        source=source,
+    )
+
+
 def build_output_path(config: AppConfig) -> Path:
     """重複回避のため、存在しないファイル名を返す"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -3100,6 +3325,37 @@ class LiveClientRiotAPIClient(RiotAPIClient):
                     self._queue_catalog = [dict(item) for item in value if isinstance(item, dict)]
 
         return build_match_metadata(session_result.payload, self._queue_catalog)
+
+    async def get_post_game_result(
+        self,
+        player_name: str | None = None,
+        player_team: Any | None = None,
+    ) -> RiotPollResult:
+        status = RiotPollStatus.NOT_IN_GAME
+        errors: list[str] = []
+        candidates = (
+            (LCU_END_OF_GAME_STATS_PATH, "lcu_end_of_game"),
+            (LCU_GAMECLIENT_END_OF_GAME_STATS_PATH, "lcu_gameclient_end_of_game"),
+            (LCU_GAMEFLOW_SESSION_PATH, "lcu_gameflow_session"),
+        )
+        for path, source in candidates:
+            result = await self._fetch_lcu_result(path, timeout_sec=1.5)
+            if result.status == RiotPollStatus.TEMPORARY_FAILURE:
+                status = RiotPollStatus.TEMPORARY_FAILURE
+            if result.error:
+                errors.append(result.error)
+            if result.status != RiotPollStatus.IN_GAME or not isinstance(result.payload, dict):
+                continue
+            post_game = build_post_game_result(
+                result.payload,
+                player_name=player_name,
+                player_team=player_team,
+                source=source,
+            )
+            if post_game.has_result:
+                return RiotPollResult(RiotPollStatus.IN_GAME, payload=post_game.to_payload())
+
+        return RiotPollResult(status, error="; ".join(errors) if errors else "Post-game result unavailable")
 
 
 class ObsWebSocketClient(OBSClient):
@@ -3772,6 +4028,9 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.enemy_champions = []
         self.match_metadata: dict[str, Any] = {}
         self.game_start_detection_source: str | None = None
+        self.game_start_anchor_game_time: float | None = None
+        self.game_start_anchor_monotonic: float | None = None
+        self.sync_time_source: str | None = None
         self.champ_select_tracker = ChampSelectTracker()
         self.game_result = None
         self.winning_team = None
@@ -4021,6 +4280,10 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.session_phase = RecordingPhase.FINALIZING
         return RecordingOutcome.COMPLETED
 
+    async def _complete_recording_end_async(self, decision: RecordingEndDecision) -> RecordingOutcome:
+        await self.ensure_post_game_result_async(decision)
+        return self._complete_recording_end(decision)
+
     async def wait_for_previous_game_clear_async(self) -> bool:
         if not self._require_game_clear:
             return True
@@ -4131,13 +4394,98 @@ class LoLAutoRecorder(RecordingSessionManager):
             winning_team = (
                 event.get("WinningTeam") or event.get("winningTeam") or event.get("Team") or event.get("team")
             )
-            self.game_result = result_value
-            self.winning_team = winning_team
+            self.game_result = normalize_game_result_value(result_value) or result_value
+            self.winning_team = normalize_lcu_team(winning_team) or winning_team
+            if self.game_result or self.winning_team:
+                self.match_metadata["result_source"] = "live_client_game_end"
             return
 
     @staticmethod
     def is_game_end_event(event: dict[str, Any] | None) -> bool:
         return bool(event and event.get("EventName") in {"GameEnd", "EndGame", "GameEnded", "GameComplete"})
+
+    def _apply_post_game_result_payload(self, payload: dict[str, Any] | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        game_result = normalize_game_result_value(payload.get("game_result") or payload.get("result"))
+        winning_team = normalize_lcu_team(payload.get("winning_team") or payload.get("winningTeam"))
+        player_team = normalize_lcu_team(payload.get("player_team") or payload.get("playerTeam"))
+
+        if game_result is None and player_team and winning_team:
+            game_result = "Win" if player_team == winning_team else "Loss"
+        if winning_team is None and player_team and game_result == "Win":
+            winning_team = player_team
+        if winning_team is None and player_team and game_result == "Loss":
+            winning_team = _opposing_lcu_team(player_team)
+
+        changed = False
+        if not self.game_result and game_result:
+            self.game_result = game_result
+            changed = True
+        if not self.winning_team and winning_team:
+            self.winning_team = winning_team
+            changed = True
+        if not self.player_team and player_team:
+            self.player_team = player_team
+            changed = True
+
+        if changed:
+            source = str(payload.get("source") or "lcu_end_of_game")
+            self.match_metadata["result_source"] = source
+            self.log(
+                "🏁 勝敗を取得しました: "
+                f"result={self.game_result or 'Unknown'}, winning_team={self.winning_team or 'Unknown'}"
+            )
+        return changed
+
+    async def _poll_post_game_result_once_async(self) -> bool:
+        get_result = getattr(self.riot_api_client, "get_post_game_result", None)
+        if not callable(get_result):
+            return False
+        try:
+            result = get_result(player_name=self.my_name, player_team=self.player_team)
+        except TypeError:
+            result = get_result(self.my_name, self.player_team)
+        if hasattr(result, "__await__"):
+            result = await result
+
+        if isinstance(result, PostGameResult):
+            return self._apply_post_game_result_payload(result.to_payload())
+        if isinstance(result, RiotPollResult):
+            if result.status == RiotPollStatus.IN_GAME:
+                return self._apply_post_game_result_payload(result.payload)
+            return False
+        if isinstance(result, dict):
+            return self._apply_post_game_result_payload(result)
+        return False
+
+    def _post_game_result_wait_seconds(self, decision: RecordingEndDecision) -> float:
+        phase = self._normalize_gameflow_phase(decision.detail)
+        if phase in LCU_POST_GAME_RESULT_WAIT_PHASES:
+            return DEFAULT_POST_GAME_RESULT_WAIT_SEC
+        return 0.0
+
+    async def ensure_post_game_result_async(self, decision: RecordingEndDecision) -> None:
+        if self.game_result and self.winning_team:
+            return
+        if await self._poll_post_game_result_once_async():
+            return
+
+        wait_seconds = self._post_game_result_wait_seconds(decision)
+        if wait_seconds > 0:
+            self.log("🏁 試合後の勝敗情報を確認しています...")
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + wait_seconds
+            while loop.time() < deadline:
+                if self.should_stop():
+                    return
+                if not await self.wait_with_stop_async(DEFAULT_POST_GAME_RESULT_POLL_SEC):
+                    return
+                if await self._poll_post_game_result_once_async():
+                    return
+
+        self.match_metadata.setdefault("result_source", "unavailable")
+        self.log("⚠️ 勝敗を取得できませんでした。録画保存を優先します。")
 
     @staticmethod
     def _live_game_time(payload: dict[str, Any] | None) -> float | None:
@@ -4160,9 +4508,15 @@ class LoLAutoRecorder(RecordingSessionManager):
         live_data: dict[str, Any] | None = None,
         game_time: float | None = None,
     ) -> bool:
+        loop = asyncio.get_running_loop()
         self.game_start_detection_source = source
+        self.match_metadata["game_start_detection_source"] = source
         if source == "live_client":
-            self.log(f"🔥 試合開始検知！ Live Client GameTime: {float(game_time or 0.0):.2f}s")
+            anchor_game_time = float(game_time or 0.0)
+            self.game_start_anchor_game_time = anchor_game_time
+            self.game_start_anchor_monotonic = loop.time()
+            self.match_metadata["game_start_game_time"] = anchor_game_time
+            self.log(f"🔥 試合開始検知！ Live Client GameTime: {anchor_game_time:.2f}s")
         else:
             phase = self.match_metadata.get("gameflow_phase") or "unknown"
             self.log(f"🔥 試合開始検知！ LCU Gameflow Phase: {phase}")
@@ -4262,6 +4616,46 @@ class LoLAutoRecorder(RecordingSessionManager):
                 return None
         return None
 
+    def _has_live_client_start_anchor(self) -> bool:
+        return (
+            self.game_start_detection_source == "live_client"
+            and self.game_start_anchor_game_time is not None
+            and self.game_start_anchor_monotonic is not None
+        )
+
+    def _estimated_game_time_from_start_anchor(self, marker_monotonic: float) -> float | None:
+        if self.game_start_anchor_game_time is None or self.game_start_anchor_monotonic is None:
+            return None
+        elapsed = max(0.0, float(marker_monotonic) - float(self.game_start_anchor_monotonic))
+        return max(0.0, float(self.game_start_anchor_game_time) + elapsed)
+
+    async def resolve_sync_game_time_async(
+        self,
+        *,
+        event_time: float | None,
+        marker_monotonic: float,
+    ) -> tuple[float, str]:
+        if self.game_start_detection_source == "lcu" and event_time is not None:
+            return float(event_time), "game_start_event"
+
+        result = await self.poll_all_game_data()
+        live_game_time = self._live_game_time(result.payload)
+        estimated_game_time = self._estimated_game_time_from_start_anchor(marker_monotonic)
+
+        if live_game_time is not None:
+            if (
+                estimated_game_time is not None
+                and live_game_time + DEFAULT_SYNC_STALE_GAME_TIME_TOLERANCE_SEC < estimated_game_time
+            ):
+                return estimated_game_time, "estimated_from_start_anchor"
+            return float(live_game_time), "live_client"
+
+        if estimated_game_time is not None:
+            return estimated_game_time, "estimated_from_start_anchor"
+        if event_time is not None:
+            return float(event_time), "game_start_event"
+        return 0.0, "unavailable"
+
     async def start_recording_async(self) -> None:
         """録画開始 -> 同期マーカー"""
         self.session_phase = RecordingPhase.STARTING
@@ -4312,27 +4706,27 @@ class LoLAutoRecorder(RecordingSessionManager):
                 message += f"\n{diagnostics}"
             self.log(f"⚠️ {message}")
             raise RecorderError(message)
-        if not await self.wait_with_stop_async(2.0):
-            return
 
-        event_time = await self.wait_until_game_start_event_async()
-        if self.should_stop():
-            self.session_phase = RecordingPhase.CANCELLED
-            return
+        event_time = None
+        if not self._has_live_client_start_anchor():
+            event_time = await self.wait_until_game_start_event_async()
+            if self.should_stop():
+                self.session_phase = RecordingPhase.CANCELLED
+                return
 
+        marker_monotonic = asyncio.get_running_loop().time()
         self.log("⚡ 同期シグナル送信 (Marker ON)")
         self.obs_client.set_sync_marker_enabled(True, item_id)
 
-        sync_time = 0.0
-        result = await self.poll_all_game_data()
-        data = result.payload
-        if data:
-            sync_time = data.get("gameData", {}).get("gameTime", 0.0)
-        if (not sync_time or sync_time <= 0) and event_time is not None:
-            sync_time = float(event_time)
+        sync_time, sync_source = await self.resolve_sync_game_time_async(
+            event_time=event_time,
+            marker_monotonic=marker_monotonic,
+        )
 
         self.sync_game_time = sync_time
-        self.log(f"📝 同期ログ記録: {sync_time:.4f}s")
+        self.sync_time_source = sync_source
+        self.match_metadata["sync_time_source"] = sync_source
+        self.log(f"📝 同期ログ記録: {sync_time:.4f}s ({sync_source})")
 
         await self.wait_with_stop_async(0.5)
         self.obs_client.set_sync_marker_enabled(False, item_id)
@@ -4516,10 +4910,10 @@ class LoLAutoRecorder(RecordingSessionManager):
             if not data:
                 decision = end_detector.observe_poll_status(result.status, now)
                 if decision.should_end:
-                    return self._complete_recording_end(decision)
+                    return await self._complete_recording_end_async(decision)
                 decision = await self._observe_recording_context_end_async(end_detector, result, now)
                 if decision.should_end:
-                    return self._complete_recording_end(decision)
+                    return await self._complete_recording_end_async(decision)
                 if not await self.wait_with_stop_async(self.config.polling.end_poll_sec):
                     self.session_phase = RecordingPhase.CANCELLED
                     return RecordingOutcome.CANCELLED
@@ -4528,7 +4922,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             end_detector.observe_poll_status(result.status, now)
             decision = await self._observe_recording_context_end_async(end_detector, result, now)
             if decision.should_end:
-                return self._complete_recording_end(decision)
+                return await self._complete_recording_end_async(decision)
             self.last_game_data = data
             self.match_metadata = merge_live_game_metadata(self.match_metadata, data)
             if not self.my_name:
@@ -4541,7 +4935,7 @@ class LoLAutoRecorder(RecordingSessionManager):
                 self.process_events(events)
                 self.update_result_from_events(events)
                 if any(self.is_game_end_event(event) for event in events):
-                    return self._complete_recording_end(end_detector.observe_game_end_event())
+                    return await self._complete_recording_end_async(end_detector.observe_game_end_event())
 
             if not await self.wait_with_stop_async(self.config.polling.event_poll_sec):
                 self.session_phase = RecordingPhase.CANCELLED
@@ -4611,11 +5005,22 @@ class LoLAutoRecorder(RecordingSessionManager):
         if self.output_file is None:
             self.output_file = build_output_path(self.config)
 
-        if self.last_game_data and self.game_result is None:
+        if self.last_game_data and (self.game_result is None or self.winning_team is None):
             game_data = self.last_game_data.get("gameData", {})
             if isinstance(game_data, dict):
-                self.game_result = game_data.get("gameResult") or game_data.get("result")
-                self.winning_team = self.winning_team or game_data.get("winningTeam") or game_data.get("winning_team")
+                result_value = game_data.get("gameResult") or game_data.get("result")
+                winning_team = game_data.get("winningTeam") or game_data.get("winning_team")
+                if self.game_result is None:
+                    self.game_result = normalize_game_result_value(result_value) or result_value
+                if self.winning_team is None:
+                    self.winning_team = normalize_lcu_team(winning_team) or winning_team
+                if self.game_result or self.winning_team:
+                    self.match_metadata["result_source"] = "live_client_game_data"
+
+        if self.game_start_detection_source:
+            self.match_metadata["game_start_detection_source"] = self.game_start_detection_source
+        if self.sync_time_source:
+            self.match_metadata["sync_time_source"] = self.sync_time_source
 
         record_path_for_json = None
         if self.record_path:

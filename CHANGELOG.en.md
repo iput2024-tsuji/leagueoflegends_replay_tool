@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.2] - 2026-06-27
+
+### Fixed
+
+- Fill missing match results and winning teams from LCU post-game data when recording ends through LCU Gameflow or LoL process disappearance without a Live Client `GameEnd` event.
+- Try to collect post-game result data briefly before finalizing recordings at `PreEndOfGame`, while still prioritizing video/session saving when the result is unavailable.
+- When game start is detected through the Live Client, stop relying on the post-recording `GameStart` event wait and estimate the marker-time game clock from the start game time plus local elapsed time.
+- Store the sync timestamp source in `match.sync_time_source`, reducing event-sync drift when the Live Client temporarily returns a stale game time immediately after recording starts.
+
 ## [0.5.1] - 2026-06-26
 
 ### Fixed

@@ -762,6 +762,70 @@ def test_riot_api_fetches_champ_select_and_champion_catalog_from_lcu():
     assert match["game_id"] == "456"
 
 
+def test_riot_api_fetches_post_game_result_from_lcu_end_of_game_stats():
+    connection = LCUConnectionInfo(port=54321, password="secret")
+    provider = SimpleNamespace(
+        get_connection_info=lambda: connection,
+        invalidate=lambda: None,
+    )
+    eog_url = f"{connection.base_url}{recordtest.LCU_END_OF_GAME_STATS_PATH}"
+    routes = {
+        eog_url: {
+            "localPlayer": {"summonerName": "Tester#JP1", "teamId": 200},
+            "teams": [
+                {"teamId": 100, "win": "Fail"},
+                {"teamId": 200, "win": "Win"},
+            ],
+        },
+    }
+    client = recordtest.LiveClientRiotAPIClient(
+        session_factory=FakeSessionFactory(routes),
+        lcu_connection_provider=provider,
+    )
+
+    result = run(client.get_post_game_result(player_name="Tester#JP1", player_team=None))
+
+    assert result.status == recordtest.RiotPollStatus.IN_GAME
+    assert result.payload == {
+        "game_result": "Win",
+        "winning_team": "CHAOS",
+        "player_team": "CHAOS",
+        "source": "lcu_end_of_game",
+    }
+
+
+def test_riot_api_falls_back_to_gameflow_session_for_post_game_result():
+    connection = LCUConnectionInfo(port=54321, password="secret")
+    provider = SimpleNamespace(
+        get_connection_info=lambda: connection,
+        invalidate=lambda: None,
+    )
+    gameflow_url = f"{connection.base_url}{recordtest.LCU_GAMEFLOW_SESSION_PATH}"
+    routes = {
+        gameflow_url: {
+            "phase": "EndOfGame",
+            "gameData": {
+                "teams": [
+                    {"teamId": 100, "isWinningTeam": True},
+                    {"teamId": 200, "isWinningTeam": False},
+                ]
+            },
+        },
+    }
+    client = recordtest.LiveClientRiotAPIClient(
+        session_factory=FakeSessionFactory(routes),
+        lcu_connection_provider=provider,
+    )
+
+    result = run(client.get_post_game_result(player_name="Tester#JP1", player_team="CHAOS"))
+
+    assert result.status == recordtest.RiotPollStatus.IN_GAME
+    assert result.payload["game_result"] == "Loss"
+    assert result.payload["winning_team"] == "ORDER"
+    assert result.payload["player_team"] == "CHAOS"
+    assert result.payload["source"] == "lcu_gameflow_session"
+
+
 def test_riot_api_returns_none_when_lcu_server_is_down():
     client = recordtest.LiveClientRiotAPIClient(
         session_factory=FakeSessionFactory(error=aiohttp.ClientConnectionError("down"))

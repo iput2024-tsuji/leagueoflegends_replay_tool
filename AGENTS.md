@@ -59,8 +59,8 @@ addressed together with its reason; do not silently ignore review comments.
 
 ## Tool-assisted work
 
-- Treat Claude and any other automated assistant as review or implementation
-  support, not as a repository author or contributor.
+- Treat automated assistants as review or implementation support, not as
+  repository authors or contributors.
 - Do not put assistant, model, tool, vendor, or generation-source attribution
   in branch names, commits, Pull Request titles or descriptions, Issues,
   review summaries, changelogs, or Release notes.

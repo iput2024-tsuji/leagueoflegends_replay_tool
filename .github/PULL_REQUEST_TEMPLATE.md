@@ -1,6 +1,7 @@
 ## 関連Issue
 
 - Closes #
+- Issueなしの場合の理由:
 
 ## 変更内容
 

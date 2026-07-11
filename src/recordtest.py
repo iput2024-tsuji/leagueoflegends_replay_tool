@@ -14,21 +14,19 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from dataclasses import dataclass
-from enum import Enum
+from dataclasses import dataclass, replace
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-import aiohttp
 import obsws_python as obs
 import urllib3
 from obsws_python.error import OBSSDKRequestError
 
 try:
-    from . import config_schema
+    from . import config_schema, storage_policy as _storage_policy
     from .app_paths import get_app_root, get_user_data_root
-    from .champ_select import ChampSelectTracker, champion_name_catalog
+    from .champ_select import ChampSelectTracker
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from .game_events import (
         COMBAT_EVENT_NAMES,
@@ -36,8 +34,7 @@ try:
         champion_kill_role,
         normalize_summoner_name,
     )
-    from .lcu_client import LCUConnectionProvider
-    from .match_metadata import build_match_metadata, merge_live_game_metadata
+    from .match_metadata import merge_live_game_metadata
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
@@ -53,10 +50,18 @@ try:
     from .obs_process import OBSProcessManager
     from .post_game_result import (
         PostGameResult,
-        build_post_game_result,
         normalize_game_result_value,
         normalize_lcu_team,
         opposing_lcu_team,
+    )
+    from .recorder_config import (  # noqa: F401 - compatibility exports
+        AppConfig as RecorderAppConfig,
+        AudioSettings,
+        AudioSlotSettings,
+        OBSSettings,
+        PathsSettings,
+        PollingSettings,
+        StorageSettings,
     )
     from .recording_state import (
         FinalizeResult,
@@ -66,11 +71,13 @@ try:
         RecordingOutcome,
         RecordingPhase,
     )
-    from .session_log import SessionLogV1, load_session_payload, save_session_payload
+    from .riot_api import LiveClientRiotAPIClient, RiotAPIClient, RiotPollResult, RiotPollStatus
+    from .session_log import SessionLogV1, save_session_payload
 except ImportError:
     import config_schema
+    import storage_policy as _storage_policy
     from app_paths import get_app_root, get_user_data_root
-    from champ_select import ChampSelectTracker, champion_name_catalog
+    from champ_select import ChampSelectTracker
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
     from game_events import (
         COMBAT_EVENT_NAMES,
@@ -78,8 +85,7 @@ except ImportError:
         champion_kill_role,
         normalize_summoner_name,
     )
-    from lcu_client import LCUConnectionProvider
-    from match_metadata import build_match_metadata, merge_live_game_metadata
+    from match_metadata import merge_live_game_metadata
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
@@ -95,10 +101,18 @@ except ImportError:
     from obs_process import OBSProcessManager
     from post_game_result import (
         PostGameResult,
-        build_post_game_result,
         normalize_game_result_value,
         normalize_lcu_team,
         opposing_lcu_team,
+    )
+    from recorder_config import (  # noqa: F401 - compatibility exports
+        AppConfig as RecorderAppConfig,
+        AudioSettings,
+        AudioSlotSettings,
+        OBSSettings,
+        PathsSettings,
+        PollingSettings,
+        StorageSettings,
     )
     from recording_state import (
         FinalizeResult,
@@ -108,7 +122,8 @@ except ImportError:
         RecordingOutcome,
         RecordingPhase,
     )
-    from session_log import SessionLogV1, load_session_payload, save_session_payload
+    from riot_api import LiveClientRiotAPIClient, RiotAPIClient, RiotPollResult, RiotPollStatus
+    from session_log import SessionLogV1, save_session_payload
 
 ROOT_DIR = get_app_root()
 DATA_DIR = get_user_data_root()
@@ -219,6 +234,21 @@ LEGACY_DATA_BIN_OBS_DIR = (DATA_DIR / LEGACY_OBS_DIR).resolve()
 PORTABLE_OBS_MARKER_NAME = "obs_portable_mode.txt"
 LEGACY_PORTABLE_OBS_MARKER_NAME = "portable_mode.txt"
 MANAGED_AUDIO_INPUTS = config_schema.MANAGED_AUDIO_INPUTS
+
+
+class AppConfig(RecorderAppConfig):
+    """Compatibility facade that honors the patchable managed OBS path."""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> AppConfig:
+        config = RecorderAppConfig.from_dict(data)
+        return cls(
+            obs=replace(config.obs, obs_dir=MANAGED_PORTABLE_OBS_DIR),
+            paths=config.paths,
+            polling=config.polling,
+            storage=config.storage,
+            audio=config.audio,
+        )
 
 LOG_DIR = DATA_DIR / "logs"
 LOGGER = logging.getLogger("lol_replay")
@@ -332,287 +362,12 @@ def ensure_obs_password_value(value: Any) -> tuple[str, bool]:
     return str(value).strip(), False
 
 
-class RiotPollStatus(str, Enum):
-    IN_GAME = "in_game"
-    NOT_IN_GAME = "not_in_game"
-    TEMPORARY_FAILURE = "temporary_failure"
-
-
-@dataclass(frozen=True)
-class RiotPollResult:
-    status: RiotPollStatus
-    payload: dict[str, Any] | None = None
-    error: str | None = None
-
-
-@dataclass(frozen=True)
-class OBSSettings:
-    host: str
-    port: int
-    password: str
-    scene_name: str
-    source_name: str
-    source_color: int
-    window_capture_name: str
-    window_capture_window: str
-    window_capture_method: int
-    fps_numerator: int
-    fps_denominator: int
-    base_width: int
-    base_height: int
-    output_width: int
-    output_height: int
-    scale_type: str
-    recording_quality: str
-    recording_encoder: str
-    obs_dir: Path
-
-    @property
-    def fps(self) -> float:
-        return self.fps_numerator / self.fps_denominator
-
-    @property
-    def game_capture_name(self) -> str:
-        return self.window_capture_name
-
-    @property
-    def game_capture_window(self) -> str:
-        return self.window_capture_window
-
-
-@dataclass(frozen=True)
-class PathsSettings:
-    bin_dir: Path
-    recordings_dir: Path
-    json_dir: Path
-    champion_icons_dir: Path
-    champion_aliases_path: Path
-
-
-@dataclass(frozen=True)
-class PollingSettings:
-    end_error_limit: int
-    end_missing_grace_sec: float
-    end_temporary_failure_grace_sec: float
-    end_poll_sec: float
-    event_poll_sec: float
-
-
-@dataclass(frozen=True)
-class StorageSettings:
-    max_size_gb: float
-    max_size_bytes: int | None
-
-
-@dataclass(frozen=True)
-class AudioSlotSettings:
-    input_name: str
-    device_id: str
-    device_name: str
-    volume_db: float
-    mute: bool
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "input_name": self.input_name,
-            "device_id": self.device_id,
-            "device_name": self.device_name,
-            "volume_db": self.volume_db,
-            "mute": self.mute,
-        }
-
-
 @dataclass(frozen=True)
 class OBSRecordingEncoderSelection:
     profile_value: str
     encoder_kind: str
     display_name: str
     hardware: bool
-
-
-@dataclass(frozen=True)
-class AudioSettings:
-    mic: AudioSlotSettings
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"mic": self.mic.to_dict()}
-
-
-@dataclass(frozen=True)
-class AppConfig:
-    obs: OBSSettings
-    paths: PathsSettings
-    polling: PollingSettings
-    storage: StorageSettings
-    audio: AudioSettings
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> AppConfig:
-        source = data if isinstance(data, dict) else {}
-        obs_cfg = source.get("obs", {}) if isinstance(source.get("obs", {}), dict) else {}
-        paths_cfg = source.get("paths", {}) if isinstance(source.get("paths", {}), dict) else {}
-        polling_cfg = source.get("polling", {}) if isinstance(source.get("polling", {}), dict) else {}
-        storage_cfg = source.get("storage", {}) if isinstance(source.get("storage", {}), dict) else {}
-
-        source_color, _ = parse_obs_source_color(
-            obs_cfg.get("source_color"),
-            default=DEFAULT_OBS_SOURCE_COLOR,
-        )
-        legacy_fps = obs_cfg.get("fps")
-        fps_numerator, _ = _safe_int(
-            obs_cfg.get("fps_numerator", legacy_fps),
-            DEFAULT_OBS_FPS_NUMERATOR,
-            minimum=1,
-            maximum=MAX_OBS_FPS_NUMERATOR,
-        )
-        fps_denominator, _ = _safe_int(
-            obs_cfg.get("fps_denominator"),
-            DEFAULT_OBS_FPS_DENOMINATOR,
-            minimum=1,
-            maximum=MAX_OBS_FPS_DENOMINATOR,
-        )
-        base_width, _ = _safe_int(obs_cfg.get("base_width"), DEFAULT_OBS_BASE_WIDTH, minimum=64, maximum=4096)
-        base_height, _ = _safe_int(obs_cfg.get("base_height"), DEFAULT_OBS_BASE_HEIGHT, minimum=64, maximum=4096)
-        output_width, _ = _safe_int(obs_cfg.get("output_width"), DEFAULT_OBS_OUTPUT_WIDTH, minimum=64, maximum=4096)
-        output_height, _ = _safe_int(obs_cfg.get("output_height"), DEFAULT_OBS_OUTPUT_HEIGHT, minimum=64, maximum=4096)
-        if base_width % 2:
-            base_width = DEFAULT_OBS_BASE_WIDTH
-        if base_height % 2:
-            base_height = DEFAULT_OBS_BASE_HEIGHT
-        if output_width % 2:
-            output_width = DEFAULT_OBS_OUTPUT_WIDTH
-        if output_height % 2:
-            output_height = DEFAULT_OBS_OUTPUT_HEIGHT
-        scale_type = str(obs_cfg.get("scale_type") or DEFAULT_OBS_SCALE_TYPE).strip().lower()
-        if scale_type not in VALID_OBS_SCALE_TYPES:
-            scale_type = DEFAULT_OBS_SCALE_TYPE
-        quality_lookup = {value.lower(): value for value in VALID_OBS_RECORDING_QUALITIES}
-        recording_quality = quality_lookup.get(
-            str(obs_cfg.get("recording_quality") or DEFAULT_OBS_RECORDING_QUALITY).strip().lower(),
-            DEFAULT_OBS_RECORDING_QUALITY,
-        )
-        recording_encoder = str(obs_cfg.get("recording_encoder") or DEFAULT_OBS_RECORDING_ENCODER).strip().lower()
-        if recording_encoder not in VALID_OBS_RECORDING_ENCODERS:
-            recording_encoder = DEFAULT_OBS_RECORDING_ENCODER
-        port, _ = _safe_int(obs_cfg.get("port"), DEFAULT_OBS_PORT, minimum=1, maximum=65535)
-        window_capture_method, _ = _safe_int(
-            obs_cfg.get("window_capture_method"),
-            DEFAULT_OBS_WINDOW_CAPTURE_METHOD,
-            minimum=0,
-            maximum=2,
-        )
-        window_capture_name = normalize_window_capture_source_name(
-            obs_cfg.get("window_capture_name"),
-            legacy_value=obs_cfg.get("game_capture_name"),
-        )
-        window_capture_window = normalize_window_capture_window_selector(
-            obs_cfg.get("window_capture_window"),
-            legacy_value=obs_cfg.get("game_capture_window"),
-        )
-        end_limit, _ = _safe_int(
-            polling_cfg.get("end_error_limit"),
-            DEFAULT_END_ERROR_LIMIT,
-            minimum=1,
-        )
-        end_missing_grace, _ = _safe_float(
-            polling_cfg.get("end_missing_grace_sec"),
-            DEFAULT_END_MISSING_GRACE_SEC,
-            minimum=0.0,
-        )
-        end_temporary_failure_grace, _ = _safe_float(
-            polling_cfg.get("end_temporary_failure_grace_sec"),
-            DEFAULT_END_TEMPORARY_FAILURE_GRACE_SEC,
-            minimum=0.0,
-        )
-        end_poll, _ = _safe_float(
-            polling_cfg.get("end_poll_sec"),
-            DEFAULT_END_POLL_SEC,
-            minimum=0.1,
-        )
-        event_poll, _ = _safe_float(
-            polling_cfg.get("event_poll_sec"),
-            DEFAULT_EVENT_POLL_SEC,
-            minimum=0.1,
-        )
-        max_size_gb, _ = _safe_float(
-            storage_cfg.get("max_size_gb"),
-            DEFAULT_MAX_STORAGE_GB,
-            minimum=0.1,
-        )
-
-        recordings_dir = resolve_path(paths_cfg.get("recordings_dir", DEFAULT_RECORDINGS_DIR), DATA_DIR)
-        json_dir = resolve_path(paths_cfg.get("json_dir", DEFAULT_JSON_DIR), DATA_DIR)
-        if json_dir is None and recordings_dir is not None:
-            json_dir = recordings_dir / "json"
-        bin_dir = resolve_path(paths_cfg.get("bin_dir", DEFAULT_BIN_DIR), DATA_DIR)
-        icons_dir = resolve_path(paths_cfg.get("champion_icons_dir", DEFAULT_CHAMPION_ICONS_DIR), DATA_DIR)
-        aliases_path = resolve_path(paths_cfg.get("champion_aliases_path", DEFAULT_CHAMPION_ALIASES_PATH), DATA_DIR)
-
-        if recordings_dir is None:
-            recordings_dir = (DATA_DIR / DEFAULT_RECORDINGS_DIR).resolve()
-        if json_dir is None:
-            json_dir = (recordings_dir / "json").resolve()
-        if bin_dir is None:
-            bin_dir = (DATA_DIR / DEFAULT_BIN_DIR).resolve()
-        if icons_dir is None:
-            icons_dir = (DATA_DIR / DEFAULT_CHAMPION_ICONS_DIR).resolve()
-        if aliases_path is None:
-            aliases_path = (DATA_DIR / DEFAULT_CHAMPION_ALIASES_PATH).resolve()
-
-        normalized_storage_cfg = dict(storage_cfg)
-        normalized_storage_cfg["max_size_gb"] = max_size_gb
-
-        return cls(
-            obs=OBSSettings(
-                host=str(obs_cfg.get("host") or DEFAULT_OBS_HOST),
-                port=port,
-                password=ensure_obs_password_value(obs_cfg.get("password"))[0],
-                scene_name=str(obs_cfg.get("scene_name") or DEFAULT_OBS_SCENE_NAME),
-                source_name=str(obs_cfg.get("source_name") or DEFAULT_OBS_SOURCE_NAME),
-                source_color=source_color,
-                window_capture_name=window_capture_name,
-                window_capture_window=window_capture_window,
-                window_capture_method=window_capture_method,
-                fps_numerator=fps_numerator,
-                fps_denominator=fps_denominator,
-                base_width=base_width,
-                base_height=base_height,
-                output_width=output_width,
-                output_height=output_height,
-                scale_type=scale_type,
-                recording_quality=recording_quality,
-                recording_encoder=recording_encoder,
-                obs_dir=MANAGED_PORTABLE_OBS_DIR,
-            ),
-            paths=PathsSettings(
-                bin_dir=bin_dir,
-                recordings_dir=recordings_dir,
-                json_dir=json_dir,
-                champion_icons_dir=icons_dir,
-                champion_aliases_path=aliases_path,
-            ),
-            polling=PollingSettings(
-                end_error_limit=end_limit,
-                end_missing_grace_sec=end_missing_grace,
-                end_temporary_failure_grace_sec=end_temporary_failure_grace,
-                end_poll_sec=end_poll,
-                event_poll_sec=event_poll,
-            ),
-            storage=StorageSettings(
-                max_size_gb=max_size_gb,
-                max_size_bytes=parse_max_storage_bytes(normalized_storage_cfg),
-            ),
-            audio=AudioSettings(
-                mic=_audio_slot_from_config(source, "mic"),
-            ),
-        )
-
-    @classmethod
-    def load(cls) -> AppConfig:
-        return cls.from_dict(load_settings())
-
-    def audio_to_dict(self) -> dict[str, Any]:
-        return {"audio": self.audio.to_dict()}
 
 
 class OBSClient(ABC):
@@ -677,50 +432,6 @@ class OBSClient(ABC):
 
     @abstractmethod
     def shutdown(self) -> None:
-        pass
-
-
-class RiotAPIClient(ABC):
-    """LoL Live Client APIとLCU APIの取得・パースを担当する。"""
-
-    @abstractmethod
-    async def get_active_player_name(self) -> str | None:
-        pass
-
-    @abstractmethod
-    async def get_event_data(self) -> dict[str, Any] | None:
-        pass
-
-    @abstractmethod
-    async def get_all_game_data(self) -> dict[str, Any] | None:
-        pass
-
-    @abstractmethod
-    async def get_all_game_data_result(self) -> RiotPollResult:
-        pass
-
-    @abstractmethod
-    async def get_champ_select_session_result(self) -> RiotPollResult:
-        pass
-
-    @abstractmethod
-    async def get_champion_catalog(self) -> dict[int, str]:
-        pass
-
-    @abstractmethod
-    async def get_gameflow_phase_result(self) -> RiotPollResult:
-        pass
-
-    @abstractmethod
-    async def get_match_metadata(self) -> dict[str, Any]:
-        pass
-
-    @abstractmethod
-    async def get_post_game_result(
-        self,
-        player_name: str | None = None,
-        player_team: Any | None = None,
-    ) -> RiotPollResult:
         pass
 
 
@@ -2459,217 +2170,32 @@ def setup_environment(config: AppConfig) -> None:
 
 
 def parse_max_storage_bytes(storage_cfg: dict[str, Any]) -> int | None:
-    max_bytes = storage_cfg.get("max_size_bytes")
-    if isinstance(max_bytes, (int, float)) and max_bytes > 0:
-        return int(max_bytes)
-    max_gb = storage_cfg.get("max_size_gb", DEFAULT_MAX_STORAGE_GB)
-    if isinstance(max_gb, (int, float)) and max_gb > 0:
-        return int(float(max_gb) * 1024 * 1024 * 1024)
-    max_mb = storage_cfg.get("max_size_mb")
-    if isinstance(max_mb, (int, float)) and max_mb > 0:
-        return int(float(max_mb) * 1024 * 1024)
-    return None
+    return _storage_policy.parse_max_storage_bytes(storage_cfg, DEFAULT_MAX_STORAGE_GB)
 
 
-def is_within(child: str | Path, parent: str | Path) -> bool:
-    try:
-        child.resolve().relative_to(parent.resolve())
-        return True
-    except Exception:
-        return False
-
-
-def _safe_path_exists(path: str | Path) -> bool:
-    try:
-        return Path(path).exists()
-    except Exception:
-        return False
-
-
-def _safe_path_is_file(path: str | Path) -> bool:
-    try:
-        return Path(path).is_file()
-    except Exception:
-        return False
-
-
-def _safe_path_resolve(path: str | Path) -> Path | None:
-    try:
-        return Path(path).resolve()
-    except Exception:
-        return None
-
-
-def _safe_path_mtime(path: str | Path) -> float | None:
-    try:
-        return Path(path).stat().st_mtime
-    except Exception:
-        return None
-
-
-def _safe_glob(path: str | Path, pattern: str) -> tuple[Path, ...]:
-    try:
-        return tuple(Path(path).glob(pattern))
-    except Exception:
-        return ()
-
-
-def get_dir_size(path: str | Path) -> int:
-    path = Path(path)
-    total = 0
-    try:
-        for item in path.rglob("*"):
-            if _safe_path_is_file(item):
-                try:
-                    total += item.stat().st_size
-                except Exception:
-                    continue
-    except Exception:
-        return 0
-    return total
+is_within = _storage_policy.is_within
+get_dir_size = _storage_policy.get_dir_size
+parse_saved_at = _storage_policy.parse_saved_at
 
 
 def total_storage_size(config: AppConfig | None = None) -> int:
-    config = config or load_app_config()
-    roots = []
-    roots.append(Path(config.paths.recordings_dir))
-    json_path = Path(config.paths.json_dir)
-    if not roots or not is_within(json_path, roots[0]):
-        roots.append(json_path)
-    return sum(get_dir_size(root) for root in roots if _safe_path_exists(root))
-
-
-def parse_saved_at(value: Any) -> float | None:
-    if not value:
-        return None
-    try:
-        return time.mktime(time.strptime(value, "%Y-%m-%d %H:%M:%S"))
-    except Exception:
-        return None
+    return _storage_policy.total_storage_size(config or load_app_config())
 
 
 def load_json_metadata(path: str | Path, config: AppConfig | None = None) -> tuple[float | None, Path | None]:
-    path = Path(path)
-    config = config or load_app_config()
-    try:
-        data = load_session_payload(path)
-        saved_at = parse_saved_at(data.get("saved_at"))
-        video_path = data.get("obs_record_path")
-        if not video_path:
-            return saved_at, None
-
-        raw_path = Path(str(video_path))
-        candidates = []
-        if raw_path.is_absolute():
-            candidates.append(raw_path)
-        else:
-            candidates.append(path.parent / raw_path)
-            candidates.append(Path(config.paths.recordings_dir) / raw_path.name)
-
-        for candidate in candidates:
-            if _safe_path_exists(candidate):
-                return saved_at, candidate
-        if candidates:
-            return saved_at, candidates[-1]
-        return saved_at, raw_path
-    except Exception:
-        return None, None
+    return _storage_policy.load_json_metadata(path, config or load_app_config())
 
 
 def is_app_owned_video_path(path: str | Path | None, config: AppConfig) -> bool:
-    if not path:
-        return False
-    try:
-        video_path = Path(path).resolve()
-        recordings_dir = Path(config.paths.recordings_dir).resolve()
-    except Exception:
-        return False
-    if not is_within(video_path, recordings_dir):
-        return False
-    return video_path.suffix.lower() in {".mp4", ".mkv", ".flv", ".mov", ".avi"}
+    return _storage_policy.is_app_owned_video_path(path, config)
 
 
 def find_app_owned_clip_paths(video_path: str | Path | None, config: AppConfig) -> tuple[Path, ...]:
-    if not video_path:
-        return ()
-    try:
-        source = Path(video_path).resolve()
-        recordings_dir = Path(config.paths.recordings_dir).resolve()
-        clips_dir = (Path(config.paths.recordings_dir) / "clips").resolve()
-    except Exception:
-        return ()
-    if not is_within(source, recordings_dir) or source.suffix.lower() not in {".mp4", ".mkv", ".flv", ".mov", ".avi"}:
-        return ()
-    if not _safe_path_exists(clips_dir):
-        return ()
-
-    matches = []
-    for candidate in _safe_glob(clips_dir, f"{source.stem}_clip_*"):
-        try:
-            resolved = candidate.resolve()
-        except Exception:
-            continue
-        if (
-            _safe_path_is_file(resolved)
-            and is_within(resolved, clips_dir)
-            and resolved.suffix.lower() in {".mp4", ".mkv", ".flv", ".mov", ".avi"}
-        ):
-            matches.append(resolved)
-    return tuple(sorted(matches))
+    return _storage_policy.find_app_owned_clip_paths(video_path, config)
 
 
 def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str | Path] | None = None) -> None:
-    config = config or load_app_config()
-    if not config.storage.max_size_bytes:
-        return
-
-    keep_paths = {resolved for path in keep_paths or [] if path and (resolved := _safe_path_resolve(path))}
-    total = total_storage_size(config)
-    if total <= config.storage.max_size_bytes:
-        return
-
-    if _safe_path_exists(config.paths.json_dir):
-        entries = []
-        for json_path in _safe_glob(config.paths.json_dir, "*.json"):
-            saved_at, video_path = load_json_metadata(json_path, config)
-            ts = saved_at if saved_at else (_safe_path_mtime(json_path) or 0.0)
-            entries.append((ts, json_path, video_path))
-        entries.sort(key=lambda item: item[0])
-
-        for _, json_path, video_path in entries:
-            resolved_json_path = _safe_path_resolve(json_path)
-            if resolved_json_path in keep_paths:
-                continue
-            try:
-                clip_paths = find_app_owned_clip_paths(video_path, config)
-                resolved_video_path = _safe_path_resolve(video_path) if video_path else None
-                if (
-                    video_path
-                    and _safe_path_exists(video_path)
-                    and resolved_video_path not in keep_paths
-                    and is_app_owned_video_path(video_path, config)
-                ):
-                    video_path.unlink(missing_ok=True)
-                for clip_path in clip_paths:
-                    resolved_clip_path = _safe_path_resolve(clip_path)
-                    if resolved_clip_path not in keep_paths:
-                        clip_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            try:
-                json_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            total = total_storage_size(config)
-            if total <= config.storage.max_size_bytes:
-                return
-
-    if total > config.storage.max_size_bytes:
-        LOGGER.warning(
-            "Storage limit is still exceeded after deleting app-owned sessions. "
-            "Untracked files under recordings_dir were left untouched: %s",
-            config.paths.recordings_dir,
-        )
+    _storage_policy.enforce_storage_limit(config or load_app_config(), keep_paths)
 
 
 def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
@@ -2850,188 +2376,6 @@ def build_output_path(config: AppConfig) -> Path:
 
 def save_payload(path: str | Path, payload: dict[str, Any]) -> None:
     save_session_payload(path, payload)
-
-
-class LiveClientRiotAPIClient(RiotAPIClient):
-    """aiohttpでLive Client APIとLCU APIを取得する本番用クライアント。"""
-
-    def __init__(
-        self,
-        session_factory: Callable[..., Any] | None = None,
-        lcu_connection_provider: LCUConnectionProvider | None = None,
-    ) -> None:
-        self.session_factory = session_factory or aiohttp.ClientSession
-        self.lcu_connection_provider = lcu_connection_provider or LCUConnectionProvider()
-        self._champion_catalog: dict[int, str] = {}
-        self._queue_catalog: list[dict[str, Any]] = []
-
-    async def _fetch_result(self, url: str, timeout_sec: float) -> RiotPollResult:
-        timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
-        try:
-            async with self.session_factory(timeout=timeout) as session:
-                async with session.get(url, ssl=False) as response:
-                    response.raise_for_status()
-                    try:
-                        data = await response.json(content_type=None)
-                    except Exception:
-                        text = await response.text()
-                        data = text.strip().replace('"', "")
-                    if isinstance(data, dict):
-                        return RiotPollResult(RiotPollStatus.IN_GAME, payload=data)
-                    return RiotPollResult(RiotPollStatus.IN_GAME, payload={"value": data})
-        except aiohttp.ClientResponseError as e:
-            if e.status in {404, 410}:
-                return RiotPollResult(RiotPollStatus.NOT_IN_GAME, error=str(e))
-            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
-        except (
-            aiohttp.ClientConnectionError,
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            OSError,
-        ) as e:
-            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
-
-    async def _fetch(self, url: str, timeout_sec: float) -> Any:
-        result = await self._fetch_result(url, timeout_sec)
-        if result.status != RiotPollStatus.IN_GAME:
-            return None
-        if result.payload and set(result.payload.keys()) == {"value"}:
-            return result.payload["value"]
-        return result.payload
-
-    async def get_active_player_name(self) -> str | None:
-        return await self._fetch(ACTIVE_PLAYER_URL, timeout_sec=5)
-
-    async def get_event_data(self) -> dict[str, Any] | None:
-        data = await self._fetch(EVENT_URL, timeout_sec=5)
-        return data if isinstance(data, dict) else None
-
-    async def get_all_game_data(self) -> dict[str, Any] | None:
-        data = await self._fetch(ALL_GAME_URL, timeout_sec=1)
-        return data if isinstance(data, dict) else None
-
-    async def get_all_game_data_result(self) -> RiotPollResult:
-        result = await self._fetch_result(ALL_GAME_URL, timeout_sec=1)
-        if result.status != RiotPollStatus.IN_GAME:
-            return result
-        if isinstance(result.payload, dict) and "gameData" in result.payload:
-            return result
-        return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error="Unexpected allgamedata payload")
-
-    async def _fetch_lcu_result(self, path: str, timeout_sec: float = 1.0) -> RiotPollResult:
-        connection = await asyncio.to_thread(self.lcu_connection_provider.get_connection_info)
-        if connection is None:
-            return RiotPollResult(RiotPollStatus.NOT_IN_GAME)
-
-        timeout = aiohttp.ClientTimeout(total=float(timeout_sec))
-        url = f"{connection.base_url}{path}"
-        try:
-            async with self.session_factory(timeout=timeout) as session:
-                async with session.get(
-                    url,
-                    auth=aiohttp.BasicAuth("riot", connection.password),
-                    ssl=False,
-                ) as response:
-                    response.raise_for_status()
-                    data = await response.json(content_type=None)
-                    if isinstance(data, dict):
-                        return RiotPollResult(RiotPollStatus.IN_GAME, payload=data)
-                    return RiotPollResult(RiotPollStatus.IN_GAME, payload={"value": data})
-        except aiohttp.ClientResponseError as e:
-            if e.status in {401, 403}:
-                self.lcu_connection_provider.invalidate()
-                return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
-            if e.status in {404, 410}:
-                return RiotPollResult(RiotPollStatus.NOT_IN_GAME, error=str(e))
-            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
-        except (
-            aiohttp.ClientConnectionError,
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            OSError,
-        ) as e:
-            self.lcu_connection_provider.invalidate()
-            return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error=str(e))
-
-    async def get_champ_select_session_result(self) -> RiotPollResult:
-        result = await self._fetch_lcu_result(LCU_CHAMP_SELECT_PATH)
-        if result.status != RiotPollStatus.IN_GAME:
-            return result
-        if isinstance(result.payload, dict) and "actions" in result.payload:
-            return result
-        return RiotPollResult(RiotPollStatus.TEMPORARY_FAILURE, error="Unexpected champ-select payload")
-
-    async def get_champion_catalog(self) -> dict[int, str]:
-        if self._champion_catalog:
-            return dict(self._champion_catalog)
-        result = await self._fetch_lcu_result(LCU_CHAMPION_SUMMARY_PATH, timeout_sec=2.0)
-        if result.status != RiotPollStatus.IN_GAME or not isinstance(result.payload, dict):
-            return {}
-        catalog = champion_name_catalog(result.payload.get("value"))
-        if catalog:
-            self._champion_catalog = catalog
-        return dict(catalog)
-
-    async def get_gameflow_phase_result(self) -> RiotPollResult:
-        result = await self._fetch_lcu_result(LCU_GAMEFLOW_PHASE_PATH, timeout_sec=1.0)
-        if result.status != RiotPollStatus.IN_GAME or not isinstance(result.payload, dict):
-            return result
-
-        phase = _first_mapping_value(result.payload, "phase", "value")
-        if phase == "":
-            return RiotPollResult(
-                RiotPollStatus.TEMPORARY_FAILURE,
-                error="Unexpected gameflow phase payload",
-            )
-        return RiotPollResult(
-            RiotPollStatus.IN_GAME,
-            payload={"phase": str(phase) if phase is not None else "None"},
-        )
-
-    async def get_match_metadata(self) -> dict[str, Any]:
-        session_result = await self._fetch_lcu_result(LCU_GAMEFLOW_SESSION_PATH, timeout_sec=1.5)
-        if session_result.status != RiotPollStatus.IN_GAME or not isinstance(session_result.payload, dict):
-            return {}
-
-        if not self._queue_catalog:
-            queue_result = await self._fetch_lcu_result(LCU_GAME_QUEUES_PATH, timeout_sec=2.0)
-            if queue_result.status == RiotPollStatus.IN_GAME and isinstance(queue_result.payload, dict):
-                value = queue_result.payload.get("value")
-                if isinstance(value, list):
-                    self._queue_catalog = [dict(item) for item in value if isinstance(item, dict)]
-
-        return build_match_metadata(session_result.payload, self._queue_catalog)
-
-    async def get_post_game_result(
-        self,
-        player_name: str | None = None,
-        player_team: Any | None = None,
-    ) -> RiotPollResult:
-        status = RiotPollStatus.NOT_IN_GAME
-        errors: list[str] = []
-        candidates = (
-            (LCU_END_OF_GAME_STATS_PATH, "lcu_end_of_game"),
-            (LCU_GAMECLIENT_END_OF_GAME_STATS_PATH, "lcu_gameclient_end_of_game"),
-            (LCU_GAMEFLOW_SESSION_PATH, "lcu_gameflow_session"),
-        )
-        for path, source in candidates:
-            result = await self._fetch_lcu_result(path, timeout_sec=1.5)
-            if result.status == RiotPollStatus.TEMPORARY_FAILURE:
-                status = RiotPollStatus.TEMPORARY_FAILURE
-            if result.error:
-                errors.append(result.error)
-            if result.status != RiotPollStatus.IN_GAME or not isinstance(result.payload, dict):
-                continue
-            post_game = build_post_game_result(
-                result.payload,
-                player_name=player_name,
-                player_team=player_team,
-                source=source,
-            )
-            if post_game.has_result:
-                return RiotPollResult(RiotPollStatus.IN_GAME, payload=post_game.to_payload())
-
-        return RiotPollResult(status, error="; ".join(errors) if errors else "Post-game result unavailable")
 
 
 class ObsWebSocketClient(OBSClient):

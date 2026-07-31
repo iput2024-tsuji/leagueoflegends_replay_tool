@@ -962,7 +962,13 @@ def test_final_pe_is_derived_from_locked_bootloader(monkeypatch, tmp_path):
 @pytest.mark.skipif(os.name != "nt", reason="PE resource construction is Windows-only")
 @pytest.mark.parametrize(
     "tamper",
-    ["text", "manifest", "resource-padding", "overlay"],
+    [
+        "text",
+        "manifest",
+        "resource-internal-padding",
+        "resource-padding",
+        "overlay",
+    ],
 )
 def test_final_pe_rejects_code_resource_and_overlay_tampering(
     monkeypatch,
@@ -993,6 +999,32 @@ def test_final_pe_rejects_code_resource_and_overlay_tampering(
         )
         record = manifest_entry.directory.entries[0].directory.entries[0].data.struct
         offset = pe.get_offset_from_rva(record.OffsetToData)
+        pe.close()
+    elif tamper == "resource-internal-padding":
+        pe = pefile.PE(str(executable))
+        payload_ranges = sorted(
+            (
+                pe.get_offset_from_rva(language_entry.data.struct.OffsetToData),
+                pe.get_offset_from_rva(language_entry.data.struct.OffsetToData)
+                + language_entry.data.struct.Size,
+            )
+            for type_entry in pe.DIRECTORY_ENTRY_RESOURCE.entries
+            for name_entry in type_entry.directory.entries
+            for language_entry in name_entry.directory.entries
+        )
+        offset = None
+        for (_previous_start, previous_end), (next_start, _next_end) in zip(
+            payload_ranges,
+            payload_ranges[1:],
+            strict=False,
+        ):
+            padding_size = next_start - previous_end
+            if 1 <= padding_size <= 3:
+                padding = bytes(pe.__data__[previous_end:next_start])
+                assert padding == b"PADDING"[:padding_size]
+                offset = previous_end
+                break
+        assert offset is not None
         pe.close()
     elif tamper == "resource-padding":
         pe = pefile.PE(str(executable))

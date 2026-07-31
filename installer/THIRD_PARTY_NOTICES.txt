@@ -26,7 +26,9 @@ OBS Studio と Gyan.dev の FFmpeg は、このインストーラーには含ま
 別途取得します。libmpv DLL も同梱されず、利用者が別途用意します。
 
 新しい公開 Release は、OBS Studio と Gyan.dev FFmpeg の自動取得に
-関する法的確認が完了するまで行いません。
+関する法的確認、および撤回済み v0.5.2 の履歴資料と遡及対応に関する
+専門家確認が完了するまで行いません。v0.5.2 の SHA-256 は撤回済み
+バイナリの履歴識別情報に限られ、元の Actions 成果物は残っていません。
 
 Third-party software and license notice
 
@@ -49,4 +51,7 @@ features are first needed. A libmpv DLL is also not included and must be
 supplied by the user.
 
 No new public Release will be made until the legal review of the automatic
-OBS Studio and Gyan.dev FFmpeg downloads is complete.
+OBS Studio and Gyan.dev FFmpeg downloads, and specialist review of the
+withdrawn v0.5.2 historical materials and retrospective remediation, are
+complete. A v0.5.2 SHA-256 is only a historical identifier for the withdrawn
+binary; its original Actions artifact is no longer retained.

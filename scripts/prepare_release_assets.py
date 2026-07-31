@@ -3,23 +3,34 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
+import email.parser
 import hashlib
 import json
 import os
+import platform
 import re
 import stat
+import sys
+import urllib.parse
 import urllib.request
 import zipfile
 from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
-from scripts.collect_licenses import COMPONENTS_FILE
+from scripts.collect_licenses import (
+    COMPONENTS_FILE,
+    canonicalize_distribution_name,
+    probe_python_native_runtime,
+)
 
 MAX_GITHUB_ASSET_SIZE = 2_000_000_000
 TARGET_SOURCE_PART_SIZE = 1_500_000_000
 COPY_BUFFER_SIZE = 1024 * 1024
 VERSION_PATTERN = re.compile(r"\d+\.\d+\.\d+(?:\.\d+)?")
+PYTHON_PACKAGE_VERSION_PATTERN = re.compile(r"\d+(?:\.\d+){1,3}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40,64}")
 WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:")
@@ -35,6 +46,28 @@ LICENSE_ROOT_FILES = (
     "SOURCE_OFFER.md",
     "THIRD_PARTY_NOTICES.md",
     "VERSION",
+)
+REQUIRED_RELEASE_BINARY_COMPONENTS = frozenset(
+    {
+        "aiohttp",
+        "charset-normalizer",
+        "frozenlist",
+        "multidict",
+        "numpy",
+        "opencv-python",
+        "pandas",
+        "pillow",
+        "propcache",
+        "pyinstaller",
+        "pyqt6",
+        "pyqt6-sip",
+        "qt",
+        "ruff",
+        "scikit-learn",
+        "scipy",
+        "setuptools-vendored-runtime",
+        "yarl",
+    }
 )
 
 
@@ -156,8 +189,516 @@ def _source_exception_reviewed(component: dict[str, Any]) -> bool:
     )
 
 
+def _license_materials_exception_reviewed(component: dict[str, Any]) -> bool:
+    exception = component.get("license_materials_exception")
+    return bool(
+        isinstance(exception, dict)
+        and isinstance(exception.get("reason"), str)
+        and exception["reason"].strip()
+        and _completed_review(component, "license_materials_exception")
+    )
+
+
+def _has_native_artifacts(component: dict[str, Any]) -> bool:
+    return any(
+        re.search(r"\.(?:dll|pyd|exe)(?:\*|$)", str(pattern), re.IGNORECASE)
+        for pattern in component.get("artifact_patterns", [])
+    )
+
+
+def _binary_archive_required(component: dict[str, Any]) -> bool:
+    return bool(component.get("distribution")) and (
+        _has_native_artifacts(component)
+        or component.get("component")
+        in {"pyinstaller", "ruff", "setuptools-vendored-runtime"}
+    )
+
+
+def _release_binary_policy_errors(lock: dict[str, Any]) -> list[str]:
+    policy = lock.get("release_binary_policy")
+    if not isinstance(policy, dict):
+        return ["release_binary_policy: required binary set is missing"]
+    errors: list[str] = []
+    raw_required = policy.get("required_components")
+    if not isinstance(raw_required, list) or not all(
+        isinstance(item, str) and item for item in raw_required
+    ):
+        errors.append("release_binary_policy: required_components is invalid")
+        required: set[str] = set()
+    else:
+        required = set(raw_required)
+        if len(required) != len(raw_required):
+            errors.append("release_binary_policy: required_components contains duplicates")
+    if required != REQUIRED_RELEASE_BINARY_COMPONENTS:
+        errors.append(
+            "release_binary_policy: required component set differs from the "
+            "audited native/build set"
+        )
+    inferred = {
+        str(component.get("component"))
+        for component in _component_entries(lock)
+        if _binary_archive_required(component)
+    }
+    if inferred != required:
+        errors.append(
+            "release_binary_policy: required component set differs from "
+            "component artifact metadata"
+        )
+    release_python = str(lock.get("python", {}).get("release_version", ""))
+    expected_abi = "cp" + "".join(release_python.split(".")[:2])
+    expected_fields = {
+        "python_implementation": "CPython",
+        "python_version": release_python,
+        "abi": expected_abi,
+        "platform": "win_amd64",
+    }
+    for field, expected in expected_fields.items():
+        if policy.get(field) != expected:
+            errors.append(
+                f"release_binary_policy: {field} must be {expected!r}"
+            )
+    pip_version = policy.get("pip_version")
+    if not isinstance(pip_version, str) or PYTHON_PACKAGE_VERSION_PATTERN.fullmatch(
+        pip_version
+    ) is None:
+        errors.append("release_binary_policy: pip_version must be an exact version")
+    for component in _component_entries(lock):
+        if component.get("component") in required:
+            errors.extend(_wheel_compatibility_errors(component, policy))
+    return errors
+
+
+def _wheel_compatibility_errors(
+    component: dict[str, Any],
+    policy: dict[str, Any],
+) -> list[str]:
+    component_name = str(component.get("component", "<unknown>"))
+    archive = component.get("binary_archive")
+    if not isinstance(archive, dict):
+        return []
+    filename = archive.get("filename")
+    if not isinstance(filename, str) or not filename.casefold().endswith(".whl"):
+        return []
+    wheel_fields = filename[:-4].rsplit("-", 3)
+    if len(wheel_fields) != 4:
+        return [f"{component_name}: binary wheel filename tags are invalid"]
+    _prefix, python_tag, abi_tag, platform_tag = wheel_fields
+    python_tags = set(python_tag.casefold().split("."))
+    abi_tags = set(abi_tag.casefold().split("."))
+    platform_tags = set(platform_tag.casefold().split("."))
+    expected_abi = str(policy.get("abi", "")).casefold()
+    expected_platform = str(policy.get("platform", "")).casefold()
+    errors: list[str] = []
+    if component_name == "setuptools-vendored-runtime":
+        if not ({"py3"} <= python_tags and "none" in abi_tags and "any" in platform_tags):
+            errors.append(
+                f"{component_name}: universal wheel tags must be py3-none-any"
+            )
+        return errors
+    if expected_platform not in platform_tags:
+        errors.append(
+            f"{component_name}: binary wheel platform does not include "
+            f"{expected_platform}"
+        )
+    if component_name in {"pyinstaller", "qt", "ruff"}:
+        if "py3" not in python_tags or "none" not in abi_tags:
+            errors.append(
+                f"{component_name}: wheel tags must be py3-none for the locked "
+                "release archive"
+            )
+        return errors
+    if "abi3" in abi_tags:
+        expected_match = re.fullmatch(r"cp(\d)(\d+)", expected_abi)
+        compatible = False
+        if expected_match is not None:
+            expected_major = int(expected_match.group(1))
+            expected_minor = int(expected_match.group(2))
+            for tag in python_tags:
+                match = re.fullmatch(r"cp(\d)(\d+)", tag)
+                if (
+                    match is not None
+                    and int(match.group(1)) == expected_major
+                    and int(match.group(2)) <= expected_minor
+                ):
+                    compatible = True
+                    break
+        if not compatible:
+            errors.append(
+                f"{component_name}: abi3 wheel Python tag is incompatible with "
+                f"{expected_abi}"
+            )
+    elif expected_abi not in python_tags or expected_abi not in abi_tags:
+        errors.append(
+            f"{component_name}: binary wheel ABI tags do not match {expected_abi}"
+        )
+    return errors
+
+
+def _locked_archive_errors(
+    component: dict[str, Any],
+    field: str,
+    *,
+    wheel_required: bool = False,
+) -> list[str]:
+    component_name = str(component.get("component", "<unknown>"))
+    archive = component.get(field)
+    if not isinstance(archive, dict):
+        return [f"{component_name}: {field} metadata is missing"]
+    errors: list[str] = []
+    try:
+        filename = _safe_filename(archive.get("filename"))
+    except ReleaseAssetError:
+        errors.append(f"{component_name}: {field}.filename is unsafe or missing")
+        filename = ""
+    if wheel_required and not filename.casefold().endswith(".whl"):
+        errors.append(f"{component_name}: {field} must identify a wheel file")
+    url = archive.get("url")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        errors.append(f"{component_name}: {field}.url must use HTTPS")
+    digest = archive.get("sha256")
+    if not isinstance(digest, str) or SHA256_PATTERN.fullmatch(digest.casefold()) is None:
+        errors.append(f"{component_name}: {field}.sha256 is invalid")
+    size = archive.get("size")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or size >= MAX_GITHUB_ASSET_SIZE
+    ):
+        errors.append(f"{component_name}: {field}.size must be below 2 GiB")
+    contents = archive.get("contents")
+    if contents is not None:
+        if not isinstance(contents, list) or not contents:
+            errors.append(f"{component_name}: {field}.contents must be a non-empty list")
+        else:
+            seen_contents: set[str] = set()
+            for content in contents:
+                if not isinstance(content, dict):
+                    errors.append(f"{component_name}: {field}.contents entry is invalid")
+                    continue
+                try:
+                    content_path = _safe_archive_member(
+                        content.get("path"),
+                        label=f"{field} content for {component_name}",
+                    ).as_posix()
+                except ReleaseAssetError:
+                    errors.append(f"{component_name}: {field}.contents path is unsafe")
+                    continue
+                if content_path.casefold() in seen_contents:
+                    errors.append(
+                        f"{component_name}: {field}.contents path is duplicated: "
+                        f"{content_path}"
+                    )
+                seen_contents.add(content_path.casefold())
+                content_size = content.get("size")
+                content_hash = content.get("sha256")
+                if (
+                    not isinstance(content_size, int)
+                    or isinstance(content_size, bool)
+                    or content_size <= 0
+                    or not isinstance(content_hash, str)
+                    or SHA256_PATTERN.fullmatch(content_hash) is None
+                ):
+                    errors.append(
+                        f"{component_name}: {field}.contents lock is invalid for "
+                        f"{content_path}"
+                    )
+    return errors
+
+
+def _license_material_lock_errors(
+    component: dict[str, Any],
+    *,
+    release_python_version: str,
+) -> list[str]:
+    component_name = str(component.get("component", "<unknown>"))
+    materials = component.get("license_materials")
+    if materials is None:
+        if _license_materials_exception_reviewed(component):
+            return []
+        return [
+            f"{component_name}: exact license materials or a completed reviewed "
+            "exception are missing"
+        ]
+    if not isinstance(materials, list) or not materials:
+        return [f"{component_name}: license_materials must be a non-empty list"]
+    errors: list[str] = []
+    seen: set[str] = set()
+    for material in materials:
+        if not isinstance(material, dict):
+            errors.append(f"{component_name}: invalid license_materials entry")
+            continue
+        try:
+            path = _safe_archive_member(
+                material.get("path"),
+                label=f"license material for {component_name}",
+            ).as_posix()
+        except ReleaseAssetError:
+            errors.append(f"{component_name}: unsafe license material path")
+            continue
+        if path.casefold() in seen:
+            errors.append(f"{component_name}: duplicate license material path: {path}")
+        seen.add(path.casefold())
+        digest = material.get("sha256")
+        version_digests = material.get("sha256_by_python_version")
+        digest_is_valid = bool(
+            isinstance(digest, str)
+            and SHA256_PATTERN.fullmatch(digest.casefold()) is not None
+        )
+        version_digests_are_valid = bool(
+            isinstance(version_digests, dict)
+            and version_digests
+            and release_python_version in version_digests
+            and all(
+                isinstance(version, str)
+                and version.strip()
+                and isinstance(version_digest, str)
+                and SHA256_PATTERN.fullmatch(version_digest.casefold()) is not None
+                for version, version_digest in version_digests.items()
+            )
+        )
+        if digest is not None and version_digests is not None:
+            errors.append(
+                f"{component_name}: license material SHA256 is ambiguous for {path}"
+            )
+        if not digest_is_valid and not version_digests_are_valid:
+            errors.append(
+                f"{component_name}: invalid license material SHA256 for {path}"
+            )
+    return errors
+
+
+def _python_native_profile_errors(lock: dict[str, Any]) -> list[str]:
+    python_lock = lock.get("python")
+    if not isinstance(python_lock, dict):
+        return ["python: component lock is missing"]
+    release_version = str(python_lock.get("release_version", ""))
+    profiles = python_lock.get("windows_native_runtime_profiles")
+    if not isinstance(profiles, dict) or not isinstance(
+        profiles.get(release_version),
+        dict,
+    ):
+        return [
+            f"python: verified Windows native runtime profile is missing for "
+            f"{release_version}"
+        ]
+    profile = profiles[release_version]
+    errors: list[str] = []
+    if profile.get("provenance_verified") is not True:
+        errors.append("python: release native runtime provenance is not verified")
+    for profile_field, label in (
+        ("official_binary_archive", "windows_binary_archive"),
+        ("official_actions_archive", "windows_actions_archive"),
+        ("official_installer", "windows_installer"),
+    ):
+        errors.extend(
+            _locked_archive_errors(
+                {
+                    "component": "python",
+                    label: profile.get(profile_field),
+                },
+                label,
+            )
+        )
+    actions_archive = profile.get("official_actions_archive")
+    if (
+        not isinstance(actions_archive, dict)
+        or not isinstance(actions_archive.get("url"), str)
+        or "github.com/actions/python-versions/releases/download/" not in actions_archive["url"]
+    ):
+        errors.append("python: official Actions archive provenance is invalid")
+    installer = profile.get("official_installer")
+    if (
+        not isinstance(installer, dict)
+        or not isinstance(installer.get("url"), str)
+        or not installer["url"].startswith("https://www.python.org/ftp/python/")
+    ):
+        errors.append("python: official installer provenance is invalid")
+
+    core_inventory = profile.get("core_native_inventory")
+    core_artifacts = (
+        core_inventory.get("artifacts")
+        if isinstance(core_inventory, dict)
+        else None
+    )
+    core_records: list[dict[str, Any]] = []
+    core_paths: set[str] = set()
+    if not isinstance(core_artifacts, list) or not core_artifacts:
+        errors.append("python: core native inventory is missing")
+    else:
+        for artifact in core_artifacts:
+            if not isinstance(artifact, dict):
+                errors.append("python: invalid core native artifact")
+                continue
+            raw_path = artifact.get("path")
+            try:
+                relative = _safe_archive_member(
+                    raw_path,
+                    label="Python core native inventory",
+                )
+            except ReleaseAssetError:
+                errors.append("python: unsafe core native artifact path")
+                continue
+            path = relative.as_posix()
+            if not (
+                len(relative.parts) == 1
+                and relative.suffix.casefold() in {".dll", ".exe"}
+                or len(relative.parts) == 2
+                and relative.parts[0] == "DLLs"
+                and relative.suffix.casefold() in {".dll", ".pyd"}
+            ):
+                errors.append(f"python: invalid core native artifact path: {path}")
+            if path.casefold() in core_paths:
+                errors.append(f"python: duplicate core native artifact path: {path}")
+            core_paths.add(path.casefold())
+            size = artifact.get("size")
+            digest = artifact.get("sha256")
+            if (
+                not isinstance(size, int)
+                or isinstance(size, bool)
+                or size <= 0
+                or not isinstance(digest, str)
+                or SHA256_PATTERN.fullmatch(digest) is None
+            ):
+                errors.append(f"python: invalid core native artifact lock: {path}")
+                continue
+            core_records.append({"path": path, "size": size, "sha256": digest})
+    inventory_digest = hashlib.sha256()
+    for record in sorted(core_records, key=lambda item: str(item["path"])):
+        inventory_digest.update(str(record["path"]).encode("utf-8"))
+        inventory_digest.update(b"\0")
+        inventory_digest.update(str(record["size"]).encode("ascii"))
+        inventory_digest.update(b"\0")
+        inventory_digest.update(str(record["sha256"]).encode("ascii"))
+        inventory_digest.update(b"\n")
+    if isinstance(core_inventory, dict) and (
+        core_inventory.get("file_count") != len(core_records)
+        or core_inventory.get("total_size")
+        != sum(int(item["size"]) for item in core_records)
+        or core_inventory.get("inventory_sha256") != inventory_digest.hexdigest()
+    ):
+        errors.append("python: core native inventory summary differs")
+    stdlib_inventory = profile.get("stdlib_python_sources")
+    if not isinstance(stdlib_inventory, dict) or (
+        not isinstance(stdlib_inventory.get("file_count"), int)
+        or stdlib_inventory.get("file_count", 0) <= 0
+        or not isinstance(stdlib_inventory.get("total_size"), int)
+        or stdlib_inventory.get("total_size", 0) <= 0
+        or not isinstance(stdlib_inventory.get("inventory_sha256"), str)
+        or SHA256_PATTERN.fullmatch(
+            str(stdlib_inventory.get("inventory_sha256", ""))
+        )
+        is None
+        or not isinstance(stdlib_inventory.get("excluded_prefixes"), list)
+    ):
+        errors.append("python: stdlib Python source inventory is invalid")
+    launchers = profile.get("venv_launchers")
+    if not isinstance(launchers, list) or {
+        item.get("kind") for item in launchers if isinstance(item, dict)
+    } != {"console", "windows"} or any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("size"), int)
+        or item.get("size", 0) <= 0
+        or not isinstance(item.get("sha256"), str)
+        or SHA256_PATTERN.fullmatch(str(item.get("sha256", ""))) is None
+        for item in launchers if isinstance(launchers, list)
+    ):
+        errors.append("python: venv launcher inventory is invalid")
+    locked_native = {
+        str(component["component"]): component
+        for component in lock.get("runtime_components", [])
+        if component.get("python_native_runtime_profile") is True
+    }
+    raw_components = profile.get("components")
+    if not isinstance(raw_components, list):
+        return [*errors, "python: release native runtime component list is missing"]
+    observed: set[str] = set()
+    for component in raw_components:
+        if not isinstance(component, dict):
+            errors.append("python: invalid release native runtime component")
+            continue
+        component_name = str(component.get("component", ""))
+        if component_name in observed or component_name not in locked_native:
+            errors.append(
+                f"python: duplicate or unexpected native runtime component: "
+                f"{component_name}"
+            )
+            continue
+        observed.add(component_name)
+        if component.get("version") != locked_native[component_name].get("version"):
+            errors.append(
+                f"python: native runtime version differs for {component_name}"
+            )
+        probes = component.get("probes", [])
+        artifacts = component.get("artifacts", [])
+        if not isinstance(probes, list) or not isinstance(artifacts, list) or (
+            not probes and not artifacts
+        ):
+            errors.append(
+                f"python: native runtime evidence is missing for {component_name}"
+            )
+        for probe in probes if isinstance(probes, list) else []:
+            if not isinstance(probe, dict) or not all(
+                isinstance(probe.get(field), str) and probe[field]
+                for field in ("module", "attribute", "expected")
+            ):
+                errors.append(
+                    f"python: invalid native runtime probe for {component_name}"
+                )
+        for artifact in artifacts if isinstance(artifacts, list) else []:
+            if not isinstance(artifact, dict):
+                errors.append(
+                    f"python: invalid native runtime artifact for {component_name}"
+                )
+                continue
+            try:
+                filename = _safe_filename(artifact.get("filename"))
+            except ReleaseAssetError:
+                filename = ""
+            if (
+                not filename
+                or not isinstance(artifact.get("size"), int)
+                or artifact["size"] <= 0
+                or not isinstance(artifact.get("sha256"), str)
+                or SHA256_PATTERN.fullmatch(artifact["sha256"]) is None
+            ):
+                errors.append(
+                    f"python: invalid native runtime artifact lock for "
+                    f"{component_name}"
+                )
+            else:
+                core_match = next(
+                    (
+                        item
+                        for item in core_records
+                        if PurePosixPath(str(item["path"])).name.casefold()
+                        == filename.casefold()
+                    ),
+                    None,
+                )
+                if core_match is None or any(
+                    artifact.get(field) != core_match.get(field)
+                    for field in ("size", "sha256")
+                ):
+                    errors.append(
+                        f"python: dependency artifact is outside core inventory for "
+                        f"{component_name}: {filename}"
+                    )
+    if observed != set(locked_native):
+        errors.append(
+            "python: release native runtime profile component set differs from lock"
+        )
+    return errors
+
+
 def release_gate_errors(lock: dict[str, Any]) -> list[str]:
     errors = []
+    if not _completed_review(lock, "historical_remediation"):
+        errors.append(
+            "v0.5.2-historical-remediation: review evidence is incomplete"
+        )
+    errors.extend(_release_binary_policy_errors(lock))
+    errors.extend(_python_native_profile_errors(lock))
     for component in [
         *_component_entries(lock),
         *lock.get("runtime_downloads", []),
@@ -167,6 +708,7 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
                 f"{component['component']}: {component.get('release_gate_reason', 'expert legal review is required')}"
             )
     source_required_components = [
+        lock["python"],
         *lock.get("runtime_components", []),
         *[component for component in lock.get("build_components", []) if component.get("packaged_in_distribution")],
     ]
@@ -175,6 +717,14 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
         exception_reviewed = _source_exception_reviewed(component)
         if not archives and not exception_reviewed:
             errors.append(f"{component['component']}: no verified exact source archive is locked")
+        if (
+            component.get("source_status") != "verified_corresponding_source"
+            and not exception_reviewed
+        ):
+            errors.append(
+                f"{component['component']}: source_status is not "
+                "verified_corresponding_source"
+            )
         license_expression = str(component.get("license", "")).casefold()
         if (
             "bundled component licenses" in license_expression
@@ -184,11 +734,6 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
             errors.append(
                 f"{component['component']}: source coverage for wheel-vendored native components is not verified"
             )
-        if (
-            component.get("source_status") is not None
-            and component.get("source_status") != "verified_corresponding_source"
-        ):
-            errors.append(f"{component['component']}: source_status is not verified_corresponding_source")
         for provenance_field in (
             "wheel_build_provenance_verified",
             "build_provenance_verified",
@@ -202,6 +747,29 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
         )
         if component.get("component") == "qt" and qt_notices_verified is not True:
             errors.append("qt: Qt third-party notices are not verified")
+    for component in _component_entries(lock):
+        errors.extend(
+            _license_material_lock_errors(
+                component,
+                release_python_version=str(lock["python"]["release_version"]),
+            )
+        )
+        if _binary_archive_required(component):
+            errors.extend(
+                _locked_archive_errors(
+                    component,
+                    "binary_archive",
+                    wheel_required=True,
+                )
+            )
+        elif component.get("binary_archive") is not None:
+            errors.extend(
+                _locked_archive_errors(
+                    component,
+                    "binary_archive",
+                    wheel_required=True,
+                )
+            )
     for component in lock.get("runtime_downloads", []):
         if not _completed_review(component, "legal_review"):
             errors.append(f"{component['component']}: runtime download legal review evidence is incomplete")
@@ -280,6 +848,186 @@ def source_archive_records(lock: dict[str, Any]) -> list[dict[str, Any]]:
     return records
 
 
+def binary_archive_records(lock: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    records_by_filename: dict[str, dict[str, Any]] = {}
+    policy_errors = _release_binary_policy_errors(lock)
+    if policy_errors:
+        raise ReleaseAssetError(" | ".join(policy_errors))
+    seen_components: set[str] = set()
+    for component in _component_entries(lock):
+        component_name = str(component.get("component"))
+        if component_name in seen_components:
+            raise ReleaseAssetError(
+                f"Duplicate component in binary archive lock: {component_name}"
+            )
+        seen_components.add(component_name)
+        archive = component.get("binary_archive")
+        if (
+            archive is None
+            and component_name not in REQUIRED_RELEASE_BINARY_COMPONENTS
+        ):
+            continue
+        archive_errors = _locked_archive_errors(
+            component,
+            "binary_archive",
+            wheel_required=True,
+        )
+        if archive_errors:
+            raise ReleaseAssetError(" | ".join(archive_errors))
+        assert isinstance(archive, dict)
+        filename = _safe_filename(archive["filename"])
+        record = {
+            "component": component_name,
+            "distribution": str(component["distribution"]),
+            "version": str(component["version"]),
+            "filename": filename,
+            "url": str(archive["url"]),
+            "sha256": str(archive["sha256"]).casefold(),
+            "size": int(archive["size"]),
+        }
+        if "contents" in archive:
+            record["contents"] = archive["contents"]
+        collision_key = filename.casefold()
+        previous = records_by_filename.get(collision_key)
+        if previous is not None:
+            raise ReleaseAssetError(
+                "Duplicate locked binary archive filename: "
+                f"{previous['component']} / {record['component']}: {filename}"
+            )
+        records_by_filename[collision_key] = record
+        records.append(record)
+    missing_components = REQUIRED_RELEASE_BINARY_COMPONENTS - seen_components
+    if missing_components:
+        raise ReleaseAssetError(
+            "Required binary components are missing from lock: "
+            + ", ".join(sorted(missing_components))
+        )
+    if not records:
+        raise ReleaseAssetError("Component lock contains no binary archives.")
+    return sorted(records, key=lambda item: str(item["filename"]).casefold())
+
+
+def _verify_wheel_metadata(path: Path, record: dict[str, Any]) -> None:
+    _require_regular_file(path, label="Locked wheel")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = _validated_zip_members(
+                archive,
+                label=f"locked wheel {path.name}",
+            )
+            metadata_members = [
+                (info, PurePosixPath(member))
+                for member, info in members.items()
+                if PurePosixPath(member).name == "METADATA"
+                and PurePosixPath(member).parent.name.casefold().endswith(
+                    ".dist-info"
+                )
+            ]
+            if len(metadata_members) != 1:
+                raise ReleaseAssetError(
+                    f"Locked wheel must contain exactly one dist-info METADATA: "
+                    f"{path.name}"
+                )
+            metadata_bytes = archive.read(metadata_members[0][0])
+            dist_info = metadata_members[0][1].parent
+            record_name = (dist_info / "RECORD").as_posix()
+            record_info = members.get(record_name)
+            if record_info is None:
+                raise ReleaseAssetError(
+                    f"Locked wheel has no dist-info RECORD: {path.name}"
+                )
+            try:
+                record_rows = list(
+                    csv.reader(
+                        archive.read(record_info).decode("utf-8", errors="strict").splitlines()
+                    )
+                )
+            except (UnicodeError, csv.Error) as exc:
+                raise ReleaseAssetError(
+                    f"Locked wheel RECORD is invalid for {path.name}: {exc}"
+                ) from exc
+            recorded_members: set[str] = set()
+            for row in record_rows:
+                if len(row) != 3:
+                    raise ReleaseAssetError(
+                        f"Locked wheel RECORD row is invalid for {path.name}"
+                    )
+                recorded_path = _safe_archive_member(
+                    row[0].replace("\\", "/"),
+                    label=f"RECORD in locked wheel {path.name}",
+                ).as_posix()
+                collision_key = recorded_path.casefold()
+                if collision_key in recorded_members:
+                    raise ReleaseAssetError(
+                        f"Locked wheel RECORD contains a duplicate path: {recorded_path}"
+                    )
+                recorded_members.add(collision_key)
+                member_info = members.get(recorded_path)
+                if member_info is None or member_info.is_dir():
+                    raise ReleaseAssetError(
+                        f"Locked wheel RECORD references a missing file: {recorded_path}"
+                    )
+                if recorded_path == record_name:
+                    if row[1] or row[2]:
+                        raise ReleaseAssetError(
+                            f"Locked wheel RECORD self-entry must be unhashed: {path.name}"
+                        )
+                    continue
+                size, digest = _hash_zip_member(archive, member_info)
+                encoded_digest = base64.urlsafe_b64encode(
+                    bytes.fromhex(digest)
+                ).rstrip(b"=").decode("ascii")
+                if row[1] != f"sha256={encoded_digest}" or row[2] != str(size):
+                    raise ReleaseAssetError(
+                        f"Locked wheel RECORD digest or size differs: {recorded_path}"
+                    )
+            actual_members = {
+                member.casefold()
+                for member, info in members.items()
+                if not info.is_dir()
+            }
+            if recorded_members != actual_members:
+                raise ReleaseAssetError(
+                    f"Locked wheel RECORD file set differs for {path.name}"
+                )
+            for content in record.get("contents", []):
+                if not isinstance(content, dict):
+                    raise ReleaseAssetError(
+                        f"Locked wheel content lock is invalid for {path.name}"
+                    )
+                content_path = _safe_archive_member(
+                    content.get("path"),
+                    label=f"content lock in wheel {path.name}",
+                ).as_posix()
+                content_info = members.get(content_path)
+                if content_info is None or content_info.is_dir():
+                    raise ReleaseAssetError(
+                        f"Locked wheel content is missing: {content_path}"
+                    )
+                size, digest = _hash_zip_member(archive, content_info)
+                if size != content.get("size") or digest != content.get("sha256"):
+                    raise ReleaseAssetError(
+                        f"Locked wheel content differs: {content_path}"
+                    )
+    except (OSError, RuntimeError, zipfile.BadZipFile, KeyError) as exc:
+        raise ReleaseAssetError(f"Cannot inspect locked wheel {path.name}: {exc}") from exc
+    message = email.parser.BytesParser().parsebytes(metadata_bytes)
+    observed_name = message.get("Name", "")
+    observed_version = message.get("Version", "")
+    if canonicalize_distribution_name(observed_name) != canonicalize_distribution_name(
+        str(record["distribution"])
+    ):
+        raise ReleaseAssetError(
+            f"Locked wheel METADATA name differs for {path.name}: {observed_name}"
+        )
+    if observed_version != str(record["version"]):
+        raise ReleaseAssetError(
+            f"Locked wheel METADATA version differs for {path.name}: "
+            f"{observed_version}"
+        )
+
+
 def _download(
     url: str,
     target: Path,
@@ -346,6 +1094,549 @@ def fetch_verified_sources(
         copied_record["size"] = target.stat().st_size
         result.append((copied_record, target))
     return result
+
+
+def create_verified_binary_manifest(
+    components_file: Path,
+    cache_dir: Path,
+    output_manifest: Path,
+    *,
+    opener: Callable[..., BinaryIO] = urllib.request.urlopen,
+) -> dict[str, Any]:
+    lock = _load_lock(components_file)
+    records = binary_archive_records(lock)
+    fetched = fetch_verified_sources(records, cache_dir, opener=opener)
+    for record, path in fetched:
+        _verify_wheel_metadata(path, record)
+    if output_manifest.parent.resolve() != cache_dir.resolve():
+        raise ReleaseAssetError(
+            "Verified binary manifest must be written directly inside its cache."
+        )
+    _reject_link_target(output_manifest, label="Verified binary manifest")
+    payload = {
+        "schema_version": 1,
+        "component_lock_sha256": sha256_file(components_file),
+        "release_python_version": str(lock["python"]["release_version"]),
+        "archives": [
+            {
+                key: record[key]
+                for key in (
+                    "component",
+                    "distribution",
+                    "version",
+                    "filename",
+                    "url",
+                    "sha256",
+                    "size",
+                )
+            }
+            for record, _path in fetched
+        ],
+    }
+    output_manifest.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    verify_binary_manifest(output_manifest, components_file=components_file)
+    return payload
+
+
+def verify_binary_manifest(
+    manifest_path: Path,
+    *,
+    components_file: Path = COMPONENTS_FILE,
+) -> dict[str, Any]:
+    _require_regular_file(manifest_path, label="Verified binary manifest")
+    lock = _load_lock(components_file)
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseAssetError(f"Cannot read verified binary manifest: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ReleaseAssetError("Unsupported verified binary manifest schema.")
+    if payload.get("component_lock_sha256") != sha256_file(components_file):
+        raise ReleaseAssetError("Verified binary manifest component lock hash differs.")
+    if payload.get("release_python_version") != lock["python"].get(
+        "release_version"
+    ):
+        raise ReleaseAssetError("Verified binary manifest Python version differs.")
+    expected = binary_archive_records(lock)
+    actual = payload.get("archives")
+    if not isinstance(actual, list) or actual != expected:
+        raise ReleaseAssetError("Verified binary manifest records differ from lock.")
+    for record in expected:
+        target = manifest_path.parent / str(record["filename"])
+        _require_regular_file(target, label="Verified binary cache entry")
+        if target.stat().st_size != record["size"]:
+            raise ReleaseAssetError(
+                f"Verified binary size mismatch for {target.name}."
+            )
+        if sha256_file(target) != record["sha256"]:
+            raise ReleaseAssetError(
+                f"Verified binary SHA256 mismatch for {target.name}."
+            )
+        _verify_wheel_metadata(target, record)
+    return payload
+
+
+def flatten_exact_requirements(
+    requirements_file: Path,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    root = requirements_file.resolve().parent
+    pins: list[dict[str, str]] = []
+    inputs: list[dict[str, str]] = []
+    seen_names: dict[str, str] = {}
+    visited: set[Path] = set()
+
+    def visit(path: Path, active: set[Path]) -> None:
+        resolved = path.resolve()
+        try:
+            relative = resolved.relative_to(root).as_posix()
+        except ValueError as exc:
+            raise ReleaseAssetError(
+                f"Requirements include escapes its root: {path}"
+            ) from exc
+        if resolved in active:
+            raise ReleaseAssetError(f"Requirements include cycle: {relative}")
+        if resolved in visited:
+            return
+        _require_regular_file(resolved, label="Requirements input")
+        active.add(resolved)
+        visited.add(resolved)
+        inputs.append({"path": relative, "sha256": sha256_file(resolved)})
+        for line_number, raw_line in enumerate(
+            resolved.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            include = re.fullmatch(r"(?:-r|--requirement)\s+([^\s]+)", line)
+            if include is not None:
+                included = resolved.parent / include.group(1)
+                visit(included, active)
+                continue
+            if line.startswith("-"):
+                raise ReleaseAssetError(
+                    f"Unsupported requirements option ({relative}:{line_number}): "
+                    f"{line}"
+                )
+            match = re.fullmatch(
+                r"([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s;@]+)",
+                line,
+            )
+            if match is None:
+                raise ReleaseAssetError(
+                    f"Release requirement must be an exact unmarked == pin "
+                    f"({relative}:{line_number}): {line}"
+                )
+            name, version = match.groups()
+            canonical = canonicalize_distribution_name(name)
+            previous = seen_names.get(canonical)
+            if previous is not None:
+                raise ReleaseAssetError(
+                    f"Duplicate release requirement: {previous} / {name}"
+                )
+            seen_names[canonical] = name
+            pins.append(
+                {
+                    "name": name,
+                    "canonical_name": canonical,
+                    "version": version,
+                }
+            )
+        active.remove(resolved)
+
+    visit(requirements_file, set())
+    return pins, sorted(inputs, key=lambda item: item["path"].casefold())
+
+
+def prepare_binary_install(
+    *,
+    components_file: Path,
+    requirements_file: Path,
+    cache_dir: Path,
+    output_requirements: Path,
+    output_plan: Path,
+    opener: Callable[..., BinaryIO] = urllib.request.urlopen,
+) -> dict[str, Any]:
+    lock = _load_lock(components_file)
+    pins, requirement_inputs = flatten_exact_requirements(requirements_file)
+    pins_by_name = {item["canonical_name"]: item for item in pins}
+    locked_distributions: dict[str, dict[str, Any]] = {}
+    for component in _component_entries(lock):
+        distribution = component.get("distribution")
+        if not distribution:
+            continue
+        canonical = canonicalize_distribution_name(str(distribution))
+        if canonical in locked_distributions:
+            raise ReleaseAssetError(
+                f"Duplicate component distribution: {distribution}"
+            )
+        locked_distributions[canonical] = component
+        pin = pins_by_name.get(canonical)
+        if pin is None:
+            raise ReleaseAssetError(
+                f"Locked distribution is absent from release requirements: "
+                f"{distribution}"
+            )
+        if pin["version"] != str(component.get("version")):
+            raise ReleaseAssetError(
+                f"Release requirements version differs from component lock for "
+                f"{distribution}."
+            )
+
+    binary_manifest_path = cache_dir / "verified-binaries.json"
+    binary_payload = create_verified_binary_manifest(
+        components_file,
+        cache_dir,
+        binary_manifest_path,
+        opener=opener,
+    )
+    binary_by_name = {
+        canonicalize_distribution_name(str(record["distribution"])): record
+        for record in binary_payload["archives"]
+    }
+    lines = [
+        "# Generated from exact repository pins and verified locked wheels.",
+        "# Do not edit or reuse outside this release run.",
+    ]
+    plan_requirements = []
+    for pin in pins:
+        binary = binary_by_name.get(pin["canonical_name"])
+        if binary is None:
+            lines.append(f"{pin['name']}=={pin['version']}")
+            plan_requirements.append({**pin, "source": "index"})
+            continue
+        wheel_path = cache_dir / str(binary["filename"])
+        wheel_url = wheel_path.resolve().as_uri()
+        lines.append(
+            f"{pin['name']} @ {wheel_url}#sha256={binary['sha256']}"
+        )
+        plan_requirements.append(
+            {
+                **pin,
+                "source": "locked-wheel",
+                "component": binary["component"],
+                "filename": binary["filename"],
+                "sha256": binary["sha256"],
+                "size": binary["size"],
+            }
+        )
+
+    for target, label in (
+        (output_requirements, "Generated release requirements"),
+        (output_plan, "Binary install plan"),
+    ):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _require_directory(target.parent, label=f"{label} directory")
+        _reject_link_target(target, label=label)
+    output_requirements.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    requirements_set = "".join(
+        f"{item['canonical_name']}=={item['version']}\n"
+        for item in sorted(pins, key=lambda item: item["canonical_name"])
+    ).encode("utf-8")
+    plan = {
+        "schema_version": 1,
+        "component_lock_sha256": sha256_file(components_file),
+        "requirements_file": str(requirements_file.resolve()),
+        "requirements_inputs": requirement_inputs,
+        "requirements_set_sha256": hashlib.sha256(requirements_set).hexdigest(),
+        "generated_requirements": str(output_requirements.resolve()),
+        "generated_requirements_sha256": sha256_file(output_requirements),
+        "release_python_version": str(lock["python"]["release_version"]),
+        "release_binary_policy": lock["release_binary_policy"],
+        "binary_manifest": str(binary_manifest_path.resolve()),
+        "binary_manifest_sha256": sha256_file(binary_manifest_path),
+        "requirements": plan_requirements,
+    }
+    output_plan.write_text(
+        json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return plan
+
+
+def _installed_distribution_digest(distribution_name: str) -> str:
+    from importlib import metadata
+
+    distribution = metadata.distribution(distribution_name)
+    records = []
+    environment_root = Path(sys.prefix)
+    for file_entry in distribution.files or ():
+        relative = str(file_entry).replace("\\", "/")
+        if relative.casefold().endswith(".pyc") or "/__pycache__/" in relative.casefold():
+            continue
+        path = Path(distribution.locate_file(file_entry))
+        if not _is_within_directory(environment_root, path):
+            raise ReleaseAssetError(
+                f"Installed distribution file escapes Python environment: {path}"
+            )
+        _require_regular_file(path, label="Installed distribution file")
+        records.append(
+            {
+                "path": relative,
+                "size": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
+    if not records:
+        raise ReleaseAssetError(
+            f"Installed distribution has no verifiable files: {distribution_name}"
+        )
+    serialized = json.dumps(
+        sorted(records, key=lambda item: item["path"].casefold()),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def _is_within_directory(root: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def attest_binary_install(
+    *,
+    components_file: Path,
+    plan_path: Path,
+    pip_report_path: Path,
+    output_provenance: Path,
+) -> dict[str, Any]:
+    _require_regular_file(plan_path, label="Binary install plan")
+    _require_regular_file(pip_report_path, label="pip install report")
+    lock = _load_lock(components_file)
+    try:
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        report = json.loads(pip_report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseAssetError(f"Cannot read install attestation input: {exc}") from exc
+    if not isinstance(plan, dict) or plan.get("schema_version") != 1:
+        raise ReleaseAssetError("Unsupported binary install plan schema.")
+    if plan.get("component_lock_sha256") != sha256_file(components_file):
+        raise ReleaseAssetError("Binary install plan component lock hash differs.")
+    binary_manifest_path = Path(str(plan.get("binary_manifest", "")))
+    if not _is_within_directory(plan_path.parent, binary_manifest_path):
+        raise ReleaseAssetError("Binary manifest escapes the install plan directory.")
+    binary_payload = verify_binary_manifest(
+        binary_manifest_path,
+        components_file=components_file,
+    )
+    if plan.get("binary_manifest_sha256") != sha256_file(binary_manifest_path):
+        raise ReleaseAssetError("Binary install plan manifest hash differs.")
+    policy = lock["release_binary_policy"]
+    if plan.get("release_binary_policy") != policy:
+        raise ReleaseAssetError("Binary install plan release policy differs from lock.")
+    requirements_file = Path(str(plan.get("requirements_file", "")))
+    live_pins, live_inputs = flatten_exact_requirements(requirements_file)
+    if plan.get("requirements_inputs") != live_inputs:
+        raise ReleaseAssetError("Binary install plan requirement inputs differ.")
+    requirements_set = "".join(
+        f"{item['canonical_name']}=={item['version']}\n"
+        for item in sorted(live_pins, key=lambda item: item["canonical_name"])
+    ).encode("utf-8")
+    if plan.get("requirements_set_sha256") != hashlib.sha256(
+        requirements_set
+    ).hexdigest():
+        raise ReleaseAssetError("Binary install plan requirement set hash differs.")
+    generated_requirements = Path(
+        str(plan.get("generated_requirements", ""))
+    )
+    if generated_requirements.parent.resolve() != plan_path.parent.resolve():
+        raise ReleaseAssetError(
+            "Generated release requirements must remain beside the install plan."
+        )
+    _require_regular_file(
+        generated_requirements,
+        label="Generated release requirements",
+    )
+    if plan.get("generated_requirements_sha256") != sha256_file(
+        generated_requirements
+    ):
+        raise ReleaseAssetError("Generated release requirements hash differs.")
+    if sys.implementation.name != "cpython":
+        raise ReleaseAssetError("Release install must use CPython.")
+    actual_python = sys.version.split()[0]
+    if actual_python != policy["python_version"]:
+        raise ReleaseAssetError(
+            f"Release install Python differs: {actual_python} != "
+            f"{policy['python_version']}"
+        )
+    if os.name != "nt" or platform.machine().casefold() not in {
+        "amd64",
+        "x86_64",
+    }:
+        raise ReleaseAssetError("Release install must use Windows amd64.")
+    python_native_runtime = probe_python_native_runtime(lock)
+    if not isinstance(report, dict) or str(report.get("version")) != "1":
+        raise ReleaseAssetError("Unsupported pip install report schema.")
+    raw_install = report.get("install")
+    if not isinstance(raw_install, list):
+        raise ReleaseAssetError("pip install report has no install list.")
+    expected_requirements = plan.get("requirements")
+    if not isinstance(expected_requirements, list):
+        raise ReleaseAssetError("Binary install plan has no requirements list.")
+    binary_by_name = {
+        canonicalize_distribution_name(str(record["distribution"])): record
+        for record in binary_payload["archives"]
+    }
+    expected_plan_requirements = []
+    for pin in live_pins:
+        binary = binary_by_name.get(pin["canonical_name"])
+        if binary is None:
+            expected_plan_requirements.append({**pin, "source": "index"})
+        else:
+            expected_plan_requirements.append(
+                {
+                    **pin,
+                    "source": "locked-wheel",
+                    "component": binary["component"],
+                    "filename": binary["filename"],
+                    "sha256": binary["sha256"],
+                    "size": binary["size"],
+                }
+            )
+    if expected_requirements != expected_plan_requirements:
+        raise ReleaseAssetError("Binary install plan requirements differ from lock.")
+    expected_by_name = {
+        str(item["canonical_name"]): item for item in expected_requirements
+    }
+    reported_by_name: dict[str, dict[str, Any]] = {}
+    for item in raw_install:
+        if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
+            raise ReleaseAssetError("pip install report contains an invalid item.")
+        metadata_record = item["metadata"]
+        canonical = canonicalize_distribution_name(str(metadata_record.get("name", "")))
+        if not canonical or canonical in reported_by_name:
+            raise ReleaseAssetError(
+                f"pip install report contains a duplicate or unnamed package: {canonical}"
+            )
+        if item.get("requested") is not True or item.get("is_yanked") is not False:
+            raise ReleaseAssetError(
+                f"pip install report package was not directly requested or is yanked: "
+                f"{canonical}"
+            )
+        reported_by_name[canonical] = item
+    if set(reported_by_name) != set(expected_by_name):
+        raise ReleaseAssetError("pip install report package set differs from plan.")
+
+    installed_binaries = []
+    from importlib import metadata
+
+    for canonical, expected in expected_by_name.items():
+        report_item = reported_by_name[canonical]
+        report_metadata = report_item["metadata"]
+        if str(report_metadata.get("version")) != str(expected["version"]):
+            raise ReleaseAssetError(
+                f"pip install report version differs for {canonical}."
+            )
+        try:
+            installed = metadata.distribution(str(expected["name"]))
+        except metadata.PackageNotFoundError as exc:
+            raise ReleaseAssetError(
+                f"Installed distribution is missing: {expected['name']}"
+            ) from exc
+        if installed.version != str(expected["version"]):
+            raise ReleaseAssetError(
+                f"Installed distribution version differs for {canonical}."
+            )
+        binary = binary_by_name.get(canonical)
+        if binary is None:
+            continue
+        download_info = report_item.get("download_info")
+        if not isinstance(download_info, dict) or report_item.get("is_direct") is not True:
+            raise ReleaseAssetError(
+                f"Locked wheel was not installed as a direct URL: {canonical}"
+            )
+        parsed_url = urllib.parse.urlsplit(str(download_info.get("url", "")))
+        if parsed_url.scheme != "file":
+            raise ReleaseAssetError(
+                f"Locked wheel report URL is not a local file: {canonical}"
+            )
+        reported_path = Path(
+            urllib.request.url2pathname(urllib.parse.unquote(parsed_url.path))
+        )
+        expected_path = binary_manifest_path.parent / str(binary["filename"])
+        if reported_path.resolve() != expected_path.resolve():
+            raise ReleaseAssetError(
+                f"Locked wheel report path differs for {canonical}."
+            )
+        archive_info = download_info.get("archive_info")
+        hashes = archive_info.get("hashes") if isinstance(archive_info, dict) else None
+        if not isinstance(hashes, dict) or hashes.get("sha256") != binary["sha256"]:
+            raise ReleaseAssetError(
+                f"Locked wheel report SHA256 differs for {canonical}."
+            )
+        direct_url_text = installed.read_text("direct_url.json")
+        try:
+            direct_url = json.loads(direct_url_text or "")
+        except json.JSONDecodeError as exc:
+            raise ReleaseAssetError(
+                f"Installed direct_url.json is invalid for {canonical}."
+            ) from exc
+        direct_archive = direct_url.get("archive_info") if isinstance(direct_url, dict) else None
+        direct_hashes = (
+            direct_archive.get("hashes") if isinstance(direct_archive, dict) else None
+        )
+        if (
+            direct_url.get("url") != expected_path.resolve().as_uri()
+            or not isinstance(direct_hashes, dict)
+            or direct_hashes.get("sha256") != binary["sha256"]
+        ):
+            raise ReleaseAssetError(
+                f"Installed direct_url provenance differs for {canonical}."
+            )
+        installed_binaries.append(
+            {
+                "component": binary["component"],
+                "distribution": binary["distribution"],
+                "version": binary["version"],
+                "filename": binary["filename"],
+                "size": binary["size"],
+                "sha256": binary["sha256"],
+                "installed_files_sha256": _installed_distribution_digest(
+                    str(binary["distribution"])
+                ),
+            }
+        )
+    if {item["component"] for item in installed_binaries} != set(
+        policy["required_components"]
+    ):
+        raise ReleaseAssetError("Installed locked binary component set differs.")
+
+    provenance = {
+        "schema_version": 1,
+        "component_lock_sha256": sha256_file(components_file),
+        "requirements_inputs": plan["requirements_inputs"],
+        "requirements_set_sha256": plan["requirements_set_sha256"],
+        "binary_manifest_sha256": plan["binary_manifest_sha256"],
+        "python_implementation": sys.implementation.name,
+        "python_version": actual_python,
+        "platform": "win_amd64",
+        "pip_version": str(report.get("pip_version", "")),
+        "installed_binaries": sorted(
+            installed_binaries,
+            key=lambda item: str(item["component"]).casefold(),
+        ),
+        "python_native_runtime": python_native_runtime,
+    }
+    if provenance["pip_version"] != policy.get("pip_version"):
+        raise ReleaseAssetError("pip install report version differs from release policy.")
+    output_provenance.parent.mkdir(parents=True, exist_ok=True)
+    _require_directory(
+        output_provenance.parent,
+        label="Build provenance directory",
+    )
+    _reject_link_target(output_provenance, label="Build provenance")
+    output_provenance.write_text(
+        json.dumps(provenance, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return provenance
 
 
 def partition_sources(
@@ -750,6 +2041,52 @@ def verify_release_asset_payload(
         asset_names[key] = name
         assets.append(asset)
 
+    expected_installer = f"LoLReplayTool-Setup-{version}.exe"
+    expected_source = f"LoLReplayTool-source-{version}.zip"
+    expected_license = f"LoLReplayTool-license-materials-{version}.zip"
+    source_pattern = re.compile(
+        rf"LoLReplayTool-third-party-sources-{re.escape(version)}-(\d{{2}})\.zip"
+    )
+    exact_required = {
+        expected_installer,
+        expected_source,
+        expected_license,
+        "SHA256SUMS.txt",
+    }
+    for required_name in sorted(exact_required):
+        matches = [asset for asset in assets if asset.name == required_name]
+        if len(matches) != 1:
+            raise ReleaseAssetError(
+                f"Release assets must contain {required_name} exactly once."
+            )
+
+    source_parts_by_number: dict[int, Path] = {}
+    unexpected_assets: list[str] = []
+    for asset in assets:
+        if asset.name in exact_required:
+            continue
+        match = source_pattern.fullmatch(asset.name)
+        if match is None:
+            unexpected_assets.append(asset.name)
+            continue
+        part_number = int(match.group(1))
+        if part_number == 0 or part_number in source_parts_by_number:
+            raise ReleaseAssetError(
+                f"Invalid or duplicate third-party source part number: {asset.name}"
+            )
+        source_parts_by_number[part_number] = asset
+    if unexpected_assets:
+        raise ReleaseAssetError(
+            "Unexpected Release assets: " + ", ".join(sorted(unexpected_assets))
+        )
+    if not source_parts_by_number:
+        raise ReleaseAssetError("Release assets contain no third-party source archive.")
+    expected_part_numbers = list(range(1, len(source_parts_by_number) + 1))
+    if sorted(source_parts_by_number) != expected_part_numbers:
+        raise ReleaseAssetError(
+            "Third-party source asset part numbers must be contiguous from 01."
+        )
+
     checksum_raw = payload.get("sha256sums")
     if not isinstance(checksum_raw, str):
         raise ReleaseAssetError("Release asset list has no SHA256SUMS path.")
@@ -774,23 +2111,13 @@ def verify_release_asset_payload(
         if checksum_records[asset.name] != actual_hash:
             raise ReleaseAssetError(f"SHA256SUMS mismatch for {asset.name}: {actual_hash}")
 
-    expected_source = f"LoLReplayTool-source-{version}.zip"
     application_sources = [asset for asset in assets if asset.name == expected_source]
-    if len(application_sources) != 1:
-        raise ReleaseAssetError(f"Release assets must contain {expected_source}.")
     validate_application_source(application_sources[0], version)
 
-    source_pattern = re.compile(rf"LoLReplayTool-third-party-sources-{re.escape(version)}-\d{{2}}\.zip")
-    source_parts = [asset for asset in assets if source_pattern.fullmatch(asset.name)]
-    if not source_parts:
-        raise ReleaseAssetError("Release assets contain no third-party source archive.")
-    for source_part in source_parts:
+    for source_part in source_parts_by_number.values():
         verify_source_part(source_part)
 
-    expected_license = f"LoLReplayTool-license-materials-{version}.zip"
     license_archives = [asset for asset in assets if asset.name == expected_license]
-    if len(license_archives) != 1:
-        raise ReleaseAssetError(f"Release assets must contain {expected_license}.")
     verify_license_archive(license_archives[0])
 
 
@@ -885,6 +2212,40 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     gates.add_argument("--components", type=Path, default=COMPONENTS_FILE)
 
+    binaries = commands.add_parser(
+        "fetch-binaries",
+        help="Fetch locked wheels and create a verified cache manifest.",
+    )
+    binaries.add_argument("--components", type=Path, default=COMPONENTS_FILE)
+    binaries.add_argument("--cache-dir", required=True, type=Path)
+    binaries.add_argument("--output-manifest", required=True, type=Path)
+
+    verify_binaries = commands.add_parser(
+        "verify-binaries",
+        help="Re-verify a locked wheel cache manifest.",
+    )
+    verify_binaries.add_argument("--components", type=Path, default=COMPONENTS_FILE)
+    verify_binaries.add_argument("--manifest", required=True, type=Path)
+
+    prepare_install = commands.add_parser(
+        "prepare-binary-install",
+        help="Create one requirements file bound to verified locked wheels.",
+    )
+    prepare_install.add_argument("--components", type=Path, default=COMPONENTS_FILE)
+    prepare_install.add_argument("--requirements", required=True, type=Path)
+    prepare_install.add_argument("--cache-dir", required=True, type=Path)
+    prepare_install.add_argument("--output-requirements", required=True, type=Path)
+    prepare_install.add_argument("--output-plan", required=True, type=Path)
+
+    attest_install = commands.add_parser(
+        "attest-binary-install",
+        help="Verify pip report and installed files, then write normalized provenance.",
+    )
+    attest_install.add_argument("--components", type=Path, default=COMPONENTS_FILE)
+    attest_install.add_argument("--plan", required=True, type=Path)
+    attest_install.add_argument("--pip-report", required=True, type=Path)
+    attest_install.add_argument("--output-provenance", required=True, type=Path)
+
     create = commands.add_parser("create", help="Create and verify release assets.")
     create.add_argument("--version", required=True)
     create.add_argument("--source-commit", required=True)
@@ -916,6 +2277,40 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "check-gates":
             assert_release_gates_closed(args.components)
             print("All centralized release gates are closed.")
+            return 0
+        if args.command == "fetch-binaries":
+            create_verified_binary_manifest(
+                args.components,
+                args.cache_dir,
+                args.output_manifest,
+            )
+            print(f"Verified binary manifest created: {args.output_manifest}")
+            return 0
+        if args.command == "verify-binaries":
+            verify_binary_manifest(
+                args.manifest,
+                components_file=args.components,
+            )
+            print(f"Verified binary manifest passed: {args.manifest}")
+            return 0
+        if args.command == "prepare-binary-install":
+            prepare_binary_install(
+                components_file=args.components,
+                requirements_file=args.requirements,
+                cache_dir=args.cache_dir,
+                output_requirements=args.output_requirements,
+                output_plan=args.output_plan,
+            )
+            print(f"Binary install plan created: {args.output_plan}")
+            return 0
+        if args.command == "attest-binary-install":
+            attest_binary_install(
+                components_file=args.components,
+                plan_path=args.plan,
+                pip_report_path=args.pip_report,
+                output_provenance=args.output_provenance,
+            )
+            print(f"Build provenance created: {args.output_provenance}")
             return 0
         if args.command == "verify":
             verify_release_asset_list(args.asset_list, asset_dir=args.asset_dir)

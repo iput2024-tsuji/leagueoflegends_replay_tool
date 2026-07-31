@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import re
 import shutil
@@ -111,6 +112,26 @@ def is_safe_regular_file(path: Path) -> bool:
     )
 
 
+def is_meaningful_license_file(path: Path) -> bool:
+    if not is_safe_regular_file(path) or path.stat().st_size < 64:
+        return False
+    try:
+        normalized = " ".join(
+            path.read_text(encoding="utf-8", errors="strict")
+            .casefold()
+            .split()
+        )
+    except (OSError, UnicodeError):
+        return False
+    return normalized not in {
+        "license",
+        "licence",
+        "placeholder",
+        "test license",
+        "todo",
+    }
+
+
 def safe_component_name(value: str) -> str:
     result = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-") or "unknown"
     return "unknown" if result in {".", ".."} else result
@@ -207,6 +228,8 @@ def collect_distribution_licenses(
     expected_version: str | None = None,
     expected_license: str | None = None,
     component: str | None = None,
+    binary_archive: dict[str, Any] | None = None,
+    verified_binary_components: set[str] | None = None,
     seen_targets: dict[str, Path] | None = None,
 ) -> dict[str, object]:
     distribution = metadata.distribution(distribution_name)
@@ -227,7 +250,7 @@ def collect_distribution_licenses(
             continue
         relative = safe_relative_path(str(metadata_path))
         source = Path(distribution.locate_file(metadata_path))
-        if not is_safe_regular_file(source) or source.stat().st_size == 0:
+        if not is_meaningful_license_file(source):
             continue
         target = package_dir / relative
         _reserve_target(target, seen)
@@ -250,7 +273,7 @@ def collect_distribution_licenses(
         or distribution.metadata.get("License")
         or "UNKNOWN"
     )
-    return {
+    result: dict[str, object] = {
         "component": component or canonicalize_distribution_name(canonical_name),
         "name": canonical_name,
         "version": distribution.version,
@@ -258,11 +281,24 @@ def collect_distribution_licenses(
         "observed_license": observed_license,
         "homepage": distribution.metadata.get("Home-page") or "",
         "license_files": sorted(set(copied_files), key=str.casefold),
+        "license_file_sha256": {
+            relative: sha256_file(destination_root.parent / relative)
+            for relative in sorted(set(copied_files), key=str.casefold)
+        },
         "substantive_license_files": sorted(
             set(substantive_files),
             key=str.casefold,
         ),
     }
+    if binary_archive is not None:
+        result["binary_archive"] = {
+            key: binary_archive[key]
+            for key in ("filename", "sha256", "size")
+        }
+        result["binary_install_verified"] = bool(
+            component and component in (verified_binary_components or set())
+        )
+    return result
 
 
 def collect_python_runtime_license(
@@ -279,7 +315,7 @@ def collect_python_runtime_license(
         (
             path
             for path in license_candidates
-            if is_safe_regular_file(path) and path.stat().st_size > 0
+            if is_meaningful_license_file(path)
         ),
         None,
     )
@@ -294,7 +330,7 @@ def collect_python_runtime_license(
         (
             path
             for path in notices_candidates
-            if is_safe_regular_file(path) and path.stat().st_size > 0
+            if is_meaningful_license_file(path)
         ),
         None,
     )
@@ -321,20 +357,428 @@ def collect_python_runtime_license(
             license_target.relative_to(destination_root.parent).as_posix(),
             notices_target.relative_to(destination_root.parent).as_posix(),
         ],
+        "license_file_sha256": {
+            license_target.relative_to(destination_root.parent).as_posix(): sha256_file(
+                license_target
+            ),
+            notices_target.relative_to(destination_root.parent).as_posix(): sha256_file(
+                notices_target
+            ),
+        },
         "substantive_license_files": [
             license_target.relative_to(destination_root.parent).as_posix()
         ],
     }
 
 
+def probe_python_native_runtime(component_lock: dict[str, Any]) -> dict[str, Any]:
+    python_lock = component_lock["python"]
+    version = sys.version.split()[0]
+    profiles = python_lock.get("windows_native_runtime_profiles")
+    if not isinstance(profiles, dict) or not isinstance(profiles.get(version), dict):
+        raise RuntimeError(
+            f"No verified Windows native runtime profile is locked for Python {version}."
+        )
+    profile = profiles[version]
+    if profile.get("provenance_verified") is not True:
+        raise RuntimeError(
+            f"Python {version} native runtime profile is not verified."
+        )
+    raw_components = profile.get("components")
+    if not isinstance(raw_components, list):
+        raise RuntimeError("Python native runtime profile has no component list.")
+    expected_components = {
+        str(component["component"])
+        for component in component_lock.get("runtime_components", [])
+        if component.get("python_native_runtime_profile") is True
+    }
+    observed_components: set[str] = set()
+    base_prefix = Path(sys.base_prefix)
+    core_lock = profile.get("core_native_inventory")
+    if not isinstance(core_lock, dict) or not isinstance(
+        core_lock.get("artifacts"), list
+    ):
+        raise RuntimeError("Python core native runtime inventory is missing.")
+    core_artifacts: list[dict[str, Any]] = []
+    seen_core_paths: set[str] = set()
+    for artifact in core_lock["artifacts"]:
+        if not isinstance(artifact, dict):
+            raise RuntimeError("Python core native runtime inventory is invalid.")
+        raw_path = artifact.get("path")
+        if not isinstance(raw_path, str) or not raw_path:
+            raise RuntimeError("Python core native runtime path is missing.")
+        relative = PurePosixPath(raw_path.replace("\\", "/"))
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != raw_path
+            or any(part in {"", ".", ".."} for part in relative.parts)
+            or not (
+                len(relative.parts) == 1
+                and relative.suffix.casefold() in {".dll", ".exe"}
+                or len(relative.parts) == 2
+                and relative.parts[0] == "DLLs"
+                and relative.suffix.casefold() in {".dll", ".pyd"}
+            )
+        ):
+            raise RuntimeError(f"Unsafe Python core native path: {raw_path}")
+        collision_key = relative.as_posix().casefold()
+        if collision_key in seen_core_paths:
+            raise RuntimeError(f"Duplicate Python core native path: {raw_path}")
+        seen_core_paths.add(collision_key)
+        expected_size = artifact.get("size")
+        expected_hash = artifact.get("sha256")
+        if (
+            not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or expected_size <= 0
+            or not isinstance(expected_hash, str)
+            or re.fullmatch(r"[0-9a-f]{64}", expected_hash) is None
+        ):
+            raise RuntimeError(f"Invalid Python core native lock: {raw_path}")
+        source = base_prefix.joinpath(*relative.parts)
+        if not is_safe_regular_file(source):
+            raise RuntimeError(f"Python core native runtime file is missing: {raw_path}")
+        actual_hash = sha256_file(source)
+        if source.stat().st_size != expected_size or actual_hash != expected_hash:
+            raise RuntimeError(f"Python core native runtime differs: {raw_path}")
+        core_artifacts.append(
+            {"path": relative.as_posix(), "size": expected_size, "sha256": actual_hash}
+        )
+
+    def inventory_digest(records: list[dict[str, Any]]) -> str:
+        digest = hashlib.sha256()
+        for record in sorted(records, key=lambda item: str(item["path"])):
+            digest.update(str(record["path"]).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(record["size"]).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(record["sha256"]).encode("ascii"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    if (
+        core_lock.get("file_count") != len(core_artifacts)
+        or core_lock.get("total_size")
+        != sum(int(item["size"]) for item in core_artifacts)
+        or core_lock.get("inventory_sha256") != inventory_digest(core_artifacts)
+    ):
+        raise RuntimeError("Python core native runtime inventory summary differs.")
+
+    launcher_lock = profile.get("venv_launchers")
+    if not isinstance(launcher_lock, list) or not launcher_lock:
+        raise RuntimeError("Python venv launcher inventory is missing.")
+    executable = Path(sys.executable)
+    if not is_safe_regular_file(executable):
+        raise RuntimeError("Active Python executable is missing or unsafe.")
+    executable_record = {
+        "size": executable.stat().st_size,
+        "sha256": sha256_file(executable),
+    }
+    if Path(sys.prefix).resolve() != base_prefix.resolve():
+        matching_launchers = [
+            item
+            for item in launcher_lock
+            if isinstance(item, dict)
+            and item.get("kind") == "console"
+            and item.get("size") == executable_record["size"]
+            and item.get("sha256") == executable_record["sha256"]
+        ]
+        if len(matching_launchers) != 1:
+            raise RuntimeError("Active Python venv launcher differs from official lock.")
+        executable_record["kind"] = "console-venv-launcher"
+    else:
+        python_executable = next(
+            (
+                item
+                for item in core_artifacts
+                if item["path"].casefold() == "python.exe"
+            ),
+            None,
+        )
+        if python_executable is None or any(
+            executable_record[field] != python_executable[field]
+            for field in ("size", "sha256")
+        ):
+            raise RuntimeError("Active base Python executable differs from official lock.")
+        executable_record["kind"] = "base-python-executable"
+
+    stdlib_lock = profile.get("stdlib_python_sources")
+    if not isinstance(stdlib_lock, dict):
+        raise RuntimeError("Python stdlib source inventory is missing.")
+    excluded_prefixes = stdlib_lock.get("excluded_prefixes")
+    if not isinstance(excluded_prefixes, list) or not all(
+        isinstance(value, str)
+        and value
+        and value.endswith("/")
+        and PurePosixPath(value[:-1]).as_posix() == value[:-1]
+        and ".." not in PurePosixPath(value[:-1]).parts
+        for value in excluded_prefixes
+    ):
+        raise RuntimeError("Python stdlib source exclusions are invalid.")
+    folded_exclusions = tuple(value.casefold() for value in excluded_prefixes)
+    stdlib_root = base_prefix / "Lib"
+    if not stdlib_root.is_dir():
+        raise RuntimeError("Python stdlib root is missing.")
+    stdlib_artifacts: list[dict[str, Any]] = []
+    for source in stdlib_root.rglob("*.py"):
+        relative = source.relative_to(stdlib_root).as_posix()
+        if relative.casefold().startswith(folded_exclusions):
+            continue
+        if not is_safe_regular_file(source):
+            raise RuntimeError(f"Python stdlib source is unsafe: {relative}")
+        stdlib_artifacts.append(
+            {
+                "path": relative,
+                "size": source.stat().st_size,
+                "sha256": sha256_file(source),
+            }
+        )
+    if (
+        stdlib_lock.get("file_count") != len(stdlib_artifacts)
+        or stdlib_lock.get("total_size")
+        != sum(int(item["size"]) for item in stdlib_artifacts)
+        or stdlib_lock.get("inventory_sha256")
+        != inventory_digest(stdlib_artifacts)
+    ):
+        raise RuntimeError("Python stdlib source inventory differs from official lock.")
+
+    result_components = []
+    for component in raw_components:
+        if not isinstance(component, dict):
+            raise RuntimeError("Python native runtime profile has an invalid component.")
+        component_name = str(component.get("component", ""))
+        if not component_name or component_name in observed_components:
+            raise RuntimeError(
+                f"Duplicate or unnamed Python native component: {component_name}"
+            )
+        observed_components.add(component_name)
+        probes = []
+        for probe in component.get("probes", []):
+            if not isinstance(probe, dict):
+                raise RuntimeError(f"Invalid runtime probe for {component_name}.")
+            module_name = str(probe.get("module", ""))
+            attribute = str(probe.get("attribute", ""))
+            expected = probe.get("expected")
+            if not module_name or not attribute or not isinstance(expected, str):
+                raise RuntimeError(f"Incomplete runtime probe for {component_name}.")
+            module = importlib.import_module(module_name)
+            actual = str(getattr(module, attribute))
+            if actual != expected:
+                raise RuntimeError(
+                    f"Python native runtime probe differs for {component_name} "
+                    f"({module_name}.{attribute}): {actual} != {expected}"
+                )
+            probes.append(
+                {
+                    "module": module_name,
+                    "attribute": attribute,
+                    "value": actual,
+                }
+            )
+        artifacts = []
+        for artifact in component.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                raise RuntimeError(f"Invalid runtime artifact for {component_name}.")
+            filename = str(artifact.get("filename", ""))
+            if safe_component_name(filename) != filename or Path(filename).name != filename:
+                raise RuntimeError(
+                    f"Unsafe Python native runtime artifact name: {filename}"
+                )
+            expected_hash = str(artifact.get("sha256", ""))
+            expected_size = artifact.get("size")
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_hash) or not isinstance(
+                expected_size, int
+            ):
+                raise RuntimeError(
+                    f"Invalid Python native artifact lock for {component_name}: {filename}"
+                )
+            candidates = [base_prefix / "DLLs" / filename, base_prefix / filename]
+            source = next((path for path in candidates if is_safe_regular_file(path)), None)
+            if source is None:
+                raise RuntimeError(
+                    f"Python native runtime artifact is missing: {filename}"
+                )
+            actual_hash = sha256_file(source)
+            if source.stat().st_size != expected_size or actual_hash != expected_hash:
+                raise RuntimeError(
+                    f"Python native runtime artifact differs for {component_name}: "
+                    f"{filename}"
+                )
+            artifacts.append(
+                {
+                    "filename": filename,
+                    "size": expected_size,
+                    "sha256": actual_hash,
+                }
+            )
+        if not probes and not artifacts:
+            raise RuntimeError(
+                f"Python native component has no probe or artifact: {component_name}"
+            )
+        result_components.append(
+            {
+                "component": component_name,
+                "version": str(component.get("version", "")),
+                "probes": probes,
+                "artifacts": artifacts,
+            }
+        )
+    if observed_components != expected_components:
+        raise RuntimeError(
+            "Python native runtime profile component set differs from component lock."
+        )
+    return {
+        "python_version": version,
+        "official_binary_archive": profile.get("official_binary_archive"),
+        "official_actions_archive": profile.get("official_actions_archive"),
+        "official_installer": profile.get("official_installer"),
+        "active_python_executable": executable_record,
+        "core_native_inventory": {
+            "file_count": len(core_artifacts),
+            "total_size": sum(int(item["size"]) for item in core_artifacts),
+            "inventory_sha256": inventory_digest(core_artifacts),
+            "artifacts": core_artifacts,
+        },
+        "stdlib_python_sources": {
+            "excluded_prefixes": excluded_prefixes,
+            "file_count": len(stdlib_artifacts),
+            "total_size": sum(int(item["size"]) for item in stdlib_artifacts),
+            "inventory_sha256": inventory_digest(stdlib_artifacts),
+            "artifacts": sorted(
+                stdlib_artifacts,
+                key=lambda item: str(item["path"]),
+            ),
+        },
+        "components": result_components,
+    }
+
+
+def _validated_build_provenance(
+    provenance_path: Path | None,
+    component_lock: dict[str, Any],
+    components_file: Path,
+    python_native_runtime: dict[str, Any],
+) -> tuple[dict[str, Any] | None, set[str]]:
+    if provenance_path is None:
+        return None, set()
+    if not is_safe_regular_file(provenance_path) or provenance_path.stat().st_size == 0:
+        raise RuntimeError(f"Build provenance is missing or unsafe: {provenance_path}")
+    try:
+        payload = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read build provenance: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise RuntimeError("Unsupported build provenance schema.")
+    if payload.get("component_lock_sha256") != sha256_file(components_file):
+        raise RuntimeError("Build provenance component lock hash differs.")
+    if payload.get("python_version") != sys.version.split()[0]:
+        raise RuntimeError("Build provenance Python version differs.")
+    policy = component_lock.get("release_binary_policy", {})
+    if payload.get("python_implementation") != "cpython":
+        raise RuntimeError("Build provenance Python implementation differs.")
+    if payload.get("platform") != policy.get("platform"):
+        raise RuntimeError("Build provenance platform differs from release policy.")
+    if payload.get("pip_version") != policy.get("pip_version"):
+        raise RuntimeError("Build provenance pip version differs from release policy.")
+    if payload.get("python_native_runtime") != python_native_runtime:
+        raise RuntimeError("Build provenance Python runtime differs from verified runtime.")
+    for field in ("requirements_set_sha256", "binary_manifest_sha256"):
+        if not isinstance(payload.get(field), str) or re.fullmatch(
+            r"[0-9a-f]{64}",
+            payload[field],
+        ) is None:
+            raise RuntimeError(f"Build provenance {field} is invalid.")
+    from scripts.prepare_release_assets import (
+        _installed_distribution_digest,
+        flatten_exact_requirements,
+    )
+
+    build_requirements = REPO_ROOT / "requirements-dev.txt"
+    pins, expected_inputs = flatten_exact_requirements(build_requirements)
+    if payload.get("requirements_inputs") != expected_inputs:
+        raise RuntimeError("Build provenance requirement inputs differ.")
+    requirements_set = "".join(
+        f"{item['canonical_name']}=={item['version']}\n"
+        for item in sorted(pins, key=lambda item: item["canonical_name"])
+    ).encode("utf-8")
+    if payload.get("requirements_set_sha256") != hashlib.sha256(
+        requirements_set
+    ).hexdigest():
+        raise RuntimeError("Build provenance requirement set differs.")
+    expected_components = set(
+        component_lock.get("release_binary_policy", {}).get(
+            "required_components",
+            [],
+        )
+    )
+    records = payload.get("installed_binaries")
+    if not isinstance(records, list):
+        raise RuntimeError("Build provenance has no installed binary list.")
+    observed: set[str] = set()
+    locked = {
+        str(component["component"]): component
+        for component in [
+            *component_lock.get("runtime_components", []),
+            *component_lock.get("build_components", []),
+        ]
+    }
+    for record in records:
+        if not isinstance(record, dict):
+            raise RuntimeError("Build provenance contains an invalid binary record.")
+        component_name = str(record.get("component", ""))
+        if component_name in observed or component_name not in expected_components:
+            raise RuntimeError(
+                f"Build provenance contains a duplicate or unexpected component: "
+                f"{component_name}"
+            )
+        observed.add(component_name)
+        component = locked.get(component_name)
+        archive = component.get("binary_archive") if component else None
+        if not isinstance(component, dict) or not isinstance(archive, dict):
+            raise RuntimeError(
+                f"Build provenance component is not locked: {component_name}"
+            )
+        for field in ("filename", "sha256", "size"):
+            if record.get(field) != archive.get(field):
+                raise RuntimeError(
+                    f"Build provenance differs from binary lock for "
+                    f"{component_name}.{field}."
+                )
+        if record.get("version") != component.get("version"):
+            raise RuntimeError(
+                f"Build provenance version differs for {component_name}."
+            )
+        try:
+            digest = _installed_distribution_digest(str(component["distribution"]))
+        except (OSError, RuntimeError, metadata.PackageNotFoundError) as exc:
+            raise RuntimeError(
+                f"Cannot verify installed files for {component_name}: {exc}"
+            ) from exc
+        if record.get("installed_files_sha256") != digest:
+            raise RuntimeError(
+                f"Installed files differ from build provenance for {component_name}."
+            )
+    if observed != expected_components:
+        raise RuntimeError("Build provenance binary component set differs from policy.")
+    return payload, observed
+
+
 def collect_licenses(
     destination: Path,
     requirements_file: Path = RUNTIME_REQUIREMENTS,
     components_file: Path = COMPONENTS_FILE,
+    build_provenance: Path | None = None,
 ) -> Path:
     component_lock = _load_component_lock(components_file)
     runtime_components = validate_runtime_lock(requirements_file, component_lock)
     locked = _locked_distributions(component_lock)
+    python_native_runtime = probe_python_native_runtime(component_lock)
+    _provenance, verified_binary_components = _validated_build_provenance(
+        build_provenance,
+        component_lock,
+        components_file,
+        python_native_runtime,
+    )
 
     destination.mkdir(parents=True, exist_ok=True)
     seen_targets: dict[str, Path] = {}
@@ -351,6 +795,13 @@ def collect_licenses(
     if not is_safe_regular_file(components_file) or components_file.stat().st_size == 0:
         raise RuntimeError(f"Component lock is not a non-empty regular file: {components_file}")
     shutil.copy2(components_file, components_target)
+
+    provenance_target = destination / "build-provenance.json"
+    provenance_hash: str | None = None
+    if build_provenance is not None:
+        _reserve_target(provenance_target, seen_targets)
+        shutil.copy2(build_provenance, provenance_target)
+        provenance_hash = sha256_file(provenance_target)
 
     package_root = destination / "python-packages"
     package_root.mkdir(parents=True, exist_ok=True)
@@ -370,6 +821,8 @@ def collect_licenses(
                 expected_version=str(component["version"]),
                 expected_license=str(component["license"]),
                 component=str(component["component"]),
+                binary_archive=component.get("binary_archive"),
+                verified_binary_components=verified_binary_components,
                 seen_targets=seen_targets,
             )
         )
@@ -383,6 +836,8 @@ def collect_licenses(
                 expected_version=str(locked_component["version"]),
                 expected_license=str(locked_component["license"]),
                 component=str(locked_component["component"]),
+                binary_archive=locked_component.get("binary_archive"),
+                verified_binary_components=verified_binary_components,
                 seen_targets=seen_targets,
             )
         )
@@ -399,6 +854,9 @@ def collect_licenses(
         "component_lock_sha256": sha256_file(components_file),
         "build_python_version": sys.version.split()[0],
         "release_python_version": str(python_lock["release_version"]),
+        "python_native_runtime": python_native_runtime,
+        "build_provenance_sha256": provenance_hash,
+        "verified_binary_components": sorted(verified_binary_components),
         "packages": manifest,
     }
     manifest_path.write_text(
@@ -413,12 +871,14 @@ def main() -> int:
     parser.add_argument("--destination", required=True, type=Path)
     parser.add_argument("--requirements", type=Path, default=RUNTIME_REQUIREMENTS)
     parser.add_argument("--components", type=Path, default=COMPONENTS_FILE)
+    parser.add_argument("--build-provenance", type=Path)
     args = parser.parse_args()
     try:
         manifest_path = collect_licenses(
             args.destination,
             args.requirements,
             args.components,
+            args.build_provenance,
         )
     except (metadata.PackageNotFoundError, RuntimeError) as exc:
         print(f"ERROR: {exc}")

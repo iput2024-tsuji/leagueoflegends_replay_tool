@@ -1,5 +1,8 @@
+import copy
 import json
+import os
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -28,59 +31,9 @@ def _component_lock():
 
 
 def _write_distribution_materials(root: Path) -> None:
-    lock = _component_lock()
-    for relative_path in license_collector.PROJECT_DOCUMENTS:
-        path = root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(Path(relative_path).read_bytes())
-
-    components_path = root / "licenses" / "components.json"
-    components_path.parent.mkdir(parents=True, exist_ok=True)
-    components_path.write_bytes(license_collector.COMPONENTS_FILE.read_bytes())
-
-    packages = [
-        {
-            "component": "python",
-            "name": "Python",
-            "version": sys.version.split()[0],
-            "expected_license": lock["python"]["license"],
-        }
-    ]
-    for section in ("runtime_components", "build_components"):
-        for component in lock[section]:
-            if not component.get("distribution"):
-                continue
-            packages.append(
-                {
-                    "component": component["component"],
-                    "name": component["distribution"],
-                    "version": component["version"],
-                    "expected_license": component["license"],
-                }
-            )
-    for package in packages:
-        relative_license = (
-            f"python-packages/{safe_component_name(package['name'])}/LICENSE"
-        )
-        path = root / "licenses" / relative_license
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("license\n", encoding="utf-8")
-        package["observed_license"] = package["expected_license"]
-        package["license_files"] = [relative_license]
-        package["substantive_license_files"] = [relative_license]
-
-    package_manifest = {
-        "schema_version": 1,
-        "build_python_version": sys.version.split()[0],
-        "release_python_version": lock["python"]["release_version"],
-        "requirements_sha256": sha256_file(license_collector.RUNTIME_REQUIREMENTS),
-        "component_lock_sha256": sha256_file(components_path),
-        "packages": packages,
-    }
-    (root / "licenses" / "python-packages.json").write_text(
-        json.dumps(package_manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    if os.name != "nt":
+        pytest.skip("Packaged license fixture requires the Windows release runtime")
+    license_collector.collect_licenses(root / "licenses")
 
 
 def _write_existing_inventory(root: Path) -> Path:
@@ -89,6 +42,17 @@ def _write_existing_inventory(root: Path) -> Path:
         (root / "licenses" / "python-packages.json").read_text(encoding="utf-8")
     )
     lock = _component_lock()
+    base_library = root / "_internal" / "base_library.zip"
+    if not base_library.exists():
+        base_library.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(base_library, "w") as archive:
+            archive.writestr("encodings/__init__.pyc", b"compiled")
+    base_errors, base_summary = compliance._validate_base_library_archive(
+        base_library,
+        package_manifest,
+    )
+    assert base_errors == []
+    assert base_summary is not None
     files = []
     for path in root.rglob("*"):
         if path.is_file() and path != manifest_path:
@@ -115,6 +79,7 @@ def _write_existing_inventory(root: Path) -> Path:
                     root / "licenses" / "components.json"
                 ),
                 "pyinstaller_collect_toc_sha256": "0" * 64,
+                "python_base_library": base_summary,
                 "files": files,
             },
             indent=2,
@@ -148,6 +113,13 @@ def test_is_license_file_rejects_code_and_authors_only():
     assert not is_license_file(Path("package/module.py"))
 
 
+def test_meaningful_license_file_rejects_placeholder(tmp_path):
+    placeholder = tmp_path / "LICENSE"
+    placeholder.write_text("license\n", encoding="utf-8")
+
+    assert not license_collector.is_meaningful_license_file(placeholder)
+
+
 def test_safe_component_and_relative_paths():
     assert safe_component_name("..") == "unknown"
     assert safe_component_name("PyQt6 sip") == "PyQt6-sip"
@@ -178,7 +150,11 @@ def test_collect_distribution_licenses_checks_version_and_is_idempotent(
 ):
     metadata_license = tmp_path / "demo.dist-info" / "LICENSE"
     metadata_license.parent.mkdir(parents=True)
-    metadata_license.write_text("MIT license", encoding="utf-8")
+    metadata_license.write_text(
+        "Permission is granted to use, copy, modify, and distribute this "
+        "software. THE SOFTWARE IS PROVIDED AS IS WITHOUT WARRANTY.\n",
+        encoding="utf-8",
+    )
 
     class FakeDistribution:
         metadata = {"Name": "demo", "License-Expression": "MIT"}
@@ -307,14 +283,19 @@ def test_toc_and_dist_are_bidirectionally_inventoried(monkeypatch, tmp_path):
     _write_distribution_materials(root)
     executable = root / "LoLReplayTool.exe"
     native = root / "_internal" / "aiohttp" / "_demo.pyd"
+    base_library = root / "_internal" / "base_library.zip"
     executable.write_bytes(b"exe")
     native.parent.mkdir(parents=True)
     native.write_bytes(b"native")
+    with zipfile.ZipFile(base_library, "w") as archive:
+        archive.writestr("encodings/__init__.pyc", b"compiled")
 
     exe_source = tmp_path / "build.exe"
     native_source = tmp_path / "_demo.pyd"
-    exe_source.write_bytes(b"source-exe")
-    native_source.write_bytes(b"source-native")
+    base_source = tmp_path / "base_library.zip"
+    exe_source.write_bytes(executable.read_bytes())
+    native_source.write_bytes(native.read_bytes())
+    base_source.write_bytes(base_library.read_bytes())
     toc = tmp_path / "COLLECT-00.toc"
     toc.write_text(
         repr(
@@ -322,6 +303,7 @@ def test_toc_and_dist_are_bidirectionally_inventoried(monkeypatch, tmp_path):
                 [
                     ("LoLReplayTool.exe", str(exe_source), "EXECUTABLE"),
                     ("aiohttp/_demo.pyd", str(native_source), "EXTENSION"),
+                    ("base_library.zip", str(base_source), "DATA"),
                 ],
             )
         ),
@@ -330,6 +312,7 @@ def test_toc_and_dist_are_bidirectionally_inventoried(monkeypatch, tmp_path):
     owners = {
         compliance._path_key(exe_source): "lol-replay-tool",
         compliance._path_key(native_source): "aiohttp",
+        compliance._path_key(base_source): "python",
     }
     monkeypatch.setattr(
         compliance,
@@ -350,6 +333,13 @@ def test_toc_and_dist_are_bidirectionally_inventoried(monkeypatch, tmp_path):
     assert by_path["_internal/aiohttp/_demo.pyd"]["sha256"] == sha256_file(native)
     assert validate_distribution(root) == []
 
+    native_source.write_bytes(b"tampered source")
+    assert any(
+        "TOC source differs from final distribution" in error
+        for error in validate_distribution(root, toc_path=toc)
+    )
+    native_source.write_bytes(native.read_bytes())
+
     native.write_bytes(b"tampered")
     assert any(
         "Manifest size differs" in error or "Manifest SHA256 differs" in error
@@ -360,12 +350,13 @@ def test_toc_and_dist_are_bidirectionally_inventoried(monkeypatch, tmp_path):
 def test_unknown_toc_file_and_extra_dist_file_fail(monkeypatch, tmp_path):
     root = tmp_path / "distribution"
     _write_distribution_materials(root)
-    executable = root / "LoLReplayTool.exe"
-    executable.write_bytes(b"exe")
+    rogue = root / "_internal" / "rogue.pyd"
+    rogue.parent.mkdir(parents=True)
+    rogue.write_bytes(b"native")
     (root / "extra.bin").write_bytes(b"extra")
     toc = tmp_path / "COLLECT-00.toc"
     toc.write_text(
-        repr(([("LoLReplayTool.exe", str(tmp_path / "unknown"), "EXECUTABLE")],)),
+        repr(([("rogue.pyd", str(tmp_path / "unknown"), "EXTENSION")],)),
         encoding="utf-8",
     )
     monkeypatch.setattr(
@@ -409,6 +400,48 @@ def test_release_mode_enforces_python_and_legal_gates(tmp_path):
     assert any("gate remains for qt:" in error for error in errors)
     assert any("gate remains for obs-studio:" in error for error in errors)
     assert any("numpy: native_source_coverage_verified" in error for error in errors)
+    assert "Release build provenance is missing." in errors
+
+
+def test_locked_license_material_rejects_placeholder_even_with_updated_hash(tmp_path):
+    root = tmp_path / "distribution"
+    _write_distribution_materials(root)
+    package_manifest_path = root / "licenses" / "python-packages.json"
+    payload = json.loads(package_manifest_path.read_text(encoding="utf-8"))
+    package = next(
+        item for item in payload["packages"] if item["component"] == "aiohttp"
+    )
+    relative = package["substantive_license_files"][0]
+    target = root / "licenses" / Path(relative)
+    target.write_text("license\n", encoding="utf-8")
+    package["license_file_sha256"][relative] = sha256_file(target)
+    package_manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    errors = validate_distribution(root)
+
+    assert any("placeholder" in error and "aiohttp" in error for error in errors)
+
+
+def test_python_native_runtime_probe_detects_locked_hash_tampering():
+    if os.name != "nt":
+        pytest.skip("CPython Windows native runtime probe is Windows-specific")
+    lock = _component_lock()
+    observed = license_collector.probe_python_native_runtime(lock)
+    assert observed["python_version"] == sys.version.split()[0]
+
+    tampered = copy.deepcopy(lock)
+    profile = tampered["python"]["windows_native_runtime_profiles"][
+        sys.version.split()[0]
+    ]
+    artifact = next(
+        artifact
+        for component in profile["components"]
+        for artifact in component.get("artifacts", [])
+    )
+    artifact["sha256"] = "0" * 64
+
+    with pytest.raises(RuntimeError, match="native runtime artifact differs"):
+        license_collector.probe_python_native_runtime(tampered)
 
 
 def test_unreferenced_or_native_license_directory_file_fails(tmp_path):
@@ -540,4 +573,225 @@ def test_native_runtime_overrides_wheel_owner(
             {compliance._path_key(source): owner},
         )
         == expected
+    )
+
+
+def test_python_runtime_classification_rejects_site_packages_rogue_file(
+    monkeypatch,
+    tmp_path,
+):
+    base = tmp_path / "Python314"
+    rogue = base / "Lib" / "site-packages" / "rogue.dll"
+    rogue.parent.mkdir(parents=True)
+    rogue.write_bytes(b"rogue")
+    monkeypatch.setattr(compliance.sys, "base_prefix", str(base))
+
+    assert (
+        compliance._classify_toc_entry(
+            {
+                "path": "_internal/rogue.dll",
+                "source": str(rogue),
+                "toc_name": "rogue.dll",
+                "type": "BINARY",
+            },
+            {},
+        )
+        is None
+    )
+
+
+def test_python_runtime_classification_requires_exact_locked_source_and_destination(
+    tmp_path,
+):
+    source = tmp_path / "Python314" / "DLLs" / "_asyncio.pyd"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"official core")
+    locked_sources = {
+        compliance._path_key(source): {
+            "path": "DLLs/_asyncio.pyd",
+            "size": source.stat().st_size,
+            "sha256": sha256_file(source),
+        }
+    }
+    entry = {
+        "path": "_internal/_asyncio.pyd",
+        "source": str(source),
+        "toc_name": source.name,
+        "type": "EXTENSION",
+    }
+
+    assert compliance._classify_toc_entry(entry, {}, {}) is None
+    assert (
+        compliance._classify_toc_entry(entry, {}, locked_sources) == "python"
+    )
+    assert (
+        compliance._classify_toc_entry(
+            {**entry, "path": "_internal/subdir/_asyncio.pyd"},
+            {},
+            locked_sources,
+        )
+        is None
+    )
+    rogue = source.with_name("_rogue.pyd")
+    rogue.write_bytes(b"rogue")
+    assert (
+        compliance._classify_toc_entry(
+            {**entry, "source": str(rogue), "toc_name": rogue.name},
+            {},
+            locked_sources,
+        )
+        is None
+    )
+
+
+def test_python_runtime_profile_rejects_python_dll_hash_mismatch(monkeypatch):
+    if os.name != "nt":
+        pytest.skip("Windows CPython runtime inventory is Windows-specific")
+    lock = _component_lock()
+    real_sha256_file = license_collector.sha256_file
+
+    def mismatched_python_dll(path):
+        if Path(path).name.casefold() == "python314.dll":
+            return "0" * 64
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(license_collector, "sha256_file", mismatched_python_dll)
+
+    with pytest.raises(RuntimeError, match="Python core native runtime differs"):
+        license_collector.probe_python_native_runtime(lock)
+
+
+def test_base_library_members_require_verified_stdlib_sources(tmp_path):
+    archive_path = tmp_path / "base_library.zip"
+    package_manifest = {
+        "python_native_runtime": {
+            "stdlib_python_sources": {
+                "inventory_sha256": "a" * 64,
+                "artifacts": [
+                    {
+                        "path": "encodings/__init__.py",
+                        "size": 1,
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        }
+    }
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("encodings/__init__.pyc", b"compiled")
+
+    errors, summary = compliance._validate_base_library_archive(
+        archive_path,
+        package_manifest,
+    )
+
+    assert errors == []
+    assert summary is not None
+    assert summary["member_count"] == 1
+
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("rogue.pyc", b"compiled")
+    errors, _summary = compliance._validate_base_library_archive(
+        archive_path,
+        package_manifest,
+    )
+    assert any("no verified stdlib source" in error for error in errors)
+
+
+def test_base_library_runtime_read_error_fails_closed(monkeypatch, tmp_path):
+    archive_path = tmp_path / "base_library.zip"
+    archive_path.write_bytes(b"not-empty")
+    package_manifest = {
+        "python_native_runtime": {
+            "stdlib_python_sources": {
+                "inventory_sha256": "a" * 64,
+                "artifacts": [
+                    {
+                        "path": "encodings/__init__.py",
+                        "size": 1,
+                        "sha256": "b" * 64,
+                    }
+                ],
+            }
+        }
+    }
+
+    def reject_archive(_path):
+        raise RuntimeError("encrypted member")
+
+    monkeypatch.setattr(compliance.zipfile, "ZipFile", reject_archive)
+    errors, summary = compliance._validate_base_library_archive(
+        archive_path,
+        package_manifest,
+    )
+
+    assert summary is None
+    assert any("Cannot inspect base_library.zip" in error for error in errors)
+
+
+def test_native_runtime_override_requires_owner_and_final_path(tmp_path):
+    msvc = tmp_path / "VCRUNTIME140.dll"
+    mesa = tmp_path / "opengl32sw.dll"
+    msvc.write_bytes(b"msvc")
+    mesa.write_bytes(b"mesa")
+
+    assert (
+        compliance._classify_toc_entry(
+            {
+                "path": "_internal/PyQt6/Qt6/bin/VCRUNTIME140.dll",
+                "source": str(msvc),
+                "toc_name": msvc.name,
+                "type": "BINARY",
+            },
+            {compliance._path_key(msvc): "aiohttp"},
+        )
+        is None
+    )
+    assert (
+        compliance._classify_toc_entry(
+            {
+                "path": "_internal/PyQt6/Qt6/bin/opengl32sw.dll",
+                "source": str(mesa),
+                "toc_name": mesa.name,
+                "type": "BINARY",
+            },
+            {compliance._path_key(mesa): "numpy"},
+        )
+        is None
+    )
+
+
+def test_system_vcomp_requires_system32_source_and_exact_final_path(
+    monkeypatch,
+    tmp_path,
+):
+    system_root = tmp_path / "Windows"
+    source = system_root / "System32" / "VCOMP140.DLL"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"system runtime")
+    monkeypatch.setenv("SystemRoot", str(system_root))
+
+    assert (
+        compliance._classify_toc_entry(
+            {
+                "path": "_internal/VCOMP140.DLL",
+                "source": str(source),
+                "toc_name": source.name,
+                "type": "BINARY",
+            },
+            {},
+        )
+        == "microsoft-vc-runtime"
+    )
+    assert (
+        compliance._classify_toc_entry(
+            {
+                "path": "_internal/PyQt6/Qt6/bin/VCOMP140.DLL",
+                "source": str(source),
+                "toc_name": source.name,
+                "type": "BINARY",
+            },
+            {},
+        )
+        is None
     )

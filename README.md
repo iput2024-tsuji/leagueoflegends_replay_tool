@@ -12,7 +12,10 @@ LoL Replay Tool は、League of Legends の試合を自動録画し、試合イ�
 配布ライセンス・対応ソース資料を再検証するため撤回しており、
 [GitHub Releases](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/releases)
 からもダウンロードできません。手元に残っているv0.5.2インストーラーの利用は
-推奨しません。
+推奨しません。v0.5.2について記載するSHA-256は撤回済みバイナリの履歴識別情報
+であり、現在入手できるバイナリや再現ビルドの保証ではありません。元のActions
+成果物は保持されていないため、当時の全ファイルを独立検証できない監査上の制約が
+あります。履歴資料の正確性と遡及対応の十分性に関する専門家確認も未完了です。
 
 次の公開版では、インストーラー、対応するプロジェクトソース、第三者ソース、
 ライセンス資料、全資産の`SHA256SUMS.txt`を同じReleaseへ添付します。OBSと
@@ -335,7 +338,11 @@ dist\installer\LoLReplayTool-Setup-<version>.exe
 完了し、管理者が公開を明示決定した場合だけ実施します。`VERSION`と日英の
 CHANGELOGを更新し、変更を`main`へmergeしてから、同じバージョンの
 `v`付きtagを作成します。tag pushだけでは公開されず、GitHubの`release`
-Environmentで管理者承認が必要です。
+Environmentで管理者承認が必要です。タグをpushした後、GitHub Actionsの
+`Release` workflowを`workflow_dispatch`から手動実行し、`tag`へ同じ
+`vX.Y.Z`、`publish_confirmation`へ大文字で正確に`PUBLISH`を入力します。
+prepare jobが全検証と資産生成を完了するとpublish jobが承認待ちになるため、
+検証結果と資産一覧を確認してから`release` Environmentを承認します。
 
 ```powershell
 git tag vX.Y.Z

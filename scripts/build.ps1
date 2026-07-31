@@ -1,3 +1,8 @@
+param(
+  [string]$PythonExe = "",
+  [string]$BuildProvenance = ""
+)
+
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -5,14 +10,35 @@ Set-Location (Join-Path $scriptDir "..")
 
 $venvPython = Join-Path (Get-Location) "venv\Scripts\python.exe"
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-$pythonExe = if (Test-Path $venvPython) { $venvPython } elseif ($pythonCmd) { $pythonCmd.Source } else { $null }
-if (-not $pythonExe) {
+if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
+  $selectedPython = (Resolve-Path -LiteralPath $PythonExe -ErrorAction Stop).Path
+  if (-not (Test-Path -LiteralPath $selectedPython -PathType Leaf)) {
+    throw "指定された Python 実行ファイルが見つかりません: $PythonExe"
+  }
+} elseif (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+  $selectedPython = $venvPython
+} elseif ($pythonCmd) {
+  $selectedPython = $pythonCmd.Source
+} else {
+  $selectedPython = $null
+}
+if (-not $selectedPython) {
   throw "Python が見つかりません。venv を作成するか、Python を PATH に追加してください。"
+}
+
+$resolvedBuildProvenance = $null
+if (-not [string]::IsNullOrWhiteSpace($BuildProvenance)) {
+  $resolvedBuildProvenance = (
+    Resolve-Path -LiteralPath $BuildProvenance -ErrorAction Stop
+  ).Path
+  if (-not (Test-Path -LiteralPath $resolvedBuildProvenance -PathType Leaf)) {
+    throw "build provenance が見つかりません: $BuildProvenance"
+  }
 }
 
 $makeIconScript = "scripts\make_icon.py"
 if (Test-Path $makeIconScript) {
-  & $pythonExe $makeIconScript
+  & $selectedPython $makeIconScript
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }
@@ -40,11 +66,11 @@ if ($iconPath -and (Test-Path $iconPath)) {
 }
 
 $pyArgs += "main.py"
-& $pythonExe -c "import PyInstaller" 2>$null
+& $selectedPython -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) {
   throw "選択した Python 環境に PyInstaller がありません。pip install pyinstaller を実行してください。"
 }
-& $pythonExe -m PyInstaller @pyArgs
+& $selectedPython -m PyInstaller @pyArgs
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
@@ -72,7 +98,11 @@ foreach ($archive in $bundledSetupArchives) {
 }
 
 $licensesDir = Join-Path $distRootDir "licenses"
-& $pythonExe "scripts\collect_licenses.py" --destination $licensesDir
+$licenseArgs = @("scripts\collect_licenses.py", "--destination", $licensesDir)
+if ($resolvedBuildProvenance) {
+  $licenseArgs += @("--build-provenance", $resolvedBuildProvenance)
+}
+& $selectedPython @licenseArgs
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
@@ -81,14 +111,14 @@ $collectToc = Join-Path (Get-Location) "build\\LoLReplayTool\\COLLECT-00.toc"
 if (-not (Test-Path $collectToc)) {
   throw "PyInstaller COLLECT TOC が見つかりません: $collectToc"
 }
-& $pythonExe -m scripts.check_license_compliance $distRootDir `
+& $selectedPython -m scripts.check_license_compliance $distRootDir `
   --toc $collectToc `
   --write-manifest
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
 
-& $pythonExe -m scripts.check_license_compliance $distRootDir
+& $selectedPython -m scripts.check_license_compliance $distRootDir
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }

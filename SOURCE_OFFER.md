@@ -120,13 +120,22 @@ The v0.5.2 installer has been withdrawn and is not available for download.
 Its original GitHub Actions artifact is no longer retained, so later historical
 materials cannot reconstruct or independently verify every file from that
 installer. Any source or hash retained for v0.5.2 is historical identification,
-not a replacement installer or proof of a newly reproduced binary.
+not a replacement installer or proof of a newly reproduced binary. The known
+build reference is Actions run `28287427901` at commit
+`c88ded675accf403f4d5e2bfee1bc53247c14af7`. No binary will be restored,
+replaced, or overwritten. Specialist review of the accuracy of any reconstructed
+materials and the sufficiency of the retrospective remediation remains
+incomplete and is an explicit gate for every new public Release.
 
 v0.5.2インストーラーは撤回され、現在ダウンロードできません。元の
 GitHub Actions成果物は保持されていないため、後から追加する履歴資料だけでは
 当時のインストーラー内の全ファイルを再構成・独立検証できません。v0.5.2用に
 残すsourceやhashは履歴識別情報であり、インストーラーの復元・差し替えや
-再現ビルドの証明ではありません。
+再現ビルドの証明ではありません。既知のビルド基準はActions run
+`28287427901`、commit `c88ded675accf403f4d5e2bfee1bc53247c14af7`です。
+バイナリの復元・差し替え・上書きは行いません。再構成した資料の正確性と
+遡及対応の十分性に関する専門家確認は未完了であり、すべての新しい公開Releaseを
+止める明示的なgateです。
 
 ## Future OBS bundling
 

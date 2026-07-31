@@ -12,7 +12,13 @@ No public installer is currently available. The v0.5.2 installer was withdrawn
 while its distribution-license and corresponding-source materials are
 revalidated, and it can no longer be downloaded from
 [GitHub Releases](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/releases).
-Use of any locally retained v0.5.2 installer is not recommended.
+Use of any locally retained v0.5.2 installer is not recommended. Any SHA-256
+recorded for v0.5.2 is only a historical identifier for the withdrawn binary;
+it does not identify a currently downloadable binary or prove a reproducible
+build. The original Actions artifact is no longer retained, so every file in
+that installer cannot now be independently audited. Specialist review of the
+historical materials and the sufficiency of the retrospective remediation is
+also incomplete.
 
 The next public version will attach its installer, exact project source,
 third-party sources, license materials, and a `SHA256SUMS.txt` covering every
@@ -265,7 +271,12 @@ Publish only after the licensing review, a dedicated Release-preparation Issue,
 CI, real-Windows checks, and an explicit maintainer decision are complete.
 Update `VERSION` and both changelogs, merge the change into `main`, and then
 create the matching tag. A tag push alone does not publish a Release; the
-`release` Environment requires maintainer approval.
+`release` Environment requires maintainer approval. After pushing the tag,
+manually run the `Release` workflow with `workflow_dispatch`, enter the same
+`vX.Y.Z` in `tag`, and enter the exact uppercase word `PUBLISH` in
+`publish_confirmation`. The publish job waits for approval after the prepare
+job has verified and generated every asset; inspect those results and the asset
+list before approving the `release` Environment.
 
 ```powershell
 git tag vX.Y.Z

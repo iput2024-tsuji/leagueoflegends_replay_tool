@@ -1,5 +1,7 @@
 param(
   [string]$Version = "",
+  [string]$PythonExe = "",
+  [string]$BuildProvenance = "",
   [switch]$SkipTests,
   [switch]$SkipBuild
 )
@@ -24,27 +26,49 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:\.\d+)?$') {
 
 $venvPython = Join-Path $repoRoot "venv\Scripts\python.exe"
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-$pythonExe = if (Test-Path $venvPython) {
-  $venvPython
+if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
+  $selectedPython = (Resolve-Path -LiteralPath $PythonExe -ErrorAction Stop).Path
+  if (-not (Test-Path -LiteralPath $selectedPython -PathType Leaf)) {
+    throw "指定された Python 実行ファイルが見つかりません: $PythonExe"
+  }
+} elseif (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+  $selectedPython = $venvPython
 } elseif ($pythonCmd) {
-  $pythonCmd.Source
+  $selectedPython = $pythonCmd.Source
 } else {
-  $null
+  $selectedPython = $null
+}
+
+$resolvedBuildProvenance = $null
+if (-not [string]::IsNullOrWhiteSpace($BuildProvenance)) {
+  $resolvedBuildProvenance = (
+    Resolve-Path -LiteralPath $BuildProvenance -ErrorAction Stop
+  ).Path
+  if (-not (Test-Path -LiteralPath $resolvedBuildProvenance -PathType Leaf)) {
+    throw "build provenance が見つかりません: $BuildProvenance"
+  }
 }
 
 if (-not $SkipTests) {
-  if (-not $pythonExe) {
+  if (-not $selectedPython) {
     throw "Python が見つからないためテストを実行できません。"
   }
   $testTemp = Join-Path $repoRoot ("tests\_tmp\installer-build-" + [guid]::NewGuid().ToString("N"))
-  & $pythonExe -m pytest -p no:cacheprovider "--basetemp=$testTemp" tests
+  & $selectedPython -m pytest -p no:cacheprovider "--basetemp=$testTemp" tests
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }
 }
 
 if (-not $SkipBuild) {
-  & (Join-Path $scriptDir "build.ps1")
+  $buildArgs = @()
+  if ($selectedPython) {
+    $buildArgs += @("-PythonExe", $selectedPython)
+  }
+  if ($resolvedBuildProvenance) {
+    $buildArgs += @("-BuildProvenance", $resolvedBuildProvenance)
+  }
+  & (Join-Path $scriptDir "build.ps1") @buildArgs
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }
@@ -54,11 +78,11 @@ $appExe = Join-Path $repoRoot "dist\LoLReplayTool\LoLReplayTool.exe"
 if (-not (Test-Path $appExe)) {
   throw "アプリのビルド成果物が見つかりません: $appExe"
 }
-if (-not $pythonExe) {
+if (-not $selectedPython) {
   throw "Python が見つからないためライセンス資料を検査できません。"
 }
 
-& $pythonExe -m scripts.check_license_compliance (Join-Path $repoRoot "dist\LoLReplayTool")
+& $selectedPython -m scripts.check_license_compliance (Join-Path $repoRoot "dist\LoLReplayTool")
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }

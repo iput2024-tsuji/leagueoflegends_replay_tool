@@ -11,6 +11,7 @@ import os
 import re
 import stat
 import sys
+import zipfile
 from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -20,9 +21,11 @@ from scripts.collect_licenses import (
     PROJECT_DOCUMENTS,
     RUNTIME_REQUIREMENTS,
     canonicalize_distribution_name,
+    is_meaningful_license_file,
     is_safe_regular_file,
     is_substantive_license_file,
     parse_requirement_pins,
+    probe_python_native_runtime,
 )
 from src.license_info import validate_distribution_documents
 
@@ -246,6 +249,12 @@ def validate_package_manifest(
                 continue
             package_paths.add(collision_key)
             target = manifest_path.parent / Path(*PurePosixPath(relative_path).parts)
+            if Path(relative_path).suffix.casefold() in NATIVE_SUFFIXES:
+                errors.append(
+                    f"Native file cannot be license material for {package_name}: "
+                    f"{value}"
+                )
+                continue
             if not _within(manifest_path.parent, target) or not is_safe_regular_file(
                 target
             ):
@@ -258,14 +267,42 @@ def validate_package_manifest(
                     f"Collected license file is empty for {package_name}: {value}"
                 )
                 continue
-            if target.suffix.casefold() in NATIVE_SUFFIXES:
+            if not is_meaningful_license_file(target):
                 errors.append(
-                    f"Native file cannot be license material for {package_name}: "
-                    f"{value}"
+                    f"Collected license file is placeholder or not meaningful for "
+                    f"{package_name}: {value}"
                 )
                 continue
             if is_substantive_license_file(Path(relative_path)):
                 substantive_paths.append(relative_path)
+        declared_hashes = package.get("license_file_sha256")
+        if not isinstance(declared_hashes, dict):
+            errors.append(f"License hash map is missing for package: {package_name}")
+        else:
+            if set(declared_hashes) != {
+                value
+                for value in license_files
+                if isinstance(value, str) and _safe_relative(value) is not None
+            }:
+                errors.append(
+                    f"License hash path set differs for package: {package_name}"
+                )
+            for relative_path, expected_hash in declared_hashes.items():
+                safe_path = _safe_relative(relative_path)
+                if safe_path is None:
+                    continue
+                target = manifest_path.parent / Path(
+                    *PurePosixPath(safe_path).parts
+                )
+                if (
+                    not isinstance(expected_hash, str)
+                    or SHA256_PATTERN.fullmatch(expected_hash) is None
+                    or not is_safe_regular_file(target)
+                    or sha256_file(target) != expected_hash
+                ):
+                    errors.append(
+                        f"License SHA256 differs for {package_name}: {safe_path}"
+                    )
         declared_substantive = package.get("substantive_license_files")
         if not isinstance(declared_substantive, list):
             errors.append(
@@ -281,6 +318,26 @@ def validate_package_manifest(
                 f"NOTICE, COPYRIGHT, or AUTHORS-only material is not a license for "
                 f"package: {package_name}"
             )
+        if expected_component is not None:
+            expected_archive = expected_component.get("binary_archive")
+            if isinstance(expected_archive, dict):
+                expected_binary = {
+                    key: expected_archive.get(key)
+                    for key in ("filename", "sha256", "size")
+                }
+                if package.get("binary_archive") != expected_binary:
+                    errors.append(
+                        f"Binary archive provenance differs for {package_name}."
+                    )
+                if not isinstance(package.get("binary_install_verified"), bool):
+                    errors.append(
+                        f"Binary install verification flag is missing for "
+                        f"{package_name}."
+                    )
+            elif "binary_archive" in package or "binary_install_verified" in package:
+                errors.append(
+                    f"Unexpected binary archive provenance for {package_name}."
+                )
 
     required = (
         set(expected)
@@ -311,6 +368,17 @@ def validate_package_manifest(
             errors.append("License manifest release Python version does not match.")
     if not isinstance(payload.get("build_python_version"), str):
         errors.append("License manifest build Python version is missing.")
+    if lock is not None:
+        try:
+            observed_native_runtime = probe_python_native_runtime(lock)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        else:
+            if payload.get("python_native_runtime") != observed_native_runtime:
+                errors.append(
+                    "Python native runtime provenance differs from the current "
+                    "verified runtime."
+                )
     return errors
 
 
@@ -411,22 +479,108 @@ def _is_relative_to(path: Path, root: Path) -> bool:
     return True
 
 
+def _python_core_source_locks(
+    lock: dict[str, Any],
+    python_version: str,
+) -> dict[str, dict[str, Any]]:
+    profiles = lock.get("python", {}).get("windows_native_runtime_profiles")
+    if not isinstance(profiles, dict):
+        return {}
+    profile = profiles.get(python_version)
+    inventory = (
+        profile.get("core_native_inventory")
+        if isinstance(profile, dict)
+        else None
+    )
+    artifacts = inventory.get("artifacts") if isinstance(inventory, dict) else None
+    if not isinstance(artifacts, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    base_prefix = Path(sys.base_prefix)
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        raw_path = artifact.get("path")
+        safe_path = _safe_relative(raw_path)
+        if safe_path is None:
+            continue
+        source = base_prefix.joinpath(*PurePosixPath(safe_path).parts)
+        result[_path_key(source)] = artifact
+    return result
+
+
+def _is_trusted_windows_system_runtime_source(source: Path) -> bool:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        return False
+    try:
+        return source.resolve().parent == (Path(system_root) / "System32").resolve()
+    except OSError:
+        return False
+
+
+def _microsoft_runtime_owner_matches(
+    owner: str | None,
+    final_path: str,
+    source: Path,
+    python_core_sources: dict[str, dict[str, Any]],
+) -> bool:
+    final_lower = final_path.casefold()
+    if _path_key(source) in python_core_sources:
+        return final_lower == f"_internal/{source.name.casefold()}"
+    if _is_trusted_windows_system_runtime_source(source):
+        return (
+            owner is None
+            and source.name.casefold() == "vcomp140.dll"
+            and final_lower == "_internal/vcomp140.dll"
+        )
+    allowed_prefixes = {
+        "qt": "_internal/pyqt6/qt6/bin/",
+        "numpy": "_internal/numpy.libs/",
+        "scikit-learn": "_internal/sklearn/.libs/",
+    }
+    prefix = allowed_prefixes.get(owner or "")
+    if prefix is not None and final_lower.startswith(prefix):
+        return True
+    return owner == "scikit-learn" and final_lower == "_internal/vcomp140.dll"
+
+
 def _classify_toc_entry(
     entry: dict[str, str],
     source_owners: dict[str, str],
+    python_core_sources: dict[str, dict[str, Any]] | None = None,
 ) -> str | None:
+    python_core_sources = python_core_sources or {}
     final_path = entry["path"]
     source = Path(entry["source"])
     final_lower = final_path.casefold()
     source_lower = source.name.casefold()
+    owner = source_owners.get(_path_key(source))
+    python_core = python_core_sources.get(_path_key(source))
 
     if re.fullmatch(
         r"(?:msvcp140(?:_[12])?|vcruntime140(?:_1)?|vcomp140)(?:-[0-9a-f]+)?\.dll",
         source_lower,
     ):
-        return "microsoft-vc-runtime"
+        if not _microsoft_runtime_owner_matches(
+            owner,
+            final_path,
+            source,
+            python_core_sources,
+        ):
+            return None
+        return (
+            "microsoft-vc-runtime-python"
+            if python_core is not None
+            else "microsoft-vc-runtime"
+        )
     if source_lower == "opengl32sw.dll":
-        return "mesa-opengl32sw"
+        return (
+            "mesa-opengl32sw"
+            if owner == "qt"
+            and final_lower == "_internal/pyqt6/qt6/bin/opengl32sw.dll"
+            else None
+        )
     python_dependency_owners = {
         "_bz2.pyd": "python-bzip2",
         "_ctypes.pyd": "python-libffi",
@@ -436,12 +590,14 @@ def _classify_toc_entry(
         "sqlite3.dll": "python-sqlite",
         "_lzma.pyd": "python-xz",
         "_zstd.pyd": "python-zstd",
+        "zlib1.dll": "python-zlib",
         "_hashlib.pyd": "python-openssl",
         "_ssl.pyd": "python-openssl",
     }
-    if source_lower in python_dependency_owners and _is_relative_to(
-        source,
-        Path(sys.base_prefix),
+    if (
+        source_lower in python_dependency_owners
+        and python_core is not None
+        and final_lower == f"_internal/{source_lower}"
     ):
         return python_dependency_owners[source_lower]
 
@@ -453,20 +609,30 @@ def _classify_toc_entry(
             return None
         return "opencv-ffmpeg"
 
-    owner = source_owners.get(_path_key(source))
     if owner is not None:
         return owner
 
-    if source_lower in {"libcrypto-3.dll", "libssl-3.dll"} and _is_relative_to(
-        source, Path(sys.base_prefix)
+    if (
+        source_lower in {"libcrypto-3.dll", "libssl-3.dll"}
+        and python_core is not None
+        and final_lower == f"_internal/{source_lower}"
     ):
         return "python-openssl"
-    if _is_relative_to(source, Path(sys.base_prefix)):
+    if (
+        python_core is not None
+        and final_lower == f"_internal/{source_lower}"
+        and source.suffix.casefold() in {".dll", ".pyd"}
+    ):
         return "python"
 
     repo_root = Path(__file__).resolve().parents[1]
     if _is_relative_to(source, repo_root):
-        if entry["toc_name"] == "base_library.zip":
+        if (
+            entry["toc_name"] == "base_library.zip"
+            and entry["path"] == "_internal/base_library.zip"
+            and entry["type"] == "DATA"
+            and _is_relative_to(source, repo_root / "build")
+        ):
             return "python"
         if entry["type"] == "EXECUTABLE" or _is_relative_to(
             source, repo_root / "assets"
@@ -564,12 +730,131 @@ def _package_license_paths(package_manifest: dict[str, Any] | None) -> set[str]:
 def _allowed_generated_files(
     package_manifest: dict[str, Any] | None,
 ) -> set[str]:
-    return {
+    result = {
         *GENERATED_ROOT_DOCUMENTS,
         "licenses/components.json",
         "licenses/python-packages.json",
         *_package_license_paths(package_manifest),
     }
+    if package_manifest and isinstance(
+        package_manifest.get("build_provenance_sha256"),
+        str,
+    ):
+        result.add("licenses/build-provenance.json")
+    return result
+
+
+def _python_native_artifact_locks(
+    lock: dict[str, Any],
+    python_version: str,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    profiles = lock.get("python", {}).get("windows_native_runtime_profiles")
+    if not isinstance(profiles, dict):
+        return {}
+    profile = profiles.get(python_version)
+    if not isinstance(profile, dict):
+        return {}
+    result: dict[tuple[str, str], dict[str, Any]] = {}
+    for component in profile.get("components", []):
+        if not isinstance(component, dict):
+            continue
+        component_name = str(component.get("component", ""))
+        for artifact in component.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            filename = str(artifact.get("filename", "")).casefold()
+            result[(component_name, filename)] = artifact
+    return result
+
+
+def _validate_base_library_archive(
+    archive_path: Path,
+    package_manifest: dict[str, Any] | None,
+) -> tuple[list[str], dict[str, Any] | None]:
+    if package_manifest is None:
+        return ["Python package manifest is required for base_library.zip."], None
+    runtime = package_manifest.get("python_native_runtime")
+    stdlib = (
+        runtime.get("stdlib_python_sources")
+        if isinstance(runtime, dict)
+        else None
+    )
+    source_artifacts = stdlib.get("artifacts") if isinstance(stdlib, dict) else None
+    if not isinstance(source_artifacts, list) or not source_artifacts:
+        return ["Verified Python stdlib source inventory is missing."], None
+    allowed_sources = {
+        str(item.get("path", "")).casefold()
+        for item in source_artifacts
+        if isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("size"), int)
+        and isinstance(item.get("sha256"), str)
+    }
+    if len(allowed_sources) != len(source_artifacts):
+        return ["Verified Python stdlib source inventory is invalid."], None
+    if not _regular_nonempty_file(archive_path):
+        return ["base_library.zip is missing or unsafe."], None
+    errors: list[str] = []
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            bad_member = archive.testzip()
+            if bad_member is not None:
+                errors.append(f"base_library.zip CRC failure: {bad_member}")
+            for info in archive.infolist():
+                if info.is_dir():
+                    errors.append(
+                        f"base_library.zip contains a directory entry: {info.filename}"
+                    )
+                    continue
+                relative = _safe_relative(info.filename)
+                if relative is None or not relative.casefold().endswith(".pyc"):
+                    errors.append(
+                        f"base_library.zip contains an unsafe or non-pyc member: "
+                        f"{info.filename}"
+                    )
+                    continue
+                collision_key = relative.casefold()
+                if collision_key in seen:
+                    errors.append(
+                        f"base_library.zip contains a duplicate member: {relative}"
+                    )
+                    continue
+                seen.add(collision_key)
+                source_path = (relative[:-1]).casefold()
+                if source_path not in allowed_sources:
+                    errors.append(
+                        f"base_library.zip member has no verified stdlib source: "
+                        f"{relative}"
+                    )
+                data = archive.read(info)
+                records.append(
+                    {
+                        "path": relative,
+                        "size": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                )
+    except (OSError, RuntimeError, zipfile.BadZipFile, KeyError) as exc:
+        return [f"Cannot inspect base_library.zip: {exc}"], None
+    if not records:
+        errors.append("base_library.zip contains no verified Python modules.")
+    digest = hashlib.sha256()
+    for record in sorted(records, key=lambda item: str(item["path"])):
+        digest.update(str(record["path"]).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(record["size"]).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(str(record["sha256"]).encode("ascii"))
+        digest.update(b"\n")
+    summary = {
+        "member_count": len(records),
+        "total_size": sum(int(item["size"]) for item in records),
+        "inventory_sha256": digest.hexdigest(),
+        "stdlib_source_inventory_sha256": stdlib.get("inventory_sha256"),
+    }
+    return errors, summary
 
 
 def _generated_file(
@@ -577,6 +862,239 @@ def _generated_file(
     allowed_generated: set[str],
 ) -> bool:
     return relative in allowed_generated
+
+
+def _validate_locked_license_materials(
+    distribution_root: Path,
+    lock: dict[str, Any],
+    package_manifest: dict[str, Any] | None,
+) -> list[str]:
+    errors: list[str] = []
+    referenced = {
+        *GENERATED_ROOT_DOCUMENTS,
+        *_package_license_paths(package_manifest),
+    }
+    build_python = (
+        str(package_manifest.get("build_python_version"))
+        if package_manifest is not None
+        else sys.version.split()[0]
+    )
+    seen_paths: dict[str, tuple[str, bool]] = {}
+    for component in _component_entries(lock):
+        component_name = str(component.get("component", "<unknown>"))
+        materials = component.get("license_materials")
+        if materials is None:
+            exception = component.get("license_materials_exception")
+            if isinstance(exception, dict):
+                required_strings = ("reason", "evidence", "scope", "reviewer", "date")
+                if (
+                    not all(isinstance(exception.get(field), str) for field in required_strings)
+                    or not exception["reason"].strip()
+                    or not isinstance(exception.get("review_completed"), bool)
+                    or (
+                        exception["review_completed"] is True
+                        and not all(
+                            exception[field].strip()
+                            for field in ("evidence", "scope", "reviewer", "date")
+                        )
+                    )
+                ):
+                    errors.append(
+                        f"Component license material exception is incomplete: "
+                        f"{component_name}"
+                    )
+                continue
+            errors.append(
+                f"Component has no locked license materials or exception: "
+                f"{component_name}"
+            )
+            continue
+        if not isinstance(materials, list) or not materials:
+            errors.append(
+                f"Component license material list is empty: {component_name}"
+            )
+            continue
+        for material in materials:
+            if not isinstance(material, dict):
+                errors.append(
+                    f"Invalid locked license material for {component_name}."
+                )
+                continue
+            relative = _safe_relative(material.get("path"))
+            if relative is None:
+                errors.append(
+                    f"Unsafe locked license material for {component_name}: "
+                    f"{material.get('path')}"
+                )
+                continue
+            key = relative.casefold()
+            shared = material.get("shared") is True
+            previous = seen_paths.get(key)
+            if previous is not None and (not shared or not previous[1]):
+                errors.append(
+                    f"Locked license material is multiply assigned without shared "
+                    f"review: {previous[0]} / {component_name}: {relative}"
+                )
+            seen_paths[key] = (component_name, shared)
+            if relative not in referenced:
+                errors.append(
+                    f"Locked license material is not referenced by packaged "
+                    f"inventory for {component_name}: {relative}"
+                )
+            target = distribution_root / Path(*PurePosixPath(relative).parts)
+            if not _within(distribution_root, target) or not is_meaningful_license_file(
+                target
+            ):
+                errors.append(
+                    f"Locked license material is missing, unsafe, or placeholder for "
+                    f"{component_name}: {relative}"
+                )
+                continue
+            expected_hash = material.get("sha256")
+            version_hashes = material.get("sha256_by_python_version")
+            if isinstance(version_hashes, dict):
+                expected_hash = version_hashes.get(build_python)
+            if (
+                not isinstance(expected_hash, str)
+                or SHA256_PATTERN.fullmatch(expected_hash) is None
+                or sha256_file(target) != expected_hash
+            ):
+                errors.append(
+                    f"Locked license material SHA256 differs for {component_name}: "
+                    f"{relative}"
+                )
+    return errors
+
+
+def _validate_build_provenance(
+    distribution_root: Path,
+    lock: dict[str, Any],
+    package_manifest: dict[str, Any] | None,
+    *,
+    release: bool,
+) -> list[str]:
+    if package_manifest is None:
+        return []
+    expected_hash = package_manifest.get("build_provenance_sha256")
+    provenance_path = distribution_root / "licenses" / "build-provenance.json"
+    if expected_hash is None:
+        return ["Release build provenance is missing."] if release else []
+    if (
+        not isinstance(expected_hash, str)
+        or SHA256_PATTERN.fullmatch(expected_hash) is None
+        or not _regular_nonempty_file(provenance_path)
+        or sha256_file(provenance_path) != expected_hash
+    ):
+        return ["Build provenance file is missing or its SHA256 differs."]
+    try:
+        payload = _read_json(provenance_path)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        return [f"Cannot read build provenance: {exc}"]
+    errors: list[str] = []
+    if payload.get("schema_version") != 1:
+        errors.append("Unsupported build provenance schema.")
+    if payload.get("component_lock_sha256") != sha256_file(
+        distribution_root / "licenses" / "components.json"
+    ):
+        errors.append("Build provenance component lock SHA256 differs.")
+    if payload.get("python_version") != package_manifest.get(
+        "build_python_version"
+    ):
+        errors.append("Build provenance Python version differs.")
+    policy = lock.get("release_binary_policy", {})
+    if payload.get("python_implementation") != "cpython":
+        errors.append("Build provenance Python implementation differs.")
+    if payload.get("platform") != policy.get("platform"):
+        errors.append("Build provenance platform differs from release policy.")
+    if payload.get("pip_version") != policy.get("pip_version"):
+        errors.append("Build provenance pip version differs from release policy.")
+    if payload.get("python_native_runtime") != package_manifest.get(
+        "python_native_runtime"
+    ):
+        errors.append("Build provenance Python runtime differs from package manifest.")
+    for field in ("requirements_set_sha256", "binary_manifest_sha256"):
+        value = payload.get(field)
+        if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+            errors.append(f"Build provenance {field} is invalid.")
+    from scripts.prepare_release_assets import (
+        _installed_distribution_digest,
+        flatten_exact_requirements,
+    )
+
+    try:
+        pins, expected_inputs = flatten_exact_requirements(
+            RUNTIME_REQUIREMENTS.with_name("requirements-dev.txt")
+        )
+    except (OSError, RuntimeError) as exc:
+        errors.append(f"Cannot verify build requirement provenance: {exc}")
+    else:
+        if payload.get("requirements_inputs") != expected_inputs:
+            errors.append("Build provenance requirement inputs differ.")
+        requirements_set = "".join(
+            f"{item['canonical_name']}=={item['version']}\n"
+            for item in sorted(pins, key=lambda item: item["canonical_name"])
+        ).encode("utf-8")
+        if payload.get("requirements_set_sha256") != hashlib.sha256(
+            requirements_set
+        ).hexdigest():
+            errors.append("Build provenance requirement set differs.")
+    expected_components = set(
+        lock.get("release_binary_policy", {}).get("required_components", [])
+    )
+    if set(package_manifest.get("verified_binary_components", [])) != expected_components:
+        errors.append("Package manifest verified binary component set differs.")
+    records = payload.get("installed_binaries")
+    if not isinstance(records, list):
+        return [*errors, "Build provenance has no installed binary records."]
+    locked = {
+        str(component["component"]): component
+        for component in _component_entries(lock)
+    }
+    observed: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            errors.append("Build provenance contains an invalid binary record.")
+            continue
+        component_name = str(record.get("component", ""))
+        component = locked.get(component_name)
+        if component_name in observed or component is None:
+            errors.append(
+                f"Build provenance component is duplicate or unexpected: "
+                f"{component_name}"
+            )
+            continue
+        observed.add(component_name)
+        archive = component.get("binary_archive")
+        if not isinstance(archive, dict):
+            errors.append(
+                f"Build provenance component has no binary lock: {component_name}"
+            )
+            continue
+        for field in ("filename", "sha256", "size"):
+            if record.get(field) != archive.get(field):
+                errors.append(
+                    f"Build provenance differs for {component_name}.{field}."
+                )
+        if record.get("version") != component.get("version"):
+            errors.append(f"Build provenance version differs for {component_name}.")
+        try:
+            actual_digest = _installed_distribution_digest(
+                str(component["distribution"])
+            )
+        except (OSError, RuntimeError, metadata.PackageNotFoundError) as exc:
+            errors.append(
+                f"Cannot verify installed build provenance for {component_name}: "
+                f"{exc}"
+            )
+        else:
+            if record.get("installed_files_sha256") != actual_digest:
+                errors.append(
+                    f"Installed files differ from build provenance for "
+                    f"{component_name}."
+                )
+    if observed != expected_components:
+        errors.append("Build provenance component set differs from binary policy.")
+    return errors
 
 
 def _validate_project_documents(distribution_root: Path) -> list[str]:
@@ -688,6 +1206,31 @@ def _release_gate_errors(
         f"Release legal/source gate remains for {error}"
         for error in release_gate_errors(lock)
     )
+    required_binary_components = set(
+        lock.get("release_binary_policy", {}).get("required_components", [])
+    )
+    verified_binary_components = set(
+        package_manifest.get("verified_binary_components", [])
+        if package_manifest is not None
+        else []
+    )
+    if verified_binary_components != required_binary_components:
+        errors.append(
+            "Release build did not verify the complete locked binary component set."
+        )
+    if package_manifest is not None:
+        package_components = {
+            str(package.get("component")): package
+            for package in package_manifest.get("packages", [])
+            if isinstance(package, dict)
+        }
+        for component_name in required_binary_components:
+            if package_components.get(component_name, {}).get(
+                "binary_install_verified"
+            ) is not True:
+                errors.append(
+                    f"Release binary install is not verified for {component_name}."
+                )
     return errors
 
 
@@ -725,6 +1268,12 @@ def _write_distribution_manifest(
             record["toc_type"] = entry["type"]
         files.append(record)
 
+    base_library_errors, base_library_summary = _validate_base_library_archive(
+        distribution_root / "_internal" / "base_library.zip",
+        package_manifest,
+    )
+    if base_library_errors or base_library_summary is None:
+        raise ValueError("Cannot inventory base_library.zip: " + " | ".join(base_library_errors))
     manifest = {
         "schema_version": 1,
         "statement": (
@@ -737,7 +1286,11 @@ def _write_distribution_manifest(
         "component_lock_sha256": sha256_file(
             distribution_root / "licenses" / "components.json"
         ),
+        "build_provenance_sha256": package_manifest.get(
+            "build_provenance_sha256"
+        ),
         "pyinstaller_collect_toc_sha256": sha256_file(toc_path),
+        "python_base_library": base_library_summary,
         "files": files,
     }
     manifest_path = distribution_root / MANIFEST_RELATIVE_PATH
@@ -781,6 +1334,17 @@ def _validate_existing_distribution_manifest(
     )
     if payload.get("component_lock_sha256") != expected_lock_hash:
         errors.append("Distribution manifest component lock SHA256 does not match.")
+    if payload.get("build_provenance_sha256") != package_manifest.get(
+        "build_provenance_sha256"
+    ):
+        errors.append("Distribution manifest build provenance SHA256 does not match.")
+    base_library_errors, base_library_summary = _validate_base_library_archive(
+        distribution_root / "_internal" / "base_library.zip",
+        package_manifest,
+    )
+    errors.extend(base_library_errors)
+    if payload.get("python_base_library") != base_library_summary:
+        errors.append("Distribution manifest base_library inventory does not match.")
     toc_hash = payload.get("pyinstaller_collect_toc_sha256")
     if not isinstance(toc_hash, str) or SHA256_PATTERN.fullmatch(toc_hash) is None:
         errors.append("Distribution manifest TOC SHA256 is invalid.")
@@ -915,6 +1479,12 @@ def validate_distribution(
             "Python package license manifest is missing, empty, or not a regular file."
         )
 
+    base_library_errors, _base_library_summary = _validate_base_library_archive(
+        distribution_root / "_internal" / "base_library.zip",
+        package_manifest,
+    )
+    errors.extend(base_library_errors)
+
     try:
         pins = parse_requirement_pins(RUNTIME_REQUIREMENTS)
         locked_runtime = {
@@ -928,6 +1498,22 @@ def validate_distribution(
             errors.append("Runtime requirements and packaged component lock differ.")
     except RuntimeError as exc:
         errors.append(str(exc))
+
+    errors.extend(
+        _validate_locked_license_materials(
+            distribution_root,
+            lock,
+            package_manifest,
+        )
+    )
+    errors.extend(
+        _validate_build_provenance(
+            distribution_root,
+            lock,
+            package_manifest,
+            release=release,
+        )
+    )
 
     allowed_generated = _allowed_generated_files(package_manifest)
     for path in physical.values():
@@ -964,6 +1550,18 @@ def validate_distribution(
         source_owners, ownership_errors = _distribution_source_owners(lock)
         errors.extend(ownership_errors)
         patterns = _artifact_patterns(lock)
+        native_artifact_locks = _python_native_artifact_locks(
+            lock,
+            str(package_manifest.get("build_python_version"))
+            if package_manifest is not None
+            else sys.version.split()[0],
+        )
+        python_core_sources = _python_core_source_locks(
+            lock,
+            str(package_manifest.get("build_python_version"))
+            if package_manifest is not None
+            else sys.version.split()[0],
+        )
     except (OSError, ValueError) as exc:
         errors.append(str(exc))
         return errors
@@ -981,6 +1579,13 @@ def validate_distribution(
             errors.append(f"TOC file is missing from final distribution: {entry['path']}")
         elif path.relative_to(distribution_root).as_posix() != entry["path"]:
             errors.append(f"TOC path casing differs from final distribution: {entry['path']}")
+        elif is_safe_regular_file(source) and (
+            source.stat().st_size != path.stat().st_size
+            or sha256_file(source) != sha256_file(path)
+        ):
+            errors.append(
+                f"TOC source differs from final distribution: {entry['path']}"
+            )
 
     for key, path in physical.items():
         relative = path.relative_to(distribution_root).as_posix()
@@ -991,7 +1596,12 @@ def validate_distribution(
     for key, entry in toc_by_path.items():
         if key not in physical:
             continue
-        component = _classify_toc_entry(entry, source_owners)
+        packaged_path = physical[key]
+        component = _classify_toc_entry(
+            entry,
+            source_owners,
+            python_core_sources,
+        )
         if component is None:
             errors.append(
                 f"Unclassified packaged file: {entry['path']} "
@@ -1009,6 +1619,34 @@ def validate_distribution(
                     f"Native artifact is not allowed by component lock: "
                     f"{entry['path']} ({component})"
                 )
+            core_lock = python_core_sources.get(_path_key(Path(entry["source"])))
+            if core_lock is not None and (
+                packaged_path.stat().st_size != core_lock.get("size")
+                or sha256_file(packaged_path) != core_lock.get("sha256")
+                or Path(entry["source"]).stat().st_size != core_lock.get("size")
+                or sha256_file(Path(entry["source"])) != core_lock.get("sha256")
+            ):
+                errors.append(
+                    f"Python core native artifact differs from official inventory: "
+                    f"{entry['path']}"
+                )
+            if component.startswith("python-"):
+                artifact_lock = native_artifact_locks.get(
+                    (component, PurePosixPath(entry["path"]).name.casefold())
+                )
+                if artifact_lock is None:
+                    errors.append(
+                        f"Python native artifact has no verified runtime hash: "
+                        f"{entry['path']} ({component})"
+                    )
+                elif (
+                    packaged_path.stat().st_size != artifact_lock.get("size")
+                    or sha256_file(packaged_path) != artifact_lock.get("sha256")
+                ):
+                    errors.append(
+                        f"Python native artifact differs from verified runtime: "
+                        f"{entry['path']} ({component})"
+                    )
 
     manifest_path = distribution_root / MANIFEST_RELATIVE_PATH
     if (

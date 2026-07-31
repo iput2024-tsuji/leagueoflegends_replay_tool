@@ -405,6 +405,8 @@ def _release_gate_errors(
     lock: dict[str, Any],
     package_manifest: dict[str, Any] | None,
 ) -> list[str]:
+    from scripts.prepare_release_assets import release_gate_errors
+
     errors = []
     build_python = (
         str(package_manifest.get("build_python_version"))
@@ -422,18 +424,10 @@ def _release_gate_errors(
             f"Release checker must run with Python {release_python}; "
             f"running {sys.version.split()[0]}."
         )
-    for component in _component_entries(lock):
-        if component.get("release_legal_review_required"):
-            errors.append(
-                f"Release legal gate remains for {component['component']}: "
-                f"{component.get('release_gate_reason', 'expert review is required')}"
-            )
-    for component in lock.get("runtime_downloads", []):
-        if component.get("release_legal_review_required"):
-            errors.append(
-                f"Release legal gate remains for runtime download "
-                f"{component['component']}: expert review is required."
-            )
+    errors.extend(
+        f"Release legal/source gate remains for {error}"
+        for error in release_gate_errors(lock)
+    )
     return errors
 
 
@@ -691,6 +685,8 @@ def main() -> int:
         return 1
     if not args.release:
         try:
+            from scripts.prepare_release_assets import release_gate_errors
+
             lock = _read_json(args.distribution_root / "licenses" / "components.json")
             release_version = str(lock["python"]["release_version"])
             if sys.version.split()[0] != release_version:
@@ -698,16 +694,12 @@ def main() -> int:
                     f"WARNING: local build uses Python {sys.version.split()[0]}; "
                     f"release builds are locked to {release_version}."
                 )
-            if any(
-                component.get("release_legal_review_required")
-                for component in [
-                    *_component_entries(lock),
-                    *lock.get("runtime_downloads", []),
-                ]
-            ):
+            open_gates = release_gate_errors(lock)
+            if open_gates:
                 print(
-                    "WARNING: release legal gates remain, including unverified "
-                    "PyQt6-Qt6 wheel build provenance and runtime downloads."
+                    f"WARNING: {len(open_gates)} release legal/source gates remain, "
+                    "including incomplete runtime source coverage, unverified "
+                    "PyQt6-Qt6 wheel build provenance, and runtime downloads."
                 )
         except (OSError, json.JSONDecodeError, KeyError, ValueError):
             pass

@@ -85,14 +85,63 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
                 f"{component['component']}: "
                 f"{component.get('release_gate_reason', 'expert legal review is required')}"
             )
+    source_required_components = [
+        *lock.get("runtime_components", []),
+        *[
+            component
+            for component in lock.get("build_components", [])
+            if component.get("packaged_in_distribution")
+        ],
+    ]
+    for component in source_required_components:
+        archives = component.get("source_archives")
+        exception_reviewed = (
+            component.get("source_archive_exception_reviewed") is True
+            and bool(component.get("source_archive_exception_reason"))
+        )
+        if not archives and not exception_reviewed:
+            errors.append(
+                f"{component['component']}: no verified exact source archive is locked"
+            )
+        license_expression = str(component.get("license", "")).casefold()
+        if (
+            "bundled component licenses" in license_expression
+            and component.get("vendored_source_coverage_verified") is not True
+        ):
+            errors.append(
+                f"{component['component']}: source coverage for wheel-vendored "
+                "native components is not verified"
+            )
     return errors
 
 
 def source_archive_records(lock: dict[str, Any]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     filenames: dict[str, str] = {}
+    source_required_ids = {
+        id(component)
+        for component in [
+            *lock.get("runtime_components", []),
+            *[
+                item
+                for item in lock.get("build_components", [])
+                if item.get("packaged_in_distribution")
+            ],
+        ]
+    }
     for component in _component_entries(lock):
-        for source in component.get("source_archives", []):
+        archives = component.get("source_archives", [])
+        if id(component) in source_required_ids and not archives:
+            exception_reviewed = (
+                component.get("source_archive_exception_reviewed") is True
+                and bool(component.get("source_archive_exception_reason"))
+            )
+            if not exception_reviewed:
+                raise ReleaseAssetError(
+                    f"Runtime component has no verified exact source archive: "
+                    f"{component['component']}"
+                )
+        for source in archives:
             if not isinstance(source, dict):
                 raise ReleaseAssetError(
                     f"Invalid source archive for {component['component']}."

@@ -18,8 +18,10 @@ The next public version will attach its installer, exact project source,
 third-party sources, license materials, and a `SHA256SUMS.txt` covering every
 asset to the same Release. OBS Studio and the Gyan.dev FFmpeg build will not be
 inside the installer; the application downloads them separately from pinned
-locations when needed. No new public Release will be made until specialist
-review of those automatic downloads is complete.
+locations when needed. No new public Release will be made until source coverage
+for every runtime dependency and wheel-vendored native component, PyQt6-Qt6
+wheel build provenance, and specialist review of those automatic downloads are
+complete.
 
 An mpv DLL is also not bundled. Obtain a supported 64-bit DLL separately and
 place it in `%LOCALAPPDATA%\LoLReplayTool\bin`.

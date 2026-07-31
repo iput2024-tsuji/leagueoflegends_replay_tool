@@ -1,5 +1,10 @@
 {
   "schema_version": 1,
+  "release_source_policy": {
+    "require_verified_source_archive_for_every_runtime_component": true,
+    "require_verified_vendored_native_source_coverage": true,
+    "missing_or_unverified_source_is_release_gate": true
+  },
   "application": {
     "component": "lol-replay-tool",
     "version_file": "VERSION",
@@ -41,6 +46,16 @@
       "license": "GPL-2.0-or-later WITH Bootloader-exception",
       "artifact_patterns": [],
       "corresponding_source_required": false
+    },
+    {
+      "component": "setuptools-vendored-runtime",
+      "distribution": "setuptools",
+      "version": "81.0.0",
+      "license": "MIT",
+      "artifact_patterns": [],
+      "packaged_in_distribution": true,
+      "release_legal_review_required": true,
+      "release_gate_reason": "PyInstallerがsetuptools vendored runtime dataを配布物へ収集するため、exact source archiveのURLとSHA256をlockへ追加するまで公開しない。"
     }
   ],
   "runtime_components": [

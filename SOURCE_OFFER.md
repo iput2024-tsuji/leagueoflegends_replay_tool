@@ -18,38 +18,57 @@ SHA256SUMS.txt
 for that binary and contains the preferred form for modifying LoL Replay Tool,
 including its build and packaging scripts. The matching Git tag is `v<version>`.
 
-The numbered third-party source archives contain the exact source archives
-locked for the components in the packaged application. They may be split into
-multiple assets, each smaller than 2 GiB. The license-materials archive contains
-the project license, notices, corresponding-source information, Qt replacement
-instructions, component lock, copied license texts and generated build
-inventory. `SHA256SUMS.txt` identifies every published asset.
+The numbered third-party source archives contain only source archives whose
+URL and SHA256 are locked and verified for the packaged components. They may be
+split into multiple assets, each smaller than 2 GiB. The Release workflow
+refuses publication unless every packaged runtime component has verified source
+coverage, including wheel-vendored native code, or a documented system-library
+exception has completed legal review. The license-materials archive contains
+the project license, notices, source information, Qt replacement instructions,
+component lock, copied license texts and generated build inventory.
+`SHA256SUMS.txt` identifies every published asset.
 
-今後のバイナリReleaseでは、上記の固定した資産名で、そのビルドに対応する
-ソースとライセンス資料を提供します。プロジェクトsource archiveは実際に
-ビルドしたcommitから生成し、番号付き第三者source archiveは2 GiB未満の
-複数資産へ分割できます。`SHA256SUMS.txt`には公開する全資産を記録します。
+今後のバイナリReleaseでは、上記の固定した資産名で、検証できたsourceと
+ライセンス資料を提供します。プロジェクトsource archiveは実際にビルドした
+commitから生成し、番号付き第三者source archiveは2 GiB未満の複数資産へ
+分割できます。全runtime componentとwheel内native codeのsource coverageが
+検証済みになるまでRelease workflowは公開を拒否します。
+`SHA256SUMS.txt`には公開する全資産を記録します。
 
 ## Build inventory and source lock
 
 `licenses/components.json` records the expected component, version, license,
-source URL, source SHA256 and artifact patterns. The generated
+artifact patterns, and source URL/SHA256 where those sources have been
+verified. A missing source archive or unverified vendored-native source is an
+explicit Release gate. The generated
 `licenses/distribution-manifest.json` records the relative path, SHA256 and
 component classification for files in the completed packaged application.
 The manifest is a technical inventory of that build, not a substitute for
 license texts or legal review.
 
-`licenses/components.json`は期待するcomponent、version、license、source URL、
-source SHA256、成果物patternを記録します。生成される
+`licenses/components.json`は期待するcomponent、version、license、成果物
+patternと、検証済みのsource URL/SHA256を記録します。source archiveの欠落や
+wheel内native sourceの未確認は公開を止めるRelease gateです。生成される
 `licenses/distribution-manifest.json`は完成した配布物の相対path、SHA256、
 component分類を記録する技術的なinventoryであり、ライセンス本文や法的確認に
 代わるものではありません。
 
-The locked source materials include LoL Replay Tool itself and the exact sources
-needed for packaged copyleft/runtime components such as Python, PyQt6, Qt,
-obsws-python, OpenCV and the FFmpeg codec library included in the locked
-opencv-python wheel. Package-specific license texts are copied under
-`licenses/python-packages/`.
+The current lock includes verified candidates for LoL Replay Tool, Python,
+PyQt6, obsws-python, OpenCV and the FFmpeg codec library in opencv-python.
+It does not yet prove complete source coverage for every runtime wheel.
+In particular, the Qt 6.10.2 official archive is an upstream reference: the
+patches, configure options and build scripts used for the PyQt6-Qt6 Windows
+wheel have not been verified, so it is not asserted to be that wheel's exact
+Corresponding Source. These gaps deliberately keep the Release gate closed.
+Package-specific license texts are copied under `licenses/python-packages/`.
+
+現在のlockには、LoL Replay Tool、Python、PyQt6、obsws-python、OpenCV、
+opencv-python内FFmpeg codec libraryについて検証済みの候補を記録していますが、
+すべてのruntime wheelのsource coverageは未確認です。特にQt 6.10.2公式archiveは
+上流参考sourceであり、PyQt6-Qt6 Windows wheelで使われたpatch、configure
+option、build scriptを確認できていないため、当該wheelのexact Corresponding
+Sourceとは断定しません。これらの不足が残る間はRelease gateを閉じたままに
+します。
 
 If a listed source asset becomes unavailable, request the matching source
 through the project's Issue tracker. Maintainers must provide an equivalent

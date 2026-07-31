@@ -28,15 +28,19 @@ LoL Replay Toolは`GPL-3.0-only`で提供され、プロジェクトのライセ
 | aiohttp, Requests and supporting packages | Network clients | Component-specific permissive licenses included with the packages |
 | PyInstaller bootloader | Executable packaging bootloader | GPL-2.0-or-later with the PyInstaller bootloader exception |
 
-The exact locked component versions, source URLs, source hashes and artifact
-patterns are recorded in `licenses/components.json`. The generated
+The exact locked component versions and artifact patterns, plus source URLs and
+hashes where verified, are recorded in `licenses/components.json`. Missing
+runtime source archives, unverified wheel-vendored native sources, and the
+unverified PyQt6-Qt6 wheel build provenance are Release gates. The generated
 `licenses/distribution-manifest.json` records relative paths, hashes and
 component classifications observed in the completed build. It is a technical
 inventory, not a controlling legal record. Copied package license texts are
 under `licenses/python-packages/`.
 
-正確なcomponentバージョン、source URL、source hash、成果物patternは
-`licenses/components.json`に記録します。生成される
+正確なcomponentバージョンと成果物pattern、および検証できたsource URL/hashは
+`licenses/components.json`に記録します。runtime source archiveの欠落、
+wheel同梱native source、PyQt6-Qt6 wheelのbuild provenanceの未確認は
+公開を止めるRelease gateです。生成される
 `licenses/distribution-manifest.json`は、完成したビルドで確認した相対path、
 hash、component分類の技術的なinventoryであり、法的に支配的な記録では
 ありません。パッケージから収集したライセンス本文は

@@ -184,6 +184,27 @@ def test_release_legal_gate_is_explicit():
     assert any(error.startswith("download-only:") for error in errors)
 
 
+def test_missing_runtime_and_vendored_sources_are_release_gates():
+    lock = _lock(b"one", b"two")
+    lock["runtime_components"].append(
+        {
+            "component": "missing",
+            "version": "1",
+            "license": "MIT AND bundled component licenses",
+        }
+    )
+
+    errors = release_gate_errors(lock)
+
+    assert "missing: no verified exact source archive is locked" in errors
+    assert any(
+        error.startswith("missing: source coverage for wheel-vendored")
+        for error in errors
+    )
+    with pytest.raises(ReleaseAssetError, match="no verified exact source archive"):
+        source_archive_records(lock)
+
+
 def test_source_partitioner_splits_before_target_size(tmp_path):
     first = tmp_path / "first"
     second = tmp_path / "second"

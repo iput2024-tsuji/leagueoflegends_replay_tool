@@ -75,13 +75,32 @@ jobs:
           $allComponents = @(
             $components.python
             $components.runtime_components
+            $components.build_components
             $components.runtime_downloads
           )
           $openGates = @($allComponents | Where-Object {
             $_.release_legal_review_required -eq $true
           })
-          if ($openGates.Count -gt 0) {
-            $names = ($openGates | ForEach-Object { $_.component }) -join ", "
+          $sourceRequired = @(
+            $components.runtime_components
+            $components.build_components | Where-Object {
+              $_.packaged_in_distribution -eq $true
+            }
+          )
+          $missingSource = @($sourceRequired | Where-Object {
+            -not $_.source_archives -and -not (
+              $_.source_archive_exception_reviewed -eq $true -and
+              $_.source_archive_exception_reason
+            )
+          })
+          $unverifiedVendoredSource = @($components.runtime_components | Where-Object {
+            $_.license -like "*bundled component licenses*" -and
+            $_.vendored_source_coverage_verified -ne $true
+          })
+          $blocked = @($openGates + $missingSource + $unverifiedVendoredSource)
+          if ($blocked.Count -gt 0) {
+            $names = ($blocked | ForEach-Object { $_.component } |
+              Sort-Object -Unique) -join ", "
             throw "Release legal gates remain open: $names"
           }
 

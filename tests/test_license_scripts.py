@@ -372,5 +372,8 @@ def test_release_mode_enforces_python_and_legal_gates(tmp_path):
     errors = validate_distribution(root, release=True)
 
     assert any("Release build Python must be 3.14.6" in error for error in errors)
-    assert any("Release legal gate remains for qt" in error for error in errors)
-    assert any("runtime download obs-studio" in error for error in errors)
+    assert any("gate remains for qt:" in error for error in errors)
+    assert any("gate remains for obs-studio:" in error for error in errors)
+    assert any(
+        "aiohttp: no verified exact source archive" in error for error in errors
+    )

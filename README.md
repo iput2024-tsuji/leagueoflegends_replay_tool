@@ -17,8 +17,9 @@ LoL Replay Tool は、League of Legends の試合を自動録画し、試合イ�
 次の公開版では、インストーラー、対応するプロジェクトソース、第三者ソース、
 ライセンス資料、全資産の`SHA256SUMS.txt`を同じReleaseへ添付します。OBSと
 Gyan.dev FFmpegはインストーラーへ同梱せず、必要になった時点で固定した
-取得元から別途ダウンロードします。この自動取得に関する専門家確認が
-完了するまで、新しい公開Releaseは行いません。
+取得元から別途ダウンロードします。全runtime依存とwheel内native codeの
+source coverage、PyQt6-Qt6 wheelのbuild provenance、この自動取得に関する
+専門家確認が完了するまで、新しい公開Releaseは行いません。
 
 リプレイ再生に必要なmpv DLLも同梱しないため、利用者が別途入手し、
 `%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。

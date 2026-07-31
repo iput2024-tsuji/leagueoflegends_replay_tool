@@ -13,7 +13,8 @@ from scripts import setup_env
 
 
 def runtime_dir(name):
-    path = Path("tests") / "_tmp" / name
+    root = Path(os.environ.get("PYTEST_BASETEMP", Path("tests") / "_tmp"))
+    path = root / "setup-env-runtime" / name
     shutil.rmtree(path, ignore_errors=True)
     path.mkdir(parents=True, exist_ok=True)
     return path

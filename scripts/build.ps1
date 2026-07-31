@@ -1,3 +1,9 @@
+param(
+  [string]$PythonExe = "",
+  [string]$BuildProvenance = "",
+  [string]$BuildProvenanceSha256 = ""
+)
+
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -5,55 +11,67 @@ Set-Location (Join-Path $scriptDir "..")
 
 $venvPython = Join-Path (Get-Location) "venv\Scripts\python.exe"
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-$pythonExe = if (Test-Path $venvPython) { $venvPython } elseif ($pythonCmd) { $pythonCmd.Source } else { $null }
+if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
+  $selectedPython = (Resolve-Path -LiteralPath $PythonExe -ErrorAction Stop).Path
+  if (-not (Test-Path -LiteralPath $selectedPython -PathType Leaf)) {
+    throw "指定された Python 実行ファイルが見つかりません: $PythonExe"
+  }
+} elseif (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+  $selectedPython = $venvPython
+} elseif ($pythonCmd) {
+  $selectedPython = $pythonCmd.Source
+} else {
+  $selectedPython = $null
+}
+if (-not $selectedPython) {
+  throw "Python が見つかりません。venv を作成するか、Python を PATH に追加してください。"
+}
+
+$resolvedBuildProvenance = $null
+if (-not [string]::IsNullOrWhiteSpace($BuildProvenance)) {
+  $resolvedBuildProvenance = (
+    Resolve-Path -LiteralPath $BuildProvenance -ErrorAction Stop
+  ).Path
+  if (-not (Test-Path -LiteralPath $resolvedBuildProvenance -PathType Leaf)) {
+    throw "build provenance が見つかりません: $BuildProvenance"
+  }
+}
+if (-not $resolvedBuildProvenance -and -not [string]::IsNullOrWhiteSpace($BuildProvenanceSha256)) {
+  throw "build provenance を指定せずに固定SHA256だけを指定することはできません。"
+}
+
+function Assert-BuildProvenance {
+  if (-not $resolvedBuildProvenance) {
+    return
+  }
+  if ($BuildProvenanceSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    throw "build provenance の固定SHA256が不正です。"
+  }
+  $actual = (Get-FileHash -LiteralPath $resolvedBuildProvenance -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -cne $BuildProvenanceSha256) {
+    throw "build provenance が固定SHA256と一致しません。"
+  }
+}
+
+Assert-BuildProvenance
+
 $makeIconScript = "scripts\make_icon.py"
-if ($pythonExe -and (Test-Path $makeIconScript)) {
-  & $pythonExe $makeIconScript
+if (Test-Path $makeIconScript) {
+  & $selectedPython $makeIconScript
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }
 }
 
-$pyArgs = @(
-  "-y",
-  "--noconsole",
-  "--onedir",
-  "--contents-directory", "_internal",
-  "--name", "LoLReplayTool",
-  "--clean",
-  "--hidden-import", "mpv",
-  "--add-data", "config\\setting.sample.json;config",
-  "--add-data", "config\\champion_aliases.json;config"
-)
-
-$iconCandidates = @("assets\\icon.ico", "assets\\app\\app.ico")
-$iconPath = $iconCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if ($iconPath -and (Test-Path $iconPath)) {
-  $pyArgs += "--icon=$iconPath"
-  $iconDest = if ($iconPath -eq "assets\\icon.ico") { "assets" } else { "assets\\app" }
-  $pyArgs += "--add-data"
-  $pyArgs += "$iconPath;$iconDest"
+& $selectedPython -c "import PyInstaller" 2>$null
+if ($LASTEXITCODE -ne 0) {
+  throw "選択した Python 環境に PyInstaller がありません。pip install pyinstaller を実行してください。"
 }
-
-$pyArgs += "main.py"
-$pyInstallerCmd = Get-Command pyinstaller -ErrorAction SilentlyContinue
-$buildExitCode = 0
-if (-not $pyInstallerCmd) {
-  $venvPyInstaller = Join-Path (Get-Location) "venv\\Scripts\\pyinstaller.exe"
-  if (Test-Path $venvPyInstaller) {
-    & $venvPyInstaller @pyArgs
-    $buildExitCode = $LASTEXITCODE
-  } else {
-    throw "pyinstaller が見つかりません。venv を有効化するか、pip install pyinstaller を実行してください。"
-  }
-} else {
-  & $pyInstallerCmd.Source @pyArgs
-  $buildExitCode = $LASTEXITCODE
+& $selectedPython -m PyInstaller --noconfirm --clean "LoLReplayTool.spec"
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
 }
-
-if ($buildExitCode -ne 0) {
-  exit $buildExitCode
-}
+Assert-BuildProvenance
 
 $distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
 $distObsDir = Join-Path $distRootDir "obs-portable"
@@ -77,13 +95,58 @@ foreach ($archive in $bundledSetupArchives) {
   Remove-Item -Path $archive.FullName -Force -ErrorAction SilentlyContinue
 }
 
-$thirdPartyNotices = Join-Path (Get-Location) "THIRD_PARTY_NOTICES.md"
-if (Test-Path $thirdPartyNotices) {
-  Copy-Item -LiteralPath $thirdPartyNotices -Destination $distRootDir -Force
+$licensesDir = Join-Path $distRootDir "licenses"
+$licenseArgs = @("scripts\collect_licenses.py", "--destination", $licensesDir)
+if ($resolvedBuildProvenance) {
+  $licenseArgs += @(
+    "--build-provenance", $resolvedBuildProvenance,
+    "--build-provenance-sha256", $BuildProvenanceSha256
+  )
+}
+Assert-BuildProvenance
+& $selectedPython @licenseArgs
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
+Assert-BuildProvenance
+
+$collectToc = Join-Path (Get-Location) "build\\LoLReplayTool\\COLLECT-00.toc"
+if (-not (Test-Path $collectToc)) {
+  throw "PyInstaller COLLECT TOC が見つかりません: $collectToc"
+}
+$writeComplianceArgs = @(
+  "-m", "scripts.check_license_compliance", $distRootDir,
+  "--toc", $collectToc,
+  "--write-manifest"
+)
+if ($resolvedBuildProvenance) {
+  $writeComplianceArgs += @(
+    "--build-provenance-sha256", $BuildProvenanceSha256
+  )
+}
+& $selectedPython @writeComplianceArgs
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
 }
 
+$verifyComplianceArgs = @(
+  "-m", "scripts.check_license_compliance", $distRootDir
+)
+if ($resolvedBuildProvenance) {
+  $verifyComplianceArgs += @(
+    "--build-provenance-sha256", $BuildProvenanceSha256
+  )
+}
+& $selectedPython @verifyComplianceArgs
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
+Assert-BuildProvenance
+
 Write-Host "Build complete. Runtime dependencies are stored under dist\\LoLReplayTool\\_internal."
-Write-Host "Portable OBS, mpv DLLs, FFmpeg, and game assets are not bundled."
-Write-Host "OBS is downloaded on first launch. FFmpeg is downloaded on first clip export. Downloads use pinned SHA256 verification."
+Write-Host "Project and third-party license materials are stored under dist\\LoLReplayTool and its licenses directory."
+Write-Host "Portable OBS, mpv DLLs, the standalone FFmpeg executable, and game assets are not bundled."
+Write-Host "The OpenCV wheel includes its own FFmpeg DLL and notices."
+Write-Host "OBS is downloaded on first launch. The standalone FFmpeg executable is downloaded on first clip export. Downloads use pinned SHA256 verification."
 Write-Host "Place mpv DLLs under %LOCALAPPDATA%\\LoLReplayTool\\bin manually."
 

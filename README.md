@@ -8,9 +8,24 @@ LoL Replay Tool は、League of Legends の試合を自動録画し、試合イ�
 
 ## ダウンロード
 
-[GitHub Releases](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/releases/latest)から最新版の`LoLReplayTool-Setup-*.exe`をダウンロードできます。
+現在、公開インストーラーは提供していません。v0.5.2のインストーラーは、
+配布ライセンス・対応ソース資料を再検証するため撤回しており、
+[GitHub Releases](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/releases)
+からもダウンロードできません。手元に残っているv0.5.2インストーラーの利用は
+推奨しません。v0.5.2について記載するSHA-256は撤回済みバイナリの履歴識別情報
+であり、現在入手できるバイナリや再現ビルドの保証ではありません。元のActions
+成果物は保持されていないため、当時の全ファイルを独立検証できない監査上の制約が
+あります。履歴資料の正確性と遡及対応の十分性に関する専門家確認も未完了です。
 
-OBSとFFmpegは必要になった時点でアプリが自動取得します。リプレイ再生に必要なmpv DLLは同梱していないため、利用者が別途入手し、`%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。Releaseに添付される`SHA256SUMS.txt`でインストーラーの整合性を確認できます。
+次の公開版では、インストーラー、対応するプロジェクトソース、第三者ソース、
+ライセンス資料、全資産の`SHA256SUMS.txt`を同じReleaseへ添付します。OBSと
+Gyan.dev FFmpegはインストーラーへ同梱せず、必要になった時点で固定した
+取得元から別途ダウンロードします。全runtime依存とwheel内native codeの
+source coverage、PyQt6-Qt6 wheelのbuild provenance、この自動取得に関する
+専門家確認が完了するまで、新しい公開Releaseは行いません。
+
+リプレイ再生に必要なmpv DLLも同梱しないため、利用者が別途入手し、
+`%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。
 
 ## Riot Games 免責事項
 
@@ -184,7 +199,8 @@ tests/
 - Python 3.14（CI と配布ビルドの検証対象）
 - mpv DLL
 
-このリポジトリおよびビルド成果物には、OBS Studio 本体、mpv DLL、Riot Games の画像アセットを同梱しません。
+このリポジトリおよびビルド成果物には、OBS Studio本体、クリップ出力用の
+Gyan.dev FFmpeg、mpv DLL、Riot Gamesの画像アセットを同梱しません。
 
 - OBS Studio は初回起動時に固定バージョンを自動取得し、開発実行時は `obs-portable`、配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable` に配置します。
 - mpv DLL は利用者が正規の配布元から取得し、開発実行時は `bin/`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin` に配置してください。
@@ -256,7 +272,9 @@ Hover中の未確定チャンピオンは保存せず、確定したアクショ
 
 ## 配布用ビルド
 
-Windows 向けにPyInstallerの`onedir`形式でビルドします。依存ファイルは`_internal`へまとめ、配布ルートには実行ファイルと第三者ソフトウェアの注意事項だけを配置します。
+Windows向けにPyInstallerの`onedir`形式でビルドします。依存ファイルは
+`_internal`へまとめ、配布ルートには実行ファイル、GPL本文、対応ソース案内、
+Qt交換手順、第三者ソフトウェアの原文ライセンスを配置します。
 
 ```powershell
 pip install pyinstaller
@@ -268,16 +286,27 @@ pip install pyinstaller
 ```text
 dist\LoLReplayTool\
   LoLReplayTool.exe
+  LICENSE
+  SOURCE_OFFER.md
   THIRD_PARTY_NOTICES.md
+  QT_RELINKING.md
+  licenses\
+    components.json
+    distribution-manifest.json
   _internal\
 ```
+
+`licenses/distribution-manifest.json`は、完成したビルド内の実ファイル、
+SHA256、component分類を記録する技術的なinventoryです。適用される
+ライセンス本文や法的判断に代わるものではありません。
 
 注意点:
 
 - `config/setting.json` は初回起動時に自動生成されます
 - OBS Studio 本体はビルド成果物へコピーされません
 - mpv DLL はビルド成果物へコピーされません
-- FFmpeg はビルド成果物へコピーされません
+- クリップ出力用の単体`ffmpeg.exe`はビルド成果物へコピーされません
+- `opencv-python`が動画入出力に使用するFFmpeg DLLと、その通知文はビルド成果物に含まれます
 - チャンピオンアイコンはビルド成果物へコピーされません
 - 配布版の可変データは `dist\LoLReplayTool` ではなく `%LOCALAPPDATA%\LoLReplayTool` に作成されます
 - `assets/app/app.ico` が存在する場合、exe アイコンとウィンドウアイコンに反映されます
@@ -294,7 +323,7 @@ winget install --id JRSoftware.InnoSetup -e
 出力先:
 
 ```text
-dist\installer\LoLReplayTool-Setup-0.1.2.exe
+dist\installer\LoLReplayTool-Setup-<version>.exe
 ```
 
 バージョンは`VERSION`から読み取ります。明示的に変更する場合は`-Version 1.2.3`を指定します。アプリだけを事前ビルド済みの場合は`-SkipBuild`、テスト済みの場合は`-SkipTests`を利用できます。
@@ -305,15 +334,50 @@ dist\installer\LoLReplayTool-Setup-0.1.2.exe
 
 ### GitHub Releaseの公開
 
-`VERSION`を更新してコミットした後、同じバージョンの`v`付きタグをプッシュすると、GitHub ActionsがインストーラーをビルドしてReleaseへ自動公開します。
-公開するバージョンの更新内容は日本語版の`CHANGELOG.md`と英語版の`CHANGELOG.en.md`へ記載してください。どちらかに該当バージョンの節がない場合、Releaseワークフローは公開を中止します。
+公開Releaseは、ライセンス確認、Release準備Issue、CI、Windows実機確認を
+完了し、管理者が公開を明示決定した場合だけ実施します。`VERSION`と日英の
+CHANGELOGを更新し、変更を`main`へmergeしてから、同じバージョンの
+`v`付きtagを作成します。tag pushだけでは公開されず、GitHubの`release`
+Environmentで管理者承認が必要です。タグをpushした後、GitHub Actionsの
+`Release` workflowを`workflow_dispatch`から手動実行し、`tag`へ同じ
+`vX.Y.Z`、`publish_confirmation`へ大文字で正確に`PUBLISH`を入力します。
+prepare jobが全検証と資産生成を完了するとpublish jobが承認待ちになるため、
+検証結果と資産一覧を確認してから`release` Environmentを承認します。
 
 ```powershell
-git tag v0.1.2
-git push origin v0.1.2
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-タグと`VERSION`が一致しない場合や、テスト・Ruff・ビルドのいずれかが失敗した場合はReleaseを公開しません。
+tag、`VERSION`、`main`祖先、source hash、テスト、Ruff、Windowsビルド、
+ライセンス検査のいずれかが一致・成功しない場合は公開しません。Releaseには
+次の資産を添付します。
+
+```text
+LoLReplayTool-Setup-<version>.exe
+LoLReplayTool-source-<version>.zip
+LoLReplayTool-third-party-sources-<version>-NN.zip
+LoLReplayTool-license-materials-<version>.zip
+SHA256SUMS.txt
+```
+
+第三者sourceは2 GiB未満の複数資産へ分割できます。公開済みReleaseの編集、
+資産の上書き、tagの移動・削除は行わず、修正版は新しいバージョンとして
+公開します。OBS StudioとGyan.dev FFmpegはインストーラー内の資産ではなく、
+インストール後の自動取得対象として別に扱います。
+
+## ライセンス
+
+LoL Replay Toolは`GPL-3.0-only`で公開しています。商用PyQtを利用する
+配布路線は現時点で採用していません。ライセンス全文は`LICENSE`、第三者
+ソフトウェアの概要と一次情報は`THIRD_PARTY_NOTICES.md`、対応ソースの案内は
+`SOURCE_OFFER.md`、Qtライブラリの交換・再ビルド手順は`QT_RELINKING.md`を
+参照してください。
+
+すでにGPLで配布した版について、受領者へ与えたGPL上の権利を後から
+取り消すことはできません。将来版を別ライセンスへ変更できるかは、その時点の
+著作権・寄稿許諾と依存関係に基づいて改めて判断し、必要に応じて全権利者の
+同意、GPL依存の商用ライセンス取得または置換を行います。
 
 ## トラブルシュート
 

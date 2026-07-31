@@ -8,9 +8,29 @@ It combines recording, event synchronization, replay review, and data analysis. 
 
 ## Download
 
-Download the latest `LoLReplayTool-Setup-*.exe` from [GitHub Releases](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/releases/latest).
+No public installer is currently available. The v0.5.2 installer was withdrawn
+while its distribution-license and corresponding-source materials are
+revalidated, and it can no longer be downloaded from
+[GitHub Releases](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/releases).
+Use of any locally retained v0.5.2 installer is not recommended. Any SHA-256
+recorded for v0.5.2 is only a historical identifier for the withdrawn binary;
+it does not identify a currently downloadable binary or prove a reproducible
+build. The original Actions artifact is no longer retained, so every file in
+that installer cannot now be independently audited. Specialist review of the
+historical materials and the sufficiency of the retrospective remediation is
+also incomplete.
 
-The application downloads OBS and FFmpeg when they are needed. An mpv DLL is not bundled. Obtain a supported 64-bit mpv DLL separately and place it in `%LOCALAPPDATA%\LoLReplayTool\bin`. You can verify the installer with the attached `SHA256SUMS.txt`.
+The next public version will attach its installer, exact project source,
+third-party sources, license materials, and a `SHA256SUMS.txt` covering every
+asset to the same Release. OBS Studio and the Gyan.dev FFmpeg build will not be
+inside the installer; the application downloads them separately from pinned
+locations when needed. No new public Release will be made until source coverage
+for every runtime dependency and wheel-vendored native component, PyQt6-Qt6
+wheel build provenance, and specialist review of those automatic downloads are
+complete.
+
+An mpv DLL is also not bundled. Obtain a supported 64-bit DLL separately and
+place it in `%LOCALAPPDATA%\LoLReplayTool\bin`.
 
 ## Riot Games Disclaimer
 
@@ -132,7 +152,9 @@ tests/
 - Python 3.14 for the currently tested development and build environment
 - A supported 64-bit mpv DLL
 
-OBS Studio, mpv DLLs, and Riot Games image assets are not included in this repository or the packaged application.
+OBS Studio, the standalone Gyan.dev FFmpeg build used for clip export, mpv
+DLLs, and Riot Games image assets are not included in this repository or the
+packaged application.
 
 - OBS Studio is downloaded at first startup. Development uses `obs-portable`; packaged builds use `%LOCALAPPDATA%\LoLReplayTool\obs-portable`.
 - Place an mpv DLL in `bin/` for development or `%LOCALAPPDATA%\LoLReplayTool\bin` for an installed build.
@@ -198,7 +220,9 @@ The test suite covers API failures, OBS disconnections, asynchronous recording t
 
 ## Windows Build
 
-The application uses PyInstaller `onedir` packaging:
+The application uses PyInstaller `onedir` packaging. The output includes the
+GPL text, corresponding-source information, Qt replacement instructions, and
+the license texts collected from the exact installed Python packages:
 
 ```powershell
 pip install pyinstaller
@@ -210,11 +234,23 @@ Output:
 ```text
 dist\LoLReplayTool\
   LoLReplayTool.exe
+  LICENSE
+  SOURCE_OFFER.md
   THIRD_PARTY_NOTICES.md
+  QT_RELINKING.md
+  licenses\
+    components.json
+    distribution-manifest.json
   _internal\
 ```
 
-OBS, FFmpeg, mpv DLLs, configuration, and recordings are not copied into the application distribution directory.
+`licenses/distribution-manifest.json` is a technical inventory of physical
+files, SHA256 values, and component classifications observed in the completed
+build. It does not replace the applicable license texts or legal analysis.
+
+OBS, the standalone `ffmpeg.exe`, mpv DLLs, configuration, and recordings are
+not copied into the application distribution directory. The FFmpeg DLL used by
+the bundled `opencv-python` wheel and its notices are included.
 
 ## Installer
 
@@ -231,14 +267,53 @@ The uninstaller provides separate unchecked options for deleting application dat
 
 ## Publishing a GitHub Release
 
-Update `VERSION`, add the same version to both `CHANGELOG.md` and `CHANGELOG.en.md`, merge the change into `main`, and push the matching tag:
+Publish only after the licensing review, a dedicated Release-preparation Issue,
+CI, real-Windows checks, and an explicit maintainer decision are complete.
+Update `VERSION` and both changelogs, merge the change into `main`, and then
+create the matching tag. A tag push alone does not publish a Release; the
+`release` Environment requires maintainer approval. After pushing the tag,
+manually run the `Release` workflow with `workflow_dispatch`, enter the same
+`vX.Y.Z` in `tag`, and enter the exact uppercase word `PUBLISH` in
+`publish_confirmation`. The publish job waits for approval after the prepare
+job has verified and generated every asset; inspect those results and the asset
+list before approving the `release` Environment.
 
 ```powershell
-git tag v0.2.0
-git push origin v0.2.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-GitHub Actions validates tests, Ruff, the Windows build, the version, and both changelog sections before publishing the installer. Release notes contain Japanese first and English second.
+GitHub Actions validates the tag, `VERSION`, ancestry from `main`, source hash,
+tests, Ruff, the Windows build, and license materials before publishing. Each
+Release contains:
+
+```text
+LoLReplayTool-Setup-<version>.exe
+LoLReplayTool-source-<version>.zip
+LoLReplayTool-third-party-sources-<version>-NN.zip
+LoLReplayTool-license-materials-<version>.zip
+SHA256SUMS.txt
+```
+
+Third-party sources may be split into multiple assets smaller than 2 GiB.
+Published Releases are not edited, assets are not overwritten, and tags are
+not moved or deleted; a correction uses a new version. OBS Studio and the
+Gyan.dev FFmpeg build are post-install downloads, not files bundled in these
+installer assets.
+
+## License
+
+LoL Replay Tool is licensed under `GPL-3.0-only`. A commercial-PyQt distribution
+path is not currently adopted. See `LICENSE` for the full text,
+`THIRD_PARTY_NOTICES.md` for third-party summaries and primary sources,
+`SOURCE_OFFER.md` for corresponding-source information, and `QT_RELINKING.md`
+for Qt library replacement and rebuild instructions.
+
+GPL rights already granted to recipients of a distributed version cannot later
+be revoked. Whether a future version can be relicensed must be assessed again
+against the copyright permissions and dependencies then in effect, with all
+required rights-holder agreements and commercial licensing or replacement of
+GPL dependencies obtained where necessary.
 
 ## Troubleshooting
 

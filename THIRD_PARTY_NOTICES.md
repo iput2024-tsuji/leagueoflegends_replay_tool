@@ -1,17 +1,101 @@
-# Third-Party Components
+# Third-Party Notices / 第三者ソフトウェア通知
 
-LoL Replay Tool is distributed with Python and third-party Python packages.
-Their copyright and license metadata is included in the packaged runtime where
-provided by each dependency.
+LoL Replay Tool is licensed under `GPL-3.0-only`; the full project license is
+in `LICENSE`. This document is a readable summary of important third-party
+components. The copied license texts, component lock and generated inventory
+are provided to help recipients identify the files in a particular build.
+They do not replace the applicable license texts or legal analysis.
 
-The following applications are not bundled in the installer:
+LoL Replay Toolは`GPL-3.0-only`で提供され、プロジェクトのライセンス全文は
+`LICENSE`にあります。この文書は主な第三者コンポーネントを読みやすく
+まとめたものです。同梱するライセンス本文、component lock、生成inventoryは、
+特定ビルド内のファイルを識別するための補助資料であり、適用される
+ライセンス本文や法的判断に代わるものではありません。
 
-- OBS Studio: downloaded from the official OBS Project release URL on first
-  launch and verified with a pinned SHA256 digest.
-- FFmpeg: downloaded from the configured distribution URL on first clip export
-  and verified with a pinned SHA256 digest.
-- mpv DLL: must be obtained and installed by the user.
-- Riot Games artwork and champion icons: not bundled or downloaded.
+## Components in the Windows application / Windows配布物に含まれるもの
 
-Users are responsible for complying with the licenses and terms of separately
-downloaded software.
+| Component | Role | License summary |
+| --- | --- | --- |
+| Python and its bundled OpenSSL runtime | Runtime, TLS and cryptography | Python Software Foundation License 2.0; Python's third-party license page contains notices for bundled components |
+| PyQt6 | GUI bindings | GPL-3.0-only for the free edition used by this project |
+| Qt 6 | GUI libraries and plugins | Module-specific LGPL-3.0, GPL-2.0/GPL-3.0 or other applicable terms |
+| obsws-python | OBS WebSocket client | GPL-3.0-only |
+| python-mpv | Python binding loaded at runtime | GPL-2.0-or-later; a separately supplied libmpv build has its own build-dependent terms |
+| opencv-python / OpenCV | Image and video processing | MIT packaging code; Apache-2.0 OpenCV code; bundled third-party notices also apply |
+| OpenCV FFmpeg DLL | Video I/O used by OpenCV | LGPL-2.1-or-later for the locked build, with the notices shipped for that wheel |
+| NumPy, pandas, SciPy, scikit-learn | Numerical and analytics libraries | Primarily BSD-3-Clause, with component-specific bundled notices |
+| OpenBLAS and other numerical binaries | Numerical runtime used by wheels | Component-specific permissive licenses included with the wheels |
+| Microsoft Visual C++ runtime files | Native runtime used by CPython, Qt and numerical wheels | Microsoft Visual C++ Redistributable terms; redistribution/source-exception evidence remains a Release gate |
+| Mesa `opengl32sw.dll` in the Qt wheel | Software OpenGL fallback | MIT and bundled component licenses; exact source/build provenance remains a Release gate |
+| aiohttp, Requests and supporting packages | Network clients | Component-specific permissive licenses included with the packages |
+| PyInstaller bootloader | Executable packaging bootloader | GPL-2.0-or-later with the PyInstaller bootloader exception |
+
+The exact locked component versions and artifact patterns, plus source URLs and
+hashes where verified, are recorded in `licenses/components.json`. Missing
+runtime source archives, unverified wheel-vendored native sources, the
+unverified PyQt6-Qt6 wheel build provenance and Qt plugin notices, Mesa
+provenance, and Microsoft runtime exception evidence are Release gates. The generated
+`licenses/distribution-manifest.json` records relative paths, hashes and
+component classifications observed in the completed build. It is a technical
+inventory, not a controlling legal record. Copied package license texts are
+under `licenses/python-packages/`.
+
+正確なcomponentバージョンと成果物pattern、および検証できたsource URL/hashは
+`licenses/components.json`に記録します。runtime source archiveの欠落、
+wheel同梱native source、PyQt6-Qt6 wheelのbuild provenanceとQt plugin通知、
+Mesaのprovenance、Microsoft runtime例外根拠の未確認は
+公開を止めるRelease gateです。生成される
+`licenses/distribution-manifest.json`は、完成したビルドで確認した相対path、
+hash、component分類の技術的なinventoryであり、法的に支配的な記録では
+ありません。パッケージから収集したライセンス本文は
+`licenses/python-packages/`にあります。
+
+Corresponding-source information is in `SOURCE_OFFER.md`. Instructions for
+replacing the dynamically linked Qt libraries are in `QT_RELINKING.md`.
+
+対応ソースの情報は`SOURCE_OFFER.md`、動的リンクされたQtライブラリの
+交換手順は`QT_RELINKING.md`を参照してください。
+
+## Components acquired after installation / インストール後に取得するもの
+
+The following components are not included in the installer or its packaged
+application directory:
+
+- **OBS Studio 32.1.2** is downloaded from a pinned official OBS Project
+  Release when recording support is first prepared.
+- **Gyan.dev FFmpeg 8.1.1 essentials build** is downloaded from a pinned
+  location when clip export first requires it. This executable is separate
+  from the OpenCV FFmpeg DLL already present in the installer. License and
+  README materials from the downloaded archive are stored in the application
+  data directory.
+- **libmpv** is supplied separately by the user. The user must retain the
+  license information supplied with that build.
+- Riot Games artwork and champion icons are neither bundled nor downloaded.
+
+上記OBS StudioとGyan.dev FFmpegは、インストーラーおよびインストール直後の
+アプリケーション配布ディレクトリには含まれず、必要になった時点で固定した
+取得元から別途ダウンロードされます。この自動取得が本プロジェクトによる
+配布に当たるか、および必要な対応は専門家確認中です。その確認が完了するまで
+新しい公開Releaseは行いません。
+
+Whether those automatic OBS Studio and Gyan.dev FFmpeg downloads constitute
+distribution by this project, and what additional measures may be required,
+remain subject to specialist review. No new public Release will be made until
+that review is recorded.
+
+## Upstream license information / 一次情報
+
+- PyQt6: https://riverbankcomputing.com/software/pyqt/
+- Qt open-source obligations:
+  https://www.qt.io/licensing/open-source-obligations
+- obsws-python:
+  https://github.com/aatikturk/obsws-python/blob/main/LICENSE
+- python-mpv:
+  https://github.com/jaseg/python-mpv/blob/main/LICENSE.GPL
+- mpv: https://github.com/mpv-player/mpv/blob/master/Copyright
+- OpenCV: https://opencv.org/license/
+- opencv-python notices:
+  https://github.com/opencv/opencv-python/blob/master/LICENSE-3RD-PARTY.txt
+- PyInstaller: https://pyinstaller.org/en/stable/license.html
+- OBS Studio: https://github.com/obsproject/obs-studio/blob/master/COPYING
+- FFmpeg: https://ffmpeg.org/legal.html

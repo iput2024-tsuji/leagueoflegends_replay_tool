@@ -29,7 +29,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.14"
+          python-version: "3.14.6"
           cache: pip
           cache-dependency-path: |
             requirements.txt
@@ -85,20 +85,60 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Set up Python
+      - name: Set up bootstrap Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.14"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
+          python-version: "3.14.6"
+
+      - name: Prepare locked Python runtime
+        shell: pwsh
+        run: |
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "LoLReplayTool-test-runtime"
+          $runtimeCache = Join-Path $env:RUNNER_TEMP "LoLReplayTool-test-runtime-cache"
+          $basePython = Join-Path $runtimeRoot "python.exe"
+          $venvRoot = Join-Path $env:RUNNER_TEMP "LoLReplayTool-test-venv"
+          $jobPython = Join-Path $venvRoot "Scripts\python.exe"
+
+          python -m scripts.prepare_release_assets `
+            prepare-python-runtime `
+            --components .\compliance\components.json `
+            --cache-dir $runtimeCache `
+            --output-dir $runtimeRoot
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & $basePython -m scripts.prepare_release_assets `
+            verify-python-runtime `
+            --components .\compliance\components.json
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & $basePython -m venv $venvRoot
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & $jobPython -m scripts.prepare_release_assets `
+            verify-bootstrap-pip `
+            --components .\compliance\components.json
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          "WINDOWS_PYTHON=$jobPython" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
 
       - name: Install test dependencies
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          & $env:WINDOWS_PYTHON -m pip `
+            --isolated `
+            --disable-pip-version-check `
+            install `
+            --no-input `
+            --require-virtualenv `
+            -r requirements-dev.txt
 
       - name: Prepare test environment
         shell: pwsh
@@ -112,7 +152,11 @@ jobs:
           TEMP: ${{ github.workspace }}\.tmp
           TMP: ${{ github.workspace }}\.tmp
           PYTEST_BASETEMP: ${{ github.workspace }}\.pytest-tmp
-        run: python -m pytest -p no:cacheprovider --basetemp="$env:PYTEST_BASETEMP" tests
+        run: |
+          & $env:WINDOWS_PYTHON -m pytest `
+            -p no:cacheprovider `
+            --basetemp="$env:PYTEST_BASETEMP" `
+            tests
 
   build-windows:
     name: Build Windows artifact
@@ -125,20 +169,60 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v6
 
-      - name: Set up Python
+      - name: Set up bootstrap Python
         uses: actions/setup-python@v6
         with:
-          python-version: "3.14"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
+          python-version: "3.14.6"
+
+      - name: Prepare locked Python runtime
+        shell: pwsh
+        run: |
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "LoLReplayTool-build-runtime"
+          $runtimeCache = Join-Path $env:RUNNER_TEMP "LoLReplayTool-build-runtime-cache"
+          $basePython = Join-Path $runtimeRoot "python.exe"
+          $venvRoot = Join-Path $env:RUNNER_TEMP "LoLReplayTool-build-venv"
+          $jobPython = Join-Path $venvRoot "Scripts\python.exe"
+
+          python -m scripts.prepare_release_assets `
+            prepare-python-runtime `
+            --components .\compliance\components.json `
+            --cache-dir $runtimeCache `
+            --output-dir $runtimeRoot
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & $basePython -m scripts.prepare_release_assets `
+            verify-python-runtime `
+            --components .\compliance\components.json
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & $basePython -m venv $venvRoot
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          & $jobPython -m scripts.prepare_release_assets `
+            verify-bootstrap-pip `
+            --components .\compliance\components.json
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          "WINDOWS_PYTHON=$jobPython" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
 
       - name: Install build dependencies
         shell: pwsh
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
+          & $env:WINDOWS_PYTHON -m pip `
+            --isolated `
+            --disable-pip-version-check `
+            install `
+            --no-input `
+            --require-virtualenv `
+            -r requirements-dev.txt
 
       - name: Install Inno Setup
         shell: pwsh
@@ -146,7 +230,13 @@ jobs:
 
       - name: Build application
         shell: pwsh
-        run: .\scripts\build.ps1
+        run: .\scripts\build.ps1 -PythonExe $env:WINDOWS_PYTHON
+
+      - name: Validate packaged license materials
+        shell: pwsh
+        run: |
+          & $env:WINDOWS_PYTHON -m scripts.check_license_compliance `
+            .\dist\LoLReplayTool
 
       - name: Run packaged self-check
         shell: pwsh
@@ -154,28 +244,8 @@ jobs:
 
       - name: Build installer
         shell: pwsh
-        run: .\scripts\build_installer.ps1 -SkipTests -SkipBuild
-
-      - name: Package build output
-        shell: pwsh
         run: |
-          if (-not (Test-Path .\dist\LoLReplayTool)) {
-            throw "dist\LoLReplayTool was not generated."
-          }
-          Compress-Archive -Path .\dist\LoLReplayTool -DestinationPath .\dist\LoLReplayTool-windows.zip -Force
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: LoLReplayTool-windows
-          path: dist/LoLReplayTool-windows.zip
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload Windows installer
-        uses: actions/upload-artifact@v7
-        with:
-          name: LoLReplayTool-installer
-          path: dist/installer/LoLReplayTool-Setup-*.exe
-          if-no-files-found: error
-          retention-days: 14
+          .\scripts\build_installer.ps1 `
+            -PythonExe $env:WINDOWS_PYTHON `
+            -SkipTests `
+            -SkipBuild

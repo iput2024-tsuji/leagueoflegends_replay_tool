@@ -1,0 +1,57 @@
+第三者ソフトウェアとライセンスに関するお知らせ
+
+LoL Replay Tool は GPL-3.0-only で提供されます。
+GPL version 3 の全文は、この画面の前に表示されるライセンス本文と、
+インストール先の LICENSE にあります。
+
+本アプリケーションには、Python、PyQt6、Qt、obsws-python、
+opencv-python、OpenCV FFmpeg、NumPy、pandas、SciPy、
+scikit-learn、Microsoft Visual C++ runtime、Mesa software OpenGL
+などの第三者コンポーネントが含まれます。
+各コンポーネントには、それぞれのライセンス条件が適用されます。
+
+インストール後は、次の同梱資料を確認できます。
+
+  THIRD_PARTY_NOTICES.md
+  SOURCE_OFFER.md
+  QT_RELINKING.md
+  licenses フォルダー
+
+licenses/distribution-manifest.json は実際のビルド成果物を記録する
+技術的な inventory です。ライセンス本文や法的判断に代わるものでは
+ありません。
+
+OBS Studio と Gyan.dev の FFmpeg は、このインストーラーには含まれません。
+機能を初めて利用するときに、固定された配布元からアプリケーションが
+別途取得します。libmpv DLL も同梱されず、利用者が別途用意します。
+
+新しい公開 Release は、OBS Studio と Gyan.dev FFmpeg の自動取得に
+関する法的確認、および撤回済み v0.5.2 の履歴資料と遡及対応に関する
+専門家確認が完了するまで行いません。v0.5.2 の SHA-256 は撤回済み
+バイナリの履歴識別情報に限られ、元の Actions 成果物は残っていません。
+
+Third-party software and license notice
+
+LoL Replay Tool is provided under GPL-3.0-only. The full GNU GPL version 3
+text appears before this page and is installed as LICENSE.
+
+The application contains third-party components including Python, PyQt6, Qt,
+obsws-python, opencv-python, the OpenCV FFmpeg DLL, NumPy, pandas, SciPy,
+scikit-learn, Microsoft Visual C++ runtime files, and Mesa software OpenGL.
+Each component remains subject to its own license terms.
+
+After installation, see THIRD_PARTY_NOTICES.md, SOURCE_OFFER.md,
+QT_RELINKING.md, and the licenses directory. The generated
+licenses/distribution-manifest.json is a technical inventory of the actual
+build. It does not replace license texts or legal analysis.
+
+OBS Studio and the Gyan.dev FFmpeg build are not included in this installer.
+The application downloads them separately from pinned locations when their
+features are first needed. A libmpv DLL is also not included and must be
+supplied by the user.
+
+No new public Release will be made until the legal review of the automatic
+OBS Studio and Gyan.dev FFmpeg downloads, and specialist review of the
+withdrawn v0.5.2 historical materials and retrospective remediation, are
+complete. A v0.5.2 SHA-256 is only a historical identifier for the withdrawn
+binary; its original Actions artifact is no longer retained.

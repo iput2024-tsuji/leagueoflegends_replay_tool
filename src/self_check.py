@@ -26,6 +26,24 @@ def run_self_check() -> dict[str, Any]:
     _add_check(checks, "app_root", app_root.exists(), f"app_root={app_root}")
     _add_check(checks, "data_root", _is_writable_directory(data_root), f"data_root={data_root}")
 
+    try:
+        from . import analytics
+
+        _add_check(
+            checks,
+            "analytics_runtime",
+            callable(analytics.DecisionTreeClassifier),
+            "scikit-learn native runtime loaded",
+        )
+    except Exception as e:
+        _add_check(
+            checks,
+            "analytics_runtime",
+            False,
+            f"{type(e).__name__}: {e}",
+            fatal=True,
+        )
+
     config_data: dict[str, Any] = {}
     app_config = None
     try:

@@ -1,5 +1,8 @@
 param(
   [string]$Version = "",
+  [string]$PythonExe = "",
+  [string]$BuildProvenance = "",
+  [string]$BuildProvenanceSha256 = "",
   [switch]$SkipTests,
   [switch]$SkipBuild
 )
@@ -24,53 +27,131 @@ if ($Version -notmatch '^\d+\.\d+\.\d+(?:\.\d+)?$') {
 
 $venvPython = Join-Path $repoRoot "venv\Scripts\python.exe"
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
-$pythonExe = if (Test-Path $venvPython) {
-  $venvPython
+if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
+  $selectedPython = (Resolve-Path -LiteralPath $PythonExe -ErrorAction Stop).Path
+  if (-not (Test-Path -LiteralPath $selectedPython -PathType Leaf)) {
+    throw "指定された Python 実行ファイルが見つかりません: $PythonExe"
+  }
+} elseif (Test-Path -LiteralPath $venvPython -PathType Leaf) {
+  $selectedPython = $venvPython
 } elseif ($pythonCmd) {
-  $pythonCmd.Source
+  $selectedPython = $pythonCmd.Source
 } else {
-  $null
+  $selectedPython = $null
 }
 
+$resolvedBuildProvenance = $null
+if (-not [string]::IsNullOrWhiteSpace($BuildProvenance)) {
+  $resolvedBuildProvenance = (
+    Resolve-Path -LiteralPath $BuildProvenance -ErrorAction Stop
+  ).Path
+  if (-not (Test-Path -LiteralPath $resolvedBuildProvenance -PathType Leaf)) {
+    throw "build provenance が見つかりません: $BuildProvenance"
+  }
+}
+if (-not $resolvedBuildProvenance -and -not [string]::IsNullOrWhiteSpace($BuildProvenanceSha256)) {
+  throw "build provenance を指定せずに固定SHA256だけを指定することはできません。"
+}
+
+function Assert-BuildProvenance {
+  if (-not $resolvedBuildProvenance) {
+    return
+  }
+  if ($BuildProvenanceSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    throw "build provenance の固定SHA256が不正です。"
+  }
+  $actual = (Get-FileHash -LiteralPath $resolvedBuildProvenance -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -cne $BuildProvenanceSha256) {
+    throw "build provenance が固定SHA256と一致しません。"
+  }
+}
+
+Assert-BuildProvenance
+
 if (-not $SkipTests) {
-  if (-not $pythonExe) {
+  if (-not $selectedPython) {
     throw "Python が見つからないためテストを実行できません。"
   }
   $testTemp = Join-Path $repoRoot ("tests\_tmp\installer-build-" + [guid]::NewGuid().ToString("N"))
-  & $pythonExe -m pytest -p no:cacheprovider "--basetemp=$testTemp" tests
+  & $selectedPython -m pytest -p no:cacheprovider "--basetemp=$testTemp" tests
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }
 }
 
 if (-not $SkipBuild) {
-  & (Join-Path $scriptDir "build.ps1")
+  $buildArgs = @()
+  if ($selectedPython) {
+    $buildArgs += @("-PythonExe", $selectedPython)
+  }
+  if ($resolvedBuildProvenance) {
+    $buildArgs += @(
+      "-BuildProvenance", $resolvedBuildProvenance,
+      "-BuildProvenanceSha256", $BuildProvenanceSha256
+    )
+  }
+  & (Join-Path $scriptDir "build.ps1") @buildArgs
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }
+  Assert-BuildProvenance
 }
 
 $appExe = Join-Path $repoRoot "dist\LoLReplayTool\LoLReplayTool.exe"
 if (-not (Test-Path $appExe)) {
   throw "アプリのビルド成果物が見つかりません: $appExe"
 }
+if (-not $selectedPython) {
+  throw "Python が見つからないためライセンス資料を検査できません。"
+}
+
+$complianceArgs = @(
+  "-m", "scripts.check_license_compliance",
+  (Join-Path $repoRoot "dist\LoLReplayTool")
+)
+if ($resolvedBuildProvenance) {
+  $complianceArgs += @(
+    "--build-provenance-sha256", $BuildProvenanceSha256
+  )
+}
+& $selectedPython @complianceArgs
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
+Assert-BuildProvenance
 
 $previousDataDir = $env:LOL_REPLAY_TOOL_DATA_DIR
-$selfCheckDir = Join-Path $repoRoot ("tests\_tmp\installer-self-check-" + [guid]::NewGuid().ToString("N"))
+$selfCheckDir = Join-Path $repoRoot ("dist\installer-self-check-" + [guid]::NewGuid().ToString("N"))
+$selfCheckStdout = Join-Path $selfCheckDir "stdout.txt"
+$selfCheckStderr = Join-Path $selfCheckDir "stderr.txt"
 try {
+  New-Item -ItemType Directory -Path $selfCheckDir -Force | Out-Null
   $env:LOL_REPLAY_TOOL_DATA_DIR = $selfCheckDir
   $selfCheckProcess = Start-Process `
     -FilePath $appExe `
     -ArgumentList "--self-check" `
     -WindowStyle Hidden `
-    -Wait `
+    -RedirectStandardOutput $selfCheckStdout `
+    -RedirectStandardError $selfCheckStderr `
     -PassThru
+  if (-not $selfCheckProcess.WaitForExit(60000)) {
+    $selfCheckProcess.Kill($true)
+    $selfCheckProcess.WaitForExit()
+    throw "packaged self-check が60秒以内に終了しませんでした。"
+  }
+  if (Test-Path $selfCheckStdout) {
+    Get-Content $selfCheckStdout | Write-Host
+  }
+  if (Test-Path $selfCheckStderr) {
+    Get-Content $selfCheckStderr | Write-Error
+  }
   if ($selfCheckProcess.ExitCode -ne 0) {
     exit $selfCheckProcess.ExitCode
   }
 } finally {
   $env:LOL_REPLAY_TOOL_DATA_DIR = $previousDataDir
 }
+Assert-BuildProvenance
 
 $isccCandidates = @()
 $isccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
@@ -105,5 +186,6 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (Test-Path $installerPath)) {
   throw "インストーラーが生成されませんでした: $installerPath"
 }
+Assert-BuildProvenance
 
 Write-Host "Installer build complete: $installerPath"

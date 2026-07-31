@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "session_status": "completed",
+  "session_phase": "completed",
+  "failure_reason": null,
+  "summoner_name": "CurrentPlayer#TEST",
+  "champion_name": "Ahri",
+  "enemy_champions": [
+    "Aatrox",
+    "Lux"
+  ],
+  "player_team": "CHAOS",
+  "game_result": "Loss",
+  "winning_team": "ORDER",
+  "saved_at": "2026-01-02 03:04:05",
+  "sync_game_time": 18.25,
+  "obs_record_path": "C:/fixture-media/current.mp4",
+  "paths": {
+    "recordings_dir": "fixture-recordings",
+    "json_path": "fixture-json/current-complete.json"
+  },
+  "match": {
+    "game_id": "fixture-current-001",
+    "queue_id": 420,
+    "queue_type": "RANKED_SOLO_5x5",
+    "display_name": "ランク ソロ/デュオ"
+  },
+  "ban_pick": {
+    "actions": [
+      {
+        "order": 1,
+        "type": "ban",
+        "team": "enemy",
+        "champion_name": "Darius"
+      }
+    ]
+  },
+  "events": [
+    {
+      "EventID": 1,
+      "EventName": "GameStart",
+      "EventTime": 0.0
+    }
+  ],
+  "events_all": [
+    {
+      "EventID": 1,
+      "EventName": "GameStart",
+      "EventTime": 0.0
+    },
+    {
+      "EventID": 2,
+      "EventName": "DragonKill",
+      "EventTime": 725.5,
+      "DragonType": "Fire"
+    }
+  ]
+}

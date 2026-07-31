@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "session_status": "failed_partial",
+  "session_phase": "failed",
+  "failure_reason": "fixture recorder interruption",
+  "summoner_name": "PartialPlayer#TEST",
+  "champion_name": "Nami",
+  "enemy_champions": [
+    "Leona"
+  ],
+  "player_team": "ORDER",
+  "saved_at": "2026-01-04 05:06:07",
+  "sync_game_time": 4.5,
+  "obs_record_path": "D:/fixture-media/partial.mkv",
+  "events_all": [
+    {
+      "EventID": 1,
+      "EventName": "GameStart",
+      "EventTime": 0.0
+    }
+  ]
+}

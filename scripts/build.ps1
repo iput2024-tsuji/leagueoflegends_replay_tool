@@ -40,23 +40,13 @@ if ($iconPath -and (Test-Path $iconPath)) {
 }
 
 $pyArgs += "main.py"
-$pyInstallerCmd = Get-Command pyinstaller -ErrorAction SilentlyContinue
-$buildExitCode = 0
-if (-not $pyInstallerCmd) {
-  $venvPyInstaller = Join-Path (Get-Location) "venv\\Scripts\\pyinstaller.exe"
-  if (Test-Path $venvPyInstaller) {
-    & $venvPyInstaller @pyArgs
-    $buildExitCode = $LASTEXITCODE
-  } else {
-    throw "pyinstaller が見つかりません。venv を有効化するか、pip install pyinstaller を実行してください。"
-  }
-} else {
-  & $pyInstallerCmd.Source @pyArgs
-  $buildExitCode = $LASTEXITCODE
+& $pythonExe -c "import PyInstaller" 2>$null
+if ($LASTEXITCODE -ne 0) {
+  throw "選択した Python 環境に PyInstaller がありません。pip install pyinstaller を実行してください。"
 }
-
-if ($buildExitCode -ne 0) {
-  exit $buildExitCode
+& $pythonExe -m PyInstaller @pyArgs
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
 }
 
 $distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
@@ -83,6 +73,17 @@ foreach ($archive in $bundledSetupArchives) {
 
 $licensesDir = Join-Path $distRootDir "licenses"
 & $pythonExe "scripts\collect_licenses.py" --destination $licensesDir
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
+
+$collectToc = Join-Path (Get-Location) "build\\LoLReplayTool\\COLLECT-00.toc"
+if (-not (Test-Path $collectToc)) {
+  throw "PyInstaller COLLECT TOC が見つかりません: $collectToc"
+}
+& $pythonExe -m scripts.check_license_compliance $distRootDir `
+  --toc $collectToc `
+  --write-manifest
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }

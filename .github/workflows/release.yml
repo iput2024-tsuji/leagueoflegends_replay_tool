@@ -15,19 +15,34 @@ jobs:
   release:
     name: Build and publish Windows installer
     runs-on: windows-latest
+    timeout-minutes: 240
+    environment: release
     env:
       PYTHONIOENCODING: utf8
 
     steps:
-      - name: Checkout repository
+      - name: Checkout exact tag commit
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-      - name: Validate release version
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14.6"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Validate immutable release inputs
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
-          if ($tag -notmatch '^v(\d+\.\d+\.\d+(?:\.\d+)?)$') {
-            throw "Release tag must use v1.2.3 or v1.2.3.4 format: $tag"
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw "Release tag must use the strict v1.2.3 format: $tag"
           }
 
           $tagVersion = $Matches[1]
@@ -36,16 +51,44 @@ jobs:
             throw "Tag version $tagVersion does not match VERSION $fileVersion."
           }
 
-          "APP_VERSION=$tagVersion" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $headCommit = (git rev-parse HEAD).Trim()
+          $tagCommit = (git rev-list -n 1 $tag).Trim()
+          if ($headCommit -ne "${{ github.sha }}" -or $tagCommit -ne "${{ github.sha }}") {
+            throw "The checked out commit, tag commit, and GitHub event SHA must match."
+          }
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.14"
-          cache: pip
-          cache-dependency-path: |
-            requirements.txt
-            requirements-dev.txt
+          git fetch origin main --no-tags
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          git merge-base --is-ancestor "${{ github.sha }}" origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release commit must be contained in origin/main."
+          }
+
+          gh release view $tag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $tag already exists. Existing Releases are immutable."
+          }
+
+          $components = Get-Content .\compliance\components.json -Raw | ConvertFrom-Json
+          $allComponents = @(
+            $components.python
+            $components.runtime_components
+            $components.runtime_downloads
+          )
+          $openGates = @($allComponents | Where-Object {
+            $_.release_legal_review_required -eq $true
+          })
+          if ($openGates.Count -gt 0) {
+            $names = ($openGates | ForEach-Object { $_.component }) -join ", "
+            throw "Release legal gates remain open: $names"
+          }
+
+          "APP_VERSION=$tagVersion" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
 
       - name: Install build dependencies
         shell: pwsh
@@ -65,94 +108,74 @@ jobs:
         shell: pwsh
         run: .\scripts\build_installer.ps1 -Version $env:APP_VERSION
 
-      - name: Create source and license archives
+      - name: Create and verify release assets
         shell: pwsh
         run: |
-          $installerName = "LoLReplayTool-Setup-$env:APP_VERSION.exe"
-          $installerPath = Join-Path .\dist\installer $installerName
-          if (-not (Test-Path $installerPath)) {
-            throw "Installer was not generated: $installerPath"
+          $installer = ".\dist\installer\LoLReplayTool-Setup-$env:APP_VERSION.exe"
+          if (-not (Test-Path $installer)) {
+            throw "Installer was not generated: $installer"
           }
 
-          python -m scripts.check_license_compliance .\dist\LoLReplayTool
+          python -m scripts.check_license_compliance `
+            .\dist\LoLReplayTool `
+            --release
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
 
-          $sourceName = "LoLReplayTool-source-$env:APP_VERSION.zip"
-          $sourcePath = Join-Path .\dist\installer $sourceName
-          git archive --format=zip --output=$sourcePath HEAD
+          $source = ".\dist\installer\LoLReplayTool-source-$env:APP_VERSION.zip"
+          git archive `
+            --format=zip `
+            --output=$source `
+            "${{ github.sha }}"
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
 
-          $licenseName = "LoLReplayTool-license-materials-$env:APP_VERSION.zip"
-          $licensePath = Join-Path .\dist\installer $licenseName
-          $licenseStage = Join-Path $env:RUNNER_TEMP (
-            "LoLReplayTool-license-materials-$env:APP_VERSION-" + [guid]::NewGuid().ToString("N")
-          )
-          New-Item -ItemType Directory -Path $licenseStage -Force | Out-Null
-          Copy-Item .\dist\LoLReplayTool\LICENSE $licenseStage
-          Copy-Item .\dist\LoLReplayTool\THIRD_PARTY_NOTICES.md $licenseStage
-          Copy-Item .\dist\LoLReplayTool\SOURCE_OFFER.md $licenseStage
-          Copy-Item .\dist\LoLReplayTool\VERSION $licenseStage
-          Copy-Item .\dist\LoLReplayTool\licenses $licenseStage -Recurse
-          Compress-Archive -Path "$licenseStage\*" -DestinationPath $licensePath -Force
-
-          $artifactPaths = @($installerPath, $sourcePath, $licensePath)
-          $checksumLines = foreach ($artifactPath in $artifactPaths) {
-            $hash = (Get-FileHash $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
-            "$hash  $(Split-Path $artifactPath -Leaf)"
+          python -m scripts.prepare_release_assets `
+            --version $env:APP_VERSION `
+            --installer $installer `
+            --application-source $source `
+            --distribution-root .\dist\LoLReplayTool `
+            --output-dir .\dist\installer `
+            --cache-dir "$env:RUNNER_TEMP\LoLReplayTool-sources"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
           }
-          $checksumLines | Set-Content .\dist\installer\SHA256SUMS.txt -Encoding ascii
 
-      - name: Publish GitHub Release
+      - name: Publish new GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           $tag = "${{ github.ref_name }}"
-          $installer = ".\dist\installer\LoLReplayTool-Setup-$env:APP_VERSION.exe"
-          $source = ".\dist\installer\LoLReplayTool-source-$env:APP_VERSION.zip"
-          $licenses = ".\dist\installer\LoLReplayTool-license-materials-$env:APP_VERSION.zip"
-          $checksums = ".\dist\installer\SHA256SUMS.txt"
+          gh release view $tag --json tagName 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $tag already exists. Existing Releases are immutable."
+          }
+
           $changelog = Get-Content .\CHANGELOG.md -Raw
           $englishChangelog = Get-Content .\CHANGELOG.en.md -Raw
           $escapedVersion = [regex]::Escape($env:APP_VERSION)
           $sectionPattern = "(?ms)^## \[$escapedVersion\].*?(?=^## \[|\z)"
           $section = [regex]::Match($changelog, $sectionPattern)
-          if (-not $section.Success) {
-            throw "CHANGELOG.md does not contain a section for $env:APP_VERSION."
-          }
           $englishSection = [regex]::Match($englishChangelog, $sectionPattern)
-          if (-not $englishSection.Success) {
-            throw "CHANGELOG.en.md does not contain a section for $env:APP_VERSION."
+          if (-not $section.Success -or -not $englishSection.Success) {
+            throw "Both changelogs must contain $env:APP_VERSION."
           }
 
-          $installNotes = @'
-          ## インストール前の注意
-
-          - リプレイ再生には64bit版のmpv DLLが別途必要です。
-          - mpv DLLは`%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。
-          - OBSとFFmpegは必要になった時点でアプリが自動取得します。
-          - 本ソフトウェアはGPL-3.0-onlyです。対応ソースと第三者ライセンス資料をReleaseへ添付しています。
-          - `SHA256SUMS.txt`で公開ファイルの整合性を確認できます。
-          '@
-          $englishInstallNotes = @'
-          ## Before installation
-
-          - Replay playback requires a separate 64-bit mpv DLL.
-          - Place the mpv DLL in `%LOCALAPPDATA%\LoLReplayTool\bin`.
-          - The application downloads OBS and FFmpeg when they are needed.
-          - This software is GPL-3.0-only. Corresponding source and third-party license materials are attached.
-          - Use `SHA256SUMS.txt` to verify the published files.
-          '@
           $releaseNotes = @"
           # 日本語
 
           $($section.Value.Trim())
 
-          $installNotes
+          ## 配布資料
+
+          - 本ソフトウェアはGPL-3.0-onlyです。
+          - アプリソース、検証済みのcomponent source資産、第三者ライセンス資料を添付しています。
+          - OBS StudioとGyan.dev FFmpegはインストーラーに含まれず、利用時に固定URL・SHA256で取得します。これらは添付source資産の対象ではありません。
+          - `SHA256SUMS.txt`で全公開ファイルを検証できます。
+          - リプレイ再生には64bit版mpv DLLを別途用意し、`%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。
 
           ---
 
@@ -160,22 +183,27 @@ jobs:
 
           $($englishSection.Value.Trim())
 
-          $englishInstallNotes
+          ## Distribution materials
+
+          - This software is GPL-3.0-only.
+          - Application source, verified component-source assets, and third-party license materials are attached.
+          - OBS Studio and the Gyan.dev FFmpeg build are not in the installer. The application downloads them from pinned URLs with SHA256 verification, and they are not represented as bundled-source assets.
+          - Verify every published file with `SHA256SUMS.txt`.
+          - Replay playback requires a separate 64-bit mpv DLL in `%LOCALAPPDATA%\LoLReplayTool\bin`.
           "@
 
-          $existingReleases = gh release list --limit 1000 --json tagName | ConvertFrom-Json
-          if ($LASTEXITCODE -ne 0) {
-            exit $LASTEXITCODE
-          }
-          if ($existingReleases.tagName -contains $tag) {
-            throw "Release $tag already exists. Do not replace published binaries; publish a new version instead."
+          $assetList = Get-Content `
+            .\dist\installer\release-assets.json `
+            -Raw | ConvertFrom-Json
+          $assets = @($assetList.assets)
+          if ($assets.Count -lt 5) {
+            throw "Release asset list is incomplete."
           }
 
-          gh release create $tag $installer $source $licenses $checksums `
+          gh release create $tag @assets `
             --verify-tag `
             --title "LoL Replay Tool $tag" `
             --notes $releaseNotes
-
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

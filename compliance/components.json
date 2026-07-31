@@ -1,0 +1,442 @@
+{
+  "schema_version": 1,
+  "application": {
+    "component": "lol-replay-tool",
+    "version_file": "VERSION",
+    "license": "GPL-3.0-only",
+    "artifact_patterns": [
+      "LoLReplayTool.exe",
+      "_internal/assets/**",
+      "_internal/config/**"
+    ]
+  },
+  "python": {
+    "component": "python",
+    "release_version": "3.14.6",
+    "license": "PSF-2.0",
+    "artifact_patterns": [
+      "_internal/base_library.zip",
+      "_internal/python*.dll",
+      "_internal/VCRUNTIME140.dll",
+      "_internal/VCRUNTIME140_1.dll",
+      "_internal/_*.pyd",
+      "_internal/select.pyd",
+      "_internal/unicodedata.pyd",
+      "_internal/pyexpat.pyd"
+    ],
+    "source_archives": [
+      {
+        "filename": "Python-3.14.6.tgz",
+        "url": "https://www.python.org/ftp/python/3.14.6/Python-3.14.6.tgz",
+        "sha256": "74d0d71d0600e477651a077101d6e62d1e2e69b8e992ba18c993dd643b7ba222",
+        "size": 31234628
+      }
+    ]
+  },
+  "build_components": [
+    {
+      "component": "pyinstaller",
+      "distribution": "PyInstaller",
+      "version": "6.18.0",
+      "license": "GPL-2.0-or-later WITH Bootloader-exception",
+      "artifact_patterns": [],
+      "corresponding_source_required": false
+    }
+  ],
+  "runtime_components": [
+    {
+      "component": "python-openssl",
+      "version": "3.5.7",
+      "license": "Apache-2.0",
+      "artifact_patterns": [
+        "_internal/libcrypto-3.dll",
+        "_internal/libssl-3.dll"
+      ],
+      "source_archives": [
+        {
+          "filename": "openssl-3.5.7.tar.gz",
+          "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/openssl-3.5.7",
+          "sha256": "ca94e7c6c223d9caf77bb51aac5949186379608ea2a0cad3aa8bdf31856912e9"
+        }
+      ]
+    },
+    {
+      "component": "python-runtime-support",
+      "version": "CPython 3.14.6 Windows dependencies",
+      "license": "Multiple permissive licenses; see Python third-party license page",
+      "artifact_patterns": [
+        "_internal/libffi-*.dll",
+        "_internal/sqlite3.dll",
+        "_internal/VCOMP140.DLL"
+      ],
+      "corresponding_source_required": false
+    },
+    {
+      "component": "aiohappyeyeballs",
+      "distribution": "aiohappyeyeballs",
+      "version": "2.6.1",
+      "license": "PSF-2.0",
+      "artifact_patterns": []
+    },
+    {
+      "component": "aiohttp",
+      "distribution": "aiohttp",
+      "version": "3.13.5",
+      "license": "Apache-2.0 AND MIT",
+      "artifact_patterns": ["_internal/aiohttp/**/*.pyd"]
+    },
+    {
+      "component": "aiosignal",
+      "distribution": "aiosignal",
+      "version": "1.4.0",
+      "license": "Apache-2.0",
+      "artifact_patterns": []
+    },
+    {
+      "component": "attrs",
+      "distribution": "attrs",
+      "version": "26.1.0",
+      "license": "MIT",
+      "artifact_patterns": []
+    },
+    {
+      "component": "certifi",
+      "distribution": "certifi",
+      "version": "2026.1.4",
+      "license": "MPL-2.0",
+      "artifact_patterns": []
+    },
+    {
+      "component": "charset-normalizer",
+      "distribution": "charset-normalizer",
+      "version": "3.4.4",
+      "license": "MIT",
+      "artifact_patterns": ["_internal/charset_normalizer/**/*.pyd"]
+    },
+    {
+      "component": "ffmpeg-python",
+      "distribution": "ffmpeg-python",
+      "version": "0.2.0",
+      "license": "Apache-2.0",
+      "artifact_patterns": []
+    },
+    {
+      "component": "frozenlist",
+      "distribution": "frozenlist",
+      "version": "1.8.0",
+      "license": "Apache-2.0",
+      "artifact_patterns": ["_internal/frozenlist/**/*.pyd"]
+    },
+    {
+      "component": "future",
+      "distribution": "future",
+      "version": "1.0.0",
+      "license": "MIT",
+      "artifact_patterns": []
+    },
+    {
+      "component": "idna",
+      "distribution": "idna",
+      "version": "3.11",
+      "license": "BSD-3-Clause",
+      "artifact_patterns": []
+    },
+    {
+      "component": "joblib",
+      "distribution": "joblib",
+      "version": "1.5.3",
+      "license": "BSD-3-Clause",
+      "artifact_patterns": []
+    },
+    {
+      "component": "multidict",
+      "distribution": "multidict",
+      "version": "6.7.1",
+      "license": "Apache-2.0",
+      "artifact_patterns": ["_internal/multidict/**/*.pyd"]
+    },
+    {
+      "component": "numpy",
+      "distribution": "numpy",
+      "version": "2.4.1",
+      "license": "BSD-3-Clause AND bundled component licenses",
+      "artifact_patterns": [
+        "_internal/numpy/**/*.pyd",
+        "_internal/numpy.libs/*.dll"
+      ]
+    },
+    {
+      "component": "obsws-python",
+      "distribution": "obsws-python",
+      "version": "1.8.0",
+      "license": "GPL-3.0-only",
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "obsws_python-1.8.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/d6/2f/624af34a5b0f09fbf858bf6743521a8626d712671ac49573e625ad1c97d3/obsws_python-1.8.0.tar.gz",
+          "sha256": "e082894f80deb0836861fdc3c222e497308c8f66328da6075baba5b456a20971",
+          "size": 28727
+        }
+      ]
+    },
+    {
+      "component": "opencv-python",
+      "distribution": "opencv-python",
+      "version": "4.13.0.90",
+      "license": "MIT AND Apache-2.0 AND bundled component licenses",
+      "artifact_patterns": ["_internal/cv2/cv2*.pyd"],
+      "source_archives": [
+        {
+          "filename": "opencv-python-6cb94ce.tar.gz",
+          "url": "https://codeload.github.com/opencv/opencv-python/tar.gz/6cb94ce088fb9db42a13164016f19b2b986623b6",
+          "sha256": "dcd464bfc0f6f44284fccc690a9933ef93b2604d50fcaea39f7e09a4c19bb2be",
+          "size": 1129895
+        },
+        {
+          "filename": "opencv-b4c5ec4.tar.gz",
+          "url": "https://codeload.github.com/opencv/opencv/tar.gz/b4c5ec4042f097e2a5b386b9d413ec7333d0a184",
+          "sha256": "4f2a381ce3377e6f22d0718fe7101e97a21968a21c81f0356f2787bb21024dc4",
+          "size": 95448014
+        }
+      ]
+    },
+    {
+      "component": "opencv-ffmpeg",
+      "version": "n4.4.6 / OpenCV binary revision d82ad9a54a7b42a1648a9cae8fed5c2f20ea396c",
+      "license": "LGPL-2.1-or-later with bundled permissive codec libraries",
+      "artifact_patterns": ["_internal/cv2/opencv_videoio_ffmpeg*.dll"],
+      "source_archives": [
+        {
+          "filename": "opencv-3rdparty-d82ad9a.tar.gz",
+          "url": "https://codeload.github.com/opencv/opencv_3rdparty/tar.gz/d82ad9a54a7b42a1648a9cae8fed5c2f20ea396c",
+          "sha256": "155c5b0674cbcd2da0b07aaff5046d74de09ec152931506f9d36f071c3f87bb5",
+          "size": 22774795
+        },
+        {
+          "filename": "ffmpeg-n4.4.6.tar.gz",
+          "url": "https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/784eb97e010cee6bb4d81c352bd6eed4b7dedda2",
+          "sha256": "3a509693f5db9efe477ba32cedca66245c890ab8460c455ff610ae8dc95ac399",
+          "size": 13757855
+        },
+        {
+          "filename": "libvpx-v1.15.2.tar.gz",
+          "url": "https://codeload.github.com/webmproject/libvpx/tar.gz/16fc99a350efdcf12e795e89cf237118c424e3af",
+          "sha256": "e5c2c9d881b62094384757892929634cce8e59c81dffe420a49bfbc818eb6aba",
+          "size": 5636157
+        },
+        {
+          "filename": "aom-v3.13.1.tar.gz",
+          "url": "https://aomedia.googlesource.com/aom/+archive/3837fd0a1f709e99417adf1ebe9b9ffd606ea1ff.tar.gz",
+          "sha256": "7da96fe360c71e381d6c9491d79677359a7f7dac677b5c6756d06f81aacded24",
+          "size": 6323795
+        },
+        {
+          "filename": "openh264-v1.8.0.tar.gz",
+          "url": "https://codeload.github.com/cisco/openh264/tar.gz/6fe15a6b82d492bebe388c55b7ee5131208e7334",
+          "sha256": "d9123e5f0a995f67cca054783fa8050acf439e66e59630c32c8f4c82a396d2b8",
+          "size": 38696359
+        }
+      ]
+    },
+    {
+      "component": "packaging",
+      "distribution": "packaging",
+      "version": "26.0",
+      "license": "Apache-2.0 OR BSD-2-Clause",
+      "artifact_patterns": []
+    },
+    {
+      "component": "pandas",
+      "distribution": "pandas",
+      "version": "3.0.2",
+      "license": "BSD-3-Clause AND bundled component licenses",
+      "artifact_patterns": [
+        "_internal/pandas/**/*.pyd",
+        "_internal/pandas.libs/*.dll"
+      ]
+    },
+    {
+      "component": "pillow",
+      "distribution": "Pillow",
+      "version": "12.1.1",
+      "license": "MIT-CMU AND bundled component licenses",
+      "artifact_patterns": [
+        "_internal/PIL/**/*.pyd",
+        "_internal/PIL/**/*.dll"
+      ]
+    },
+    {
+      "component": "propcache",
+      "distribution": "propcache",
+      "version": "0.4.1",
+      "license": "Apache-2.0",
+      "artifact_patterns": ["_internal/propcache/**/*.pyd"]
+    },
+    {
+      "component": "pyqt6",
+      "distribution": "PyQt6",
+      "version": "6.10.2",
+      "license": "GPL-3.0-only",
+      "artifact_patterns": ["_internal/PyQt6/Qt*.pyd"],
+      "source_archives": [
+        {
+          "filename": "pyqt6-6.10.2.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/96/03/e756f52e8b0d7bb5527baf8c46d59af0746391943bdb8655acba22ee4168/pyqt6-6.10.2.tar.gz",
+          "sha256": "6c0db5d8cbb9a3e7e2b5b51d0ff3f283121fa27b864db6d2f35b663c9be5cc83",
+          "size": 1085573
+        }
+      ]
+    },
+    {
+      "component": "qt",
+      "distribution": "PyQt6-Qt6",
+      "version": "6.10.2",
+      "license": "LGPL-3.0-only",
+      "artifact_patterns": ["_internal/PyQt6/Qt6/**/*.dll"],
+      "source_status": "upstream_reference_not_verified_corresponding_source",
+      "wheel_build_provenance_verified": false,
+      "release_legal_review_required": true,
+      "release_gate_reason": "PyQt6-Qt6 Windows wheelのpatch、configure option、build scriptを含む完全なbuild provenanceを確認できていないため、Qt公式archiveを当該wheelのexact Corresponding Sourceとは断定しない。",
+      "source_archives": [
+        {
+          "filename": "qt-everywhere-src-6.10.2.tar.xz",
+          "url": "https://download.qt.io/official_releases/qt/6.10/6.10.2/single/qt-everywhere-src-6.10.2.tar.xz",
+          "sha256": "c3df0f0e421130cc52ed81cb712358804471ce9bd2a41d97828f9f5b1bf7fed2",
+          "size": 1315359412
+        }
+      ]
+    },
+    {
+      "component": "pyqt6-sip",
+      "distribution": "PyQt6_sip",
+      "version": "13.11.0",
+      "license": "BSD-2-Clause",
+      "artifact_patterns": ["_internal/PyQt6/sip*.pyd"],
+      "source_archives": [
+        {
+          "filename": "pyqt6_sip-13.11.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/e3/7d/d2916048e2e3960f68cb4e93907639844f7b8ff95897dcc98553776ccdfc/pyqt6_sip-13.11.0.tar.gz",
+          "sha256": "d463af37738bda1856c9ef513e5620a37b7a005e9d589c986c3304db4a8a14d3",
+          "size": 92509
+        }
+      ]
+    },
+    {
+      "component": "python-dateutil",
+      "distribution": "python-dateutil",
+      "version": "2.9.0.post0",
+      "license": "Apache-2.0 OR BSD-3-Clause",
+      "artifact_patterns": []
+    },
+    {
+      "component": "python-mpv",
+      "distribution": "python-mpv",
+      "version": "1.0.8",
+      "license": "GPL-2.0-or-later OR LGPL-2.1-or-later",
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "python_mpv-1.0.8.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/77/bc/6aa34c8805ff62e2fefc7d171563c60598aac215d5241186031a2c839935/python_mpv-1.0.8.tar.gz",
+          "sha256": "017fa359da059c831a94c419083491903e6d2f7c81b9841c33c196cabf4b3fe3",
+          "size": 52680
+        }
+      ]
+    },
+    {
+      "component": "requests",
+      "distribution": "requests",
+      "version": "2.32.5",
+      "license": "Apache-2.0",
+      "artifact_patterns": []
+    },
+    {
+      "component": "scikit-learn",
+      "distribution": "scikit-learn",
+      "version": "1.8.0",
+      "license": "BSD-3-Clause AND bundled component licenses",
+      "artifact_patterns": [
+        "_internal/sklearn/**/*.pyd",
+        "_internal/sklearn/.libs/*.dll"
+      ]
+    },
+    {
+      "component": "scipy",
+      "distribution": "scipy",
+      "version": "1.17.1",
+      "license": "BSD-3-Clause AND bundled component licenses",
+      "artifact_patterns": [
+        "_internal/scipy/**/*.pyd",
+        "_internal/scipy.libs/*.dll"
+      ]
+    },
+    {
+      "component": "six",
+      "distribution": "six",
+      "version": "1.17.0",
+      "license": "MIT",
+      "artifact_patterns": []
+    },
+    {
+      "component": "threadpoolctl",
+      "distribution": "threadpoolctl",
+      "version": "3.6.0",
+      "license": "BSD-3-Clause",
+      "artifact_patterns": []
+    },
+    {
+      "component": "typing-extensions",
+      "distribution": "typing_extensions",
+      "version": "4.15.0",
+      "license": "PSF-2.0",
+      "artifact_patterns": []
+    },
+    {
+      "component": "tzdata",
+      "distribution": "tzdata",
+      "version": "2026.2",
+      "license": "Apache-2.0",
+      "artifact_patterns": []
+    },
+    {
+      "component": "urllib3",
+      "distribution": "urllib3",
+      "version": "2.6.3",
+      "license": "MIT",
+      "artifact_patterns": []
+    },
+    {
+      "component": "websocket-client",
+      "distribution": "websocket-client",
+      "version": "1.9.0",
+      "license": "Apache-2.0",
+      "artifact_patterns": []
+    },
+    {
+      "component": "yarl",
+      "distribution": "yarl",
+      "version": "1.23.0",
+      "license": "Apache-2.0",
+      "artifact_patterns": ["_internal/yarl/**/*.pyd"]
+    }
+  ],
+  "runtime_downloads": [
+    {
+      "component": "obs-studio",
+      "version": "32.1.2",
+      "archive_url": "https://github.com/obsproject/obs-studio/releases/download/32.1.2/OBS-Studio-32.1.2-Windows-x64.zip",
+      "archive_sha256": "8d97e4563bd8d22d03e63042aa7dccede1d555c9bd35ce8a9e5019b0d0201bf6",
+      "bundled_in_installer": false,
+      "release_legal_review_required": true
+    },
+    {
+      "component": "gyan-ffmpeg",
+      "version": "8.1.1",
+      "archive_url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip",
+      "archive_sha256": "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541",
+      "bundled_in_installer": false,
+      "release_legal_review_required": true
+    }
+  ]
+}

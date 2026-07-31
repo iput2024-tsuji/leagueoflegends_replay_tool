@@ -1,18 +1,5 @@
 # Changelog
 
-## [Unreleased]
-
-### Changed
-
-- Declared the project license as `GPL-3.0-only` and exposed it from the About dialog and installer.
-- Included the GPL text, original third-party license files, corresponding-source information, and an exact dependency manifest in Windows distributions.
-- Added source and license-material archives to each Release and made builds fail when required license materials are missing.
-
-### Fixed
-
-- Corrected the notices to reflect that the Windows distribution contains the FFmpeg DLL shipped by OpenCV.
-- Preserved the license and README files from the separately downloaded clip-export FFmpeg archive.
-
 ## [0.5.2] - 2026-06-27
 
 ### Fixed

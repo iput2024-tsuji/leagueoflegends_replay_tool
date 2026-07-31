@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import shutil
 import time
@@ -15,6 +16,25 @@ def runtime_dir(name):
     path = Path("tests") / "_tmp" / name
     shutil.rmtree(path, ignore_errors=True)
     path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def write_ffmpeg_archive(
+    path,
+    *,
+    executable=b"new ffmpeg",
+    license_text="GPL license text",
+    readme_text="build and source information",
+    extra_members=(),
+):
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("ffmpeg-build/bin/ffmpeg.exe", executable)
+        if license_text is not None:
+            archive.writestr("ffmpeg-build/LICENSE", license_text)
+        if readme_text is not None:
+            archive.writestr("ffmpeg-build/README.txt", readme_text)
+        for name, content in extra_members:
+            archive.writestr(name, content)
     return path
 
 
@@ -70,10 +90,7 @@ def test_extract_ffmpeg_preserves_license_materials():
     dest = tmp_path / "bin" / "ffmpeg.exe"
     license_dir = tmp_path / "licenses" / "FFmpeg"
 
-    with zipfile.ZipFile(zip_path, "w") as archive:
-        archive.writestr("ffmpeg-build/bin/ffmpeg.exe", "fake")
-        archive.writestr("ffmpeg-build/LICENSE", "GPL license text")
-        archive.writestr("ffmpeg-build/README.txt", "build and source information")
+    write_ffmpeg_archive(zip_path, executable=b"fake")
 
     result = setup_env._extract_ffmpeg(zip_path, dest, license_dir)
 
@@ -81,6 +98,34 @@ def test_extract_ffmpeg_preserves_license_materials():
     assert dest.read_text(encoding="utf-8") == "fake"
     assert (license_dir / "LICENSE").read_text(encoding="utf-8") == "GPL license text"
     assert (license_dir / "README.txt").read_text(encoding="utf-8") == "build and source information"
+    manifest = json.loads((license_dir / setup_env.FFMPEG_INSTALL_MANIFEST).read_text(encoding="utf-8"))
+    assert manifest["version"] == setup_env.FFMPEG_VERSION
+    assert manifest["archive_sha256"] == setup_env._sha256(zip_path)
+    assert manifest["executable"]["sha256"] == setup_env._sha256(dest)
+    assert [entry["path"] for entry in manifest["license_files"]] == ["LICENSE"]
+    assert [entry["path"] for entry in manifest["documentation_files"]] == ["README.txt"]
+    setup_env._validate_ffmpeg_installation(
+        dest,
+        license_dir,
+        archive_sha256=setup_env._sha256(zip_path),
+    )
+
+
+def test_ffmpeg_installation_readiness_rejects_modified_material():
+    tmp_path = runtime_dir("setup_env_ffmpeg_modified_material")
+    zip_path = write_ffmpeg_archive(tmp_path / "ffmpeg.zip")
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+    license_dir = tmp_path / "licenses" / "FFmpeg"
+    archive_sha256 = setup_env._sha256(zip_path)
+    setup_env._extract_ffmpeg(zip_path, dest, license_dir)
+
+    (license_dir / "README.txt").write_text("modified", encoding="utf-8")
+
+    assert not setup_env._is_ffmpeg_installation_ready(
+        dest,
+        license_dir,
+        archive_sha256=archive_sha256,
+    )
 
 
 def test_extract_ffmpeg_rejects_archive_without_license_materials():
@@ -88,13 +133,135 @@ def test_extract_ffmpeg_rejects_archive_without_license_materials():
     zip_path = tmp_path / "ffmpeg.zip"
     dest = tmp_path / "bin" / "ffmpeg.exe"
 
-    with zipfile.ZipFile(zip_path, "w") as archive:
-        archive.writestr("ffmpeg-build/bin/ffmpeg.exe", "fake")
+    write_ffmpeg_archive(zip_path, license_text=None)
 
-    with pytest.raises(RuntimeError, match="license or README"):
+    with pytest.raises(RuntimeError, match="real FFmpeg license"):
         setup_env._extract_ffmpeg(zip_path, dest)
 
     assert not dest.exists()
+
+
+def test_extract_ffmpeg_rejects_authors_without_real_license():
+    tmp_path = runtime_dir("setup_env_ffmpeg_authors_only")
+    zip_path = tmp_path / "ffmpeg.zip"
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+
+    write_ffmpeg_archive(
+        zip_path,
+        license_text=None,
+        extra_members=(("ffmpeg-build/AUTHORS", "contributors"),),
+    )
+
+    with pytest.raises(RuntimeError, match="real FFmpeg license"):
+        setup_env._extract_ffmpeg(zip_path, dest)
+
+    assert not dest.exists()
+
+
+def test_extract_ffmpeg_rejects_archive_without_build_information():
+    tmp_path = runtime_dir("setup_env_ffmpeg_missing_readme")
+    zip_path = tmp_path / "ffmpeg.zip"
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+
+    write_ffmpeg_archive(zip_path, readme_text=None)
+
+    with pytest.raises(RuntimeError, match="README or build information"):
+        setup_env._extract_ffmpeg(zip_path, dest)
+
+    assert not dest.exists()
+
+
+def test_extract_ffmpeg_rejects_zip_member_outside_destination():
+    tmp_path = runtime_dir("setup_env_ffmpeg_extract_zip_slip")
+    zip_path = tmp_path / "ffmpeg.zip"
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+    outside = tmp_path / "evil.txt"
+
+    write_ffmpeg_archive(
+        zip_path,
+        extra_members=(("../evil.txt", "must not be written"),),
+    )
+
+    with pytest.raises(RuntimeError, match="Unsafe ZIP member path"):
+        setup_env._extract_ffmpeg(zip_path, dest)
+
+    assert not outside.exists()
+    assert not dest.exists()
+
+
+def test_extract_ffmpeg_rejects_zip_symlink():
+    tmp_path = runtime_dir("setup_env_ffmpeg_extract_symlink")
+    zip_path = tmp_path / "ffmpeg.zip"
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+
+    write_ffmpeg_archive(zip_path)
+    symlink = zipfile.ZipInfo("ffmpeg-build/docs-link")
+    symlink.create_system = 3
+    symlink.external_attr = 0o120777 << 16
+    with zipfile.ZipFile(zip_path, "a") as archive:
+        archive.writestr(symlink, "../outside")
+
+    with pytest.raises(RuntimeError, match="symbolic links"):
+        setup_env._extract_ffmpeg(zip_path, dest)
+
+    assert not dest.exists()
+
+
+def test_extract_ffmpeg_rejects_case_insensitive_collision():
+    tmp_path = runtime_dir("setup_env_ffmpeg_extract_case_collision")
+    zip_path = tmp_path / "ffmpeg.zip"
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+
+    write_ffmpeg_archive(
+        zip_path,
+        extra_members=(("FFMPEG-BUILD/license", "duplicate license path"),),
+    )
+
+    with pytest.raises(RuntimeError, match="Case-insensitive ZIP member collision"):
+        setup_env._extract_ffmpeg(zip_path, dest)
+
+    assert not dest.exists()
+
+
+def test_extract_ffmpeg_rolls_back_partial_replace_and_can_retry(monkeypatch):
+    tmp_path = runtime_dir("setup_env_ffmpeg_transaction_retry")
+    zip_path = write_ffmpeg_archive(tmp_path / "ffmpeg.zip")
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+    license_dir = tmp_path / "licenses" / "FFmpeg"
+    dest.parent.mkdir(parents=True)
+    license_dir.mkdir(parents=True)
+    dest.write_text("old ffmpeg", encoding="utf-8")
+    (license_dir / "old.txt").write_text("old materials", encoding="utf-8")
+
+    real_replace = os.replace
+    failed = False
+
+    def fail_material_replace_once(source, target):
+        nonlocal failed
+        if Path(source).name == "materials" and not failed:
+            failed = True
+            raise OSError("simulated replace failure")
+        return real_replace(source, target)
+
+    monkeypatch.setattr(setup_env.os, "replace", fail_material_replace_once)
+
+    with pytest.raises(RuntimeError, match="rolled back"):
+        setup_env._extract_ffmpeg(zip_path, dest, license_dir)
+
+    assert dest.read_text(encoding="utf-8") == "old ffmpeg"
+    assert (license_dir / "old.txt").read_text(encoding="utf-8") == "old materials"
+    assert not (license_dir / setup_env.FFMPEG_INSTALL_MANIFEST).exists()
+
+    monkeypatch.setattr(setup_env.os, "replace", real_replace)
+    setup_env._extract_ffmpeg(zip_path, dest, license_dir)
+
+    assert dest.read_bytes() == b"new ffmpeg"
+    assert not (license_dir / "old.txt").exists()
+    setup_env._validate_ffmpeg_installation(
+        dest,
+        license_dir,
+        archive_sha256=setup_env._sha256(zip_path),
+    )
 
 
 def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypatch):
@@ -378,23 +545,82 @@ def test_download_retries_with_fallback_url(monkeypatch):
 def test_ensure_ffmpeg_rechecks_after_setup_lock(monkeypatch):
     root = runtime_dir("setup_env_ffmpeg_recheck")
     ffmpeg = root / "bin" / "ffmpeg.exe"
+    license_dir = root / "licenses" / "FFmpeg"
+    zip_path = write_ffmpeg_archive(root / "ffmpeg.zip")
+    package = setup_env.BinaryPackage(
+        name="FFmpeg",
+        version=setup_env.FFMPEG_VERSION,
+        url="https://example.invalid/ffmpeg.zip",
+        sha256=setup_env._sha256(zip_path),
+        archive_name="ffmpeg.zip",
+        progress_start=0,
+        progress_end=95,
+    )
 
     @contextmanager
     def fake_setup_lock(**kwargs):
-        ffmpeg.parent.mkdir(parents=True, exist_ok=True)
-        ffmpeg.write_text("installed by another process", encoding="utf-8")
+        setup_env._extract_ffmpeg(
+            zip_path,
+            ffmpeg,
+            license_dir,
+            version=package.version,
+            expected_archive_sha256=package.sha256,
+        )
         yield root / ".setup.lock"
 
     async def fail_download(*args, **kwargs):
         raise AssertionError("download must not run after another process installed FFmpeg")
 
     monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
+    monkeypatch.setattr(setup_env, "FFMPEG_LICENSE_DIR", license_dir)
+    monkeypatch.setattr(setup_env, "FFMPEG_PACKAGE", package)
     monkeypatch.setattr(setup_env, "setup_lock", fake_setup_lock)
     monkeypatch.setattr(setup_env, "download_file", fail_download)
 
     result = asyncio.run(setup_env.ensure_ffmpeg())
 
     assert result == ffmpeg
+
+
+def test_ensure_ffmpeg_repairs_executable_without_license_manifest(monkeypatch):
+    root = runtime_dir("setup_env_ffmpeg_repairs_exe_only")
+    ffmpeg = root / "bin" / "ffmpeg.exe"
+    license_dir = root / "licenses" / "FFmpeg"
+    source_zip = write_ffmpeg_archive(root / "source.zip")
+    package = setup_env.BinaryPackage(
+        name="FFmpeg",
+        version=setup_env.FFMPEG_VERSION,
+        url="https://example.invalid/ffmpeg.zip",
+        sha256=setup_env._sha256(source_zip),
+        archive_name="ffmpeg.zip",
+        progress_start=0,
+        progress_end=95,
+    )
+    ffmpeg.parent.mkdir(parents=True)
+    ffmpeg.write_text("legacy executable", encoding="utf-8")
+    downloads = []
+
+    async def fake_download(package_arg, dest, progress_cb=None, cancel_cb=None):
+        downloads.append(package_arg)
+        shutil.copyfile(source_zip, dest)
+
+    monkeypatch.setattr(setup_env, "DATA_DIR", root)
+    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
+    monkeypatch.setattr(setup_env, "FFMPEG_LICENSE_DIR", license_dir)
+    monkeypatch.setattr(setup_env, "FFMPEG_PACKAGE", package)
+    monkeypatch.setattr(setup_env, "download_file", fake_download)
+
+    result = asyncio.run(setup_env.ensure_ffmpeg())
+
+    assert result == ffmpeg
+    assert downloads == [package]
+    assert ffmpeg.read_bytes() == b"new ffmpeg"
+    assert setup_env._is_ffmpeg_installation_ready(
+        ffmpeg,
+        license_dir,
+        version=package.version,
+        archive_sha256=package.sha256,
+    )
 
 
 def test_ensure_environment_skips_optional_ffmpeg(monkeypatch):

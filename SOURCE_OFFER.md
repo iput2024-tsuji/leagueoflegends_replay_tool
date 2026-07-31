@@ -2,83 +2,116 @@
 
 LoL Replay Tool is licensed under `GPL-3.0-only`.
 
-## LoL Replay Tool source
+## Release source assets
 
-The complete preferred form for modifying each released version, including
-build and packaging scripts, is provided from the matching Git tag:
+Every future binary Release must provide the source and license materials for
+the exact build under these stable asset names:
 
-https://github.com/iput2024-tsuji/leagueoflegends_replay_tool
+```text
+LoLReplayTool-source-<version>.zip
+LoLReplayTool-third-party-sources-<version>-NN.zip
+LoLReplayTool-license-materials-<version>.zip
+SHA256SUMS.txt
+```
 
-Each binary Release must include a `LoLReplayTool-source-<version>.zip` archive
-created from the exact commit used to build that binary.
+`LoLReplayTool-source-<version>.zip` is created from the exact Git commit used
+for that binary and contains the preferred form for modifying LoL Replay Tool,
+including its build and packaging scripts. The matching Git tag is `v<version>`.
 
-The source archive covers LoL Replay Tool itself. Exact third-party versions,
-license files and upstream source locations are supplied separately in the
-license materials archive. If a listed source becomes unavailable, request the
-matching source through the project's Issue tracker; maintainers must provide
-an equivalent copy at no charge.
+The numbered third-party source archives contain the exact source archives
+locked for the components in the packaged application. They may be split into
+multiple assets, each smaller than 2 GiB. The license-materials archive contains
+the project license, notices, corresponding-source information, Qt replacement
+instructions, component lock, copied license texts and generated build
+inventory. `SHA256SUMS.txt` identifies every published asset.
 
-## Bundled components
+今後のバイナリReleaseでは、上記の固定した資産名で、そのビルドに対応する
+ソースとライセンス資料を提供します。プロジェクトsource archiveは実際に
+ビルドしたcommitから生成し、番号付き第三者source archiveは2 GiB未満の
+複数資産へ分割できます。`SHA256SUMS.txt`には公開する全資産を記録します。
 
-The packaged application includes Python packages pinned in `requirements.txt`.
-Their license files are copied to `licenses/python-packages/` during the build.
-The generated `licenses/python-packages.json` records the exact installed
-versions and copied files.
+## Build inventory and source lock
 
-Important upstream source locations:
+`licenses/components.json` records the expected component, version, license,
+source URL, source SHA256 and artifact patterns. The generated
+`licenses/distribution-manifest.json` records the relative path, SHA256 and
+component classification for files in the completed packaged application.
+The manifest is a technical inventory of that build, not a substitute for
+license texts or legal review.
 
-- PyQt6 6.10.2:
-  https://pypi.org/project/PyQt6/6.10.2/#files
-- Qt 6.10.2:
-  https://download.qt.io/official_releases/qt/6.10/6.10.2/single/
-- obsws-python 1.8.0:
-  https://pypi.org/project/obsws-python/1.8.0/#files
-- opencv-python 4.13.0.90:
-  https://pypi.org/project/opencv-python/4.13.0.90/#files
-- OpenCV:
-  https://github.com/opencv/opencv
-- FFmpeg:
-  https://github.com/FFmpeg/FFmpeg
-- python-mpv 1.0.8:
-  https://pypi.org/project/python-mpv/1.0.8/#files
-- NumPy, pandas, SciPy and scikit-learn:
-  https://pypi.org/
+`licenses/components.json`は期待するcomponent、version、license、source URL、
+source SHA256、成果物patternを記録します。生成される
+`licenses/distribution-manifest.json`は完成した配布物の相対path、SHA256、
+component分類を記録する技術的なinventoryであり、ライセンス本文や法的確認に
+代わるものではありません。
 
-The opencv-python Windows wheel includes an FFmpeg DLL under LGPL-2.1. Its
-`LICENSE-3RD-PARTY.txt` is preserved by the license collection step.
+The locked source materials include LoL Replay Tool itself and the exact sources
+needed for packaged copyleft/runtime components such as Python, PyQt6, Qt,
+obsws-python, OpenCV and the FFmpeg codec library included in the locked
+opencv-python wheel. Package-specific license texts are copied under
+`licenses/python-packages/`.
 
-## Components acquired after installation
-
-- OBS Studio 32.1.2 is downloaded from its official Release and retains the
-  license and notice files present in the official archive. Matching sources:
-  https://github.com/obsproject/obs-studio/releases/tag/32.1.2
-- FFmpeg 8.1.1 essentials build is downloaded from Gyan.dev. Its license,
-  README and other notice files are retained next to the installed executable.
-  Build information: https://www.gyan.dev/ffmpeg/builds/
-  Matching FFmpeg source commit:
-  https://github.com/FFmpeg/FFmpeg/commit/239f2c733d
-- The mpv DLL is not distributed by this project. Users must obtain a
-  correctly licensed build. mpv licensing depends on its build configuration:
-  https://github.com/mpv-player/mpv
-
-For source availability problems, open an Issue at:
+If a listed source asset becomes unavailable, request the matching source
+through the project's Issue tracker. Maintainers must provide an equivalent
+copy at no charge:
 
 https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues
 
-## If OBS Studio is bundled in a future offline installer
+## Qt replacement
 
-OBS Studio is currently downloaded after installation. A future offline
-installer must not simply copy the OBS program directory. Before distribution,
-maintainers must:
+The packaged application dynamically loads Qt libraries. See
+`QT_RELINKING.md` for the file locations, compatibility constraints, replacement
+procedure and complete application rebuild instructions.
 
-1. preserve OBS Studio's GPL text and every bundled plugin/library notice;
-2. provide equivalent access to the exact corresponding OBS and applicable
-   bundled component source used by that binary;
-3. preserve build scripts and configuration needed to reproduce modifications;
-4. review codec, FFmpeg, plugin, font, trademark and installer notices for the
-   selected OBS package; and
-5. extend the build manifest and CI checks so an OBS binary cannot be published
-   without its license and source materials.
+配布アプリケーションはQtライブラリを動的に読み込みます。ファイルの場所、
+互換性条件、交換手順、アプリケーション全体の再ビルド方法は
+`QT_RELINKING.md`を参照してください。
 
-The exact obligations depend on the selected OBS build and must be checked
-again when offline bundling is designed.
+## Components acquired after installation
+
+OBS Studio 32.1.2 and the Gyan.dev FFmpeg 8.1.1 essentials build are not
+included in the installer or packaged application. The application downloads
+them separately from pinned locations after installation when their features
+are needed. libmpv is also not distributed by this project and must be supplied
+by the user.
+
+The legal treatment of the automatic OBS Studio and Gyan.dev FFmpeg downloads,
+including whether the project is acting as a distributor and what source
+delivery is required, remains under specialist review. These runtime downloads
+are therefore documented separately from the source assets for files actually
+contained in the installer. No new public Release will be made until that review
+is recorded.
+
+OBS Studio 32.1.2とGyan.dev FFmpeg 8.1.1 essentials buildはインストーラーや
+インストール直後の配布物には含まれず、必要になった時点で固定した取得元から
+別途ダウンロードされます。この自動取得を本プロジェクトによる配布として
+扱うべきか、どのsource提供が必要かは専門家確認中です。このため、
+インストーラーに実際に含まれるファイルのsource assetsとは分けて記録し、
+確認完了までは新しい公開Releaseを行いません。
+
+## v0.5.2 historical limitation
+
+The v0.5.2 installer has been withdrawn and is not available for download.
+Its original GitHub Actions artifact is no longer retained, so later historical
+materials cannot reconstruct or independently verify every file from that
+installer. Any source or hash retained for v0.5.2 is historical identification,
+not a replacement installer or proof of a newly reproduced binary.
+
+v0.5.2インストーラーは撤回され、現在ダウンロードできません。元の
+GitHub Actions成果物は保持されていないため、後から追加する履歴資料だけでは
+当時のインストーラー内の全ファイルを再構成・独立検証できません。v0.5.2用に
+残すsourceやhashは履歴識別情報であり、インストーラーの復元・差し替えや
+再現ビルドの証明ではありません。
+
+## Future OBS bundling
+
+OBS Studio is currently outside the installer. If a future offline installer
+bundles OBS Studio or the project integrates libobs, that work requires a
+separate licensing and product decision. It must preserve the applicable
+license texts and notices, provide the exact corresponding sources and build
+information, and extend the artifact checks before publication.
+
+現在、OBS Studioはインストーラーの対象外です。将来のオフライン同梱または
+libobs統合は、ライセンスと製品仕様に関する別の判断が必要です。公開前に、
+適用されるライセンス本文・通知、正確な対応ソース・ビルド情報を提供し、
+成果物検査を拡張する必要があります。

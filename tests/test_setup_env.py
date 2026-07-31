@@ -64,6 +64,39 @@ def test_safe_extractall_rejects_windows_absolute_member():
             setup_env._safe_extractall(archive, dest)
 
 
+def test_extract_ffmpeg_preserves_license_materials():
+    tmp_path = runtime_dir("setup_env_ffmpeg_extract")
+    zip_path = tmp_path / "ffmpeg.zip"
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+    license_dir = tmp_path / "licenses" / "FFmpeg"
+
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("ffmpeg-build/bin/ffmpeg.exe", "fake")
+        archive.writestr("ffmpeg-build/LICENSE", "GPL license text")
+        archive.writestr("ffmpeg-build/README.txt", "build and source information")
+
+    result = setup_env._extract_ffmpeg(zip_path, dest, license_dir)
+
+    assert result == dest
+    assert dest.read_text(encoding="utf-8") == "fake"
+    assert (license_dir / "LICENSE").read_text(encoding="utf-8") == "GPL license text"
+    assert (license_dir / "README.txt").read_text(encoding="utf-8") == "build and source information"
+
+
+def test_extract_ffmpeg_rejects_archive_without_license_materials():
+    tmp_path = runtime_dir("setup_env_ffmpeg_missing_license")
+    zip_path = tmp_path / "ffmpeg.zip"
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+
+    with zipfile.ZipFile(zip_path, "w") as archive:
+        archive.writestr("ffmpeg-build/bin/ffmpeg.exe", "fake")
+
+    with pytest.raises(RuntimeError, match="license or README"):
+        setup_env._extract_ffmpeg(zip_path, dest)
+
+    assert not dest.exists()
+
+
 def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypatch):
     obs_dir = runtime_dir("setup_env_obs_bootstrap") / "obs-portable"
 

@@ -43,6 +43,7 @@ try:
     from . import recordtest
     from .app_paths import get_app_root, get_resource_root, get_user_data_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController
+    from .license_info import build_about_html
     from .notifications import (
         DEFAULT_NOTIFICATION_SETTINGS,
         NotificationEvent,
@@ -59,6 +60,7 @@ except ImportError:
     import recordtest
     from app_paths import get_app_root, get_resource_root, get_user_data_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController
+    from license_info import build_about_html
     from notifications import DEFAULT_NOTIFICATION_SETTINGS, NotificationEvent, NotificationService
     from player import PlayerWidget
     from qt_lifecycle import WorkerRegistry, force_worker_stop, request_worker_stop
@@ -1602,6 +1604,7 @@ class MainWindow(QMainWindow):
         icon = get_app_icon()
         if icon:
             self.setWindowIcon(icon)
+        self.init_menu_bar()
         self.init_tray_icon()
 
         self.stack = QStackedWidget()
@@ -1634,6 +1637,19 @@ class MainWindow(QMainWindow):
                 "⚪ セットアップ未完了",
                 color_hex="#cfcfcf",
             )
+
+    def init_menu_bar(self) -> None:
+        help_menu = self.menuBar().addMenu("ヘルプ")
+        about_action = QAction("ライセンスとこのアプリについて", self)
+        about_action.triggered.connect(self.show_about_dialog)
+        help_menu.addAction(about_action)
+
+    def show_about_dialog(self) -> None:
+        QMessageBox.about(
+            self,
+            "LoL Replay Tool について",
+            build_about_html(),
+        )
 
     def init_tray_icon(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():

@@ -256,7 +256,7 @@ Hover中の未確定チャンピオンは保存せず、確定したアクショ
 
 ## 配布用ビルド
 
-Windows 向けにPyInstallerの`onedir`形式でビルドします。依存ファイルは`_internal`へまとめ、配布ルートには実行ファイルと第三者ソフトウェアの注意事項だけを配置します。
+Windows 向けにPyInstallerの`onedir`形式でビルドします。依存ファイルは`_internal`へまとめ、配布ルートには実行ファイル、GPL本文、対応ソース案内、第三者ソフトウェアの原文ライセンスを配置します。
 
 ```powershell
 pip install pyinstaller
@@ -268,7 +268,10 @@ pip install pyinstaller
 ```text
 dist\LoLReplayTool\
   LoLReplayTool.exe
+  LICENSE
+  SOURCE_OFFER.md
   THIRD_PARTY_NOTICES.md
+  licenses\
   _internal\
 ```
 
@@ -277,7 +280,8 @@ dist\LoLReplayTool\
 - `config/setting.json` は初回起動時に自動生成されます
 - OBS Studio 本体はビルド成果物へコピーされません
 - mpv DLL はビルド成果物へコピーされません
-- FFmpeg はビルド成果物へコピーされません
+- クリップ出力用の単体`ffmpeg.exe`はビルド成果物へコピーされません
+- `opencv-python`が動画入出力に使用するFFmpeg DLLと、その通知文はビルド成果物に含まれます
 - チャンピオンアイコンはビルド成果物へコピーされません
 - 配布版の可変データは `dist\LoLReplayTool` ではなく `%LOCALAPPDATA%\LoLReplayTool` に作成されます
 - `assets/app/app.ico` が存在する場合、exe アイコンとウィンドウアイコンに反映されます
@@ -313,7 +317,13 @@ git tag v0.1.2
 git push origin v0.1.2
 ```
 
-タグと`VERSION`が一致しない場合や、テスト・Ruff・ビルドのいずれかが失敗した場合はReleaseを公開しません。
+タグと`VERSION`が一致しない場合や、テスト・Ruff・ビルド・ライセンス検査のいずれかが失敗した場合はReleaseを公開しません。Releaseにはインストーラーに加えて、同じコミットから作成したソースアーカイブとライセンス資料アーカイブを添付します。公開済みタグのバイナリは上書きせず、修正版は新しいバージョンとして公開します。
+
+## ライセンス
+
+LoL Replay Toolは`GPL-3.0-only`で公開しています。ライセンス全文は`LICENSE`、第三者ソフトウェアの概要と一次情報は`THIRD_PARTY_NOTICES.md`、対応ソースの案内は`SOURCE_OFFER.md`を参照してください。
+
+すでにGPLで配布した版について、受領者へ与えたGPL上の権利を後から取り消すことはできません。将来版を別ライセンスへ変更する場合は、その時点の全著作権者の同意と、PyQt6やobsws-pythonなどGPL依存の商用ライセンス取得または置換が必要です。
 
 ## トラブルシュート
 

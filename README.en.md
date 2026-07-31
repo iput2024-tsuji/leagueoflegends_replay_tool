@@ -198,7 +198,9 @@ The test suite covers API failures, OBS disconnections, asynchronous recording t
 
 ## Windows Build
 
-The application uses PyInstaller `onedir` packaging:
+The application uses PyInstaller `onedir` packaging. The output includes the
+GPL text, corresponding-source information, and the license texts collected
+from the exact installed Python packages:
 
 ```powershell
 pip install pyinstaller
@@ -210,11 +212,16 @@ Output:
 ```text
 dist\LoLReplayTool\
   LoLReplayTool.exe
+  LICENSE
+  SOURCE_OFFER.md
   THIRD_PARTY_NOTICES.md
+  licenses\
   _internal\
 ```
 
-OBS, FFmpeg, mpv DLLs, configuration, and recordings are not copied into the application distribution directory.
+OBS, the standalone `ffmpeg.exe`, mpv DLLs, configuration, and recordings are
+not copied into the application distribution directory. The FFmpeg DLL used by
+the bundled `opencv-python` wheel and its notices are included.
 
 ## Installer
 
@@ -238,7 +245,22 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-GitHub Actions validates tests, Ruff, the Windows build, the version, and both changelog sections before publishing the installer. Release notes contain Japanese first and English second.
+GitHub Actions validates tests, Ruff, the Windows build, license materials, the
+version, and both changelog sections before publishing. Each Release includes
+the installer, an archive of the exact project source commit, and a license
+materials archive. Published tag assets are never replaced; a correction must
+use a new version. Release notes contain Japanese first and English second.
+
+## License
+
+LoL Replay Tool is licensed under `GPL-3.0-only`. See `LICENSE` for the full
+text, `THIRD_PARTY_NOTICES.md` for third-party summaries and primary sources,
+and `SOURCE_OFFER.md` for corresponding-source information.
+
+GPL rights already granted to recipients of a distributed version cannot later
+be revoked. Relicensing a future version would require agreement from every
+copyright holder at that time and commercial licensing or replacement of GPL
+dependencies such as PyQt6 and obsws-python.
 
 ## Troubleshooting
 

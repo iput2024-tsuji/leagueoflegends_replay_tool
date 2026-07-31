@@ -54,6 +54,14 @@ $appExe = Join-Path $repoRoot "dist\LoLReplayTool\LoLReplayTool.exe"
 if (-not (Test-Path $appExe)) {
   throw "アプリのビルド成果物が見つかりません: $appExe"
 }
+if (-not $pythonExe) {
+  throw "Python が見つからないためライセンス資料を検査できません。"
+}
+
+& $pythonExe -m scripts.check_license_compliance (Join-Path $repoRoot "dist\LoLReplayTool")
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
 
 $previousDataDir = $env:LOL_REPLAY_TOOL_DATA_DIR
 $selfCheckDir = Join-Path $repoRoot ("tests\_tmp\installer-self-check-" + [guid]::NewGuid().ToString("N"))

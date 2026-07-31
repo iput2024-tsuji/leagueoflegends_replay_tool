@@ -6,8 +6,12 @@ Set-Location (Join-Path $scriptDir "..")
 $venvPython = Join-Path (Get-Location) "venv\Scripts\python.exe"
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
 $pythonExe = if (Test-Path $venvPython) { $venvPython } elseif ($pythonCmd) { $pythonCmd.Source } else { $null }
+if (-not $pythonExe) {
+  throw "Python が見つかりません。venv を作成するか、Python を PATH に追加してください。"
+}
+
 $makeIconScript = "scripts\make_icon.py"
-if ($pythonExe -and (Test-Path $makeIconScript)) {
+if (Test-Path $makeIconScript) {
   & $pythonExe $makeIconScript
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
@@ -77,13 +81,21 @@ foreach ($archive in $bundledSetupArchives) {
   Remove-Item -Path $archive.FullName -Force -ErrorAction SilentlyContinue
 }
 
-$thirdPartyNotices = Join-Path (Get-Location) "THIRD_PARTY_NOTICES.md"
-if (Test-Path $thirdPartyNotices) {
-  Copy-Item -LiteralPath $thirdPartyNotices -Destination $distRootDir -Force
+$licensesDir = Join-Path $distRootDir "licenses"
+& $pythonExe "scripts\collect_licenses.py" --destination $licensesDir
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
+}
+
+& $pythonExe -m scripts.check_license_compliance $distRootDir
+if ($LASTEXITCODE -ne 0) {
+  exit $LASTEXITCODE
 }
 
 Write-Host "Build complete. Runtime dependencies are stored under dist\\LoLReplayTool\\_internal."
-Write-Host "Portable OBS, mpv DLLs, FFmpeg, and game assets are not bundled."
-Write-Host "OBS is downloaded on first launch. FFmpeg is downloaded on first clip export. Downloads use pinned SHA256 verification."
+Write-Host "Project and third-party license materials are stored under dist\\LoLReplayTool and its licenses directory."
+Write-Host "Portable OBS, mpv DLLs, the standalone FFmpeg executable, and game assets are not bundled."
+Write-Host "The OpenCV wheel includes its own FFmpeg DLL and notices."
+Write-Host "OBS is downloaded on first launch. The standalone FFmpeg executable is downloaded on first clip export. Downloads use pinned SHA256 verification."
 Write-Host "Place mpv DLLs under %LOCALAPPDATA%\\LoLReplayTool\\bin manually."
 

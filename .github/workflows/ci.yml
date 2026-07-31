@@ -148,6 +148,10 @@ jobs:
         shell: pwsh
         run: .\scripts\build.ps1
 
+      - name: Validate packaged license materials
+        shell: pwsh
+        run: python -m scripts.check_license_compliance .\dist\LoLReplayTool
+
       - name: Run packaged self-check
         shell: pwsh
         run: .\dist\LoLReplayTool\LoLReplayTool.exe --self-check

@@ -39,6 +39,7 @@ OBS_EXE = OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
 LEGACY_OBS_EXE = LEGACY_OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
 
 FFMPEG_VERSION = "8.1.1"
+FFMPEG_LICENSE_DIR = DATA_DIR / "licenses" / f"FFmpeg-{FFMPEG_VERSION}"
 FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip"
 FFMPEG_ZIP_MIRROR_URL = (
     "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip"
@@ -365,14 +366,38 @@ async def verify_sha256(path: Path, expected_sha256: str, label: str) -> None:
         raise RuntimeError(f"{label} checksum mismatch.\nexpected: {expected_sha256}\nactual:   {actual}")
 
 
-def _extract_ffmpeg(zip_path: Path, dest: Path) -> Path:
+def _extract_ffmpeg(zip_path: Path, dest: Path, license_dir: Path | None = None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
+    resolved_license_dir = license_dir or dest.parent.parent / "licenses" / f"FFmpeg-{FFMPEG_VERSION}"
     with zipfile.ZipFile(zip_path) as archive:
-        members = [name for name in archive.namelist() if name.replace("\\", "/").endswith("/bin/ffmpeg.exe")]
-        if not members:
+        executable_members = [
+            name for name in archive.namelist() if name.replace("\\", "/").endswith("/bin/ffmpeg.exe")
+        ]
+        license_members = [
+            info
+            for info in archive.infolist()
+            if not info.is_dir()
+            and Path(info.filename.replace("\\", "/"))
+            .name.casefold()
+            .startswith(("license", "copying", "notice", "readme"))
+        ]
+        if not executable_members:
             raise RuntimeError("ffmpeg.exe was not found inside the downloaded ZIP.")
-        with archive.open(members[0]) as src, open(dest, "wb") as out:
+        if not license_members:
+            raise RuntimeError("FFmpeg license or README files were not found inside the downloaded ZIP.")
+
+        with archive.open(executable_members[0]) as src, open(dest, "wb") as out:
             shutil.copyfileobj(src, out)
+
+        resolved_license_dir.mkdir(parents=True, exist_ok=True)
+        for info in license_members:
+            source_name = Path(info.filename.replace("\\", "/"))
+            target_name = source_name.name
+            target = resolved_license_dir / target_name
+            if target.exists():
+                target = resolved_license_dir / "-".join(source_name.parts[-2:])
+            with archive.open(info) as src, open(target, "wb") as out:
+                shutil.copyfileobj(src, out)
     return dest
 
 
@@ -513,7 +538,7 @@ async def ensure_ffmpeg(
             await download_file(FFMPEG_PACKAGE, zip_path, progress_cb, cancel_cb)
             report(progress_cb, FFMPEG_PACKAGE.progress_end, "FFmpegのSHA256を検証しています...")
             await verify_sha256(zip_path, FFMPEG_PACKAGE.sha256, FFMPEG_PACKAGE.name)
-            await asyncio.to_thread(_extract_ffmpeg, zip_path, FFMPEG_EXE)
+            await asyncio.to_thread(_extract_ffmpeg, zip_path, FFMPEG_EXE, FFMPEG_LICENSE_DIR)
 
     report(progress_cb, FFMPEG_PACKAGE.progress_end, f"FFmpeg installed: {FFMPEG_EXE}")
     return FFMPEG_EXE

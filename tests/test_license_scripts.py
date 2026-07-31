@@ -8,6 +8,7 @@ import os
 import shutil
 import struct
 import sys
+import sysconfig
 import types
 import zipfile
 import zlib
@@ -48,8 +49,12 @@ def _write_distribution_materials(root: Path) -> None:
     license_collector.collect_licenses(root / "licenses")
 
 
+def _stdlib_root() -> Path:
+    return Path(sysconfig.get_path("stdlib"))
+
+
 def _stdlib_source_record(relative: str = "linecache.py") -> dict[str, object]:
-    source = Path(sys.base_prefix) / "Lib" / relative
+    source = _stdlib_root() / relative
     return {
         "path": relative,
         "size": source.stat().st_size,
@@ -67,7 +72,7 @@ def _verified_stdlib_pyc(
 ) -> bytes:
     relative = str(source_record["path"])
     if source_bytes is None:
-        source_bytes = (Path(sys.base_prefix) / "Lib" / relative).read_bytes()
+        source_bytes = (_stdlib_root() / relative).read_bytes()
     code = compile(
         source_bytes,
         relative,
@@ -359,7 +364,7 @@ def _write_minimal_pyinstaller_tocs(tmp_path: Path) -> dict[str, Path]:
     demo_module = ("demo", main, "PYMODULE")
     struct_module = (
         "struct",
-        str(Path(sys.base_prefix) / "Lib" / "struct.py"),
+        str(_stdlib_root() / "struct.py"),
         "PYMODULE",
     )
     binary = ("demo.dll", str(tmp_path / "demo.dll"), "BINARY")
@@ -915,6 +920,7 @@ def test_pyz_layout_rejects_independent_archive_tampering(mutation):
 
 
 def _build_test_pe(tmp_path: Path, monkeypatch):
+    from PIL import Image
     from PyInstaller import config
     from PyInstaller.utils.win32 import icon, winmanifest, winresource, winutils
 
@@ -927,7 +933,9 @@ def _build_test_pe(tmp_path: Path, monkeypatch):
     executable = tmp_path / "test.exe"
     shutil.copyfile(bootloader, executable)
     winresource.remove_all_resources(str(executable))
-    icon_path = Path(__file__).resolve().parents[1] / "assets" / "app" / "app.ico"
+    icon_path = tmp_path / "test.ico"
+    with Image.new("RGBA", (16, 16), (24, 96, 192, 255)) as image:
+        image.save(icon_path, format="ICO", sizes=[(16, 16)])
     icon.CopyIcons(str(executable), [str(icon_path)])
     manifest = winmanifest.create_application_manifest(None, False, False)
     winmanifest.write_manifest_to_executable(str(executable), manifest)
@@ -1037,6 +1045,14 @@ def test_final_pe_rejects_code_resource_and_overlay_tampering(
         offset = (
             resource_section.PointerToRawData + resource_section.SizeOfRawData - 1
         )
+        raw_padding_index = (
+            resource_section.SizeOfRawData
+            - resource_section.Misc_VirtualSize
+            - 1
+        )
+        expected_padding_byte = b"PADDINGXXPADDING"[
+            raw_padding_index % len(b"PADDINGXXPADDING")
+        ]
         pe.close()
     else:
         offset = None
@@ -1046,7 +1062,7 @@ def test_final_pe_rejects_code_resource_and_overlay_tampering(
             stream.seek(offset)
             original = stream.read(1)
             if tamper == "resource-padding":
-                assert original == b"G"
+                assert original == bytes([expected_padding_byte])
             stream.seek(offset)
             stream.write(bytes([original[0] ^ 1]))
         winutils.update_exe_pe_checksum(str(executable))
@@ -1326,6 +1342,15 @@ def test_python_native_runtime_probe_detects_locked_hash_tampering():
     lock = _component_lock()
     observed = license_collector.probe_python_native_runtime(lock)
     assert observed["python_version"] == sys.version.split()[0]
+    assert observed["runtime_source"] == "official_binary_archive"
+
+    source_tampered = copy.deepcopy(lock)
+    source_profile = source_tampered["python"][
+        "windows_native_runtime_profiles"
+    ][sys.version.split()[0]]
+    source_profile["runtime_source"] = "official_actions_archive"
+    with pytest.raises(RuntimeError, match="native runtime source"):
+        license_collector.probe_python_native_runtime(source_tampered)
 
     tampered = copy.deepcopy(lock)
     profile = tampered["python"]["windows_native_runtime_profiles"][

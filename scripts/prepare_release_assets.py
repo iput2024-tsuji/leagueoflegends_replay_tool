@@ -14,11 +14,13 @@ import marshal
 import os
 import platform
 import re
+import shutil
 import stat
 import struct
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import types
 import urllib.parse
 import urllib.request
@@ -55,6 +57,7 @@ LICENSE_ROOT_FILES = (
     "THIRD_PARTY_NOTICES.md",
     "VERSION",
 )
+PYTHON_RUNTIME_SOURCE = "official_binary_archive"
 REQUIRED_RELEASE_BINARY_COMPONENTS = frozenset(
     {
         "aiohappyeyeballs",
@@ -620,6 +623,11 @@ def _python_native_profile_errors(lock: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if profile.get("provenance_verified") is not True:
         errors.append("python: release native runtime provenance is not verified")
+    if profile.get("runtime_source") != PYTHON_RUNTIME_SOURCE:
+        errors.append(
+            "python: release native runtime source must be "
+            f"{PYTHON_RUNTIME_SOURCE}"
+        )
     for profile_field, label in (
         ("official_binary_archive", "windows_binary_archive"),
         ("official_actions_archive", "windows_actions_archive"),
@@ -641,6 +649,18 @@ def _python_native_profile_errors(lock: dict[str, Any]) -> list[str]:
         or "github.com/actions/python-versions/releases/download/" not in actions_archive["url"]
     ):
         errors.append("python: official Actions archive provenance is invalid")
+    binary_archive = profile.get("official_binary_archive")
+    expected_binary_filename = f"python-{release_version}-amd64.zip"
+    expected_binary_url = (
+        f"https://www.python.org/ftp/python/{release_version}/"
+        f"{expected_binary_filename}"
+    )
+    if (
+        not isinstance(binary_archive, dict)
+        or binary_archive.get("filename") != expected_binary_filename
+        or binary_archive.get("url") != expected_binary_url
+    ):
+        errors.append("python: official binary archive provenance is invalid")
     installer = profile.get("official_installer")
     if (
         not isinstance(installer, dict)
@@ -2353,6 +2373,153 @@ def _validated_zip_members(
     return members
 
 
+def _release_python_runtime_record(lock: dict[str, Any]) -> dict[str, Any]:
+    profile_errors = _python_native_profile_errors(lock)
+    if profile_errors:
+        raise ReleaseAssetError(" | ".join(profile_errors))
+    python_lock = lock["python"]
+    version = str(python_lock["release_version"])
+    profile = python_lock["windows_native_runtime_profiles"][version]
+    runtime_source = profile["runtime_source"]
+    if runtime_source != PYTHON_RUNTIME_SOURCE:
+        raise ReleaseAssetError("Release Python runtime source is not uniquely locked.")
+    archive = profile[runtime_source]
+    return {
+        "component": "python",
+        "version": version,
+        "filename": _safe_filename(archive["filename"]),
+        "url": str(archive["url"]),
+        "sha256": str(archive["sha256"]).casefold(),
+        "size": int(archive["size"]),
+    }
+
+
+def _validated_python_runtime_members(
+    archive: zipfile.ZipFile,
+) -> dict[str, zipfile.ZipInfo]:
+    label = "locked Python runtime archive"
+    for info in archive.infolist():
+        if "\\" in info.filename:
+            raise ReleaseAssetError(
+                f"Backslash path is forbidden in {label}: {info.filename}"
+            )
+    members = _validated_zip_members(archive, label=label)
+    files = {
+        name.casefold()
+        for name, info in members.items()
+        if not info.is_dir()
+    }
+    for name in members:
+        parts = PurePosixPath(name).parts
+        for index in range(1, len(parts)):
+            parent = PurePosixPath(*parts[:index]).as_posix().casefold()
+            if parent in files:
+                raise ReleaseAssetError(
+                    f"File/directory collision in {label}: {name}"
+                )
+    python_executable = members.get("python.exe")
+    if python_executable is None or python_executable.is_dir():
+        raise ReleaseAssetError(
+            "Locked Python runtime archive does not contain root python.exe."
+        )
+    return members
+
+
+def prepare_python_runtime(
+    *,
+    components_file: Path,
+    cache_dir: Path,
+    output_dir: Path,
+    opener: Callable[..., BinaryIO] = urllib.request.urlopen,
+) -> Path:
+    """Fetch and transactionally extract the locked release Python runtime."""
+    components_file = components_file.absolute()
+    raw_cache_dir = cache_dir.absolute()
+    raw_output_dir = output_dir.absolute()
+    _safe_path_component(
+        raw_output_dir.name,
+        label="Python runtime output directory name",
+    )
+    if os.path.lexists(raw_output_dir):
+        raise ReleaseAssetError(
+            f"Python runtime output must not already exist: {raw_output_dir}"
+        )
+    if os.path.lexists(raw_cache_dir) and _path_is_link_or_reparse(raw_cache_dir):
+        raise ReleaseAssetError(
+            f"Python runtime cache must not be a link: {raw_cache_dir}"
+        )
+    cache_dir = raw_cache_dir.resolve(strict=False)
+    output_dir = raw_output_dir.parent.resolve(strict=False) / raw_output_dir.name
+    if (
+        cache_dir == output_dir
+        or cache_dir.is_relative_to(output_dir)
+        or output_dir.is_relative_to(cache_dir)
+    ):
+        raise ReleaseAssetError(
+            "Python runtime cache and output directories must not overlap."
+        )
+    try:
+        lock = _load_lock(components_file)
+        record = _release_python_runtime_record(lock)
+        fetched = fetch_verified_sources([record], cache_dir, opener=opener)
+        archive_path = fetched[0][1]
+
+        output_parent = output_dir.parent
+        output_parent.mkdir(parents=True, exist_ok=True)
+        _require_directory(output_parent, label="Python runtime output parent")
+        if os.path.lexists(output_dir):
+            raise ReleaseAssetError(
+                f"Python runtime output appeared during preparation: {output_dir}"
+            )
+    except ReleaseAssetError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise ReleaseAssetError(
+            f"Cannot prepare locked Python runtime archive: {exc}"
+        ) from exc
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=f".{output_dir.name}-",
+            dir=output_parent,
+        ) as transaction_root_text:
+            transaction_root = Path(transaction_root_text)
+            staging = transaction_root / "runtime"
+            staging.mkdir()
+            with zipfile.ZipFile(archive_path) as archive:
+                members = _validated_python_runtime_members(archive)
+                for name, info in members.items():
+                    relative = PurePosixPath(name)
+                    target = staging.joinpath(*relative.parts)
+                    if info.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(info) as source, target.open("xb") as output:
+                        shutil.copyfileobj(source, output, COPY_BUFFER_SIZE)
+            python_executable = staging / "python.exe"
+            _require_regular_file(
+                python_executable,
+                label="Extracted release Python executable",
+            )
+            if python_executable.stat().st_size <= 0:
+                raise ReleaseAssetError(
+                    "Extracted release Python executable is empty."
+                )
+            if os.path.lexists(output_dir):
+                raise ReleaseAssetError(
+                    f"Python runtime output appeared during extraction: {output_dir}"
+                )
+            staging.replace(output_dir)
+    except ReleaseAssetError:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile) as exc:
+        raise ReleaseAssetError(
+            f"Cannot extract locked Python runtime archive: {exc}"
+        ) from exc
+    return output_dir / "python.exe"
+
+
 def _hash_zip_member(
     archive: zipfile.ZipFile,
     info: zipfile.ZipInfo,
@@ -3037,6 +3204,14 @@ def _create_parser() -> argparse.ArgumentParser:
     )
     verify_runtime.add_argument("--components", type=Path, default=COMPONENTS_FILE)
 
+    prepare_runtime = commands.add_parser(
+        "prepare-python-runtime",
+        help="Fetch and safely extract the locked release Python runtime.",
+    )
+    prepare_runtime.add_argument("--components", type=Path, default=COMPONENTS_FILE)
+    prepare_runtime.add_argument("--cache-dir", required=True, type=Path)
+    prepare_runtime.add_argument("--output-dir", required=True, type=Path)
+
     verify_bootstrap = commands.add_parser(
         "verify-bootstrap-pip",
         help="Verify ensurepip and the new venv's pip before installing packages.",
@@ -3117,6 +3292,14 @@ def main(argv: list[str] | None = None) -> int:
                 "Verified release Python runtime: "
                 f"{runtime['python_version']} ({runtime['active_python_executable']['kind']})"
             )
+            return 0
+        if args.command == "prepare-python-runtime":
+            python_executable = prepare_python_runtime(
+                components_file=args.components,
+                cache_dir=args.cache_dir,
+                output_dir=args.output_dir,
+            )
+            print(f"Verified release Python runtime prepared: {python_executable}")
             return 0
         if args.command == "verify-bootstrap-pip":
             bootstrap = verify_bootstrap_pip(args.components)

@@ -111,6 +111,7 @@
     "windows_native_runtime_profiles": {
       "3.14.2": {
         "provenance_verified": true,
+        "runtime_source": "official_binary_archive",
         "official_binary_archive": {
           "filename": "python-3.14.2-amd64.zip",
           "url": "https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.zip",
@@ -275,6 +276,7 @@
       },
       "3.14.6": {
         "provenance_verified": true,
+        "runtime_source": "official_binary_archive",
         "official_binary_archive": {
           "filename": "python-3.14.6-amd64.zip",
           "url": "https://www.python.org/ftp/python/3.14.6/python-3.14.6-amd64.zip",

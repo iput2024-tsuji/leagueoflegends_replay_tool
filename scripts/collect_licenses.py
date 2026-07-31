@@ -506,6 +506,12 @@ def probe_python_native_runtime(component_lock: dict[str, Any]) -> dict[str, Any
         raise RuntimeError(
             f"Python {version} native runtime profile is not verified."
         )
+    runtime_source = profile.get("runtime_source")
+    if runtime_source != "official_binary_archive":
+        raise RuntimeError(
+            f"Python {version} native runtime source is not the locked official "
+            "binary archive."
+        )
     raw_components = profile.get("components")
     if not isinstance(raw_components, list):
         raise RuntimeError("Python native runtime profile has no component list.")
@@ -787,6 +793,7 @@ def probe_python_native_runtime(component_lock: dict[str, Any]) -> dict[str, Any
         )
     return {
         "python_version": version,
+        "runtime_source": runtime_source,
         "official_binary_archive": profile.get("official_binary_archive"),
         "official_actions_archive": profile.get("official_actions_archive"),
         "official_installer": profile.get("official_installer"),

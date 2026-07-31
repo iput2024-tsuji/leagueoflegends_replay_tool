@@ -63,6 +63,63 @@ def _wheel_bytes(name: str = "demo", version: str = "1.0") -> bytes:
     return wheel_buffer.getvalue()
 
 
+def _runtime_zip_bytes(
+    entries: list[tuple[str, bytes, int | None]] | None = None,
+) -> bytes:
+    if entries is None:
+        entries = [
+            ("python.exe", b"locked-python", None),
+            ("Lib/os.py", b"# locked stdlib\n", None),
+        ]
+    runtime_buffer = io.BytesIO()
+    with zipfile.ZipFile(runtime_buffer, "w") as archive:
+        for name, payload, external_attr in entries:
+            info = zipfile.ZipInfo(name)
+            info.filename = name
+            info.orig_filename = name
+            if external_attr is not None:
+                info.external_attr = external_attr
+            archive.writestr(info, payload)
+    payload = runtime_buffer.getvalue()
+    for name, _data, _external_attr in entries:
+        if "\\" in name:
+            payload = payload.replace(
+                name.replace("\\", "/").encode(),
+                name.encode(),
+            )
+    return payload
+
+
+def _write_runtime_lock(
+    tmp_path: Path,
+    archive: bytes,
+    *,
+    declared_size: int | None = None,
+    declared_sha256: str | None = None,
+) -> tuple[Path, dict[str, object]]:
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+    python_lock = lock["python"]
+    version = python_lock["release_version"]
+    profile = python_lock["windows_native_runtime_profiles"][version]
+    archive_lock = profile["official_binary_archive"]
+    archive_lock["size"] = len(archive) if declared_size is None else declared_size
+    archive_lock["sha256"] = declared_sha256 or _sha(archive)
+    components_file = tmp_path / "components.json"
+    components_file.write_text(json.dumps(lock), encoding="utf-8")
+    return components_file, lock
+
+
+def _runtime_opener(archive: bytes, expected_url: str):
+    def opener(request, *, timeout):
+        assert request.full_url == expected_url
+        assert timeout == 120
+        return io.BytesIO(archive)
+
+    return opener
+
+
 def _wheel_contents(wheel: bytes) -> list[dict[str, object]]:
     with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
         return [
@@ -446,6 +503,462 @@ def test_download_aborts_on_streamed_size_mismatch(tmp_path, downloaded, message
         fetch_verified_sources([record], cache, opener=opener)
 
     assert not (cache / f"{record['filename']}.partial").exists()
+
+
+def test_prepare_python_runtime_extracts_verified_archive_transactionally(
+    tmp_path,
+):
+    archive = _runtime_zip_bytes()
+    components_file, lock = _write_runtime_lock(tmp_path, archive)
+    python_lock = lock["python"]
+    version = python_lock["release_version"]
+    archive_lock = python_lock["windows_native_runtime_profiles"][version][
+        "official_binary_archive"
+    ]
+    output_dir = tmp_path / "prepared" / "runtime"
+    cache_dir = tmp_path / "cache"
+
+    python_executable = release_assets.prepare_python_runtime(
+        components_file=components_file,
+        cache_dir=cache_dir,
+        output_dir=output_dir,
+        opener=_runtime_opener(archive, archive_lock["url"]),
+    )
+
+    assert python_executable == output_dir.resolve() / "python.exe"
+    assert python_executable.read_bytes() == b"locked-python"
+    assert (output_dir / "Lib" / "os.py").read_bytes() == b"# locked stdlib\n"
+    assert (cache_dir / archive_lock["filename"]).read_bytes() == archive
+    assert not list(output_dir.parent.glob(f".{output_dir.name}-*"))
+
+
+@pytest.mark.parametrize(
+    ("declared_size", "declared_sha256", "message"),
+    [
+        (1, None, "size mismatch"),
+        (None, "0" * 64, "SHA256 mismatch"),
+    ],
+)
+def test_prepare_python_runtime_rejects_size_or_hash_mismatch_without_output(
+    tmp_path,
+    declared_size,
+    declared_sha256,
+    message,
+):
+    archive = _runtime_zip_bytes()
+    if declared_size is not None:
+        declared_size = len(archive) + declared_size
+    components_file, lock = _write_runtime_lock(
+        tmp_path,
+        archive,
+        declared_size=declared_size,
+        declared_sha256=declared_sha256,
+    )
+    version = lock["python"]["release_version"]
+    archive_lock = lock["python"]["windows_native_runtime_profiles"][version][
+        "official_binary_archive"
+    ]
+    output_dir = tmp_path / "runtime"
+
+    with pytest.raises(ReleaseAssetError, match=message):
+        release_assets.prepare_python_runtime(
+            components_file=components_file,
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+            opener=_runtime_opener(archive, archive_lock["url"]),
+        )
+
+    assert not os.path.lexists(output_dir)
+
+
+def test_prepare_python_runtime_rejects_truncated_zip_without_output(tmp_path):
+    archive = b"not-a-zip"
+    components_file, lock = _write_runtime_lock(tmp_path, archive)
+    version = lock["python"]["release_version"]
+    archive_lock = lock["python"]["windows_native_runtime_profiles"][version][
+        "official_binary_archive"
+    ]
+    output_dir = tmp_path / "runtime"
+
+    with pytest.raises(ReleaseAssetError, match="Cannot extract locked Python"):
+        release_assets.prepare_python_runtime(
+            components_file=components_file,
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+            opener=_runtime_opener(archive, archive_lock["url"]),
+        )
+
+    assert not os.path.lexists(output_dir)
+
+
+def test_prepare_python_runtime_wraps_download_error_without_output(tmp_path):
+    archive = _runtime_zip_bytes()
+    components_file, _lock_payload = _write_runtime_lock(tmp_path, archive)
+    output_dir = tmp_path / "runtime"
+
+    def failing_opener(_request, *, timeout):
+        assert timeout == 120
+        raise OSError("network unavailable")
+
+    with pytest.raises(
+        ReleaseAssetError,
+        match="Cannot prepare locked Python runtime archive",
+    ):
+        release_assets.prepare_python_runtime(
+            components_file=components_file,
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+            opener=failing_opener,
+        )
+
+    assert not os.path.lexists(output_dir)
+
+
+@pytest.mark.parametrize(
+    "unsafe_name",
+    [
+        "/absolute.py",
+        "../escape.py",
+        "C:/escape.py",
+        "//server/share/escape.py",
+        "..\\escape.py",
+    ],
+)
+def test_prepare_python_runtime_rejects_unsafe_member_without_output(
+    tmp_path,
+    unsafe_name,
+):
+    archive = _runtime_zip_bytes(
+        [
+            ("python.exe", b"locked-python", None),
+            (unsafe_name, b"unsafe", None),
+        ]
+    )
+    components_file, lock = _write_runtime_lock(tmp_path, archive)
+    version = lock["python"]["release_version"]
+    archive_lock = lock["python"]["windows_native_runtime_profiles"][version][
+        "official_binary_archive"
+    ]
+    output_dir = tmp_path / "runtime"
+
+    with pytest.raises(ReleaseAssetError, match="Unsafe|Backslash"):
+        release_assets.prepare_python_runtime(
+            components_file=components_file,
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+            opener=_runtime_opener(archive, archive_lock["url"]),
+        )
+
+    assert not os.path.lexists(output_dir)
+
+
+@pytest.mark.parametrize(
+    "external_attr",
+    [
+        (stat.S_IFLNK | 0o777) << 16,
+        (stat.S_IFIFO | 0o644) << 16,
+        ((stat.S_IFREG | 0o644) << 16) | 0x400,
+    ],
+)
+def test_prepare_python_runtime_rejects_special_member_without_output(
+    tmp_path,
+    external_attr,
+):
+    archive = _runtime_zip_bytes(
+        [
+            ("python.exe", b"locked-python", None),
+            ("Lib/special", b"target", external_attr),
+        ]
+    )
+    components_file, lock = _write_runtime_lock(tmp_path, archive)
+    version = lock["python"]["release_version"]
+    archive_lock = lock["python"]["windows_native_runtime_profiles"][version][
+        "official_binary_archive"
+    ]
+    output_dir = tmp_path / "runtime"
+
+    with pytest.raises(ReleaseAssetError, match="Unsafe special entry"):
+        release_assets.prepare_python_runtime(
+            components_file=components_file,
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+            opener=_runtime_opener(archive, archive_lock["url"]),
+        )
+
+    assert not os.path.lexists(output_dir)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [
+            ("python.exe", b"first", None),
+            ("python.exe", b"second", None),
+        ],
+        [
+            ("python.exe", b"first", None),
+            ("PYTHON.EXE", b"second", None),
+        ],
+    ],
+)
+def test_prepare_python_runtime_rejects_duplicate_or_case_collision(
+    tmp_path,
+    entries,
+):
+    archive = _runtime_zip_bytes(entries)
+    components_file, lock = _write_runtime_lock(tmp_path, archive)
+    version = lock["python"]["release_version"]
+    archive_lock = lock["python"]["windows_native_runtime_profiles"][version][
+        "official_binary_archive"
+    ]
+    output_dir = tmp_path / "runtime"
+
+    with pytest.raises(ReleaseAssetError, match="Duplicate or case-insensitive"):
+        release_assets.prepare_python_runtime(
+            components_file=components_file,
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+            opener=_runtime_opener(archive, archive_lock["url"]),
+        )
+
+    assert not os.path.lexists(output_dir)
+
+
+def test_prepare_python_runtime_rejects_existing_nonempty_output(tmp_path):
+    output_dir = tmp_path / "runtime"
+    output_dir.mkdir()
+    marker = output_dir / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    with pytest.raises(ReleaseAssetError, match="must not already exist"):
+        release_assets.prepare_python_runtime(
+            components_file=tmp_path / "unused.json",
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+        )
+
+    assert marker.read_text(encoding="utf-8") == "keep"
+
+
+def test_prepare_python_runtime_rejects_existing_output_symlink(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    output_dir = tmp_path / "runtime-link"
+    try:
+        output_dir.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(ReleaseAssetError, match="must not already exist"):
+        release_assets.prepare_python_runtime(
+            components_file=tmp_path / "unused.json",
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+        )
+
+    assert output_dir.is_symlink()
+
+
+def test_prepare_python_runtime_rejects_parent_traversal_output(tmp_path):
+    parent = tmp_path / "new-parent"
+    output_dir = parent / ".."
+
+    with pytest.raises(ReleaseAssetError, match="Unsafe Python runtime output"):
+        release_assets.prepare_python_runtime(
+            components_file=tmp_path / "unused.json",
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+        )
+
+    assert not parent.exists()
+
+
+@pytest.mark.parametrize(
+    "overlap",
+    ["same", "descendant", "ancestor", "dotdot"],
+)
+def test_prepare_python_runtime_rejects_cache_output_overlap_without_side_effects(
+    tmp_path,
+    overlap,
+):
+    archive = _runtime_zip_bytes()
+    components_file, _lock_payload = _write_runtime_lock(tmp_path, archive)
+    output_dir = tmp_path / "runtime"
+    if overlap == "same":
+        cache_dir = output_dir
+    elif overlap == "descendant":
+        cache_dir = output_dir / "cache"
+    elif overlap == "ancestor":
+        cache_dir = tmp_path / "cache"
+        output_dir = cache_dir / "runtime"
+    else:
+        cache_dir = tmp_path / "alias" / ".." / "runtime" / "cache"
+
+    with pytest.raises(ReleaseAssetError, match="must not overlap"):
+        release_assets.prepare_python_runtime(
+            components_file=components_file,
+            cache_dir=cache_dir,
+            output_dir=output_dir,
+        )
+
+    assert not os.path.lexists(output_dir)
+
+
+@pytest.mark.parametrize(
+    ("entries", "message"),
+    [
+        ([("pythonw.exe", b"python", None)], "does not contain root python.exe"),
+        ([("python.exe", b"", None)], "executable is empty"),
+        (
+            [
+                ("python.exe", b"python", None),
+                ("Lib", b"not-a-directory", None),
+                ("Lib/os.py", b"stdlib", None),
+            ],
+            "File/directory collision",
+        ),
+    ],
+)
+def test_prepare_python_runtime_rejects_incomplete_or_ambiguous_layout(
+    tmp_path,
+    entries,
+    message,
+):
+    archive = _runtime_zip_bytes(entries)
+    components_file, lock = _write_runtime_lock(tmp_path, archive)
+    version = lock["python"]["release_version"]
+    archive_lock = lock["python"]["windows_native_runtime_profiles"][version][
+        "official_binary_archive"
+    ]
+    output_dir = tmp_path / "runtime"
+
+    with pytest.raises(ReleaseAssetError, match=message):
+        release_assets.prepare_python_runtime(
+            components_file=components_file,
+            cache_dir=tmp_path / "cache",
+            output_dir=output_dir,
+            opener=_runtime_opener(archive, archive_lock["url"]),
+        )
+
+    assert not os.path.lexists(output_dir)
+
+
+@pytest.mark.parametrize("runtime_source", [None, "official_actions_archive"])
+def test_release_gate_requires_exact_python_runtime_source(runtime_source):
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+    version = lock["python"]["release_version"]
+    profile = lock["python"]["windows_native_runtime_profiles"][version]
+    if runtime_source is None:
+        profile.pop("runtime_source")
+    else:
+        profile["runtime_source"] = runtime_source
+
+    errors = release_gate_errors(lock)
+
+    assert (
+        "python: release native runtime source must be official_binary_archive"
+        in errors
+    )
+
+
+def test_every_locked_windows_python_profile_declares_official_runtime_source():
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+    profiles = lock["python"]["windows_native_runtime_profiles"]
+
+    assert profiles
+    assert {
+        version: profile["runtime_source"]
+        for version, profile in profiles.items()
+    } == {
+        version: "official_binary_archive" for version in profiles
+    }
+
+
+def test_release_gate_binds_python_runtime_to_exact_official_url():
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+    version = lock["python"]["release_version"]
+    profile = lock["python"]["windows_native_runtime_profiles"][version]
+    profile["official_binary_archive"]["url"] = (
+        f"https://www.python.org/ftp/python/{version}/unexpected.zip"
+    )
+
+    assert "python: official binary archive provenance is invalid" in (
+        release_gate_errors(lock)
+    )
+
+
+def test_prepare_python_runtime_cli_accepts_cache_and_output_paths():
+    args = release_assets._create_parser().parse_args(
+        [
+            "prepare-python-runtime",
+            "--components",
+            "components.json",
+            "--cache-dir",
+            "cache",
+            "--output-dir",
+            "runtime",
+        ]
+    )
+
+    assert args.command == "prepare-python-runtime"
+    assert args.components == Path("components.json")
+    assert args.cache_dir == Path("cache")
+    assert args.output_dir == Path("runtime")
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["prepare-python-runtime", "--output-dir", "runtime"],
+        ["prepare-python-runtime", "--cache-dir", "cache"],
+    ],
+)
+def test_prepare_python_runtime_cli_requires_cache_and_output_paths(arguments):
+    with pytest.raises(SystemExit):
+        release_assets._create_parser().parse_args(arguments)
+
+
+def test_prepare_python_runtime_cli_dispatches_helper(monkeypatch, tmp_path):
+    components = tmp_path / "components.json"
+    cache = tmp_path / "cache"
+    output = tmp_path / "runtime"
+    observed = {}
+
+    def fake_prepare_python_runtime(**kwargs):
+        observed.update(kwargs)
+        return output / "python.exe"
+
+    monkeypatch.setattr(
+        release_assets,
+        "prepare_python_runtime",
+        fake_prepare_python_runtime,
+    )
+
+    assert (
+        release_assets.main(
+            [
+                "prepare-python-runtime",
+                "--components",
+                str(components),
+                "--cache-dir",
+                str(cache),
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert observed == {
+        "components_file": components,
+        "cache_dir": cache,
+        "output_dir": output,
+    }
 
 
 def test_release_legal_gate_is_explicit():
@@ -1542,8 +2055,32 @@ def test_release_workflow_requires_manual_approval_and_remote_verification():
     )
     assert "prepare-binary-install" in workflow
     assert "attest-binary-install" in workflow
-    assert "verify-python-runtime" in workflow
+    assert workflow.count("verify-python-runtime") == 2
     assert "verify-bootstrap-pip" in workflow
+    assert workflow.count("prepare-python-runtime") == 2
+    assert "& $releaseBasePython -m venv $releaseVenv" in workflow
+    assert (
+        "& $releaseBasePython -m scripts.prepare_release_assets `\n"
+        "            check-gates"
+    ) in workflow
+    assert (
+        "& $releasePython -m scripts.prepare_release_assets `\n"
+        "            prepare-binary-install"
+    ) in workflow
+    assert (
+        "& $env:PUBLISH_PYTHON -m scripts.prepare_release_assets `\n"
+        "            verify"
+    ) in workflow
+    bare_python_commands = [
+        line.strip()
+        for line in workflow.splitlines()
+        if line.strip().startswith("python -m")
+    ]
+    assert bare_python_commands == [
+        "python -m scripts.prepare_release_assets `",
+        "python -m scripts.prepare_release_assets `",
+    ]
+    assert "python -m venv" not in workflow
     assert "--only-binary=:all:" in workflow
     assert "--require-hashes" in workflow
     assert "--no-index" in workflow
@@ -1573,10 +2110,27 @@ def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
         / "ci.yml"
     ).read_text(encoding="utf-8")
 
-    assert "name: Build Windows artifact" in workflow
-    assert "run: .\\scripts\\build.ps1" in workflow
-    assert "Run packaged self-check" in workflow
-    assert "run: .\\scripts\\build_installer.ps1 -SkipTests -SkipBuild" in workflow
+    windows_workflow = workflow.split("  test-windows:", maxsplit=1)[1]
+
+    assert "name: Build Windows artifact" in windows_workflow
+    assert windows_workflow.count("prepare-python-runtime") == 2
+    assert windows_workflow.count("verify-python-runtime") == 2
+    assert windows_workflow.count("verify-bootstrap-pip") == 2
+    assert windows_workflow.count("& $basePython -m venv $venvRoot") == 2
+    assert windows_workflow.count("python -m scripts.prepare_release_assets `") == 2
+    assert windows_workflow.count("& $env:WINDOWS_PYTHON -m pip `") == 2
+    assert windows_workflow.count("& $env:WINDOWS_PYTHON -m pytest `") == 1
+    assert "python -m pip" not in windows_workflow
+    assert "run: python -m" not in windows_workflow
+    assert (
+        "run: .\\scripts\\build.ps1 -PythonExe $env:WINDOWS_PYTHON"
+        in windows_workflow
+    )
+    assert "& $env:WINDOWS_PYTHON -m scripts.check_license_compliance" in (
+        windows_workflow
+    )
+    assert "-PythonExe $env:WINDOWS_PYTHON `" in windows_workflow
+    assert "Run packaged self-check" in windows_workflow
     assert "actions/upload-artifact@" not in workflow
     assert "Compress-Archive" not in workflow
     assert "LoLReplayTool-installer" not in workflow

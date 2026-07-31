@@ -16,6 +16,7 @@ import stat
 import struct
 import subprocess
 import sys
+import sysconfig
 import types
 import zipfile
 from collections import Counter
@@ -903,7 +904,7 @@ def _stdlib_source_records(
         relative = _safe_relative(record.get("path"))
         if relative is None or not relative.endswith(".py"):
             raise ValueError("Verified Python stdlib source path is invalid.")
-        source = Path(sys.base_prefix) / "Lib" / Path(*PurePosixPath(relative).parts)
+        source = _stdlib_root() / Path(*PurePosixPath(relative).parts)
         if (
             not is_safe_regular_file(source)
             or source.stat().st_size != record.get("size")
@@ -917,6 +918,10 @@ def _stdlib_source_records(
     if len(result) != len(artifacts):
         raise ValueError("Verified Python stdlib source inventory is not bijective.")
     return result
+
+
+def _stdlib_root() -> Path:
+    return Path(sysconfig.get_path("stdlib"))
 
 
 def _module_source_component(
@@ -2688,7 +2693,7 @@ def _validate_base_library_archive(
                         f"{relative}"
                     )
                     continue
-                source = Path(sys.base_prefix) / "Lib" / Path(
+                source = _stdlib_root() / Path(
                     *PurePosixPath(source_record["path"]).parts
                 )
                 if (

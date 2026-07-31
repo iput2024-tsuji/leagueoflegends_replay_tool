@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "session_status": "aborted",
+  "session_phase": "aborted",
+  "failure_reason": "fixture cancellation",
+  "summoner_name": "OptionalMissing#TEST",
+  "champion_name": "Lux",
+  "saved_at": "2026-01-03 04:05:06"
+}

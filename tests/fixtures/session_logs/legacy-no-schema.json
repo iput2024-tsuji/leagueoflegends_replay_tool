@@ -1,0 +1,17 @@
+{
+  "summoner_name": "LegacyPlayer#TEST",
+  "champion_name": "Malphite",
+  "enemy_champions": "Darius,Lux",
+  "player_team": "ORDER",
+  "game_result": "Win",
+  "saved_at": "2025-01-01 00:00:00",
+  "sync_game_time": "12.5",
+  "obs_record_path": "videos/legacy.mp4",
+  "events": [
+    {
+      "EventID": 1,
+      "EventName": "GameStart",
+      "EventTime": 0.0
+    }
+  ]
+}

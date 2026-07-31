@@ -59,7 +59,11 @@ It does not yet prove complete source coverage for every runtime wheel.
 In particular, the Qt 6.10.2 official archive is an upstream reference: the
 patches, configure options and build scripts used for the PyQt6-Qt6 Windows
 wheel have not been verified, so it is not asserted to be that wheel's exact
-Corresponding Source. These gaps deliberately keep the Release gate closed.
+Corresponding Source. The same fail-closed treatment applies to the wheel's
+Qt plugin third-party notices and bundled Mesa `opengl32sw.dll`. Microsoft
+Visual C++ runtime files are classified separately; their redistribution and
+source-exception basis requires recorded specialist evidence. These gaps
+deliberately keep the Release gate closed.
 Package-specific license texts are copied under `licenses/python-packages/`.
 
 現在のlockには、LoL Replay Tool、Python、PyQt6、obsws-python、OpenCV、
@@ -67,8 +71,10 @@ opencv-python内FFmpeg codec libraryについて検証済みの候補を記録�
 すべてのruntime wheelのsource coverageは未確認です。特にQt 6.10.2公式archiveは
 上流参考sourceであり、PyQt6-Qt6 Windows wheelで使われたpatch、configure
 option、build scriptを確認できていないため、当該wheelのexact Corresponding
-Sourceとは断定しません。これらの不足が残る間はRelease gateを閉じたままに
-します。
+Sourceとは断定しません。Qt pluginの第三者通知とwheel同梱Mesa
+`opengl32sw.dll`にも同じfail-closed方針を適用します。Microsoft Visual C++
+runtimeは別componentとして分類し、再配布とsource例外の根拠を専門家の証拠付きで
+記録する必要があります。これらの不足が残る間はRelease gateを閉じたままにします。
 
 If a listed source asset becomes unavailable, request the matching source
 through the project's Issue tracker. Maintainers must provide an equivalent

@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import shutil
+import stat
 import sys
 from importlib import metadata
 from pathlib import Path, PurePosixPath
@@ -24,6 +25,15 @@ PROJECT_DOCUMENTS = (
 )
 LICENSE_FILE_PREFIXES = ("license", "copying", "notice", "copyright")
 INVALID_WINDOWS_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 def canonicalize_distribution_name(name: str) -> str:
@@ -80,6 +90,27 @@ def is_license_file(relative_path: Path) -> bool:
     return False
 
 
+def is_substantive_license_file(relative_path: Path) -> bool:
+    """Return whether a file can serve as the package's actual license text."""
+    name = relative_path.name.casefold()
+    return name.startswith(("license", "copying"))
+
+
+def is_safe_regular_file(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and not (
+            getattr(metadata, "st_file_attributes", 0)
+            & FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    )
+
+
 def safe_component_name(value: str) -> str:
     result = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-") or "unknown"
     return "unknown" if result in {".", ".."} else result
@@ -91,7 +122,12 @@ def safe_relative_path(value: str | Path) -> Path:
     if (
         not raw
         or relative.is_absolute()
-        or any(part in {"", ".", ".."} for part in relative.parts)
+        or any(
+            part in {"", ".", ".."}
+            or part.endswith((" ", "."))
+            or part.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES
+            for part in relative.parts
+        )
         or any(INVALID_WINDOWS_CHARS.search(part) for part in relative.parts)
     ):
         raise RuntimeError(f"Unsafe distribution metadata path: {value}")
@@ -182,6 +218,7 @@ def collect_distribution_licenses(
         )
     package_dir = destination_root / safe_component_name(canonical_name)
     copied_files: list[str] = []
+    substantive_files: list[str] = []
     seen = seen_targets if seen_targets is not None else {}
 
     for metadata_path in distribution.files or ():
@@ -190,19 +227,22 @@ def collect_distribution_licenses(
             continue
         relative = safe_relative_path(str(metadata_path))
         source = Path(distribution.locate_file(metadata_path))
-        if not source.is_file():
+        if not is_safe_regular_file(source) or source.stat().st_size == 0:
             continue
         target = package_dir / relative
         _reserve_target(target, seen)
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists() or target.read_bytes() != source.read_bytes():
             shutil.copy2(source, target)
-        copied_files.append(target.relative_to(destination_root.parent).as_posix())
+        relative_target = target.relative_to(destination_root.parent).as_posix()
+        copied_files.append(relative_target)
+        if is_substantive_license_file(relative):
+            substantive_files.append(relative_target)
 
-    if not copied_files:
+    if not substantive_files:
         raise RuntimeError(
-            f"No license, COPYING, NOTICE, or copyright file was found for "
-            f"{canonical_name}; AUTHORS alone is not sufficient."
+            f"No non-empty LICENSE or COPYING file was found for {canonical_name}; "
+            "NOTICE, COPYRIGHT, and AUTHORS alone are not sufficient."
         )
 
     observed_license = (
@@ -218,6 +258,10 @@ def collect_distribution_licenses(
         "observed_license": observed_license,
         "homepage": distribution.metadata.get("Home-page") or "",
         "license_files": sorted(set(copied_files), key=str.casefold),
+        "substantive_license_files": sorted(
+            set(substantive_files),
+            key=str.casefold,
+        ),
     }
 
 
@@ -231,7 +275,14 @@ def collect_python_runtime_license(
         Path(sys.base_prefix) / "LICENSE.txt",
         Path(sys.prefix) / "LICENSE.txt",
     ]
-    license_source = next((path for path in license_candidates if path.is_file()), None)
+    license_source = next(
+        (
+            path
+            for path in license_candidates
+            if is_safe_regular_file(path) and path.stat().st_size > 0
+        ),
+        None,
+    )
     if license_source is None:
         raise RuntimeError("Python runtime LICENSE.txt was not found.")
 
@@ -239,7 +290,14 @@ def collect_python_runtime_license(
         Path(sys.base_prefix) / "Doc" / "html" / "license.html",
         Path(sys.prefix) / "Doc" / "html" / "license.html",
     ]
-    notices_source = next((path for path in notices_candidates if path.is_file()), None)
+    notices_source = next(
+        (
+            path
+            for path in notices_candidates
+            if is_safe_regular_file(path) and path.stat().st_size > 0
+        ),
+        None,
+    )
     if notices_source is None:
         raise RuntimeError("Python runtime third-party license page was not found.")
 
@@ -263,6 +321,9 @@ def collect_python_runtime_license(
             license_target.relative_to(destination_root.parent).as_posix(),
             notices_target.relative_to(destination_root.parent).as_posix(),
         ],
+        "substantive_license_files": [
+            license_target.relative_to(destination_root.parent).as_posix()
+        ],
     }
 
 
@@ -279,7 +340,7 @@ def collect_licenses(
     seen_targets: dict[str, Path] = {}
     for document in PROJECT_DOCUMENTS:
         source = REPO_ROOT / document
-        if not source.is_file():
+        if not is_safe_regular_file(source) or source.stat().st_size == 0:
             raise RuntimeError(f"Required project document is missing: {source}")
         target = destination.parent / document
         _reserve_target(target, seen_targets)
@@ -287,6 +348,8 @@ def collect_licenses(
 
     components_target = destination / "components.json"
     _reserve_target(components_target, seen_targets)
+    if not is_safe_regular_file(components_file) or components_file.stat().st_size == 0:
+        raise RuntimeError(f"Component lock is not a non-empty regular file: {components_file}")
     shutil.copy2(components_file, components_target)
 
     package_root = destination / "python-packages"

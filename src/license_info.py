@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import stat
 from html import escape
 from pathlib import Path
 
@@ -21,6 +22,23 @@ REQUIRED_DISTRIBUTION_DOCUMENTS = (
     "VERSION",
     "licenses/python-packages.json",
 )
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_nonempty_regular_file(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+        and not (
+            getattr(metadata, "st_file_attributes", 0)
+            & FILE_ATTRIBUTE_REPARSE_POINT
+        )
+        and metadata.st_size > 0
+    )
 
 
 def read_app_version(resource_root: Path | None = None) -> str:
@@ -33,6 +51,8 @@ def read_app_version(resource_root: Path | None = None) -> str:
         seen.add(resolved)
         version_file = resolved / "VERSION"
         try:
+            if not _is_nonempty_regular_file(version_file):
+                continue
             version = version_file.read_text(encoding="utf-8").strip()
         except OSError:
             continue
@@ -66,7 +86,7 @@ def _document_href(
             continue
         seen.add(resolved_root)
         document_path = resolved_root / relative_path
-        if document_path.is_file():
+        if _is_nonempty_regular_file(document_path):
             return document_path.resolve().as_uri()
     return f"{PROJECT_SOURCE_URL}/blob/{source_ref}/{relative_path}"
 
@@ -125,5 +145,7 @@ def validate_distribution_documents(distribution_root: Path) -> list[str]:
     return [
         relative_path
         for relative_path in REQUIRED_DISTRIBUTION_DOCUMENTS
-        if not (distribution_root / Path(relative_path)).is_file()
+        if not _is_nonempty_regular_file(
+            distribution_root / Path(relative_path)
+        )
     ]

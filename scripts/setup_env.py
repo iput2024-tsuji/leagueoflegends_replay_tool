@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -47,6 +48,7 @@ FFMPEG_ZIP_MIRROR_URL = (
 )
 FFMPEG_ZIP_SHA256 = "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541"
 FFMPEG_INSTALL_MANIFEST = "_installed.json"
+FFMPEG_TRANSACTION_SCHEMA_VERSION = 1
 
 OBS_VERSION = "32.1.2"
 OBS_ZIP_URL = "https://github.com/obsproject/obs-studio/releases/download/32.1.2/OBS-Studio-32.1.2-Windows-x64.zip"
@@ -378,6 +380,21 @@ _WINDOWS_RESERVED_NAMES = {
     *(f"lpt{number}" for number in range(1, 10)),
 }
 _WINDOWS_INVALID_PATH_CHARS = frozenset('<>:"|?*')
+_WINDOWS_REPARSE_POINT_ATTRIBUTE = 0x400
+
+
+def _is_path_link_or_reparse(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISLNK(metadata.st_mode)
+        or (
+            getattr(metadata, "st_file_attributes", 0)
+            & _WINDOWS_REPARSE_POINT_ATTRIBUTE
+        )
+    )
 
 
 def _validated_zip_members(archive: zipfile.ZipFile) -> dict[zipfile.ZipInfo, PurePosixPath]:
@@ -408,8 +425,14 @@ def _validated_zip_members(archive: zipfile.ZipFile) -> dict[zipfile.ZipInfo, Pu
             raise RuntimeError(f"Unsafe ZIP member path: {info.filename}")
 
         mode = info.external_attr >> 16
-        if stat.S_ISLNK(mode):
-            raise RuntimeError(f"ZIP symbolic links are not allowed: {info.filename}")
+        if stat.S_ISLNK(mode) or (
+            info.create_system == 0
+            and info.external_attr & _WINDOWS_REPARSE_POINT_ATTRIBUTE
+        ):
+            raise RuntimeError(
+                f"ZIP symbolic links or reparse points are not allowed: "
+                f"{info.filename}"
+            )
 
         canonical = tuple(part.casefold() for part in parts)
         previous = seen.get(canonical)
@@ -463,10 +486,111 @@ def _material_manifest_entries(directory: Path, paths: list[PurePosixPath]) -> l
 
 
 def _remove_install_path(path: Path) -> None:
-    if path.is_dir() and not path.is_symlink():
+    if _is_path_link_or_reparse(path):
+        if path.is_dir():
+            path.rmdir()
+        else:
+            path.unlink(missing_ok=True)
+    elif path.is_dir():
         shutil.rmtree(path)
     else:
         path.unlink(missing_ok=True)
+
+
+def _ffmpeg_transaction_journal_path(dest: Path, license_dir: Path) -> Path:
+    return license_dir.parent / f".{license_dir.name}.{dest.name}.transaction.json"
+
+
+def _write_json_atomically(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="\n") as output:
+            json.dump(payload, output, ensure_ascii=False, indent=2, sort_keys=True)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _recover_interrupted_ffmpeg_transaction(
+    dest: Path,
+    license_dir: Path,
+    *,
+    validate: Callable[[], None] | None = None,
+) -> bool:
+    """Finish or roll back an interrupted executable/materials replacement."""
+
+    journal_path = _ffmpeg_transaction_journal_path(dest, license_dir)
+    if not journal_path.exists() and not _is_path_link_or_reparse(journal_path):
+        return False
+    if _is_path_link_or_reparse(journal_path) or not journal_path.is_file():
+        raise RuntimeError("FFmpeg transaction journal is not a regular file.")
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("FFmpeg transaction journal is invalid.") from error
+    if (
+        not isinstance(journal, dict)
+        or journal.get("schema_version") != FFMPEG_TRANSACTION_SCHEMA_VERSION
+        or journal.get("executable") != dest.name
+        or journal.get("license_directory") != license_dir.name
+        or not isinstance(journal.get("had_executable"), bool)
+        or not isinstance(journal.get("had_licenses"), bool)
+    ):
+        raise RuntimeError("FFmpeg transaction journal does not match its destination.")
+
+    token = journal.get("token")
+    if not isinstance(token, str) or re.fullmatch(r"[0-9a-f]{32}", token) is None:
+        raise RuntimeError("FFmpeg transaction journal token is invalid.")
+    executable_backup = dest.with_name(f".{dest.name}.{token}.bak")
+    license_backup = license_dir.with_name(f".{license_dir.name}.{token}.bak")
+    if journal.get("executable_backup") != executable_backup.name or journal.get(
+        "license_backup"
+    ) != license_backup.name:
+        raise RuntimeError("FFmpeg transaction journal backup paths are invalid.")
+    if _is_path_link_or_reparse(executable_backup) or _is_path_link_or_reparse(
+        license_backup
+    ):
+        raise RuntimeError("FFmpeg transaction backups must not be links or reparse points.")
+
+    if validate is not None:
+        try:
+            validate()
+        except Exception:
+            pass
+        else:
+            _remove_install_path(executable_backup)
+            _remove_install_path(license_backup)
+            journal_path.unlink()
+            return True
+
+    rollback_errors = []
+    try:
+        if executable_backup.exists() or _is_path_link_or_reparse(executable_backup):
+            _remove_install_path(dest)
+            os.replace(executable_backup, dest)
+        elif journal.get("had_executable") is False:
+            _remove_install_path(dest)
+    except Exception as error:
+        rollback_errors.append(f"executable: {error}")
+    try:
+        if license_backup.exists() or _is_path_link_or_reparse(license_backup):
+            _remove_install_path(license_dir)
+            os.replace(license_backup, license_dir)
+        elif journal.get("had_licenses") is False:
+            _remove_install_path(license_dir)
+    except Exception as error:
+        rollback_errors.append(f"license materials: {error}")
+    if rollback_errors:
+        raise RuntimeError(
+            "Interrupted FFmpeg transaction recovery failed: "
+            + "; ".join(rollback_errors)
+        )
+    journal_path.unlink()
+    return True
 
 
 def _transactional_replace_ffmpeg(
@@ -481,16 +605,37 @@ def _transactional_replace_ffmpeg(
     token = uuid.uuid4().hex
     executable_backup = dest.with_name(f".{dest.name}.{token}.bak")
     license_backup = license_dir.with_name(f".{license_dir.name}.{token}.bak")
+    journal_path = _ffmpeg_transaction_journal_path(dest, license_dir)
     backed_up_executable = False
     backed_up_licenses = False
     installed_executable = False
     installed_licenses = False
 
+    had_executable = dest.exists() or _is_path_link_or_reparse(dest)
+    had_licenses = license_dir.exists() or _is_path_link_or_reparse(license_dir)
+    if journal_path.exists() or _is_path_link_or_reparse(journal_path):
+        raise RuntimeError(
+            "An unrecovered FFmpeg installation transaction already exists."
+        )
+    _write_json_atomically(
+        journal_path,
+        {
+            "schema_version": FFMPEG_TRANSACTION_SCHEMA_VERSION,
+            "token": token,
+            "executable": dest.name,
+            "license_directory": license_dir.name,
+            "executable_backup": executable_backup.name,
+            "license_backup": license_backup.name,
+            "had_executable": had_executable,
+            "had_licenses": had_licenses,
+        },
+    )
+
     try:
-        if dest.exists() or dest.is_symlink():
+        if had_executable:
             os.replace(dest, executable_backup)
             backed_up_executable = True
-        if license_dir.exists() or license_dir.is_symlink():
+        if had_licenses:
             os.replace(license_dir, license_backup)
             backed_up_licenses = True
 
@@ -520,12 +665,17 @@ def _transactional_replace_ffmpeg(
         details = ""
         if rollback_errors:
             details = "\nRollback also failed: " + "; ".join(rollback_errors)
-        raise RuntimeError(f"FFmpeg installation failed and was rolled back.{details}") from install_error
+        else:
+            journal_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"FFmpeg installation failed; rollback was attempted.{details}"
+        ) from install_error
     else:
         if backed_up_executable:
             _remove_install_path(executable_backup)
         if backed_up_licenses:
             _remove_install_path(license_backup)
+        journal_path.unlink()
 
 
 def _safe_manifest_path(value: object) -> PurePosixPath:
@@ -574,7 +724,7 @@ def _validate_manifest_materials(
         expected_sha256 = entry.get("sha256")
         if (
             not target.is_file()
-            or target.is_symlink()
+            or _is_path_link_or_reparse(target)
             or not isinstance(expected_sha256, str)
             or _sha256(target).casefold() != expected_sha256.casefold()
         ):
@@ -588,11 +738,15 @@ def _validate_ffmpeg_installation(
     version: str = FFMPEG_VERSION,
     archive_sha256: str = FFMPEG_ZIP_SHA256,
 ) -> None:
-    if not dest.is_file() or dest.is_symlink():
+    if not dest.is_file() or _is_path_link_or_reparse(dest):
         raise RuntimeError("FFmpeg executable is missing.")
     manifest_path = license_dir / FFMPEG_INSTALL_MANIFEST
-    if license_dir.is_symlink() or manifest_path.is_symlink():
-        raise RuntimeError("FFmpeg installation materials must not be symbolic links.")
+    if _is_path_link_or_reparse(license_dir) or _is_path_link_or_reparse(
+        manifest_path
+    ):
+        raise RuntimeError(
+            "FFmpeg installation materials must not be links or reparse points."
+        )
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception as error:
@@ -622,6 +776,9 @@ def _is_ffmpeg_installation_ready(
     archive_sha256: str = FFMPEG_ZIP_SHA256,
 ) -> bool:
     try:
+        journal_path = _ffmpeg_transaction_journal_path(dest, license_dir)
+        if journal_path.exists() or _is_path_link_or_reparse(journal_path):
+            return False
         _validate_ffmpeg_installation(
             dest,
             license_dir,
@@ -648,6 +805,16 @@ def _extract_ffmpeg(
         and archive_sha256.casefold() != expected_archive_sha256.casefold()
     ):
         raise RuntimeError("FFmpeg source archive hash changed before extraction.")
+    _recover_interrupted_ffmpeg_transaction(
+        dest,
+        resolved_license_dir,
+        validate=lambda: _validate_ffmpeg_installation(
+            dest,
+            resolved_license_dir,
+            version=version,
+            archive_sha256=archive_sha256,
+        ),
+    )
 
     with zipfile.ZipFile(zip_path) as archive:
         members = _validated_zip_members(archive)
@@ -877,6 +1044,16 @@ async def ensure_ffmpeg(
         return FFMPEG_EXE
 
     with setup_lock(cancel_cb=cancel_cb):
+        _recover_interrupted_ffmpeg_transaction(
+            FFMPEG_EXE,
+            FFMPEG_LICENSE_DIR,
+            validate=lambda: _validate_ffmpeg_installation(
+                FFMPEG_EXE,
+                FFMPEG_LICENSE_DIR,
+                version=FFMPEG_PACKAGE.version,
+                archive_sha256=FFMPEG_PACKAGE.sha256,
+            ),
+        )
         if _is_ffmpeg_installation_ready(
             FFMPEG_EXE,
             FFMPEG_LICENSE_DIR,

@@ -1,30 +1,42 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Publish an existing vX.Y.Z tag"
+        required: true
+        type: string
+      publish_confirmation:
+        description: "Enter PUBLISH to confirm public Release publication"
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  release:
-    name: Build and publish Windows installer
+  prepare:
+    name: Build and verify Windows installer
     runs-on: windows-latest
     timeout-minutes: 240
-    environment: release
+    outputs:
+      release_commit: ${{ steps.release_inputs.outputs.release_commit }}
+      release_version: ${{ steps.release_inputs.outputs.release_version }}
     env:
       PYTHONIOENCODING: utf8
+      RELEASE_TAG: ${{ inputs.tag }}
+      PUBLISH_CONFIRMATION: ${{ inputs.publish_confirmation }}
 
     steps:
       - name: Checkout exact tag commit
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag }}
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -36,11 +48,15 @@ jobs:
             requirements-dev.txt
 
       - name: Validate immutable release inputs
+        id: release_inputs
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:RELEASE_TAG
+          if ($env:PUBLISH_CONFIRMATION -cne "PUBLISH") {
+            throw "Public Release publication requires the exact PUBLISH confirmation."
+          }
           if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
             throw "Release tag must use the strict v1.2.3 format: $tag"
           }
@@ -52,60 +68,57 @@ jobs:
           }
 
           $headCommit = (git rev-parse HEAD).Trim()
+          $tagRefspec = "+refs/tags/${tag}:refs/tags/${tag}"
+          git fetch origin $tagRefspec --no-tags
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
           $tagCommit = (git rev-list -n 1 $tag).Trim()
-          if ($headCommit -ne "${{ github.sha }}" -or $tagCommit -ne "${{ github.sha }}") {
-            throw "The checked out commit, tag commit, and GitHub event SHA must match."
+          if ($headCommit -ne $tagCommit) {
+            throw "The checked out commit and tag commit must match."
           }
 
           git fetch origin main --no-tags
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
-          git merge-base --is-ancestor "${{ github.sha }}" origin/main
+          git merge-base --is-ancestor $tagCommit origin/main
           if ($LASTEXITCODE -ne 0) {
             throw "Release commit must be contained in origin/main."
           }
 
-          gh release view $tag --json tagName 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            throw "Release $tag already exists. Existing Releases are immutable."
+          $existingIds = @(gh api `
+            --paginate `
+            "repos/${{ github.repository }}/releases?per_page=100" `
+            --jq ".[] | select(.tag_name == `"$tag`") | .id")
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($existingIds.Count -ne 0) {
+            throw "Release $tag already exists (draft or published). Existing Releases are immutable."
           }
 
-          $components = Get-Content .\compliance\components.json -Raw | ConvertFrom-Json
-          $allComponents = @(
-            $components.python
-            $components.runtime_components
-            $components.build_components
-            $components.runtime_downloads
-          )
-          $openGates = @($allComponents | Where-Object {
-            $_.release_legal_review_required -eq $true
-          })
-          $sourceRequired = @(
-            $components.runtime_components
-            $components.build_components | Where-Object {
-              $_.packaged_in_distribution -eq $true
-            }
-          )
-          $missingSource = @($sourceRequired | Where-Object {
-            -not $_.source_archives -and -not (
-              $_.source_archive_exception_reviewed -eq $true -and
-              $_.source_archive_exception_reason
-            )
-          })
-          $unverifiedVendoredSource = @($components.runtime_components | Where-Object {
-            $_.license -like "*bundled component licenses*" -and
-            $_.vendored_source_coverage_verified -ne $true
-          })
-          $blocked = @($openGates + $missingSource + $unverifiedVendoredSource)
-          if ($blocked.Count -gt 0) {
-            $names = ($blocked | ForEach-Object { $_.component } |
-              Sort-Object -Unique) -join ", "
-            throw "Release legal gates remain open: $names"
+          python -m scripts.prepare_release_assets `
+            check-gates `
+            --components .\compliance\components.json
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
           }
 
           "APP_VERSION=$tagVersion" | Out-File `
             -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+          "RELEASE_COMMIT=$tagCommit" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+          "release_commit=$tagCommit" | Out-File `
+            -FilePath $env:GITHUB_OUTPUT `
+            -Encoding utf8 `
+            -Append
+          "release_version=$tagVersion" | Out-File `
+            -FilePath $env:GITHUB_OUTPUT `
             -Encoding utf8 `
             -Append
 
@@ -137,7 +150,8 @@ jobs:
 
           python -m scripts.check_license_compliance `
             .\dist\LoLReplayTool `
-            --release
+            --release `
+            --toc .\build\LoLReplayTool\COLLECT-00.toc
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -146,13 +160,15 @@ jobs:
           git archive `
             --format=zip `
             --output=$source `
-            "${{ github.sha }}"
+            $env:RELEASE_COMMIT
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
 
           python -m scripts.prepare_release_assets `
+            create `
             --version $env:APP_VERSION `
+            --source-commit $env:RELEASE_COMMIT `
             --installer $installer `
             --application-source $source `
             --distribution-root .\dist\LoLReplayTool `
@@ -162,25 +178,157 @@ jobs:
             exit $LASTEXITCODE
           }
 
-      - name: Publish new GitHub Release
+          python -m scripts.prepare_release_assets `
+            verify `
+            --asset-list .\dist\installer\release-assets.json
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Preserve verified Release assets for approved publication
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets-${{ inputs.tag }}
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            dist/installer/LoLReplayTool-Setup-${{ env.APP_VERSION }}.exe
+            dist/installer/LoLReplayTool-source-${{ env.APP_VERSION }}.zip
+            dist/installer/LoLReplayTool-third-party-sources-${{ env.APP_VERSION }}-*.zip
+            dist/installer/LoLReplayTool-license-materials-${{ env.APP_VERSION }}.zip
+            dist/installer/SHA256SUMS.txt
+            dist/installer/release-assets.json
+
+  publish:
+    name: Publish approved GitHub Release
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    environment:
+      name: release
+    env:
+      PYTHONIOENCODING: utf8
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_RELEASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
+      EXPECTED_RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14.6"
+
+      - name: Revalidate immutable tag after Environment approval
+        shell: pwsh
+        run: |
+          $tag = $env:RELEASE_TAG
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw "Release tag must use the strict v1.2.3 format: $tag"
+          }
+          if ($Matches[1] -ne $env:EXPECTED_RELEASE_VERSION) {
+            throw "Prepared Release version no longer matches the requested tag."
+          }
+
+          $tagRefspec = "+refs/tags/${tag}:refs/tags/${tag}"
+          git fetch origin $tagRefspec --no-tags
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          git fetch origin main --no-tags
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $headCommit = (git rev-parse HEAD).Trim()
+          $tagCommit = (git rev-list -n 1 $tag).Trim()
+          if (
+            $headCommit -ne $env:EXPECTED_RELEASE_COMMIT -or
+            $tagCommit -ne $env:EXPECTED_RELEASE_COMMIT
+          ) {
+            throw "HEAD, current tag, and prepared Release commit must remain identical."
+          }
+          $fileVersion = (Get-Content .\VERSION -Raw).Trim()
+          if ($fileVersion -ne $env:EXPECTED_RELEASE_VERSION) {
+            throw "VERSION no longer matches the prepared Release version."
+          }
+          git merge-base --is-ancestor $env:EXPECTED_RELEASE_COMMIT origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "Prepared Release commit must remain contained in origin/main."
+          }
+
+      - name: Restore verified Release assets
+        uses: actions/download-artifact@v7
+        with:
+          name: release-assets-${{ inputs.tag }}
+          path: dist/installer
+
+      - name: Re-verify Release assets after transfer
+        shell: pwsh
+        run: |
+          python -m scripts.prepare_release_assets `
+            verify `
+            --asset-list .\dist\installer\release-assets.json `
+            --asset-dir .\dist\installer
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $assetList = Get-Content `
+            .\dist\installer\release-assets.json `
+            -Raw | ConvertFrom-Json
+          if ($assetList.source_commit -cne $env:EXPECTED_RELEASE_COMMIT) {
+            throw "Release asset source commit does not match the prepared commit."
+          }
+          if ($assetList.version -cne $env:EXPECTED_RELEASE_VERSION) {
+            throw "Release asset version does not match the prepared version."
+          }
+
+      - name: Create, verify, and publish new GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          gh release view $tag --json tagName 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            throw "Release $tag already exists. Existing Releases are immutable."
+          $tag = $env:RELEASE_TAG
+          $version = $tag.Substring(1)
+          function Assert-TagStillImmutable {
+            $tagRefspec = "+refs/tags/${tag}:refs/tags/${tag}"
+            git fetch origin $tagRefspec --no-tags
+            if ($LASTEXITCODE -ne 0) {
+              throw "Cannot refresh Release tag $tag."
+            }
+            $currentTagCommit = (git rev-list -n 1 $tag).Trim()
+            if ($currentTagCommit -ne $env:EXPECTED_RELEASE_COMMIT) {
+              throw "Release tag moved after assets were prepared."
+            }
+          }
+          Assert-TagStillImmutable
+
+          $existingIds = @(gh api `
+            --paginate `
+            "repos/${{ github.repository }}/releases?per_page=100" `
+            --jq ".[] | select(.tag_name == `"$tag`") | .id")
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($existingIds.Count -ne 0) {
+            throw "Release $tag already exists (draft or published). Existing Releases are immutable."
           }
 
           $changelog = Get-Content .\CHANGELOG.md -Raw
           $englishChangelog = Get-Content .\CHANGELOG.en.md -Raw
-          $escapedVersion = [regex]::Escape($env:APP_VERSION)
+          $escapedVersion = [regex]::Escape($version)
           $sectionPattern = "(?ms)^## \[$escapedVersion\].*?(?=^## \[|\z)"
           $section = [regex]::Match($changelog, $sectionPattern)
           $englishSection = [regex]::Match($englishChangelog, $sectionPattern)
           if (-not $section.Success -or -not $englishSection.Success) {
-            throw "Both changelogs must contain $env:APP_VERSION."
+            throw "Both changelogs must contain $version."
           }
 
           $releaseNotes = @"
@@ -193,7 +341,7 @@ jobs:
           - 本ソフトウェアはGPL-3.0-onlyです。
           - アプリソース、検証済みのcomponent source資産、第三者ライセンス資料を添付しています。
           - OBS StudioとGyan.dev FFmpegはインストーラーに含まれず、利用時に固定URL・SHA256で取得します。これらは添付source資産の対象ではありません。
-          - `SHA256SUMS.txt`で全公開ファイルを検証できます。
+          - `SHA256SUMS.txt`で他の全公開ファイルを検証できます。
           - リプレイ再生には64bit版mpv DLLを別途用意し、`%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。
 
           ---
@@ -207,22 +355,100 @@ jobs:
           - This software is GPL-3.0-only.
           - Application source, verified component-source assets, and third-party license materials are attached.
           - OBS Studio and the Gyan.dev FFmpeg build are not in the installer. The application downloads them from pinned URLs with SHA256 verification, and they are not represented as bundled-source assets.
-          - Verify every published file with `SHA256SUMS.txt`.
+          - Verify every other published file with `SHA256SUMS.txt`.
           - Replay playback requires a separate 64-bit mpv DLL in `%LOCALAPPDATA%\LoLReplayTool\bin`.
           "@
 
           $assetList = Get-Content `
             .\dist\installer\release-assets.json `
             -Raw | ConvertFrom-Json
-          $assets = @($assetList.assets)
-          if ($assets.Count -lt 5) {
-            throw "Release asset list is incomplete."
+          $assets = @(
+            $assetList.assets | ForEach-Object {
+              Join-Path .\dist\installer ([System.IO.Path]::GetFileName($_))
+            }
+          )
+          $localAssets = @{}
+          foreach ($asset in $assets) {
+            $file = Get-Item -LiteralPath $asset
+            if ($localAssets.ContainsKey($file.Name)) {
+              throw "Duplicate local Release asset name: $($file.Name)"
+            }
+            $localAssets[$file.Name] = [PSCustomObject]@{
+              Name = $file.Name
+              Size = [int64]$file.Length
+              Digest = "sha256:$((Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+            }
           }
 
-          gh release create $tag @assets `
+          $notesPath = Join-Path $env:RUNNER_TEMP "LoLReplayTool-release-notes.md"
+          Set-Content `
+            -LiteralPath $notesPath `
+            -Value $releaseNotes `
+            -Encoding utf8NoBOM
+
+          gh release create $tag `
+            --draft `
             --verify-tag `
             --title "LoL Replay Tool $tag" `
-            --notes $releaseNotes
+            --notes-file $notesPath
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $createdIds = @(gh api `
+            --paginate `
+            "repos/${{ github.repository }}/releases?per_page=100" `
+            --jq ".[] | select(.tag_name == `"$tag`") | .id")
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($createdIds.Count -ne 1) {
+            throw "Expected exactly one newly created draft Release for $tag."
+          }
+          $releaseId = $createdIds[0]
+
+          foreach ($asset in $assets) {
+            gh release upload $tag $asset
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+
+          $remoteRelease = gh api `
+            "repos/${{ github.repository }}/releases/$releaseId" |
+            ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          if ($remoteRelease.draft -ne $true) {
+            throw "Release $tag was not kept as a draft during verification."
+          }
+          $remoteAssets = @($remoteRelease.assets)
+          if ($remoteAssets.Count -ne $localAssets.Count) {
+            throw "Remote/local Release asset count mismatch."
+          }
+          foreach ($remote in $remoteAssets) {
+            if (-not $localAssets.ContainsKey($remote.name)) {
+              throw "Unexpected remote Release asset: $($remote.name)"
+            }
+            $local = $localAssets[$remote.name]
+            if ($remote.name -cne $local.Name) {
+              throw "Remote Release asset name mismatch: $($remote.name)"
+            }
+            if ([int64]$remote.size -ne $local.Size) {
+              throw "Remote Release asset size mismatch: $($remote.name)"
+            }
+            if ([string]$remote.digest -cne $local.Digest) {
+              throw "Remote Release asset digest mismatch: $($remote.name)"
+            }
+          }
+
+          Assert-TagStillImmutable
+          gh api `
+            --method PATCH `
+            "repos/${{ github.repository }}/releases/$releaseId" `
+            -F draft=false `
+            --silent
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

@@ -246,7 +246,7 @@ def test_extract_ffmpeg_rolls_back_partial_replace_and_can_retry(monkeypatch):
 
     monkeypatch.setattr(setup_env.os, "replace", fail_material_replace_once)
 
-    with pytest.raises(RuntimeError, match="rolled back"):
+    with pytest.raises(RuntimeError, match="rollback was attempted"):
         setup_env._extract_ffmpeg(zip_path, dest, license_dir)
 
     assert dest.read_text(encoding="utf-8") == "old ffmpeg"
@@ -263,6 +263,47 @@ def test_extract_ffmpeg_rolls_back_partial_replace_and_can_retry(monkeypatch):
         license_dir,
         archive_sha256=setup_env._sha256(zip_path),
     )
+
+
+def test_ffmpeg_startup_recovers_backups_after_process_interruption():
+    tmp_path = runtime_dir("setup_env_ffmpeg_crash_recovery")
+    dest = tmp_path / "bin" / "ffmpeg.exe"
+    license_dir = tmp_path / "licenses" / "FFmpeg"
+    dest.parent.mkdir(parents=True)
+    license_dir.mkdir(parents=True)
+    dest.write_text("old ffmpeg", encoding="utf-8")
+    (license_dir / "old.txt").write_text("old materials", encoding="utf-8")
+
+    token = "1" * 32
+    executable_backup = dest.with_name(f".{dest.name}.{token}.bak")
+    license_backup = license_dir.with_name(f".{license_dir.name}.{token}.bak")
+    os.replace(dest, executable_backup)
+    os.replace(license_dir, license_backup)
+    dest.write_text("partial new ffmpeg", encoding="utf-8")
+    license_dir.mkdir()
+    (license_dir / "partial.txt").write_text("partial", encoding="utf-8")
+    journal_path = setup_env._ffmpeg_transaction_journal_path(dest, license_dir)
+    setup_env._write_json_atomically(
+        journal_path,
+        {
+            "schema_version": setup_env.FFMPEG_TRANSACTION_SCHEMA_VERSION,
+            "token": token,
+            "executable": dest.name,
+            "license_directory": license_dir.name,
+            "executable_backup": executable_backup.name,
+            "license_backup": license_backup.name,
+            "had_executable": True,
+            "had_licenses": True,
+        },
+    )
+
+    assert not setup_env._is_ffmpeg_installation_ready(dest, license_dir)
+    setup_env._recover_interrupted_ffmpeg_transaction(dest, license_dir)
+    assert dest.read_text(encoding="utf-8") == "old ffmpeg"
+    assert (license_dir / "old.txt").read_text(encoding="utf-8") == "old materials"
+    assert not journal_path.exists()
+    assert not executable_backup.exists()
+    assert not license_backup.exists()
 
 
 def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypatch):

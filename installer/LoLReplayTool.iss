@@ -96,6 +96,7 @@ begin
   DelTree(AddBackslash(DataDir) + 'obs-portable', True, True, True);
   DelTree(AddBackslash(DataDir) + 'downloads', True, True, True);
   DelTree(AddBackslash(DataDir) + 'assets', True, True, True);
+  DelTree(AddBackslash(DataDir) + 'licenses', True, True, True);
   DeleteFile(AddBackslash(DataDir) + '.app-instance.lock');
   RemoveDir(DataDir);
 end;

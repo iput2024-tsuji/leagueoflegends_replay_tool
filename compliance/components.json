@@ -19,23 +19,28 @@
     "component": "python",
     "release_version": "3.14.6",
     "license": "PSF-2.0",
+    "native_source_coverage_verified": true,
     "artifact_patterns": [
       "_internal/base_library.zip",
       "_internal/python*.dll",
-      "_internal/VCRUNTIME140.dll",
-      "_internal/VCRUNTIME140_1.dll",
       "_internal/_*.pyd",
       "_internal/select.pyd",
       "_internal/unicodedata.pyd",
       "_internal/pyexpat.pyd"
     ],
     "source_archives": [
-      {
-        "filename": "Python-3.14.6.tgz",
-        "url": "https://www.python.org/ftp/python/3.14.6/Python-3.14.6.tgz",
-        "sha256": "74d0d71d0600e477651a077101d6e62d1e2e69b8e992ba18c993dd643b7ba222",
-        "size": 31234628
-      }
+        {
+          "filename": "Python-3.14.6.tgz",
+          "url": "https://www.python.org/ftp/python/3.14.6/Python-3.14.6.tgz",
+          "sha256": "74d0d71d0600e477651a077101d6e62d1e2e69b8e992ba18c993dd643b7ba222",
+          "size": 31234628
+        },
+        {
+          "filename": "zlib-ng-2.2.4.tar.gz",
+          "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/zlib-ng-2.2.4",
+          "sha256": "00bbd88709bc416cb96160ab61d3e1c8f76e106799af7328d0fe434dc7dd5004",
+          "size": 2415819
+        }
     ]
   },
   "build_components": [
@@ -45,7 +50,21 @@
       "version": "6.18.0",
       "license": "GPL-2.0-or-later WITH Bootloader-exception",
       "artifact_patterns": [],
-      "corresponding_source_required": false
+      "corresponding_source_required": false,
+      "binary_archive": {
+        "filename": "pyinstaller-6.18.0-py3-none-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/fb/d5/48eef2002b6d3937ceac2717fe17e9ca3a43a4c9826bafee367dfc75ba85/pyinstaller-6.18.0-py3-none-win_amd64.whl",
+        "sha256": "976fabd90ecfbda47571c87055ad73413ec615ff7dea35e12a4304174de78de9",
+        "size": 1384389
+      },
+      "source_archives": [
+        {
+          "filename": "pyinstaller-6.18.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/9f/b8/0fe3359920b0a4e7008e0e93ff383003763e3eee3eb31a07c52868722960/pyinstaller-6.18.0.tar.gz",
+          "sha256": "cdc507542783511cad4856fce582fdc37e9f29665ca596889c663c83ec8c6ec9",
+          "size": 4034976
+        }
+      ]
     },
     {
       "component": "setuptools-vendored-runtime",
@@ -54,8 +73,20 @@
       "license": "MIT",
       "artifact_patterns": [],
       "packaged_in_distribution": true,
-      "release_legal_review_required": true,
-      "release_gate_reason": "PyInstallerがsetuptools vendored runtime dataを配布物へ収集するため、exact source archiveのURLとSHA256をlockへ追加するまで公開しない。"
+      "binary_archive": {
+        "filename": "setuptools-81.0.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/e1/e3/c164c88b2e5ce7b24d667b9bd83589cf4f3520d97cad01534cd3c4f55fdb/setuptools-81.0.0-py3-none-any.whl",
+        "sha256": "fdd925d5c5d9f62e4b74b30d6dd7828ce236fd6ed998a08d81de62ce5a6310d6",
+        "size": 1062021
+      },
+      "source_archives": [
+        {
+          "filename": "setuptools-81.0.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/0d/1c/73e719955c59b8e424d015ab450f51c0af856ae46ea2da83eba51cc88de1/setuptools-81.0.0.tar.gz",
+          "sha256": "487b53915f52501f0a79ccfd0c02c165ffe06631443a886740b91af4b7a5845a",
+          "size": 1198299
+        }
+      ]
     }
   ],
   "runtime_components": [
@@ -65,110 +96,332 @@
       "license": "Apache-2.0",
       "artifact_patterns": [
         "_internal/libcrypto-3.dll",
-        "_internal/libssl-3.dll"
+        "_internal/libssl-3.dll",
+        "_internal/_hashlib.pyd",
+        "_internal/_ssl.pyd"
       ],
+      "native_source_coverage_verified": true,
       "source_archives": [
         {
           "filename": "openssl-3.5.7.tar.gz",
           "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/openssl-3.5.7",
-          "sha256": "ca94e7c6c223d9caf77bb51aac5949186379608ea2a0cad3aa8bdf31856912e9"
+          "sha256": "ca94e7c6c223d9caf77bb51aac5949186379608ea2a0cad3aa8bdf31856912e9",
+          "size": 53341406
         }
       ]
     },
     {
-      "component": "python-runtime-support",
-      "version": "CPython 3.14.6 Windows dependencies",
-      "license": "Multiple permissive licenses; see Python third-party license page",
+      "component": "python-bzip2",
+      "version": "1.0.8",
+      "license": "bzip2 license",
+      "artifact_patterns": ["_internal/_bz2.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "bzip2-1.0.8.tar.gz",
+          "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/bzip2-1.0.8",
+          "sha256": "ab8d1b0cc087c20d4c32c0e4fcf7d0c733a95da12cedc6d63b3f0a9af07427e2",
+          "size": 818771
+        }
+      ]
+    },
+    {
+      "component": "python-libffi",
+      "version": "3.4.4",
+      "license": "MIT",
       "artifact_patterns": [
-        "_internal/libffi-*.dll",
-        "_internal/sqlite3.dll",
-        "_internal/VCOMP140.DLL"
+        "_internal/_ctypes.pyd",
+        "_internal/libffi-*.dll"
       ],
-      "corresponding_source_required": false
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "libffi-3.4.4.tar.gz",
+          "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/libffi-3.4.4",
+          "sha256": "9d802681adfea27d84cae0487a785fb9caa925bdad44c401b364c59ab2b8edda",
+          "size": 1375889
+        }
+      ]
+    },
+    {
+      "component": "python-mpdecimal",
+      "version": "4.0.0",
+      "license": "BSD-2-Clause",
+      "artifact_patterns": ["_internal/_decimal.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "mpdecimal-4.0.0.tar.gz",
+          "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/mpdecimal-4.0.0",
+          "sha256": "338fac3fb8cdd60f406b6326431338756f58a8af94229ffd9bf1e7c2b1ad71ca",
+          "size": 319629
+        }
+      ]
+    },
+    {
+      "component": "python-sqlite",
+      "version": "3.50.4.0",
+      "license": "blessing / public-domain dedication",
+      "artifact_patterns": [
+        "_internal/_sqlite3.pyd",
+        "_internal/sqlite3.dll"
+      ],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "sqlite-3.50.4.0.tar.gz",
+          "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/sqlite-3.50.4.0",
+          "sha256": "fb5ab81f27612b0a7b4861ba655906c76dc85ee969e7a4905d2075aff931e8d0",
+          "size": 2845090
+        }
+      ]
+    },
+    {
+      "component": "python-xz",
+      "version": "5.2.5",
+      "license": "Public-Domain AND LGPL-2.1-or-later",
+      "artifact_patterns": ["_internal/_lzma.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "xz-5.2.5.tar.gz",
+          "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/xz-5.2.5",
+          "sha256": "a15c168e39e87d750c3dc766edc7f19bdda57dacf01e509678467eace91ad282",
+          "size": 1744796
+        }
+      ]
+    },
+    {
+      "component": "python-zstd",
+      "version": "1.5.7",
+      "license": "BSD-3-Clause",
+      "artifact_patterns": ["_internal/_zstd.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "zstd-1.5.7.tar.gz",
+          "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/zstd-1.5.7",
+          "sha256": "f24b52470d12f466e9fa4fcc94e6c530625ada51d7b36de7fdc6ed7e6f499c8e",
+          "size": 2440298
+        }
+      ]
+    },
+    {
+      "component": "microsoft-vc-runtime",
+      "version": "MSVC 14.40.33810.0 and 14.44.35211.0 runtime files",
+      "license": "Microsoft Visual C++ Redistributable terms",
+      "artifact_patterns": [
+        "_internal/MSVCP140*.dll",
+        "_internal/VCRUNTIME140*.dll",
+        "_internal/VCOMP140*.dll",
+        "_internal/**/msvcp140*.dll",
+        "_internal/**/vcruntime140*.dll",
+        "_internal/**/vcomp140*.dll"
+      ],
+      "corresponding_source_required": false,
+      "source_exception": {
+        "kind": "proprietary-runtime-redistribution",
+        "review_completed": false,
+        "evidence": ""
+      },
+      "release_legal_review_required": true,
+      "release_gate_reason": "Microsoft Visual C++ runtimeの再配布条件、正確なversion別の出所、system libraryまたは対応ソース例外の適用根拠を専門家が確認し、証拠を記録するまで公開しない。"
+    },
+    {
+      "component": "mesa-opengl32sw",
+      "version": "PyQt6-Qt6 6.10.2 bundled opengl32sw.dll; exact Mesa revision unknown",
+      "license": "MIT and bundled component licenses",
+      "artifact_patterns": [
+        "_internal/PyQt6/Qt6/bin/opengl32sw.dll"
+      ],
+      "source_status": "unverified_vendored_native_source",
+      "build_provenance_verified": false,
+      "release_legal_review_required": true,
+      "release_gate_reason": "PyQt6-Qt6 wheel内opengl32sw.dllのexact Mesa revision、対応ソース、patch、build provenanceを確認できていないため公開しない。"
     },
     {
       "component": "aiohappyeyeballs",
       "distribution": "aiohappyeyeballs",
       "version": "2.6.1",
       "license": "PSF-2.0",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "aiohappyeyeballs-2.6.1.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/26/30/f84a107a9c4331c14b2b586036f40965c128aa4fee4dda5d3d51cb14ad54/aiohappyeyeballs-2.6.1.tar.gz",
+          "sha256": "c3f9d0113123803ccadfdf3f0faa505bc78e6a72d1cc4806cbd719826e943558",
+          "size": 22760
+        }
+      ]
     },
     {
       "component": "aiohttp",
       "distribution": "aiohttp",
       "version": "3.13.5",
       "license": "Apache-2.0 AND MIT",
-      "artifact_patterns": ["_internal/aiohttp/**/*.pyd"]
+      "artifact_patterns": ["_internal/aiohttp/**/*.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "aiohttp-3.13.5.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/77/9a/152096d4808df8e4268befa55fba462f440f14beab85e8ad9bf990516918/aiohttp-3.13.5.tar.gz",
+          "sha256": "9d98cc980ecc96be6eb4c1994ce35d28d8b1f5e5208a23b421187d1209dbb7d1",
+          "size": 7858271
+        }
+      ]
     },
     {
       "component": "aiosignal",
       "distribution": "aiosignal",
       "version": "1.4.0",
       "license": "Apache-2.0",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "aiosignal-1.4.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/61/62/06741b579156360248d1ec624842ad0edf697050bbaf7c3e46394e106ad1/aiosignal-1.4.0.tar.gz",
+          "sha256": "f47eecd9468083c2029cc99945502cb7708b082c232f9aca65da147157b251c7",
+          "size": 25007
+        }
+      ]
     },
     {
       "component": "attrs",
       "distribution": "attrs",
       "version": "26.1.0",
       "license": "MIT",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "attrs-26.1.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/9a/8e/82a0fe20a541c03148528be8cac2408564a6c9a0cc7e9171802bc1d26985/attrs-26.1.0.tar.gz",
+          "sha256": "d03ceb89cb322a8fd706d4fb91940737b6642aa36998fe130a9bc96c985eff32",
+          "size": 952055
+        }
+      ]
     },
     {
       "component": "certifi",
       "distribution": "certifi",
       "version": "2026.1.4",
       "license": "MPL-2.0",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "certifi-2026.1.4.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/e0/2d/a891ca51311197f6ad14a7ef42e2399f36cf2f9bd44752b3dc4eab60fdc5/certifi-2026.1.4.tar.gz",
+          "sha256": "ac726dd470482006e014ad384921ed6438c457018f4b3d204aea4281258b2120",
+          "size": 154268
+        }
+      ]
     },
     {
       "component": "charset-normalizer",
       "distribution": "charset-normalizer",
       "version": "3.4.4",
       "license": "MIT",
-      "artifact_patterns": ["_internal/charset_normalizer/**/*.pyd"]
+      "artifact_patterns": ["_internal/charset_normalizer/**/*.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "charset_normalizer-3.4.4.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/13/69/33ddede1939fdd074bce5434295f38fae7136463422fe4fd3e0e89b98062/charset_normalizer-3.4.4.tar.gz",
+          "sha256": "94537985111c35f28720e43603b8e7b43a6ecfb2ce1d3058bbe955b73404e21a",
+          "size": 129418
+        }
+      ]
     },
     {
       "component": "ffmpeg-python",
       "distribution": "ffmpeg-python",
       "version": "0.2.0",
       "license": "Apache-2.0",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "ffmpeg-python-0.2.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/dd/5e/d5f9105d59c1325759d838af4e973695081fbbc97182baf73afc78dec266/ffmpeg-python-0.2.0.tar.gz",
+          "sha256": "65225db34627c578ef0e11c8b1eb528bb35e024752f6f10b78c011f6f64c4127",
+          "size": 21543
+        }
+      ]
     },
     {
       "component": "frozenlist",
       "distribution": "frozenlist",
       "version": "1.8.0",
       "license": "Apache-2.0",
-      "artifact_patterns": ["_internal/frozenlist/**/*.pyd"]
+      "artifact_patterns": ["_internal/frozenlist/**/*.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "frozenlist-1.8.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/2d/f5/c831fac6cc817d26fd54c7eaccd04ef7e0288806943f7cc5bbf69f3ac1f0/frozenlist-1.8.0.tar.gz",
+          "sha256": "3ede829ed8d842f6cd48fc7081d7a41001a56f1f38603f9d49bf3020d59a31ad",
+          "size": 45875
+        }
+      ]
     },
     {
       "component": "future",
       "distribution": "future",
       "version": "1.0.0",
       "license": "MIT",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "future-1.0.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/a7/b2/4140c69c6a66432916b26158687e821ba631a4c9273c474343badf84d3ba/future-1.0.0.tar.gz",
+          "sha256": "bd2968309307861edae1458a4f8a4f3598c03be43b97521076aebf5d94c07b05",
+          "size": 1228490
+        }
+      ]
     },
     {
       "component": "idna",
       "distribution": "idna",
       "version": "3.11",
       "license": "BSD-3-Clause",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "idna-3.11.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/6f/6d/0703ccc57f3a7233505399edb88de3cbd678da106337b9fcde432b65ed60/idna-3.11.tar.gz",
+          "sha256": "795dafcc9c04ed0c1fb032c2aa73654d8e8c5023a7df64a53f39190ada629902",
+          "size": 194582
+        }
+      ]
     },
     {
       "component": "joblib",
       "distribution": "joblib",
       "version": "1.5.3",
       "license": "BSD-3-Clause",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "joblib-1.5.3.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/41/f2/d34e8b3a08a9cc79a50b2208a93dce981fe615b64d5a4d4abee421d898df/joblib-1.5.3.tar.gz",
+          "sha256": "8561a3269e6801106863fd0d6d84bb737be9e7631e33aaed3fb9ce5953688da3",
+          "size": 331603
+        }
+      ]
     },
     {
       "component": "multidict",
       "distribution": "multidict",
       "version": "6.7.1",
       "license": "Apache-2.0",
-      "artifact_patterns": ["_internal/multidict/**/*.pyd"]
+      "artifact_patterns": ["_internal/multidict/**/*.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "multidict-6.7.1.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/1a/c2/c2d94cbe6ac1753f3fc980da97b3d930efe1da3af3c9f5125354436c073d/multidict-6.7.1.tar.gz",
+          "sha256": "ec6652a1bee61c53a3e5776b6049172c53b6aaba34f18c9ad04f82712bac623d",
+          "size": 102010
+        }
+      ]
     },
     {
       "component": "numpy",
@@ -178,6 +431,35 @@
       "artifact_patterns": [
         "_internal/numpy/**/*.pyd",
         "_internal/numpy.libs/*.dll"
+      ],
+      "binary_archive": {
+        "filename": "numpy-2.4.1-cp314-cp314-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/7e/bb/c6513edcce5a831810e2dddc0d3452ce84d208af92405a0c2e58fd8e7881/numpy-2.4.1-cp314-cp314-win_amd64.whl",
+        "sha256": "7d5d7999df434a038d75a748275cd6c0094b0ecdb0837342b332a82defc4dc4d",
+        "size": 12438590
+      },
+      "native_source_coverage_verified": false,
+      "release_legal_review_required": true,
+      "release_gate_reason": "NumPy本体とOpenBLASのexact source/build recipeは確認済みだが、Windows wheelのOpenBLASにstatic linkされたGCC/Rtools toolchain source、patch、build provenanceを完全には確認できていないため公開しない。",
+      "source_archives": [
+        {
+          "filename": "numpy-2.4.1.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/24/62/ae72ff66c0f1fd959925b4c11f8c2dea61f47f6acaea75a08512cdfe3fed/numpy-2.4.1.tar.gz",
+          "sha256": "a1ceafc5042451a858231588a104093474c6a5c57dcc724841f5c888d237d690",
+          "size": 20721320
+        },
+        {
+          "filename": "openblas-libs-v0.3.30.0.7.tar.gz",
+          "url": "https://codeload.github.com/MacPython/openblas-libs/tar.gz/refs/tags/v0.3.30.0.7",
+          "sha256": "f5051a23674867774bc6c619799cfc40185963876695143c3bd0b3c67a7dece3",
+          "size": 409819
+        },
+        {
+          "filename": "OpenBLAS-b5456c1.tar.gz",
+          "url": "https://codeload.github.com/OpenMathLib/OpenBLAS/tar.gz/b5456c1b41ea88d4e0041778aa8ec09ee2a111a0",
+          "sha256": "0a17959ade3b0fc0b7d4af7b67bc5fc7823da643ad3f0699c9c84e795e6c204a",
+          "size": 24730332
+        }
       ]
     },
     {
@@ -201,6 +483,15 @@
       "version": "4.13.0.90",
       "license": "MIT AND Apache-2.0 AND bundled component licenses",
       "artifact_patterns": ["_internal/cv2/cv2*.pyd"],
+      "binary_archive": {
+        "filename": "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/13/de/291cbb17f44242ed6bfd3450fc2535d6bd298115c0ccd6f01cd51d4a11d7/opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl",
+        "sha256": "526bde4c33a86808a751e2bb57bf4921beb49794621810971926c472897f6433",
+        "size": 40211706
+      },
+      "native_source_coverage_verified": false,
+      "release_legal_review_required": true,
+      "release_gate_reason": "OpenCV/opencv-pythonと多くの同梱sourceは固定済みだが、cv2.pydに含まれるIntel IPPICV 2022.2.0等のprebuilt proprietary binaryについて承認済みsource例外と証拠がないため公開しない。",
       "source_archives": [
         {
           "filename": "opencv-python-6cb94ce.tar.gz",
@@ -221,6 +512,7 @@
       "version": "n4.4.6 / OpenCV binary revision d82ad9a54a7b42a1648a9cae8fed5c2f20ea396c",
       "license": "LGPL-2.1-or-later with bundled permissive codec libraries",
       "artifact_patterns": ["_internal/cv2/opencv_videoio_ffmpeg*.dll"],
+      "native_source_coverage_verified": true,
       "source_archives": [
         {
           "filename": "opencv-3rdparty-d82ad9a.tar.gz",
@@ -259,7 +551,15 @@
       "distribution": "packaging",
       "version": "26.0",
       "license": "Apache-2.0 OR BSD-2-Clause",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "packaging-26.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/65/ee/299d360cdc32edc7d2cf530f3accf79c4fca01e96ffc950d8a52213bd8e4/packaging-26.0.tar.gz",
+          "sha256": "00243ae351a257117b6a241061796684b084ed1c516a08c48a3f7e147a9d80b4",
+          "size": 143416
+        }
+      ]
     },
     {
       "component": "pandas",
@@ -269,6 +569,21 @@
       "artifact_patterns": [
         "_internal/pandas/**/*.pyd",
         "_internal/pandas.libs/*.dll"
+      ],
+      "binary_archive": {
+        "filename": "pandas-3.0.2-cp314-cp314-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/db/60/aba6a38de456e7341285102bede27514795c1eaa353bc0e7638b6b785356/pandas-3.0.2-cp314-cp314-win_amd64.whl",
+        "sha256": "b35d14bb5d8285d9494fe93815a9e9307c0876e10f1e8e89ac5b88f728ec8dcf",
+        "size": 9865893
+      },
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "pandas-3.0.2.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/da/99/b342345300f13440fe9fe385c3c481e2d9a595ee3bab4d3219247ac94e9a/pandas-3.0.2.tar.gz",
+          "sha256": "f4753e73e34c8d83221ba58f232433fca2748be8b18dbca02d242ed153945043",
+          "size": 4645855
+        }
       ]
     },
     {
@@ -279,6 +594,23 @@
       "artifact_patterns": [
         "_internal/PIL/**/*.pyd",
         "_internal/PIL/**/*.dll"
+      ],
+      "binary_archive": {
+        "filename": "pillow-12.1.1-cp314-cp314-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/40/72/4c245f7d1044b67affc7f134a09ea619d4895333d35322b775b928180044/pillow-12.1.1-cp314-cp314-win_amd64.whl",
+        "sha256": "50480dcd74fa63b8e78235957d302d98d98d82ccbfac4c7e12108ba9ecbdba15",
+        "size": 7176748
+      },
+      "native_source_coverage_verified": false,
+      "release_legal_review_required": true,
+      "release_gate_reason": "Pillow sdistのWindows build定義は確認済みだが、mutable mirrorとlibavif nested dependenciesを含むactual wheelのexact dependency archive bytesとbuild provenanceを確認できていないため公開しない。",
+      "source_archives": [
+        {
+          "filename": "pillow-12.1.1.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/1f/42/5c74462b4fd957fcd7b13b04fb3205ff8349236ea74c7c375766d6c82288/pillow-12.1.1.tar.gz",
+          "sha256": "9ad8fa5937ab05218e2b6a4cff30295ad35afd2f83ac592e68c0d871bb0fdbc4",
+          "size": 46980264
+        }
       ]
     },
     {
@@ -286,7 +618,16 @@
       "distribution": "propcache",
       "version": "0.4.1",
       "license": "Apache-2.0",
-      "artifact_patterns": ["_internal/propcache/**/*.pyd"]
+      "artifact_patterns": ["_internal/propcache/**/*.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "propcache-0.4.1.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/9e/da/e9fc233cf63743258bff22b3dfa7ea5baef7b5bc324af47a0ad89b8ffc6f/propcache-0.4.1.tar.gz",
+          "sha256": "f48107a8c637e80362555f37ecf49abe20370e557cc4ab374f04ec4423c97c3d",
+          "size": 46442
+        }
+      ]
     },
     {
       "component": "pyqt6",
@@ -294,6 +635,13 @@
       "version": "6.10.2",
       "license": "GPL-3.0-only",
       "artifact_patterns": ["_internal/PyQt6/Qt*.pyd"],
+      "binary_archive": {
+        "filename": "pyqt6-6.10.2-cp39-abi3-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/75/34/be7a55529607b21db00a49ca53cb07c3092d2a5a95ea19bb95cfa0346904/pyqt6-6.10.2-cp39-abi3-win_amd64.whl",
+        "sha256": "bd328cb70bc382c48861cd5f0a11b2b8ae6f5692d5a2d6679ba52785dced327b",
+        "size": 26015391
+      },
+      "native_source_coverage_verified": true,
       "source_archives": [
         {
           "filename": "pyqt6-6.10.2.tar.gz",
@@ -308,9 +656,20 @@
       "distribution": "PyQt6-Qt6",
       "version": "6.10.2",
       "license": "LGPL-3.0-only",
-      "artifact_patterns": ["_internal/PyQt6/Qt6/**/*.dll"],
+      "artifact_patterns": [
+        "_internal/PyQt6/Qt6/bin/Qt6*.dll",
+        "_internal/PyQt6/Qt6/plugins/**/*.dll"
+      ],
+      "binary_archive": {
+        "filename": "pyqt6_qt6-6.10.2-py3-none-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/06/8e/595f215876d507417cc8565e05519916d3b0b76baedea6a1e4e5105633fc/pyqt6_qt6-6.10.2-py3-none-win_amd64.whl",
+        "sha256": "c4b7f7d66cc58bddf1bc1ca28dfcf7a45f58cfcb11d81d13a0510409dd4957ac",
+        "size": 78433821
+      },
       "source_status": "upstream_reference_not_verified_corresponding_source",
       "wheel_build_provenance_verified": false,
+      "qt_plugin_third_party_notices_verified": false,
+      "native_source_coverage_verified": false,
       "release_legal_review_required": true,
       "release_gate_reason": "PyQt6-Qt6 Windows wheelのpatch、configure option、build scriptを含む完全なbuild provenanceを確認できていないため、Qt公式archiveを当該wheelのexact Corresponding Sourceとは断定しない。",
       "source_archives": [
@@ -328,6 +687,7 @@
       "version": "13.11.0",
       "license": "BSD-2-Clause",
       "artifact_patterns": ["_internal/PyQt6/sip*.pyd"],
+      "native_source_coverage_verified": true,
       "source_archives": [
         {
           "filename": "pyqt6_sip-13.11.0.tar.gz",
@@ -342,7 +702,15 @@
       "distribution": "python-dateutil",
       "version": "2.9.0.post0",
       "license": "Apache-2.0 OR BSD-3-Clause",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "python-dateutil-2.9.0.post0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz",
+          "sha256": "37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3",
+          "size": 342432
+        }
+      ]
     },
     {
       "component": "python-mpv",
@@ -364,7 +732,15 @@
       "distribution": "requests",
       "version": "2.32.5",
       "license": "Apache-2.0",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "requests-2.32.5.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/c9/74/b3ff8e6c8446842c3f5c837e9c3dfcfe2018ea6ecef224c710c85ef728f4/requests-2.32.5.tar.gz",
+          "sha256": "dbba0bac56e100853db0ea71b82b4dfd5fe2bf6d3754a8893c3af500cec7d7cf",
+          "size": 134517
+        }
+      ]
     },
     {
       "component": "scikit-learn",
@@ -374,6 +750,21 @@
       "artifact_patterns": [
         "_internal/sklearn/**/*.pyd",
         "_internal/sklearn/.libs/*.dll"
+      ],
+      "binary_archive": {
+        "filename": "scikit_learn-1.8.0-cp314-cp314-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/76/18/a8def8f91b18cd1ba6e05dbe02540168cb24d47e8dcf69e8d00b7da42a08/scikit_learn-1.8.0-cp314-cp314-win_amd64.whl",
+        "sha256": "56079a99c20d230e873ea40753102102734c5953366972a71d5cb39a32bc40c6",
+        "size": 8096518
+      },
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "scikit_learn-1.8.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/0e/d4/40988bf3b8e34feec1d0e6a051446b1f66225f8529b9309becaeef62b6c4/scikit_learn-1.8.0.tar.gz",
+          "sha256": "9bccbb3b40e3de10351f8f5068e105d0f4083b1a65fa07b6634fbc401a6287fd",
+          "size": 7335585
+        }
       ]
     },
     {
@@ -384,6 +775,35 @@
       "artifact_patterns": [
         "_internal/scipy/**/*.pyd",
         "_internal/scipy.libs/*.dll"
+      ],
+      "binary_archive": {
+        "filename": "scipy-1.17.1-cp314-cp314-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/4b/39/f0e8ea762a764a9dc52aa7dabcfad51a354819de1f0d4652b6a1122424d6/scipy-1.17.1-cp314-cp314-win_amd64.whl",
+        "sha256": "3877ac408e14da24a6196de0ddcace62092bfc12a83823e92e49e40747e52c19",
+        "size": 37290984
+      },
+      "native_source_coverage_verified": false,
+      "release_legal_review_required": true,
+      "release_gate_reason": "SciPy/OpenBLASのexact sourceとbuild recipeは固定済みだが、Windows wheelのOpenBLASにstatic linkされたGCC/Rtools toolchain source、patch、build provenanceを完全には確認できていないため公開しない。",
+      "source_archives": [
+        {
+          "filename": "scipy-1.17.1.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/7a/97/5a3609c4f8d58b039179648e62dd220f89864f56f7357f5d4f45c29eb2cc/scipy-1.17.1.tar.gz",
+          "sha256": "95d8e012d8cb8816c226aef832200b1d45109ed4464303e997c5b13122b297c0",
+          "size": 30573822
+        },
+        {
+          "filename": "openblas-libs-v0.3.30.0.8.tar.gz",
+          "url": "https://codeload.github.com/MacPython/openblas-libs/tar.gz/refs/tags/v0.3.30.0.8",
+          "sha256": "e13ccd7b9732af924497c49ccb90c1ea04983cfaeb5ad7e4e133a6a8f77e6c40",
+          "size": 409853
+        },
+        {
+          "filename": "OpenBLAS-b5456c1.tar.gz",
+          "url": "https://codeload.github.com/OpenMathLib/OpenBLAS/tar.gz/b5456c1b41ea88d4e0041778aa8ec09ee2a111a0",
+          "sha256": "0a17959ade3b0fc0b7d4af7b67bc5fc7823da643ad3f0699c9c84e795e6c204a",
+          "size": 24730332
+        }
       ]
     },
     {
@@ -391,49 +811,106 @@
       "distribution": "six",
       "version": "1.17.0",
       "license": "MIT",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "six-1.17.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz",
+          "sha256": "ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81",
+          "size": 34031
+        }
+      ]
     },
     {
       "component": "threadpoolctl",
       "distribution": "threadpoolctl",
       "version": "3.6.0",
       "license": "BSD-3-Clause",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "threadpoolctl-3.6.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/b7/4d/08c89e34946fce2aec4fbb45c9016efd5f4d7f24af8e5d93296e935631d8/threadpoolctl-3.6.0.tar.gz",
+          "sha256": "8ab8b4aa3491d812b623328249fab5302a68d2d71745c8a4c719a2fcaba9f44e",
+          "size": 21274
+        }
+      ]
     },
     {
       "component": "typing-extensions",
       "distribution": "typing_extensions",
       "version": "4.15.0",
       "license": "PSF-2.0",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "typing_extensions-4.15.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/72/94/1a15dd82efb362ac84269196e94cf00f187f7ed21c242792a923cdb1c61f/typing_extensions-4.15.0.tar.gz",
+          "sha256": "0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466",
+          "size": 109391
+        }
+      ]
     },
     {
       "component": "tzdata",
       "distribution": "tzdata",
       "version": "2026.2",
       "license": "Apache-2.0",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "tzdata-2026.2.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/ba/19/1b9b0e29f30c6d35cb345486df41110984ea67ae69dddbc0e8a100999493/tzdata-2026.2.tar.gz",
+          "sha256": "9173fde7d80d9018e02a662e168e5a2d04f87c41ea174b139fbef642eda62d10",
+          "size": 198254
+        }
+      ]
     },
     {
       "component": "urllib3",
       "distribution": "urllib3",
       "version": "2.6.3",
       "license": "MIT",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "urllib3-2.6.3.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/c7/24/5f1b3bdffd70275f6661c76461e25f024d5a38a46f04aaca912426a2b1d3/urllib3-2.6.3.tar.gz",
+          "sha256": "1b62b6884944a57dbe321509ab94fd4d3b307075e0c2eae991ac71ee15ad38ed",
+          "size": 435556
+        }
+      ]
     },
     {
       "component": "websocket-client",
       "distribution": "websocket-client",
       "version": "1.9.0",
       "license": "Apache-2.0",
-      "artifact_patterns": []
+      "artifact_patterns": [],
+      "source_archives": [
+        {
+          "filename": "websocket_client-1.9.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/2c/41/aa4bf9664e4cda14c3b39865b12251e8e7d239f4cd0e3cc1b6c2ccde25c1/websocket_client-1.9.0.tar.gz",
+          "sha256": "9e813624b6eb619999a97dc7958469217c3176312b3a16a4bd1bc7e08a46ec98",
+          "size": 70576
+        }
+      ]
     },
     {
       "component": "yarl",
       "distribution": "yarl",
       "version": "1.23.0",
       "license": "Apache-2.0",
-      "artifact_patterns": ["_internal/yarl/**/*.pyd"]
+      "artifact_patterns": ["_internal/yarl/**/*.pyd"],
+      "native_source_coverage_verified": true,
+      "source_archives": [
+        {
+          "filename": "yarl-1.23.0.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/23/6e/beb1beec874a72f23815c1434518bfc4ed2175065173fb138c3705f658d4/yarl-1.23.0.tar.gz",
+          "sha256": "53b1ea6ca88ebd4420379c330aea57e258408dd0df9af0992e5de2078dc9f5d5",
+          "size": 194676
+        }
+      ]
     }
   ],
   "runtime_downloads": [
@@ -442,6 +919,7 @@
       "version": "32.1.2",
       "archive_url": "https://github.com/obsproject/obs-studio/releases/download/32.1.2/OBS-Studio-32.1.2-Windows-x64.zip",
       "archive_sha256": "8d97e4563bd8d22d03e63042aa7dccede1d555c9bd35ce8a9e5019b0d0201bf6",
+      "fallback_urls": [],
       "bundled_in_installer": false,
       "release_legal_review_required": true
     },
@@ -450,6 +928,9 @@
       "version": "8.1.1",
       "archive_url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip",
       "archive_sha256": "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541",
+      "fallback_urls": [
+        "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip"
+      ],
       "bundled_in_installer": false,
       "release_legal_review_required": true
     }

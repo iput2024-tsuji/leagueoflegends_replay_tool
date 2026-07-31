@@ -64,15 +64,30 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $previousDataDir = $env:LOL_REPLAY_TOOL_DATA_DIR
-$selfCheckDir = Join-Path $repoRoot ("tests\_tmp\installer-self-check-" + [guid]::NewGuid().ToString("N"))
+$selfCheckDir = Join-Path $repoRoot ("dist\installer-self-check-" + [guid]::NewGuid().ToString("N"))
+$selfCheckStdout = Join-Path $selfCheckDir "stdout.txt"
+$selfCheckStderr = Join-Path $selfCheckDir "stderr.txt"
 try {
+  New-Item -ItemType Directory -Path $selfCheckDir -Force | Out-Null
   $env:LOL_REPLAY_TOOL_DATA_DIR = $selfCheckDir
   $selfCheckProcess = Start-Process `
     -FilePath $appExe `
     -ArgumentList "--self-check" `
     -WindowStyle Hidden `
-    -Wait `
+    -RedirectStandardOutput $selfCheckStdout `
+    -RedirectStandardError $selfCheckStderr `
     -PassThru
+  if (-not $selfCheckProcess.WaitForExit(60000)) {
+    $selfCheckProcess.Kill($true)
+    $selfCheckProcess.WaitForExit()
+    throw "packaged self-check が60秒以内に終了しませんでした。"
+  }
+  if (Test-Path $selfCheckStdout) {
+    Get-Content $selfCheckStdout | Write-Host
+  }
+  if (Test-Path $selfCheckStderr) {
+    Get-Content $selfCheckStderr | Write-Error
+  }
   if ($selfCheckProcess.ExitCode -ne 0) {
     exit $selfCheckProcess.ExitCode
   }

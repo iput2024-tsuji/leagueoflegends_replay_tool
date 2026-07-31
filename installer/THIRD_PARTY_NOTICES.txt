@@ -6,7 +6,8 @@ GPL version 3 の全文は、この画面の前に表示されるライセンス
 
 本アプリケーションには、Python、PyQt6、Qt、obsws-python、
 opencv-python、OpenCV FFmpeg、NumPy、pandas、SciPy、
-scikit-learn などの第三者コンポーネントが含まれます。
+scikit-learn、Microsoft Visual C++ runtime、Mesa software OpenGL
+などの第三者コンポーネントが含まれます。
 各コンポーネントには、それぞれのライセンス条件が適用されます。
 
 インストール後は、次の同梱資料を確認できます。
@@ -33,8 +34,9 @@ LoL Replay Tool is provided under GPL-3.0-only. The full GNU GPL version 3
 text appears before this page and is installed as LICENSE.
 
 The application contains third-party components including Python, PyQt6, Qt,
-obsws-python, opencv-python, the OpenCV FFmpeg DLL, NumPy, pandas, SciPy, and
-scikit-learn. Each component remains subject to its own license terms.
+obsws-python, opencv-python, the OpenCV FFmpeg DLL, NumPy, pandas, SciPy,
+scikit-learn, Microsoft Visual C++ runtime files, and Mesa software OpenGL.
+Each component remains subject to its own license terms.
 
 After installation, see THIRD_PARTY_NOTICES.md, SOURCE_OFFER.md,
 QT_RELINKING.md, and the licenses directory. The generated

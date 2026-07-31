@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from importlib import metadata
 from pathlib import Path, PurePosixPath
@@ -16,8 +17,11 @@ from typing import Any
 
 from scripts.collect_licenses import (
     COMPONENTS_FILE,
+    PROJECT_DOCUMENTS,
     RUNTIME_REQUIREMENTS,
     canonicalize_distribution_name,
+    is_safe_regular_file,
+    is_substantive_license_file,
     parse_requirement_pins,
 )
 from src.license_info import validate_distribution_documents
@@ -31,6 +35,17 @@ GENERATED_ROOT_DOCUMENTS = {
     "VERSION",
 }
 NATIVE_SUFFIXES = {".dll", ".exe", ".pyd"}
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+SHA256_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+INVALID_WINDOWS_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')
 
 # Kept as a public constant for existing tests and downstream tooling.
 REQUIRED_PACKAGE_LICENSES = {
@@ -73,7 +88,13 @@ def _safe_relative(value: object) -> str | None:
     if (
         relative.is_absolute()
         or re.match(r"^[A-Za-z]:", normalized)
-        or any(part in {"", ".", ".."} for part in relative.parts)
+        or any(
+            part in {"", ".", ".."}
+            or part.endswith((" ", "."))
+            or part.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES
+            or INVALID_WINDOWS_CHARS.search(part)
+            for part in relative.parts
+        )
     ):
         return None
     return relative.as_posix()
@@ -85,6 +106,27 @@ def _within(root: Path, candidate: Path) -> bool:
     except (OSError, ValueError):
         return False
     return True
+
+
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    return bool(
+        stat.S_ISLNK(metadata.st_mode)
+        or (
+            getattr(metadata, "st_file_attributes", 0)
+            & FILE_ATTRIBUTE_REPARSE_POINT
+        )
+    )
+
+
+def _regular_nonempty_file(path: Path) -> bool:
+    return is_safe_regular_file(path) and path.stat().st_size > 0
+
+
+def _component_names(lock: dict[str, Any]) -> set[str]:
+    return {
+        *(str(component["component"]) for component in _component_entries(lock)),
+        "license-materials",
+    }
 
 
 def _component_entries(lock: dict[str, Any]) -> list[dict[str, Any]]:
@@ -118,9 +160,12 @@ def validate_package_manifest(
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         return [f"Cannot read license manifest: {exc}"]
 
+    errors: list[str] = []
+    if payload.get("schema_version") != 1:
+        errors.append("Unsupported Python package license manifest schema.")
     packages = payload.get("packages")
     if not isinstance(packages, list):
-        return ["License manifest does not contain a package list."]
+        return [*errors, "License manifest does not contain a package list."]
 
     lock = component_lock
     if lock is None:
@@ -136,7 +181,6 @@ def validate_package_manifest(
         expected["python"] = lock["python"]
 
     by_name: dict[str, dict[str, Any]] = {}
-    errors: list[str] = []
     seen_paths: dict[str, str] = {}
     for package in packages:
         if not isinstance(package, dict):
@@ -148,44 +192,22 @@ def validate_package_manifest(
             errors.append(f"Duplicate package in license manifest: {package_name}")
         by_name[canonical] = package
 
-        license_files = package.get("license_files")
-        if not isinstance(license_files, list) or not license_files:
-            errors.append(f"No license file was collected for package: {package_name}")
-            continue
-        substantive = False
-        for value in license_files:
-            relative_path = _safe_relative(value)
-            if relative_path is None:
-                errors.append(f"Unsafe license path for {package_name}: {value}")
-                continue
-            collision_key = relative_path.casefold()
-            previous = seen_paths.get(collision_key)
-            if previous is not None and previous != relative_path:
-                errors.append(
-                    f"Case-insensitive license path collision: {previous} / {relative_path}"
-                )
-            seen_paths[collision_key] = relative_path
-            target = manifest_path.parent / Path(*PurePosixPath(relative_path).parts)
-            if not _within(manifest_path.parent, target) or not target.is_file():
-                errors.append(
-                    f"Collected license file is missing for {package_name}: {value}"
-                )
-                continue
-            filename = target.name.casefold()
-            if not filename.startswith("authors"):
-                substantive = True
-        if not substantive:
-            errors.append(
-                f"AUTHORS-only material is not a license for package: {package_name}"
-            )
-
         expected_component = expected.get(canonical)
-        if expected_component is not None:
-            expected_version = str(
-                expected_component.get("release_version")
-                or expected_component.get("version")
+        if expected and expected_component is None:
+            errors.append(f"Unexpected package in license manifest: {package_name}")
+        elif expected_component is not None:
+            if package.get("component") != expected_component.get("component"):
+                errors.append(
+                    f"Component differs from component lock for {package_name}."
+                )
+            expected_version = (
+                payload.get("build_python_version")
+                if canonical == "python"
+                else expected_component.get("version")
             )
-            if str(package.get("version")) != expected_version and canonical != "python":
+            if not isinstance(expected_version, str) or (
+                package.get("version") != expected_version
+            ):
                 errors.append(
                     f"Package version differs from component lock for {package_name}: "
                     f"{package.get('version')} != {expected_version}"
@@ -194,6 +216,71 @@ def validate_package_manifest(
                 errors.append(
                     f"Expected license differs from component lock for {package_name}."
                 )
+
+        license_files = package.get("license_files")
+        if not isinstance(license_files, list) or not license_files:
+            errors.append(f"No license file was collected for package: {package_name}")
+            continue
+        substantive_paths: list[str] = []
+        package_paths: set[str] = set()
+        for value in license_files:
+            relative_path = _safe_relative(value)
+            if relative_path is None:
+                errors.append(f"Unsafe license path for {package_name}: {value}")
+                continue
+            if not relative_path.startswith("python-packages/"):
+                errors.append(
+                    f"License path is outside python-packages for {package_name}: "
+                    f"{value}"
+                )
+                continue
+            collision_key = relative_path.casefold()
+            previous = seen_paths.get(collision_key)
+            if previous is not None:
+                errors.append(
+                    f"Duplicate or multiply referenced license path: "
+                    f"{previous} / {relative_path}"
+                )
+            seen_paths[collision_key] = relative_path
+            if collision_key in package_paths:
+                continue
+            package_paths.add(collision_key)
+            target = manifest_path.parent / Path(*PurePosixPath(relative_path).parts)
+            if not _within(manifest_path.parent, target) or not is_safe_regular_file(
+                target
+            ):
+                errors.append(
+                    f"Collected license file is missing for {package_name}: {value}"
+                )
+                continue
+            if target.stat().st_size == 0:
+                errors.append(
+                    f"Collected license file is empty for {package_name}: {value}"
+                )
+                continue
+            if target.suffix.casefold() in NATIVE_SUFFIXES:
+                errors.append(
+                    f"Native file cannot be license material for {package_name}: "
+                    f"{value}"
+                )
+                continue
+            if is_substantive_license_file(Path(relative_path)):
+                substantive_paths.append(relative_path)
+        declared_substantive = package.get("substantive_license_files")
+        if not isinstance(declared_substantive, list):
+            errors.append(
+                f"Substantive license list is missing for package: {package_name}"
+            )
+        elif declared_substantive != substantive_paths:
+            errors.append(
+                f"Substantive license list differs from collected files for "
+                f"{package_name}."
+            )
+        if not substantive_paths:
+            errors.append(
+                f"NOTICE, COPYRIGHT, or AUTHORS-only material is not a license for "
+                f"package: {package_name}"
+            )
 
     required = (
         set(expected)
@@ -204,9 +291,13 @@ def validate_package_manifest(
         errors.append(f"Required package is missing from license manifest: {canonical}")
 
     if lock is not None:
-        actual_lock_hash = sha256_file(manifest_path.parent / "components.json")
-        if payload.get("component_lock_sha256") != actual_lock_hash:
-            errors.append("License manifest component lock SHA256 does not match.")
+        lock_path = manifest_path.parent / "components.json"
+        if not _regular_nonempty_file(lock_path):
+            errors.append("Packaged component lock is not a non-empty regular file.")
+        else:
+            actual_lock_hash = sha256_file(lock_path)
+            if payload.get("component_lock_sha256") != actual_lock_hash:
+                errors.append("License manifest component lock SHA256 does not match.")
         try:
             expected_requirements_hash = sha256_file(RUNTIME_REQUIREMENTS)
         except OSError as exc:
@@ -214,6 +305,12 @@ def validate_package_manifest(
         else:
             if payload.get("requirements_sha256") != expected_requirements_hash:
                 errors.append("License manifest requirements SHA256 does not match.")
+        if payload.get("release_python_version") != lock["python"].get(
+            "release_version"
+        ):
+            errors.append("License manifest release Python version does not match.")
+    if not isinstance(payload.get("build_python_version"), str):
+        errors.append("License manifest build Python version is missing.")
     return errors
 
 
@@ -324,6 +421,31 @@ def _classify_toc_entry(
     source_lower = source.name.casefold()
 
     if re.fullmatch(
+        r"(?:msvcp140(?:_[12])?|vcruntime140(?:_1)?|vcomp140)(?:-[0-9a-f]+)?\.dll",
+        source_lower,
+    ):
+        return "microsoft-vc-runtime"
+    if source_lower == "opengl32sw.dll":
+        return "mesa-opengl32sw"
+    python_dependency_owners = {
+        "_bz2.pyd": "python-bzip2",
+        "_ctypes.pyd": "python-libffi",
+        "libffi-8.dll": "python-libffi",
+        "_decimal.pyd": "python-mpdecimal",
+        "_sqlite3.pyd": "python-sqlite",
+        "sqlite3.dll": "python-sqlite",
+        "_lzma.pyd": "python-xz",
+        "_zstd.pyd": "python-zstd",
+        "_hashlib.pyd": "python-openssl",
+        "_ssl.pyd": "python-openssl",
+    }
+    if source_lower in python_dependency_owners and _is_relative_to(
+        source,
+        Path(sys.base_prefix),
+    ):
+        return python_dependency_owners[source_lower]
+
+    if re.fullmatch(
         r"_internal/cv2/opencv_videoio_ffmpeg[^/]*\.dll",
         final_lower,
     ):
@@ -339,14 +461,6 @@ def _classify_toc_entry(
         source, Path(sys.base_prefix)
     ):
         return "python-openssl"
-    if (
-        source_lower.startswith("libffi-")
-        or source_lower in {"sqlite3.dll", "vcomp140.dll"}
-    ) and (
-        _is_relative_to(source, Path(sys.base_prefix))
-        or _is_relative_to(source, Path(os.environ.get("SystemRoot", r"C:\Windows")))
-    ):
-        return "python-runtime-support"
     if _is_relative_to(source, Path(sys.base_prefix)):
         return "python"
 
@@ -379,26 +493,172 @@ def _artifact_patterns(lock: dict[str, Any]) -> dict[str, list[str]]:
 
 
 def _physical_files(distribution_root: Path) -> dict[str, Path]:
+    try:
+        root_metadata = distribution_root.lstat()
+    except OSError as exc:
+        raise ValueError(f"Cannot inspect distribution root: {exc}") from exc
+    if _is_reparse_point(root_metadata) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise ValueError("Distribution root must be a real directory, not a link.")
+
     result: dict[str, Path] = {}
-    for path in distribution_root.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(distribution_root).as_posix()
-        if relative == MANIFEST_RELATIVE_PATH:
-            continue
-        collision_key = relative.casefold()
-        previous = result.get(collision_key)
-        if previous is not None and previous != path:
-            raise ValueError(
-                f"Case-insensitive distribution path collision: "
-                f"{previous.relative_to(distribution_root).as_posix()} / {relative}"
-            )
-        result[collision_key] = path
+    pending = [distribution_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise ValueError(f"Cannot scan distribution directory: {exc}") from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                metadata = path.lstat()
+            except OSError as exc:
+                raise ValueError(f"Cannot inspect distribution path {path}: {exc}") from exc
+            relative = path.relative_to(distribution_root).as_posix()
+            if _safe_relative(relative) is None:
+                raise ValueError(f"Unsafe path in final distribution: {relative}")
+            if _is_reparse_point(metadata):
+                raise ValueError(
+                    f"Links and reparse points are forbidden in distribution: {relative}"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(
+                    f"Non-regular object is forbidden in distribution: {relative}"
+                )
+            if relative == MANIFEST_RELATIVE_PATH:
+                continue
+            collision_key = relative.casefold()
+            previous = result.get(collision_key)
+            if previous is not None and previous != path:
+                raise ValueError(
+                    f"Case-insensitive distribution path collision: "
+                    f"{previous.relative_to(distribution_root).as_posix()} / {relative}"
+                )
+            result[collision_key] = path
     return result
 
 
-def _generated_file(relative: str) -> bool:
-    return relative in GENERATED_ROOT_DOCUMENTS or relative.startswith("licenses/")
+def _package_license_paths(package_manifest: dict[str, Any] | None) -> set[str]:
+    result: set[str] = set()
+    if not package_manifest:
+        return result
+    packages = package_manifest.get("packages")
+    if not isinstance(packages, list):
+        return result
+    for package in packages:
+        if not isinstance(package, dict):
+            continue
+        values = package.get("license_files")
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            relative = _safe_relative(value)
+            if relative is not None:
+                result.add(f"licenses/{relative}")
+    return result
+
+
+def _allowed_generated_files(
+    package_manifest: dict[str, Any] | None,
+) -> set[str]:
+    return {
+        *GENERATED_ROOT_DOCUMENTS,
+        "licenses/components.json",
+        "licenses/python-packages.json",
+        *_package_license_paths(package_manifest),
+    }
+
+
+def _generated_file(
+    relative: str,
+    allowed_generated: set[str],
+) -> bool:
+    return relative in allowed_generated
+
+
+def _validate_project_documents(distribution_root: Path) -> list[str]:
+    errors: list[str] = []
+    repository_root = Path(__file__).resolve().parents[1]
+    for relative in PROJECT_DOCUMENTS:
+        packaged = distribution_root / relative
+        repository = repository_root / relative
+        if not _regular_nonempty_file(packaged):
+            errors.append(
+                f"Required distribution document is not a non-empty regular file: "
+                f"{relative}"
+            )
+            continue
+        if not _regular_nonempty_file(repository):
+            errors.append(
+                f"Repository distribution document is not a non-empty regular file: "
+                f"{relative}"
+            )
+            continue
+        if sha256_file(packaged) != sha256_file(repository):
+            errors.append(
+                f"Packaged distribution document differs from repository: {relative}"
+            )
+    license_path = distribution_root / "LICENSE"
+    if _regular_nonempty_file(license_path):
+        try:
+            license_text = license_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            errors.append(f"Cannot read packaged project license: {exc}")
+        else:
+            if (
+                "GNU GENERAL PUBLIC LICENSE" not in license_text
+                or "Version 3" not in license_text
+            ):
+                errors.append("Packaged LICENSE is not the GNU GPL version 3 text.")
+    return errors
+
+
+def _validate_runtime_download_lock(lock: dict[str, Any]) -> list[str]:
+    from scripts import setup_env
+
+    expected = {
+        "obs-studio": {
+            "version": setup_env.OBS_PACKAGE.version,
+            "archive_url": setup_env.OBS_PACKAGE.url,
+            "archive_sha256": setup_env.OBS_PACKAGE.sha256,
+            "fallback_urls": list(setup_env.OBS_PACKAGE.fallback_urls),
+        },
+        "gyan-ffmpeg": {
+            "version": setup_env.FFMPEG_PACKAGE.version,
+            "archive_url": setup_env.FFMPEG_PACKAGE.url,
+            "archive_sha256": setup_env.FFMPEG_PACKAGE.sha256,
+            "fallback_urls": list(setup_env.FFMPEG_PACKAGE.fallback_urls),
+        },
+    }
+    actual_entries = lock.get("runtime_downloads")
+    if not isinstance(actual_entries, list):
+        return ["Component lock runtime_downloads must be a list."]
+    actual: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for entry in actual_entries:
+        if not isinstance(entry, dict) or not isinstance(entry.get("component"), str):
+            errors.append("Component lock contains an invalid runtime download.")
+            continue
+        component = entry["component"]
+        if component in actual:
+            errors.append(f"Duplicate runtime download lock: {component}")
+        actual[component] = entry
+    if set(actual) != set(expected):
+        errors.append("Runtime download component set differs from setup_env constants.")
+    for component, fields in expected.items():
+        entry = actual.get(component)
+        if entry is None:
+            continue
+        for field, value in fields.items():
+            if entry.get(field, [] if field == "fallback_urls" else None) != value:
+                errors.append(
+                    f"Runtime download lock differs from setup_env for "
+                    f"{component}.{field}."
+                )
+    return errors
 
 
 def _release_gate_errors(
@@ -491,18 +751,52 @@ def _write_distribution_manifest(
 def _validate_existing_distribution_manifest(
     distribution_root: Path,
     manifest_path: Path,
+    component_lock: dict[str, Any],
+    package_manifest: dict[str, Any],
+    *,
+    toc_path: Path | None = None,
+    expected_ownership: dict[str, str] | None = None,
+    toc_entries: list[dict[str, str]] | None = None,
 ) -> list[str]:
     try:
         payload = _read_json(manifest_path)
         physical = _physical_files(distribution_root)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         return [f"Cannot validate distribution manifest: {exc}"]
+    errors: list[str] = []
+    if payload.get("schema_version") != 1:
+        errors.append("Unsupported distribution manifest schema.")
+    if not isinstance(payload.get("statement"), str) or not payload["statement"].strip():
+        errors.append("Distribution manifest statement is missing.")
+    if payload.get("build_python_version") != package_manifest.get(
+        "build_python_version"
+    ):
+        errors.append("Distribution manifest build Python version does not match.")
+    if payload.get("release_python_version") != component_lock["python"].get(
+        "release_version"
+    ):
+        errors.append("Distribution manifest release Python version does not match.")
+    expected_lock_hash = sha256_file(
+        distribution_root / "licenses" / "components.json"
+    )
+    if payload.get("component_lock_sha256") != expected_lock_hash:
+        errors.append("Distribution manifest component lock SHA256 does not match.")
+    toc_hash = payload.get("pyinstaller_collect_toc_sha256")
+    if not isinstance(toc_hash, str) or SHA256_PATTERN.fullmatch(toc_hash) is None:
+        errors.append("Distribution manifest TOC SHA256 is invalid.")
+    elif toc_path is not None and toc_hash != sha256_file(toc_path):
+        errors.append("Distribution manifest TOC SHA256 does not match.")
+
     records = payload.get("files")
     if not isinstance(records, list):
-        return ["Distribution manifest does not contain a file list."]
+        return [*errors, "Distribution manifest does not contain a file list."]
 
-    errors: list[str] = []
     recorded: dict[str, str] = {}
+    valid_components = _component_names(component_lock)
+    toc_by_path = {
+        entry["path"].casefold(): entry for entry in (toc_entries or [])
+    }
+    allowed_generated = _allowed_generated_files(package_manifest)
     for record in records:
         if not isinstance(record, dict):
             errors.append("Distribution manifest contains an invalid file entry.")
@@ -525,10 +819,43 @@ def _validate_existing_distribution_manifest(
             errors.append(f"Manifest path casing differs from distribution: {relative}")
         if path.stat().st_size != record.get("size"):
             errors.append(f"Manifest size differs for: {relative}")
-        if sha256_file(path) != record.get("sha256"):
+        record_hash = record.get("sha256")
+        if (
+            not isinstance(record_hash, str)
+            or SHA256_PATTERN.fullmatch(record_hash) is None
+            or sha256_file(path) != record_hash
+        ):
             errors.append(f"Manifest SHA256 differs for: {relative}")
-        if not isinstance(record.get("component"), str) or not record["component"]:
-            errors.append(f"Manifest component is missing for: {relative}")
+        component = record.get("component")
+        if component not in valid_components:
+            errors.append(f"Manifest component is invalid for: {relative}")
+        expected_component = None
+        toc_entry = toc_by_path.get(key)
+        if relative.startswith("licenses/") or relative in GENERATED_ROOT_DOCUMENTS:
+            expected_component = (
+                "license-materials"
+                if relative.startswith("licenses/")
+                else "lol-replay-tool"
+            )
+        elif expected_ownership is not None:
+            expected_component = expected_ownership.get(key)
+        if expected_component is not None and component != expected_component:
+            errors.append(f"Manifest component ownership differs for: {relative}")
+        if toc_entry is None:
+            if toc_entries is not None and relative not in allowed_generated:
+                errors.append(f"Manifest file has no matching TOC entry: {relative}")
+            if toc_entries is not None and (
+                "toc_name" in record or "toc_type" in record
+            ):
+                errors.append(
+                    f"Generated manifest file unexpectedly records TOC metadata: "
+                    f"{relative}"
+                )
+        elif (
+            record.get("toc_name") != toc_entry["toc_name"]
+            or record.get("toc_type") != toc_entry["type"]
+        ):
+            errors.append(f"Manifest TOC metadata differs for: {relative}")
 
     for key, path in physical.items():
         if key not in recorded:
@@ -547,11 +874,20 @@ def validate_distribution(
     release: bool = False,
 ) -> list[str]:
     errors = [
-        f"Required distribution document is missing: {relative_path}"
+        f"Required distribution document is missing or unsafe: {relative_path}"
         for relative_path in validate_distribution_documents(distribution_root)
     ]
+    errors.extend(_validate_project_documents(distribution_root))
+    try:
+        physical = _physical_files(distribution_root)
+    except (OSError, ValueError) as exc:
+        errors.append(str(exc))
+        return errors
     lock_path = distribution_root / "licenses" / "components.json"
     package_manifest_path = distribution_root / "licenses" / "python-packages.json"
+    if not _regular_nonempty_file(lock_path):
+        errors.append("Packaged component lock is not a non-empty regular file.")
+        return errors
     try:
         lock = _read_json(lock_path)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -560,6 +896,7 @@ def validate_distribution(
 
     if lock.get("schema_version") != 1:
         errors.append("Unsupported packaged component lock schema.")
+    errors.extend(_validate_runtime_download_lock(lock))
     try:
         if sha256_file(lock_path) != sha256_file(COMPONENTS_FILE):
             errors.append("Packaged component lock differs from repository lock.")
@@ -567,14 +904,16 @@ def validate_distribution(
         errors.append(f"Cannot compare component lock: {exc}")
 
     package_manifest: dict[str, Any] | None = None
-    if package_manifest_path.is_file():
+    if _regular_nonempty_file(package_manifest_path):
         errors.extend(validate_package_manifest(package_manifest_path, lock))
         try:
             package_manifest = _read_json(package_manifest_path)
         except (OSError, json.JSONDecodeError, ValueError):
             pass
     else:
-        errors.append("Python package license manifest is missing.")
+        errors.append(
+            "Python package license manifest is missing, empty, or not a regular file."
+        )
 
     try:
         pins = parse_requirement_pins(RUNTIME_REQUIREMENTS)
@@ -590,25 +929,38 @@ def validate_distribution(
     except RuntimeError as exc:
         errors.append(str(exc))
 
+    allowed_generated = _allowed_generated_files(package_manifest)
+    for path in physical.values():
+        relative = path.relative_to(distribution_root).as_posix()
+        if relative.startswith("licenses/") and relative not in allowed_generated:
+            errors.append(f"Unreferenced file in license directory: {relative}")
+
     if release:
         errors.extend(_release_gate_errors(lock, package_manifest))
+        if toc_path is None:
+            errors.append(
+                "Release validation requires the exact PyInstaller COLLECT TOC."
+            )
 
     if toc_path is None:
         manifest_path = distribution_root / MANIFEST_RELATIVE_PATH
-        if manifest_path.is_file():
+        if _regular_nonempty_file(manifest_path) and package_manifest is not None:
             errors.extend(
                 _validate_existing_distribution_manifest(
                     distribution_root,
                     manifest_path,
+                    lock,
+                    package_manifest,
                 )
             )
         else:
-            errors.append("Distribution manifest is missing.")
+            errors.append(
+                "Distribution manifest is missing, empty, or not a regular file."
+            )
         return errors
 
     try:
         toc_entries = parse_collect_toc(toc_path)
-        physical = _physical_files(distribution_root)
         source_owners, ownership_errors = _distribution_source_owners(lock)
         errors.extend(ownership_errors)
         patterns = _artifact_patterns(lock)
@@ -618,6 +970,12 @@ def validate_distribution(
 
     toc_by_path = {entry["path"].casefold(): entry for entry in toc_entries}
     for key, entry in toc_by_path.items():
+        source = Path(entry["source"])
+        if not is_safe_regular_file(source):
+            errors.append(
+                f"TOC source is missing, linked, or not a regular file: "
+                f"{entry['source']}"
+            )
         path = physical.get(key)
         if path is None:
             errors.append(f"TOC file is missing from final distribution: {entry['path']}")
@@ -626,7 +984,7 @@ def validate_distribution(
 
     for key, path in physical.items():
         relative = path.relative_to(distribution_root).as_posix()
-        if not _generated_file(relative) and key not in toc_by_path:
+        if not _generated_file(relative, allowed_generated) and key not in toc_by_path:
             errors.append(f"Final distribution file is missing from TOC: {relative}")
 
     ownership: dict[str, str] = {}
@@ -651,6 +1009,28 @@ def validate_distribution(
                     f"Native artifact is not allowed by component lock: "
                     f"{entry['path']} ({component})"
                 )
+
+    manifest_path = distribution_root / MANIFEST_RELATIVE_PATH
+    if (
+        not write_manifest
+        and _regular_nonempty_file(manifest_path)
+        and package_manifest is not None
+    ):
+        errors.extend(
+            _validate_existing_distribution_manifest(
+                distribution_root,
+                manifest_path,
+                lock,
+                package_manifest,
+                toc_path=toc_path,
+                expected_ownership=ownership,
+                toc_entries=toc_entries,
+            )
+        )
+    elif not write_manifest:
+        errors.append(
+            "Distribution manifest is missing, empty, or not a regular file."
+        )
 
     if write_manifest and not errors and package_manifest is not None:
         _write_distribution_manifest(

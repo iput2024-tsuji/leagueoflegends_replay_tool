@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import csv
+import email.parser
 import hashlib
 import importlib
 import json
@@ -10,6 +13,7 @@ import re
 import shutil
 import stat
 import sys
+import zipfile
 from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -47,6 +51,124 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def verified_wheel_record_inventory(
+    wheel_path: Path,
+    *,
+    distribution: str,
+    version: str,
+) -> dict[str, Any]:
+    """Verify a wheel's RECORD and return an exact member inventory."""
+    if not is_safe_regular_file(wheel_path):
+        raise RuntimeError(f"Wheel is missing or unsafe: {wheel_path}")
+    try:
+        with zipfile.ZipFile(wheel_path) as archive:
+            members: dict[str, zipfile.ZipInfo] = {}
+            seen: set[str] = set()
+            for info in archive.infolist():
+                relative = safe_relative_path(info.filename).as_posix()
+                if relative != info.filename.replace("\\", "/"):
+                    raise RuntimeError(f"Wheel member is not normalized: {info.filename}")
+                folded = relative.casefold()
+                if folded in seen:
+                    raise RuntimeError(f"Wheel member collides by case: {relative}")
+                seen.add(folded)
+                if info.flag_bits & 0x1:
+                    raise RuntimeError(f"Encrypted wheel member is forbidden: {relative}")
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == stat.S_IFLNK:
+                    raise RuntimeError(f"Wheel symlink is forbidden: {relative}")
+                members[relative] = info
+
+            metadata_names = [
+                name
+                for name, info in members.items()
+                if not info.is_dir()
+                and len(PurePosixPath(name).parts) == 2
+                and PurePosixPath(name).name == "METADATA"
+                and PurePosixPath(name).parent.name.casefold().endswith(".dist-info")
+            ]
+            matching_metadata = []
+            for metadata_name in metadata_names:
+                message = email.parser.BytesParser().parsebytes(
+                    archive.read(members[metadata_name])
+                )
+                if (
+                    canonicalize_distribution_name(message.get("Name", ""))
+                    == canonicalize_distribution_name(distribution)
+                    and message.get("Version", "") == version
+                ):
+                    matching_metadata.append((metadata_name, message))
+            if len(matching_metadata) != 1:
+                raise RuntimeError("Wheel has no unique matching root METADATA.")
+            metadata_name, message = matching_metadata[0]
+            dist_info = PurePosixPath(metadata_name).parent
+            wheel_name = (dist_info / "WHEEL").as_posix()
+            wheel_info = members.get(wheel_name)
+            if wheel_info is None or wheel_info.is_dir():
+                raise RuntimeError("Wheel matching WHEEL file is missing.")
+            record_name = (dist_info / "RECORD").as_posix()
+            record_info = members.get(record_name)
+            if record_info is None or record_info.is_dir():
+                raise RuntimeError("Wheel RECORD is missing.")
+            try:
+                rows = list(
+                    csv.reader(
+                        archive.read(record_info)
+                        .decode("utf-8", errors="strict")
+                        .splitlines()
+                    )
+                )
+            except (UnicodeError, csv.Error) as exc:
+                raise RuntimeError(f"Wheel RECORD is invalid: {exc}") from exc
+            recorded: set[str] = set()
+            for row in rows:
+                if len(row) != 3:
+                    raise RuntimeError("Wheel RECORD row is invalid.")
+                relative = safe_relative_path(row[0]).as_posix()
+                folded = relative.casefold()
+                if folded in recorded:
+                    raise RuntimeError(f"Wheel RECORD path is duplicated: {relative}")
+                recorded.add(folded)
+                info = members.get(relative)
+                if info is None or info.is_dir():
+                    raise RuntimeError(f"Wheel RECORD member is missing: {relative}")
+                if relative == record_name:
+                    if row[1] or row[2]:
+                        raise RuntimeError("Wheel RECORD self-entry must be unhashed.")
+                    continue
+                data = archive.read(info)
+                encoded = base64.urlsafe_b64encode(
+                    hashlib.sha256(data).digest()
+                ).rstrip(b"=").decode("ascii")
+                if row[1] != f"sha256={encoded}" or row[2] != str(len(data)):
+                    raise RuntimeError(f"Wheel RECORD digest or size differs: {relative}")
+            actual_files = {
+                name.casefold() for name, info in members.items() if not info.is_dir()
+            }
+            if recorded != actual_files:
+                raise RuntimeError("Wheel RECORD file set differs from archive.")
+            artifacts = []
+            for relative, info in members.items():
+                if info.is_dir():
+                    continue
+                data = archive.read(info)
+                artifacts.append(
+                    {
+                        "path": relative,
+                        "size": len(data),
+                        "sha256": hashlib.sha256(data).hexdigest(),
+                    }
+                )
+    except (OSError, RuntimeError, zipfile.BadZipFile, KeyError) as exc:
+        raise RuntimeError(f"Cannot verify wheel {wheel_path.name}: {exc}") from exc
+    return {
+        "distribution": distribution,
+        "version": version,
+        "record_path": record_name,
+        "artifacts": sorted(artifacts, key=lambda item: str(item["path"]).casefold()),
+    }
 
 
 def parse_requirement_pins(requirements_file: Path) -> dict[str, tuple[str, str]]:
@@ -502,6 +624,42 @@ def probe_python_native_runtime(component_lock: dict[str, Any]) -> dict[str, Any
             raise RuntimeError("Active base Python executable differs from official lock.")
         executable_record["kind"] = "base-python-executable"
 
+    ensurepip_lock = profile.get("ensurepip_wheel")
+    if not isinstance(ensurepip_lock, dict):
+        raise RuntimeError("Python ensurepip wheel lock is missing.")
+    ensurepip_relative = ensurepip_lock.get("relative_path")
+    ensurepip_filename = ensurepip_lock.get("filename")
+    ensurepip_distribution = ensurepip_lock.get("distribution")
+    ensurepip_version = ensurepip_lock.get("version")
+    ensurepip_size = ensurepip_lock.get("size")
+    ensurepip_sha256 = ensurepip_lock.get("sha256")
+    if (
+        not isinstance(ensurepip_relative, str)
+        or safe_relative_path(ensurepip_relative).as_posix() != ensurepip_relative
+        or not ensurepip_relative.startswith("Lib/ensurepip/_bundled/")
+        or PurePosixPath(ensurepip_relative).name != ensurepip_filename
+        or ensurepip_distribution != "pip"
+        or not isinstance(ensurepip_version, str)
+        or not isinstance(ensurepip_size, int)
+        or isinstance(ensurepip_size, bool)
+        or ensurepip_size <= 0
+        or not isinstance(ensurepip_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", ensurepip_sha256) is None
+    ):
+        raise RuntimeError("Python ensurepip wheel lock is invalid.")
+    ensurepip_path = base_prefix.joinpath(*PurePosixPath(ensurepip_relative).parts)
+    if (
+        not is_safe_regular_file(ensurepip_path)
+        or ensurepip_path.stat().st_size != ensurepip_size
+        or sha256_file(ensurepip_path) != ensurepip_sha256
+    ):
+        raise RuntimeError("Python ensurepip wheel differs from official lock.")
+    ensurepip_inventory = verified_wheel_record_inventory(
+        ensurepip_path,
+        distribution=ensurepip_distribution,
+        version=ensurepip_version,
+    )
+
     stdlib_lock = profile.get("stdlib_python_sources")
     if not isinstance(stdlib_lock, dict):
         raise RuntimeError("Python stdlib source inventory is missing.")
@@ -633,6 +791,11 @@ def probe_python_native_runtime(component_lock: dict[str, Any]) -> dict[str, Any
         "official_actions_archive": profile.get("official_actions_archive"),
         "official_installer": profile.get("official_installer"),
         "active_python_executable": executable_record,
+        "ensurepip_wheel": {
+            **ensurepip_lock,
+            "record_path": ensurepip_inventory["record_path"],
+            "artifacts": ensurepip_inventory["artifacts"],
+        },
         "core_native_inventory": {
             "file_count": len(core_artifacts),
             "total_size": sum(int(item["size"]) for item in core_artifacts),
@@ -658,11 +821,17 @@ def _validated_build_provenance(
     component_lock: dict[str, Any],
     components_file: Path,
     python_native_runtime: dict[str, Any],
+    expected_sha256: str | None = None,
 ) -> tuple[dict[str, Any] | None, set[str]]:
     if provenance_path is None:
         return None, set()
     if not is_safe_regular_file(provenance_path) or provenance_path.stat().st_size == 0:
         raise RuntimeError(f"Build provenance is missing or unsafe: {provenance_path}")
+    if expected_sha256 is not None and (
+        re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        or sha256_file(provenance_path) != expected_sha256
+    ):
+        raise RuntimeError("Build provenance differs from the externally sealed SHA256.")
     try:
         payload = json.loads(provenance_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -689,9 +858,19 @@ def _validated_build_provenance(
         ) is None:
             raise RuntimeError(f"Build provenance {field} is invalid.")
     from scripts.prepare_release_assets import (
-        _installed_distribution_digest,
+        _verify_bootstrap_pip_environment,
+        _verify_environment_file_ownership,
+        capture_git_source_identity,
         flatten_exact_requirements,
+        verify_recorded_install_inventory,
     )
+
+    try:
+        current_git_source = capture_git_source_identity()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"Cannot verify Git source identity: {exc}") from exc
+    if payload.get("git_source") != current_git_source:
+        raise RuntimeError("Build provenance Git source identity differs after build.")
 
     build_requirements = REPO_ROOT / "requirements-dev.txt"
     pins, expected_inputs = flatten_exact_requirements(build_requirements)
@@ -714,6 +893,21 @@ def _validated_build_provenance(
     records = payload.get("installed_binaries")
     if not isinstance(records, list):
         raise RuntimeError("Build provenance has no installed binary list.")
+    try:
+        observed_bootstrap = _verify_bootstrap_pip_environment(
+            python_native_runtime
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"Cannot verify bootstrap pip provenance: {exc}") from exc
+    if payload.get("bootstrap_pip") != observed_bootstrap:
+        raise RuntimeError("Build provenance bootstrap pip inventory differs.")
+    try:
+        allowed_environment_files = verify_recorded_install_inventory(
+            "pip",
+            observed_bootstrap,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"Cannot verify recorded bootstrap pip files: {exc}") from exc
     observed: set[str] = set()
     locked = {
         str(component["component"]): component
@@ -749,17 +943,21 @@ def _validated_build_provenance(
                 f"Build provenance version differs for {component_name}."
             )
         try:
-            digest = _installed_distribution_digest(str(component["distribution"]))
-        except (OSError, RuntimeError, metadata.PackageNotFoundError) as exc:
+            owned = verify_recorded_install_inventory(
+                str(component["distribution"]),
+                record,
+            )
+        except (OSError, RuntimeError, metadata.PackageNotFoundError, ValueError) as exc:
             raise RuntimeError(
                 f"Cannot verify installed files for {component_name}: {exc}"
             ) from exc
-        if record.get("installed_files_sha256") != digest:
-            raise RuntimeError(
-                f"Installed files differ from build provenance for {component_name}."
-            )
+        allowed_environment_files.update(owned)
     if observed != expected_components:
         raise RuntimeError("Build provenance binary component set differs from policy.")
+    try:
+        _verify_environment_file_ownership(allowed_environment_files)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise RuntimeError(f"Build environment ownership verification failed: {exc}") from exc
     return payload, observed
 
 
@@ -768,6 +966,7 @@ def collect_licenses(
     requirements_file: Path = RUNTIME_REQUIREMENTS,
     components_file: Path = COMPONENTS_FILE,
     build_provenance: Path | None = None,
+    build_provenance_sha256: str | None = None,
 ) -> Path:
     component_lock = _load_component_lock(components_file)
     runtime_components = validate_runtime_lock(requirements_file, component_lock)
@@ -778,6 +977,7 @@ def collect_licenses(
         component_lock,
         components_file,
         python_native_runtime,
+        build_provenance_sha256,
     )
 
     destination.mkdir(parents=True, exist_ok=True)
@@ -802,6 +1002,13 @@ def collect_licenses(
         _reserve_target(provenance_target, seen_targets)
         shutil.copy2(build_provenance, provenance_target)
         provenance_hash = sha256_file(provenance_target)
+        if (
+            build_provenance_sha256 is not None
+            and provenance_hash != build_provenance_sha256
+        ):
+            raise RuntimeError(
+                "Packaged build provenance differs from the externally sealed SHA256."
+            )
 
     package_root = destination / "python-packages"
     package_root.mkdir(parents=True, exist_ok=True)
@@ -872,6 +1079,7 @@ def main() -> int:
     parser.add_argument("--requirements", type=Path, default=RUNTIME_REQUIREMENTS)
     parser.add_argument("--components", type=Path, default=COMPONENTS_FILE)
     parser.add_argument("--build-provenance", type=Path)
+    parser.add_argument("--build-provenance-sha256")
     args = parser.parse_args()
     try:
         manifest_path = collect_licenses(
@@ -879,6 +1087,7 @@ def main() -> int:
             args.requirements,
             args.components,
             args.build_provenance,
+            args.build_provenance_sha256,
         )
     except (metadata.PackageNotFoundError, RuntimeError) as exc:
         print(f"ERROR: {exc}")

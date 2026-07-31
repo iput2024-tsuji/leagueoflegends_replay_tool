@@ -25,23 +25,53 @@
     "platform": "win_amd64",
     "pip_version": "26.1.2",
     "required_components": [
+      "aiohappyeyeballs",
       "aiohttp",
+      "aiosignal",
+      "altgraph",
+      "attrs",
+      "certifi",
       "charset-normalizer",
+      "colorama",
+      "ffmpeg-python",
       "frozenlist",
+      "future",
+      "idna",
+      "iniconfig",
+      "joblib",
       "multidict",
       "numpy",
+      "obsws-python",
       "opencv-python",
+      "packaging",
       "pandas",
+      "pefile",
       "pillow",
+      "pluggy",
       "propcache",
+      "pygments",
       "pyinstaller",
+      "pyinstaller-hooks-contrib",
       "pyqt6",
       "pyqt6-sip",
+      "pytest",
+      "pytest-asyncio",
+      "pytest-qt",
+      "pywin32-ctypes",
+      "python-dateutil",
+      "python-mpv",
       "qt",
+      "requests",
       "ruff",
       "scikit-learn",
       "scipy",
       "setuptools-vendored-runtime",
+      "six",
+      "threadpoolctl",
+      "typing-extensions",
+      "tzdata",
+      "urllib3",
+      "websocket-client",
       "yarl"
     ]
   },
@@ -99,6 +129,14 @@
           "url": "https://www.python.org/ftp/python/3.14.2/python-3.14.2-amd64.exe",
           "sha256": "9db919cefe30a0051658c600a9912acb0cd2b872aaf35842c9ec2bf401efa848",
           "size": 29882512
+        },
+        "ensurepip_wheel": {
+          "relative_path": "Lib/ensurepip/_bundled/pip-25.3-py3-none-any.whl",
+          "filename": "pip-25.3-py3-none-any.whl",
+          "distribution": "pip",
+          "version": "25.3",
+          "sha256": "9655943313a94722b7774661c21049070f6bbb0a1516bf02f7c8d5d9201514cd",
+          "size": 1778622
         },
         "core_native_inventory": {
           "file_count": 36,
@@ -255,6 +293,14 @@
           "sha256": "14b3e9a710a3fcf0bd9b55ab6b60412bd91227563f813fc49040cabc0209e0bd",
           "size": 30774112
         },
+        "ensurepip_wheel": {
+          "relative_path": "Lib/ensurepip/_bundled/pip-26.1.2-py3-none-any.whl",
+          "filename": "pip-26.1.2-py3-none-any.whl",
+          "distribution": "pip",
+          "version": "26.1.2",
+          "sha256": "382ff9f685ee3bc25864f820aa50505825f10f5458ffff07e30a6d96e5715cab",
+          "size": 1813144
+        },
         "core_native_inventory": {
           "file_count": 36,
           "total_size": 23351008,
@@ -403,6 +449,12 @@
           "url": "https://codeload.github.com/python/cpython-source-deps/tar.gz/refs/tags/zlib-ng-2.2.4",
           "sha256": "00bbd88709bc416cb96160ab61d3e1c8f76e106799af7328d0fe434dc7dd5004",
           "size": 2415819
+        },
+        {
+          "filename": "pip-26.1.2.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/source/p/pip/pip-26.1.2.tar.gz",
+          "sha256": "f49cd134c61cf2fd75e0ce2676db03e4054504a5a4986d00f8299ae632dc4605",
+          "size": 1840799
         }
     ]
   },
@@ -426,7 +478,14 @@
         "filename": "pyinstaller-6.18.0-py3-none-win_amd64.whl",
         "url": "https://files.pythonhosted.org/packages/fb/d5/48eef2002b6d3937ceac2717fe17e9ca3a43a4c9826bafee367dfc75ba85/pyinstaller-6.18.0-py3-none-win_amd64.whl",
         "sha256": "976fabd90ecfbda47571c87055ad73413ec615ff7dea35e12a4304174de78de9",
-        "size": 1384389
+        "size": 1384389,
+        "contents": [
+          {
+            "path": "PyInstaller/bootloader/Windows-64bit-intel/runw.exe",
+            "size": 279552,
+            "sha256": "8aecee0dbd166bff885c5c9ea4d46a8e23cb3fba4a68597b95dc35ead4e12660"
+          }
+        ]
       },
       "source_archives": [
         {
@@ -441,7 +500,7 @@
       "component": "setuptools-vendored-runtime",
       "distribution": "setuptools",
       "version": "81.0.0",
-      "license": "MIT",
+      "license": "MIT AND bundled component licenses",
       "artifact_patterns": [],
       "packaged_in_distribution": true,
       "source_status": "verified_corresponding_source",
@@ -488,7 +547,7 @@
         "size": 11837758,
         "contents": [
           {
-            "path": "ruff.exe",
+            "path": "ruff-0.15.12.data/scripts/ruff.exe",
             "size": 32350208,
             "sha256": "ccfbe6e11d75c3c2b6b419adf1fd018de519055543d28d261caad3cf78335754"
           }
@@ -502,6 +561,149 @@
           "size": 4643852
         }
       ]
+    },
+    {
+      "component": "altgraph",
+      "distribution": "altgraph",
+      "version": "0.17.5",
+      "license": "MIT",
+      "artifact_patterns": [],
+      "packaged_in_distribution": false,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/altgraph/altgraph-0.17.5.dist-info/LICENSE", "sha256": "6c194d6db0c64d45535d10c95142b9b0cda7b7dcc7f1ddee302b3d536f3dbe46"}],
+      "binary_archive": {"filename": "altgraph-0.17.5-py2.py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/a9/ba/000a1996d4308bc65120167c21241a3b205464a2e0b58deda26ae8ac21d1/altgraph-0.17.5-py2.py3-none-any.whl", "sha256": "f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597", "size": 21228},
+      "source_archives": [{"filename": "altgraph-0.17.5.tar.gz", "url": "https://files.pythonhosted.org/packages/7e/f8/97fdf103f38fed6792a1601dbc16cc8aac56e7459a9fff08c812d8ae177a/altgraph-0.17.5.tar.gz", "sha256": "c87b395dd12fabde9c99573a9749d67da8d29ef9de0125c7f536699b4a9bc9e7", "size": 48428}]
+    },
+    {
+      "component": "colorama",
+      "distribution": "colorama",
+      "version": "0.4.6",
+      "license": "BSD-3-Clause",
+      "artifact_patterns": [],
+      "packaged_in_distribution": true,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/colorama/colorama-0.4.6.dist-info/licenses/LICENSE.txt", "sha256": "cac35c02686e5d04a5a7140bfb3b36e73aed496656e891102e428886d7930318"}],
+      "binary_archive": {"filename": "colorama-0.4.6-py2.py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/d1/d6/3965ed04c63042e047cb6a3e6ed1a63a35087b6a609aa3a15ed8ac56c221/colorama-0.4.6-py2.py3-none-any.whl", "sha256": "4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6", "size": 25335},
+      "source_archives": [{"filename": "colorama-0.4.6.tar.gz", "url": "https://files.pythonhosted.org/packages/d8/53/6f443c9a4a8358a93a6792e2acffb9d9d5cb0a5cfd8802644b7b1c9a02e4/colorama-0.4.6.tar.gz", "sha256": "08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44", "size": 27697}]
+    },
+    {
+      "component": "iniconfig",
+      "distribution": "iniconfig",
+      "version": "2.3.0",
+      "license": "MIT",
+      "artifact_patterns": [],
+      "packaged_in_distribution": true,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/iniconfig/iniconfig-2.3.0.dist-info/licenses/LICENSE", "sha256": "3409fa91f7ace557894632676656e32264fe5ef7581535725dc9a23774551bd4"}],
+      "binary_archive": {"filename": "iniconfig-2.3.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", "sha256": "f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", "size": 7484},
+      "source_archives": [{"filename": "iniconfig-2.3.0.tar.gz", "url": "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc35312d08ba8bf51fdd999c576889fc2c24cb97f4f10/iniconfig-2.3.0.tar.gz", "sha256": "c76315c77db068650d49c5b56314774a7804df16fee4402c1f19d6d15d8c4730", "size": 20503}]
+    },
+    {
+      "component": "pefile",
+      "distribution": "pefile",
+      "version": "2024.8.26",
+      "license": "MIT",
+      "artifact_patterns": [],
+      "packaged_in_distribution": false,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/pefile/pefile-2024.8.26.dist-info/LICENSE", "sha256": "b44409c067c6da52bfb54bb6624fb11a7b52157c3a13ae1400232f8196e86ad3"}],
+      "binary_archive": {"filename": "pefile-2024.8.26-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/54/16/12b82f791c7f50ddec566873d5bdd245baa1491bac11d15ffb98aecc8f8b/pefile-2024.8.26-py3-none-any.whl", "sha256": "76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f", "size": 74766},
+      "source_archives": [{"filename": "pefile-2024.8.26.tar.gz", "url": "https://files.pythonhosted.org/packages/03/4f/2750f7f6f025a1507cd3b7218691671eecfd0bbebebe8b39aa0fe1d360b8/pefile-2024.8.26.tar.gz", "sha256": "3ff6c5d8b43e8c37bb6e6dd5085658d658a7a0bdcd20b6a07b1fcfc1c4e9d632", "size": 76008}]
+    },
+    {
+      "component": "pluggy",
+      "distribution": "pluggy",
+      "version": "1.6.0",
+      "license": "MIT",
+      "artifact_patterns": [],
+      "packaged_in_distribution": true,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/pluggy/pluggy-1.6.0.dist-info/licenses/LICENSE", "sha256": "d6b65e6c213a5d0b577911d34d6e5949b9f59d76c238c5071a2f3fc16cfb2606"}],
+      "binary_archive": {"filename": "pluggy-1.6.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", "sha256": "e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", "size": 20538},
+      "source_archives": [{"filename": "pluggy-1.6.0.tar.gz", "url": "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe6ef3fa267035b518369d9511ffab804f839851d2779/pluggy-1.6.0.tar.gz", "sha256": "7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3", "size": 69412}]
+    },
+    {
+      "component": "pygments",
+      "distribution": "Pygments",
+      "version": "2.20.0",
+      "license": "BSD-2-Clause",
+      "artifact_patterns": [],
+      "packaged_in_distribution": true,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/Pygments/pygments-2.20.0.dist-info/licenses/LICENSE", "sha256": "a9d66f1d526df02e29dce73436d34e56e8632f46c275bbdffc70569e882f9f17"}],
+      "binary_archive": {"filename": "pygments-2.20.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/f4/7e/a72dd26f3b0f4f2bf1dd8923c85f7ceb43172af56d63c7383eb62b332364/pygments-2.20.0-py3-none-any.whl", "sha256": "81a9e26dd42fd28a23a2d169d86d7ac03b46e2f8b59ed4698fb4785f946d0176", "size": 1231151},
+      "source_archives": [{"filename": "pygments-2.20.0.tar.gz", "url": "https://files.pythonhosted.org/packages/c3/b2/bc9c9196916376152d655522fdcebac55e66de6603a76a02bca1b6414f6c/pygments-2.20.0.tar.gz", "sha256": "6757cd03768053ff99f3039c1a36d6c0aa0b263438fcab17520b30a303a82b5f", "size": 4955991}]
+    },
+    {
+      "component": "pyinstaller-hooks-contrib",
+      "distribution": "pyinstaller-hooks-contrib",
+      "version": "2026.0",
+      "license": "GPL-2.0-or-later AND Apache-2.0 (file-scoped)",
+      "artifact_patterns": [],
+      "packaged_in_distribution": false,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/pyinstaller-hooks-contrib/pyinstaller_hooks_contrib-2026.0.dist-info/licenses/LICENSE", "sha256": "91d0baaff00773038e72c0a1fc9d5d2d38706b7a2b9c04f34296608f931b9cd0"}],
+      "binary_archive": {"filename": "pyinstaller_hooks_contrib-2026.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/d5/b1/9da6ec3e88696018ee7bb9dc4a7310c2cfaebf32923a19598cd342767c10/pyinstaller_hooks_contrib-2026.0-py3-none-any.whl", "sha256": "0590db8edeba3e6c30c8474937021f5cd39c0602b4d10f74a064c73911efaca5", "size": 452318},
+      "source_archives": [{"filename": "pyinstaller-hooks-contrib-2026.0.tar.gz", "url": "https://files.pythonhosted.org/packages/31/8f/8052ff65067697ee80fde45b9731842e160751c41ac5690ba232c22030e8/pyinstaller-hooks-contrib-2026.0.tar.gz", "sha256": "0120893de491a000845470ca9c0b39284731ac6bace26f6849dea9627aaed48e", "size": 170311}]
+    },
+    {
+      "component": "pytest",
+      "distribution": "pytest",
+      "version": "9.0.3",
+      "license": "MIT",
+      "artifact_patterns": [],
+      "packaged_in_distribution": true,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/pytest/pytest-9.0.3.dist-info/licenses/LICENSE", "sha256": "ca836a5f9ecca3b2f350230faa20a48fb8b145653b5568d784862df864706b9b"}],
+      "binary_archive": {"filename": "pytest-9.0.3-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/d4/24/a372aaf5c9b7208e7112038812994107bc65a84cd00e0354a88c2c77a617/pytest-9.0.3-py3-none-any.whl", "sha256": "2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9", "size": 375249},
+      "source_archives": [{"filename": "pytest-9.0.3.tar.gz", "url": "https://files.pythonhosted.org/packages/7d/0d/549bd94f1a0a402dc8cf64563a117c0f3765662e2e668477624baeec44d5/pytest-9.0.3.tar.gz", "sha256": "b86ada508af81d19edeb213c681b1d48246c1a91d304c6c81a427674c17eb91c", "size": 1572165}]
+    },
+    {
+      "component": "pytest-asyncio",
+      "distribution": "pytest-asyncio",
+      "version": "1.3.0",
+      "license": "Apache-2.0",
+      "artifact_patterns": [],
+      "packaged_in_distribution": false,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/pytest-asyncio/pytest_asyncio-1.3.0.dist-info/licenses/LICENSE", "sha256": "a8ad31b1c3f40dca5a84119351b8fa8ddc868edd77fad8a8ebf6d8f2d16fa4ae"}],
+      "binary_archive": {"filename": "pytest_asyncio-1.3.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/e5/35/f8b19922b6a25bc0880171a2f1a003eaeb93657475193ab516fd87cac9da/pytest_asyncio-1.3.0-py3-none-any.whl", "sha256": "611e26147c7f77640e6d0a92a38ed17c3e9848063698d5c93d5aa7aa11cebff5", "size": 15075},
+      "source_archives": [{"filename": "pytest_asyncio-1.3.0.tar.gz", "url": "https://files.pythonhosted.org/packages/90/2c/8af215c0f776415f3590cac4f9086ccefd6fd463befeae41cd4d3f193e5a/pytest_asyncio-1.3.0.tar.gz", "sha256": "d7f52f36d231b80ee124cd216ffb19369aa168fc10095013c6b014a34d3ee9e5", "size": 50087}]
+    },
+    {
+      "component": "pytest-qt",
+      "distribution": "pytest-qt",
+      "version": "4.5.0",
+      "license": "MIT",
+      "artifact_patterns": [],
+      "packaged_in_distribution": false,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/pytest-qt/pytest_qt-4.5.0.dist-info/licenses/LICENSE", "sha256": "ddb94f90ceb2ebb3d88d5354fa635c1d7404d6624b15ed1954a14255f348f119"}],
+      "binary_archive": {"filename": "pytest_qt-4.5.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/cc/d0/8339b888ad64a3d4e508fed8245a402b503846e1972c10ad60955883dcbb/pytest_qt-4.5.0-py3-none-any.whl", "sha256": "ed21ea9b861247f7d18090a26bfbda8fb51d7a8a7b6f776157426ff2ccf26eff", "size": 37214},
+      "source_archives": [{"filename": "pytest_qt-4.5.0.tar.gz", "url": "https://files.pythonhosted.org/packages/d3/61/8bdec02663c18bf5016709b909411dce04a868710477dc9b9844ffcf8dd2/pytest_qt-4.5.0.tar.gz", "sha256": "51620e01c488f065d2036425cbc1cbcf8a6972295105fd285321eb47e66a319f", "size": 128702}]
+    },
+    {
+      "component": "pywin32-ctypes",
+      "distribution": "pywin32-ctypes",
+      "version": "0.2.3",
+      "license": "BSD-3-Clause",
+      "artifact_patterns": [],
+      "packaged_in_distribution": false,
+      "corresponding_source_required": false,
+      "source_status": "verified_corresponding_source",
+      "license_materials": [{"path": "licenses/python-packages/pywin32-ctypes/pywin32_ctypes-0.2.3.dist-info/LICENSE.txt", "sha256": "dfa83b3e2709adfcdb838d9ad55823ca674abb780e60563d9dd9544ccbf785e9"}],
+      "binary_archive": {"filename": "pywin32_ctypes-0.2.3-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/de/3d/8161f7711c017e01ac9f008dfddd9410dff3674334c233bde66e7ba65bbf/pywin32_ctypes-0.2.3-py3-none-any.whl", "sha256": "8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8", "size": 30756},
+      "source_archives": [{"filename": "pywin32-ctypes-0.2.3.tar.gz", "url": "https://files.pythonhosted.org/packages/85/9f/01a1a99704853cb63f253eea009390c88e7131c67e66a0a02099a8c917cb/pywin32-ctypes-0.2.3.tar.gz", "sha256": "d162dc04946d704503b2edc4d55f3dba5c1d539ead017afa00142c38b9885755", "size": 29471}]
     }
   ],
   "runtime_components": [
@@ -821,6 +1023,12 @@
       "component": "aiohappyeyeballs",
       "distribution": "aiohappyeyeballs",
       "version": "2.6.1",
+      "binary_archive": {
+        "filename": "aiohappyeyeballs-2.6.1-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/0f/15/5bf3b99495fb160b63f95972b81750f18f7f4e02ad051373b669d17d44f2/aiohappyeyeballs-2.6.1-py3-none-any.whl",
+        "sha256": "f349ba8f4b75cb25c99c5c2d84e997e485204d2902a9597802b0371f09331fb8",
+        "size": 15265
+      },
       "license": "PSF-2.0",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -872,6 +1080,12 @@
       "component": "aiosignal",
       "distribution": "aiosignal",
       "version": "1.4.0",
+      "binary_archive": {
+        "filename": "aiosignal-1.4.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/fb/76/641ae371508676492379f16e2fa48f4e2c11741bd63c48be4b12a6b09cba/aiosignal-1.4.0-py3-none-any.whl",
+        "sha256": "053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e",
+        "size": 7490
+      },
       "license": "Apache-2.0",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -894,6 +1108,12 @@
       "component": "attrs",
       "distribution": "attrs",
       "version": "26.1.0",
+      "binary_archive": {
+        "filename": "attrs-26.1.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/64/b4/17d4b0b2a2dc85a6df63d1157e028ed19f90d4cd97c36717afef2bc2f395/attrs-26.1.0-py3-none-any.whl",
+        "sha256": "c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309",
+        "size": 67548
+      },
       "license": "MIT",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -916,6 +1136,12 @@
       "component": "certifi",
       "distribution": "certifi",
       "version": "2026.1.4",
+      "binary_archive": {
+        "filename": "certifi-2026.1.4-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/e6/ad/3cc14f097111b4de0040c83a525973216457bbeeb63739ef1ed275c1c021/certifi-2026.1.4-py3-none-any.whl",
+        "sha256": "9943707519e4add1115f44c2bc244f782c0249876bf51b6599fee1ffbedd685c",
+        "size": 152900
+      },
       "license": "MPL-2.0",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -967,6 +1193,12 @@
       "component": "ffmpeg-python",
       "distribution": "ffmpeg-python",
       "version": "0.2.0",
+      "binary_archive": {
+        "filename": "ffmpeg_python-0.2.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/d7/0c/56be52741f75bad4dc6555991fabd2e07b432d333da82c11ad701123888a/ffmpeg_python-0.2.0-py3-none-any.whl",
+        "sha256": "ac441a0404e053f8b6a1113a77c0f452f1cfc62f6344a769475ffdc0f56c23c5",
+        "size": 25024
+      },
       "license": "Apache-2.0",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1018,6 +1250,12 @@
       "component": "future",
       "distribution": "future",
       "version": "1.0.0",
+      "binary_archive": {
+        "filename": "future-1.0.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/da/71/ae30dadffc90b9006d77af76b393cb9dfbfc9629f339fc1574a1c52e6806/future-1.0.0-py3-none-any.whl",
+        "sha256": "929292d34f5872e70396626ef385ec22355a1fae8ad29e1a734c3e43f9fbc216",
+        "size": 491326
+      },
       "license": "MIT",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1040,6 +1278,12 @@
       "component": "idna",
       "distribution": "idna",
       "version": "3.11",
+      "binary_archive": {
+        "filename": "idna-3.11-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/0e/61/66938bbb5fc52dbdf84594873d5b51fb1f7c7794e9c0f5bd885f30bc507b/idna-3.11-py3-none-any.whl",
+        "sha256": "771a87f49d9defaf64091e6e6fe9c18d4833f140bd19464795bc32d966ca37ea",
+        "size": 71008
+      },
       "license": "BSD-3-Clause",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1062,6 +1306,12 @@
       "component": "joblib",
       "distribution": "joblib",
       "version": "1.5.3",
+      "binary_archive": {
+        "filename": "joblib-1.5.3-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/7b/91/984aca2ec129e2757d1e4e3c81c3fcda9d0f85b74670a094cc443d9ee949/joblib-1.5.3-py3-none-any.whl",
+        "sha256": "5fc3c5039fc5ca8c0276333a188bbd59d6b7ab37fe6632daa76bc7f9ec18e713",
+        "size": 309071
+      },
       "license": "BSD-3-Clause",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1159,6 +1409,12 @@
       "component": "obsws-python",
       "distribution": "obsws-python",
       "version": "1.8.0",
+      "binary_archive": {
+        "filename": "obsws_python-1.8.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/97/4b/537f3d372f065b2aeeac3812228066eb70f47436adf88aaacc94eb5fd4e1/obsws_python-1.8.0-py3-none-any.whl",
+        "sha256": "537bde416e149b6f59e0b2f31761d4a40329feafec171bde6fc1346ab8516e28",
+        "size": 30819
+      },
       "license": "GPL-3.0-only",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1266,6 +1522,12 @@
       "component": "packaging",
       "distribution": "packaging",
       "version": "26.0",
+      "binary_archive": {
+        "filename": "packaging-26.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/b7/b9/c538f279a4e237a006a2c98387d081e9eb060d203d8ed34467cc0f0b9b53/packaging-26.0-py3-none-any.whl",
+        "sha256": "b36f1fef9334a5588b4166f8bcd26a14e521f2b55e6b9de3aaa80d3ff7a37529",
+        "size": 74366
+      },
       "license": "Apache-2.0 OR BSD-2-Clause",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1477,6 +1739,12 @@
       "component": "python-dateutil",
       "distribution": "python-dateutil",
       "version": "2.9.0.post0",
+      "binary_archive": {
+        "filename": "python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+        "sha256": "a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427",
+        "size": 229892
+      },
       "license": "Apache-2.0 OR BSD-3-Clause",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1499,6 +1767,12 @@
       "component": "python-mpv",
       "distribution": "python-mpv",
       "version": "1.0.8",
+      "binary_archive": {
+        "filename": "python_mpv-1.0.8-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/22/f3/4c632eaacebfc62ab9414586137aecf6c0ea2a1e99708cf5a4c0dec13ae0/python_mpv-1.0.8-py3-none-any.whl",
+        "sha256": "b5296403e990fb7348df4ca2211937a030f524bf638657bda7e45a00bc2df0cd",
+        "size": 46169
+      },
       "license": "GPL-2.0-or-later OR LGPL-2.1-or-later",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1521,6 +1795,12 @@
       "component": "requests",
       "distribution": "requests",
       "version": "2.32.5",
+      "binary_archive": {
+        "filename": "requests-2.32.5-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/1e/db/4254e3eabe8020b458f1a747140d32277ec7a271daf1d235b70dc0b4e6e3/requests-2.32.5-py3-none-any.whl",
+        "sha256": "2462f94637a34fd532264295e186976db0f5d453d1cdd31473c85a6a161affb6",
+        "size": 64738
+      },
       "license": "Apache-2.0",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1621,6 +1901,12 @@
       "component": "six",
       "distribution": "six",
       "version": "1.17.0",
+      "binary_archive": {
+        "filename": "six-1.17.0-py2.py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl",
+        "sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274",
+        "size": 11050
+      },
       "license": "MIT",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1643,6 +1929,12 @@
       "component": "threadpoolctl",
       "distribution": "threadpoolctl",
       "version": "3.6.0",
+      "binary_archive": {
+        "filename": "threadpoolctl-3.6.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/32/d5/f9a850d79b0851d1d4ef6456097579a9005b31fea68726a4ae5f2d82ddd9/threadpoolctl-3.6.0-py3-none-any.whl",
+        "sha256": "43a0b8fd5a2928500110039e43a5eed8480b918967083ea48dc3ab9f13c4a7fb",
+        "size": 18638
+      },
       "license": "BSD-3-Clause",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1665,6 +1957,12 @@
       "component": "typing-extensions",
       "distribution": "typing_extensions",
       "version": "4.15.0",
+      "binary_archive": {
+        "filename": "typing_extensions-4.15.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/18/67/36e9267722cc04a6b9f15c7f3441c2363321a3ea07da7ae0c0707beb2a9c/typing_extensions-4.15.0-py3-none-any.whl",
+        "sha256": "f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548",
+        "size": 44614
+      },
       "license": "PSF-2.0",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1687,6 +1985,12 @@
       "component": "tzdata",
       "distribution": "tzdata",
       "version": "2026.2",
+      "binary_archive": {
+        "filename": "tzdata-2026.2-py2.py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/ce/e4/dccd7f47c4b64213ac01ef921a1337ee6e30e8c6466046018326977efd95/tzdata-2026.2-py2.py3-none-any.whl",
+        "sha256": "bbe9af844f658da81a5f95019480da3a89415801f6cc966806612cc7169bffe7",
+        "size": 349321
+      },
       "license": "Apache-2.0",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1709,6 +2013,12 @@
       "component": "urllib3",
       "distribution": "urllib3",
       "version": "2.6.3",
+      "binary_archive": {
+        "filename": "urllib3-2.6.3-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/39/08/aaaad47bc4e9dc8c725e68f9d04865dbcb2052843ff09c97b08904852d84/urllib3-2.6.3-py3-none-any.whl",
+        "sha256": "bf272323e553dfb2e87d9bfd225ca7b0f467b919d7bbd355436d3fd37cb0acd4",
+        "size": 131584
+      },
       "license": "MIT",
       "source_status": "verified_corresponding_source",
       "license_materials": [
@@ -1731,6 +2041,12 @@
       "component": "websocket-client",
       "distribution": "websocket-client",
       "version": "1.9.0",
+      "binary_archive": {
+        "filename": "websocket_client-1.9.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/34/db/b10e48aa8fff7407e67470363eac595018441cf32d5e1001567a7aeba5d2/websocket_client-1.9.0-py3-none-any.whl",
+        "sha256": "af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef",
+        "size": 82616
+      },
       "license": "Apache-2.0",
       "source_status": "verified_corresponding_source",
       "license_materials": [

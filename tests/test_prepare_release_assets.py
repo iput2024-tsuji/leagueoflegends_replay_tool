@@ -38,22 +38,42 @@ def _sha(data: bytes) -> str:
 
 def _wheel_bytes(name: str = "demo", version: str = "1.0") -> bytes:
     metadata_path = f"{name}-{version}.dist-info/METADATA"
+    wheel_path = f"{name}-{version}.dist-info/WHEEL"
     record_path = f"{name}-{version}.dist-info/RECORD"
     metadata = (
         f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
     ).encode()
-    encoded_digest = base64.urlsafe_b64encode(
-        hashlib.sha256(metadata).digest()
-    ).rstrip(b"=").decode("ascii")
-    record = (
-        f"{metadata_path},sha256={encoded_digest},{len(metadata)}\n"
-        f"{record_path},,\n"
+    wheel_metadata = (
+        b"Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: false\n"
+        b"Tag: cp314-cp314-win_amd64\n"
     )
+    members = {metadata_path: metadata, wheel_path: wheel_metadata}
+    rows = []
+    for member_path, payload in members.items():
+        encoded_digest = base64.urlsafe_b64encode(
+            hashlib.sha256(payload).digest()
+        ).rstrip(b"=").decode("ascii")
+        rows.append(f"{member_path},sha256={encoded_digest},{len(payload)}")
+    record = "\n".join([*rows, f"{record_path},,"]) + "\n"
     wheel_buffer = io.BytesIO()
     with zipfile.ZipFile(wheel_buffer, "w") as archive:
-        archive.writestr(metadata_path, metadata)
+        for member_path, payload in members.items():
+            archive.writestr(member_path, payload)
         archive.writestr(record_path, record)
     return wheel_buffer.getvalue()
+
+
+def _wheel_contents(wheel: bytes) -> list[dict[str, object]]:
+    with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+        return [
+            {
+                "path": info.filename,
+                "size": info.file_size,
+                "sha256": _sha(archive.read(info)),
+            }
+            for info in sorted(archive.infolist(), key=lambda item: item.filename)
+            if not info.is_dir()
+        ]
 
 
 def _installable_wheel_bytes(name: str = "demo", version: str = "1.0") -> bytes:
@@ -102,6 +122,7 @@ def _binary_lock(wheel: bytes) -> dict[str, object]:
         "url": "https://example.invalid/demo.whl",
         "sha256": _sha(wheel),
         "size": len(wheel),
+        "contents": _wheel_contents(wheel),
     }
     lock["release_binary_policy"] = {
         "python_implementation": "CPython",
@@ -115,10 +136,16 @@ def _binary_lock(wheel: bytes) -> dict[str, object]:
 
 
 def _write_source_zip(path: Path, version: str = "1.2.3") -> None:
+    files = {
+        "VERSION": (version + "\n").encode(),
+        "LICENSE": b"GPL\n",
+        "main.py": b"print('test')\n",
+    }
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("VERSION", version + "\n")
-        archive.writestr("LICENSE", "GPL\n")
-        archive.writestr("main.py", "print('test')\n")
+        for name, data in files.items():
+            info = zipfile.ZipInfo(name)
+            info.external_attr = 0o100644 << 16
+            archive.writestr(info, data)
 
 
 def _review() -> dict[str, object]:
@@ -202,13 +229,23 @@ def _write_distribution(root: Path) -> None:
     licenses.mkdir()
     (licenses / "components.json").write_text("{}\n", encoding="utf-8")
     (licenses / "distribution-manifest.json").write_text("{}\n", encoding="utf-8")
+    (licenses / "build-provenance.json").write_text(
+        json.dumps({"git_source": {"commit": "a" * 40}}) + "\n",
+        encoding="utf-8",
+    )
 
 
-def _create_asset_set(tmp_path: Path) -> tuple[dict[str, object], Path]:
+def _create_asset_set(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    provenance_seal: str | None = "actual",
+) -> tuple[dict[str, object], Path]:
     first = b"python source"
     second = b"demo source"
     lock_path = tmp_path / "components.json"
     lock_path.write_text(json.dumps(_lock(first, second)), encoding="utf-8")
+    monkeypatch.setattr(release_assets, "COMPONENTS_FILE", lock_path)
     cache = tmp_path / "cache"
     cache.mkdir()
     (cache / "python-source.tar.gz").write_bytes(first)
@@ -217,8 +254,47 @@ def _create_asset_set(tmp_path: Path) -> tuple[dict[str, object], Path]:
     installer.write_bytes(b"installer")
     source = tmp_path / "LoLReplayTool-source-1.2.3.zip"
     _write_source_zip(source)
+    source_files = {
+        "VERSION": b"1.2.3\n",
+        "LICENSE": b"GPL\n",
+        "main.py": b"print('test')\n",
+    }
+    source_blobs = {
+        hashlib.sha1(
+            b"blob " + str(len(data)).encode("ascii") + b"\0" + data,
+            usedforsecurity=False,
+        ).hexdigest(): data
+        for data in source_files.values()
+    }
+    path_blobs = {
+        path: next(
+            object_id
+            for object_id, data in source_blobs.items()
+            if data == contents
+        )
+        for path, contents in source_files.items()
+    }
+
+    def fake_git_output(*arguments, binary=False):
+        if arguments == ("rev-parse", f"{'a' * 40}^{{commit}}"):
+            return "a" * 40 + "\n"
+        if arguments == ("ls-tree", "-r", "-z", "a" * 40):
+            return b"".join(
+                f"100644 blob {path_blobs[path]}\t{path}\0".encode()
+                for path in sorted(path_blobs)
+            )
+        if arguments[:2] == ("cat-file", "blob"):
+            return source_blobs[str(arguments[2])]
+        raise AssertionError((arguments, binary))
+
+    monkeypatch.setattr(release_assets, "_git_output", fake_git_output)
     distribution = tmp_path / "distribution"
     _write_distribution(distribution)
+    build_provenance_sha256 = release_assets.sha256_file(
+        distribution / "licenses" / "build-provenance.json"
+    )
+    if provenance_seal != "actual":
+        build_provenance_sha256 = provenance_seal
     output = tmp_path / "release"
     payload = create_release_assets(
         version="1.2.3",
@@ -230,8 +306,23 @@ def _create_asset_set(tmp_path: Path) -> tuple[dict[str, object], Path]:
         components_file=lock_path,
         cache_dir=cache,
         enforce_release_gates=False,
+        build_provenance_sha256=build_provenance_sha256,
     )
     return payload, output
+
+
+@pytest.mark.parametrize("provenance_seal", [None, "0" * 64])
+def test_create_release_assets_requires_exact_external_provenance_seal(
+    monkeypatch,
+    tmp_path,
+    provenance_seal,
+):
+    with pytest.raises(ReleaseAssetError, match="externally sealed"):
+        _create_asset_set(
+            tmp_path,
+            monkeypatch,
+            provenance_seal=provenance_seal,
+        )
 
 
 def _replace_zip_member(path: Path, member_name: str, replacement: bytes) -> None:
@@ -243,8 +334,8 @@ def _replace_zip_member(path: Path, member_name: str, replacement: bytes) -> Non
     temporary.replace(path)
 
 
-def test_create_release_assets_uses_fixed_names_and_hashes(tmp_path):
-    payload, output = _create_asset_set(tmp_path)
+def test_create_release_assets_uses_fixed_names_and_hashes(monkeypatch, tmp_path):
+    payload, output = _create_asset_set(tmp_path, monkeypatch)
 
     names = [Path(path).name for path in payload["assets"]]
     assert payload["source_commit"] == "a" * 40
@@ -413,10 +504,10 @@ def test_native_wheel_metadata_is_required_and_tampering_fails(
     lock["release_binary_policy"] = {
         "python_implementation": "CPython",
         "python_version": "3.14.6",
-            "abi": "cp314",
-            "platform": "win_amd64",
-            "pip_version": "26.0",
-            "required_components": ["demo"],
+        "abi": "cp314",
+        "platform": "win_amd64",
+        "pip_version": "26.0",
+        "required_components": ["demo"],
     }
     monkeypatch.setattr(
         release_assets,
@@ -432,6 +523,8 @@ def test_native_wheel_metadata_is_required_and_tampering_fails(
         "size": len(wheel),
     }
     assert binary_archive_records(lock)[0]["component"] == "demo"
+    component["binary_archive"]["contents"] = _wheel_contents(wheel)
+    assert binary_archive_records(lock)[0]["contents"] == _wheel_contents(wheel)
     lock_path = tmp_path / "components.json"
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
     cache = tmp_path / "binary-cache"
@@ -447,6 +540,13 @@ def test_native_wheel_metadata_is_required_and_tampering_fails(
         manifest,
         opener=opener,
     )
+    binary_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert binary_payload["archives"][0]["contents"] == component[
+        "binary_archive"
+    ]["contents"]
+    assert binary_payload["archives"][0]["verified_contents"] == _wheel_contents(
+        wheel
+    )
     verify_binary_manifest(manifest, components_file=lock_path)
     (cache / component["binary_archive"]["filename"]).write_bytes(b"tampered")
     with pytest.raises(ReleaseAssetError, match="size mismatch|SHA256 mismatch"):
@@ -459,10 +559,11 @@ def test_wheel_record_digest_tampering_fails_even_when_archive_hash_is_locked(
 ):
     valid_wheel = _wheel_bytes()
     source = zipfile.ZipFile(io.BytesIO(valid_wheel))
-    metadata = source.read("demo-1.0.dist-info/METADATA")
     tampered_buffer = io.BytesIO()
     with zipfile.ZipFile(tampered_buffer, "w") as archive:
-        archive.writestr("demo-1.0.dist-info/METADATA", metadata)
+        for info in source.infolist():
+            if info.filename != "demo-1.0.dist-info/RECORD":
+                archive.writestr(info, source.read(info))
         archive.writestr(
             "demo-1.0.dist-info/RECORD",
             "demo-1.0.dist-info/METADATA,sha256=invalid,1\n"
@@ -524,7 +625,7 @@ def test_repository_lock_requires_exact_ruff_windows_wheel():
         "size": 11837758,
         "contents": [
             {
-                "path": "ruff.exe",
+                "path": "ruff-0.15.12.data/scripts/ruff.exe",
                 "size": 32350208,
                 "sha256": "ccfbe6e11d75c3c2b6b419adf1fd018de519055543d28d261caad3cf78335754",
             }
@@ -596,8 +697,38 @@ def test_binary_install_attestation_rejects_plan_and_report_tampering(
     )
     monkeypatch.setattr(
         release_assets,
-        "_installed_distribution_digest",
-        lambda _distribution: "d" * 64,
+        "_verify_bootstrap_pip_environment",
+        lambda _runtime: {
+            "filename": "pip.whl",
+            "version": "26.0",
+            "size": 1,
+            "sha256": "a" * 64,
+            "inventory_sha256": "b" * 64,
+            "files": [],
+        },
+    )
+    monkeypatch.setattr(
+        release_assets,
+        "_verify_installed_distribution_from_wheel",
+        lambda _distribution, _wheel: {
+            "inventory_sha256": "d" * 64,
+            "files": [],
+        },
+    )
+    monkeypatch.setattr(
+        release_assets,
+        "_verify_environment_file_ownership",
+        lambda _allowed: None,
+    )
+    monkeypatch.setattr(
+        release_assets,
+        "capture_git_source_identity",
+        lambda: {
+            "commit": "a" * 40,
+            "tree": "b" * 40,
+            "tracked_file_count": 1,
+            "tracked_inventory_sha256": "c" * 64,
+        },
     )
     lock_path = tmp_path / "components.json"
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
@@ -760,6 +891,7 @@ def test_real_venv_attests_local_wheel_pip_report_and_direct_url(
             "--require-virtualenv",
             "--no-deps",
             "--only-binary=:all:",
+            "--require-hashes",
             "--force-reinstall",
             "--no-index",
             "--report",
@@ -781,11 +913,20 @@ def test_real_venv_attests_local_wheel_pip_report_and_direct_url(
     )
 
     attestation_script = (
-        "import sys; from pathlib import Path; "
+        "import sys; from importlib import metadata; from pathlib import Path; "
         "from scripts import prepare_release_assets as assets; "
         "assets.REQUIRED_RELEASE_BINARY_COMPONENTS=frozenset({'demo'}); "
+        "pip_wheel=next((Path(sys.base_prefix)/'Lib/ensurepip/_bundled').glob('pip-*.whl')); "
+        "pip_inventory=assets._verify_installed_distribution_from_wheel('pip', pip_wheel); "
+        "bootstrap={'filename':pip_wheel.name,'version':metadata.version('pip'),"
+        "'size':pip_wheel.stat().st_size,'sha256':assets.sha256_file(pip_wheel),"
+        "**pip_inventory}; "
         "assets.probe_python_native_runtime=lambda lock: "
         "{'python_version': sys.version.split()[0], 'test_fixture': True}; "
+        "assets._verify_bootstrap_pip_environment=lambda runtime: bootstrap; "
+        "assets.capture_git_source_identity=lambda: "
+        "{'commit':'a'*40,'tree':'b'*40,'tracked_file_count':1,"
+        "'tracked_inventory_sha256':'c'*64}; "
         "assets.attest_binary_install(components_file=Path(sys.argv[1]), "
         "plan_path=Path(sys.argv[2]), pip_report_path=Path(sys.argv[3]), "
         "output_provenance=Path(sys.argv[4]))"
@@ -828,6 +969,44 @@ def test_real_venv_attests_local_wheel_pip_report_and_direct_url(
     assert installed_report["download_info"]["archive_info"]["hashes"][
         "sha256"
     ] == _sha(wheel)
+
+    installed_file_checks = (
+        "import os,sys,zipfile; from importlib import metadata; "
+        "from pathlib import Path; "
+        "from scripts import prepare_release_assets as a; "
+        "wheel=Path(sys.argv[1]); "
+        "dist=metadata.distribution('demo'); "
+        "source=Path(dist.locate_file('demo/__init__.py')); "
+        "original=zipfile.ZipFile(wheel).read('demo/__init__.py'); "
+        "source.write_bytes(b'tampered'); "
+        "\ntry: a._verify_installed_distribution_from_wheel('demo',wheel)\n"
+        "except a.ReleaseAssetError: pass\n"
+        "else: raise AssertionError('tampered installed file accepted')\n"
+        "source.write_bytes(original); source.unlink(); "
+        "\ntry: a._verify_installed_distribution_from_wheel('demo',wheel)\n"
+        "except a.ReleaseAssetError: pass\n"
+        "else: raise AssertionError('missing installed file accepted')\n"
+        "source.parent.mkdir(parents=True,exist_ok=True); source.write_bytes(original); "
+        "demo=a._verify_installed_distribution_from_wheel('demo',wheel); "
+        "pipwheel=next((Path(sys.base_prefix)/'Lib/ensurepip/_bundled').glob('pip-*.whl')); "
+        "pip=a._verify_installed_distribution_from_wheel('pip',pipwheel); "
+        "allowed={os.path.normcase(str((Path(sys.prefix)/i['path']).resolve())) "
+        "for i in [*demo['files'],*pip['files']]}; "
+        "rogue=Path(dist.locate_file('rogue-owned-by-nobody.py')); "
+        "rogue.write_text('rogue',encoding='utf-8'); "
+        "\ntry: a._verify_environment_file_ownership(allowed)\n"
+        "except a.ReleaseAssetError: pass\n"
+        "else: raise AssertionError('rogue installed file accepted')\n"
+        "rogue.unlink()"
+    )
+    subprocess.run(
+        [str(venv_python), "-c", installed_file_checks, str(expected_wheel)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=Path(__file__).resolve().parents[1],
+    )
 
 
 def test_release_binary_policy_rejects_wrong_wheel_platform(monkeypatch):
@@ -1041,8 +1220,65 @@ def test_application_source_runs_crc_test(tmp_path):
         validate_application_source(source, "1.2.3")
 
 
-def test_generated_archive_indexes_detect_member_tampering(tmp_path):
-    _payload, output = _create_asset_set(tmp_path)
+def test_application_source_commit_and_blob_must_match(monkeypatch, tmp_path):
+    source = tmp_path / "source.zip"
+    _write_source_zip(source)
+
+    def mismatched_git(*arguments, binary=False):
+        if arguments[0] == "rev-parse":
+            return "b" * 40 + "\n"
+        raise AssertionError((arguments, binary))
+
+    monkeypatch.setattr(release_assets, "_git_output", mismatched_git)
+    with pytest.raises(ReleaseAssetError, match="does not resolve exactly"):
+        validate_application_source(source, "1.2.3", "a" * 40)
+
+
+def test_application_source_validates_git_tree_modes_and_blob_bytes(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "source.zip"
+    _write_source_zip(source)
+    source_files = {
+        "VERSION": b"1.2.3\n",
+        "LICENSE": b"GPL\n",
+        "main.py": b"print('test')\n",
+    }
+    blob_by_path = {
+        path: hashlib.sha1(
+            b"blob " + str(len(data)).encode("ascii") + b"\0" + data,
+            usedforsecurity=False,
+        ).hexdigest()
+        for path, data in source_files.items()
+    }
+
+    def verified_git(*arguments, binary=False):
+        if arguments[0] == "rev-parse":
+            return "a" * 40 + "\n"
+        if arguments[:3] == ("ls-tree", "-r", "-z"):
+            return b"".join(
+                f"100644 blob {blob_by_path[path]}\t{path}\0".encode()
+                for path in sorted(blob_by_path)
+            )
+        if arguments[:2] == ("cat-file", "blob"):
+            object_id = str(arguments[2])
+            path = next(
+                path for path, digest in blob_by_path.items() if digest == object_id
+            )
+            return source_files[path]
+        raise AssertionError((arguments, binary))
+
+    monkeypatch.setattr(release_assets, "_git_output", verified_git)
+    validate_application_source(source, "1.2.3", "a" * 40)
+
+    _replace_zip_member(source, "main.py", b"print('forged')\n")
+    with pytest.raises(ReleaseAssetError, match="differs from Git blob"):
+        validate_application_source(source, "1.2.3", "a" * 40)
+
+
+def test_generated_archive_indexes_detect_member_tampering(monkeypatch, tmp_path):
+    _payload, output = _create_asset_set(tmp_path, monkeypatch)
     source_part = output / "LoLReplayTool-third-party-sources-1.2.3-01.zip"
     _replace_zip_member(
         source_part,
@@ -1058,8 +1294,48 @@ def test_generated_archive_indexes_detect_member_tampering(tmp_path):
         verify_license_archive(license_archive)
 
 
-def test_license_archive_rejects_indexed_empty_material(tmp_path):
-    _payload, output = _create_asset_set(tmp_path)
+def test_release_source_parts_must_match_checkout_component_lock(
+    monkeypatch,
+    tmp_path,
+):
+    payload, output = _create_asset_set(tmp_path, monkeypatch)
+    source_part = output / "LoLReplayTool-third-party-sources-1.2.3-01.zip"
+    replacement = source_part.with_suffix(".replacement.zip")
+    with zipfile.ZipFile(source_part) as source, zipfile.ZipFile(
+        replacement,
+        "w",
+    ) as target:
+        index = json.loads(source.read("SOURCE_INDEX.json"))
+        index["sources"][0]["component"] = "forged-component"
+        for info in source.infolist():
+            data = (
+                json.dumps(index).encode()
+                if info.filename == "SOURCE_INDEX.json"
+                else source.read(info)
+            )
+            target.writestr(info, data)
+    replacement.replace(source_part)
+    checksums = output / "SHA256SUMS.txt"
+    lines = checksums.read_text(encoding="ascii").splitlines()
+    checksums.write_text(
+        "\n".join(
+            (
+                f"{release_assets.sha256_file(source_part)}  {source_part.name}"
+                if line.endswith(f"  {source_part.name}")
+                else line
+            )
+            for line in lines
+        )
+        + "\n",
+        encoding="ascii",
+    )
+
+    with pytest.raises(ReleaseAssetError, match="checkout component lock"):
+        verify_release_asset_list(Path(payload["asset_list"]))
+
+
+def test_license_archive_rejects_indexed_empty_material(monkeypatch, tmp_path):
+    _payload, output = _create_asset_set(tmp_path, monkeypatch)
     license_archive = output / "LoLReplayTool-license-materials-1.2.3.zip"
     replacement = license_archive.with_suffix(".replacement.zip")
     with zipfile.ZipFile(license_archive) as source:
@@ -1083,8 +1359,8 @@ def test_license_archive_rejects_indexed_empty_material(tmp_path):
         verify_license_archive(license_archive)
 
 
-def test_sha256sums_detects_tampered_asset(tmp_path):
-    payload, _output = _create_asset_set(tmp_path)
+def test_sha256sums_detects_tampered_asset(monkeypatch, tmp_path):
+    payload, _output = _create_asset_set(tmp_path, monkeypatch)
     installer = next(Path(asset) for asset in payload["assets"] if Path(asset).suffix == ".exe")
     installer.write_bytes(b"tampered installer")
 
@@ -1092,8 +1368,8 @@ def test_sha256sums_detects_tampered_asset(tmp_path):
         verify_release_asset_list(Path(payload["asset_list"]))
 
 
-def test_sha256sums_requires_exact_release_asset_set(tmp_path):
-    payload, output = _create_asset_set(tmp_path)
+def test_sha256sums_requires_exact_release_asset_set(monkeypatch, tmp_path):
+    payload, output = _create_asset_set(tmp_path, monkeypatch)
     checksum_path = output / "SHA256SUMS.txt"
     lines = checksum_path.read_text(encoding="ascii").splitlines()
     checksum_path.write_text("\n".join(lines[:-1]) + "\n", encoding="ascii")
@@ -1102,8 +1378,11 @@ def test_sha256sums_requires_exact_release_asset_set(tmp_path):
         verify_release_asset_list(Path(payload["asset_list"]))
 
 
-def test_release_asset_allowlist_requires_installer_and_rejects_extra(tmp_path):
-    payload, output = _create_asset_set(tmp_path)
+def test_release_asset_allowlist_requires_installer_and_rejects_extra(
+    monkeypatch,
+    tmp_path,
+):
+    payload, output = _create_asset_set(tmp_path, monkeypatch)
     asset_list = Path(payload["asset_list"])
     stored = json.loads(asset_list.read_text(encoding="utf-8"))
     stored["assets"] = [
@@ -1116,7 +1395,7 @@ def test_release_asset_allowlist_requires_installer_and_rejects_extra(tmp_path):
 
     extra_case = tmp_path / "extra-case"
     extra_case.mkdir()
-    payload, output = _create_asset_set(extra_case)
+    payload, output = _create_asset_set(extra_case, monkeypatch)
     asset_list = Path(payload["asset_list"])
     stored = json.loads(asset_list.read_text(encoding="utf-8"))
     extra = output / "unexpected.zip"
@@ -1128,8 +1407,11 @@ def test_release_asset_allowlist_requires_installer_and_rejects_extra(tmp_path):
         verify_release_asset_list(asset_list)
 
 
-def test_release_asset_allowlist_rejects_duplicate_and_gapped_source_parts(tmp_path):
-    payload, _output = _create_asset_set(tmp_path)
+def test_release_asset_allowlist_rejects_duplicate_and_gapped_source_parts(
+    monkeypatch,
+    tmp_path,
+):
+    payload, _output = _create_asset_set(tmp_path, monkeypatch)
     asset_list = Path(payload["asset_list"])
     stored = json.loads(asset_list.read_text(encoding="utf-8"))
     source_part = next(
@@ -1145,7 +1427,7 @@ def test_release_asset_allowlist_rejects_duplicate_and_gapped_source_parts(tmp_p
 
     gap_case = tmp_path / "gap-case"
     gap_case.mkdir()
-    payload, output = _create_asset_set(gap_case)
+    payload, output = _create_asset_set(gap_case, monkeypatch)
     asset_list = Path(payload["asset_list"])
     stored = json.loads(asset_list.read_text(encoding="utf-8"))
     old_part = next(
@@ -1165,8 +1447,11 @@ def test_release_asset_allowlist_rejects_duplicate_and_gapped_source_parts(tmp_p
         verify_release_asset_list(asset_list)
 
 
-def test_release_asset_list_can_be_reverified_after_safe_relocation(tmp_path):
-    payload, _output = _create_asset_set(tmp_path)
+def test_release_asset_list_can_be_reverified_after_safe_relocation(
+    monkeypatch,
+    tmp_path,
+):
+    payload, _output = _create_asset_set(tmp_path, monkeypatch)
     relocated = tmp_path / "relocated"
     relocated.mkdir()
     for asset in payload["assets"]:
@@ -1214,15 +1499,44 @@ def test_release_workflow_requires_manual_approval_and_remote_verification():
     )
     assert "prepare-binary-install" in workflow
     assert "attest-binary-install" in workflow
+    assert "verify-python-runtime" in workflow
+    assert "verify-bootstrap-pip" in workflow
     assert "--only-binary=:all:" in workflow
+    assert "--require-hashes" in workflow
+    assert "--no-index" in workflow
     assert "--no-deps" in workflow
     assert "--report $pipReport" in workflow
     assert "pip install -r requirements-dev.txt" not in workflow
     assert "-PythonExe $env:RELEASE_PYTHON" in workflow
     assert "-BuildProvenance $env:BUILD_PROVENANCE" in workflow
+    assert "-BuildProvenanceSha256 $env:SEALED_BUILD_PROVENANCE_SHA256" in workflow
+    assert workflow.count("--components .\\compliance\\components.json") >= 6
+    assert "--build-provenance-sha256 $env:BUILD_PROVENANCE_SHA256" in workflow
+    assert "EXPECTED_BUILD_PROVENANCE_SHA256:" in workflow
     assert '$pipVersion -cne "26.1.2"' in workflow
     assert "choco install innosetup --version=6.7.3" in workflow
     assert "retention-days: 7" in workflow
+    assert workflow.count("persist-credentials: false") == 2
+    assert "gh release edit" not in workflow
+    assert "push:\n    tags" not in workflow
+    assert workflow.count("git merge-base --is-ancestor") == 2
+
+
+def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github"
+        / "workflows"
+        / "ci.yml"
+    ).read_text(encoding="utf-8")
+
+    assert "name: Build Windows artifact" in workflow
+    assert "run: .\\scripts\\build.ps1" in workflow
+    assert "Run packaged self-check" in workflow
+    assert "run: .\\scripts\\build_installer.ps1 -SkipTests -SkipBuild" in workflow
+    assert "actions/upload-artifact@" not in workflow
+    assert "Compress-Archive" not in workflow
+    assert "LoLReplayTool-installer" not in workflow
 
 
 def test_build_scripts_accept_verified_python_and_provenance():
@@ -1232,8 +1546,12 @@ def test_build_scripts_accept_verified_python_and_provenance():
     for script in (build, installer):
         assert "[string]$PythonExe" in script
         assert "[string]$BuildProvenance" in script
+        assert "[string]$BuildProvenanceSha256" in script
         assert "Resolve-Path -LiteralPath $PythonExe" in script
         assert "Resolve-Path -LiteralPath $BuildProvenance" in script
+        assert "Assert-BuildProvenance" in script
     assert '"--build-provenance", $resolvedBuildProvenance' in build
+    assert '"--build-provenance-sha256", $BuildProvenanceSha256' in build
     assert '$buildArgs += @("-PythonExe", $selectedPython)' in installer
-    assert '$buildArgs += @("-BuildProvenance", $resolvedBuildProvenance)' in installer
+    assert '"-BuildProvenance", $resolvedBuildProvenance' in installer
+    assert '"-BuildProvenanceSha256", $BuildProvenanceSha256' in installer

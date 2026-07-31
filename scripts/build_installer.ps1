@@ -2,6 +2,7 @@ param(
   [string]$Version = "",
   [string]$PythonExe = "",
   [string]$BuildProvenance = "",
+  [string]$BuildProvenanceSha256 = "",
   [switch]$SkipTests,
   [switch]$SkipBuild
 )
@@ -48,6 +49,24 @@ if (-not [string]::IsNullOrWhiteSpace($BuildProvenance)) {
     throw "build provenance が見つかりません: $BuildProvenance"
   }
 }
+if (-not $resolvedBuildProvenance -and -not [string]::IsNullOrWhiteSpace($BuildProvenanceSha256)) {
+  throw "build provenance を指定せずに固定SHA256だけを指定することはできません。"
+}
+
+function Assert-BuildProvenance {
+  if (-not $resolvedBuildProvenance) {
+    return
+  }
+  if ($BuildProvenanceSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    throw "build provenance の固定SHA256が不正です。"
+  }
+  $actual = (Get-FileHash -LiteralPath $resolvedBuildProvenance -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -cne $BuildProvenanceSha256) {
+    throw "build provenance が固定SHA256と一致しません。"
+  }
+}
+
+Assert-BuildProvenance
 
 if (-not $SkipTests) {
   if (-not $selectedPython) {
@@ -66,12 +85,16 @@ if (-not $SkipBuild) {
     $buildArgs += @("-PythonExe", $selectedPython)
   }
   if ($resolvedBuildProvenance) {
-    $buildArgs += @("-BuildProvenance", $resolvedBuildProvenance)
+    $buildArgs += @(
+      "-BuildProvenance", $resolvedBuildProvenance,
+      "-BuildProvenanceSha256", $BuildProvenanceSha256
+    )
   }
   & (Join-Path $scriptDir "build.ps1") @buildArgs
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }
+  Assert-BuildProvenance
 }
 
 $appExe = Join-Path $repoRoot "dist\LoLReplayTool\LoLReplayTool.exe"
@@ -82,10 +105,20 @@ if (-not $selectedPython) {
   throw "Python が見つからないためライセンス資料を検査できません。"
 }
 
-& $selectedPython -m scripts.check_license_compliance (Join-Path $repoRoot "dist\LoLReplayTool")
+$complianceArgs = @(
+  "-m", "scripts.check_license_compliance",
+  (Join-Path $repoRoot "dist\LoLReplayTool")
+)
+if ($resolvedBuildProvenance) {
+  $complianceArgs += @(
+    "--build-provenance-sha256", $BuildProvenanceSha256
+  )
+}
+& $selectedPython @complianceArgs
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
+Assert-BuildProvenance
 
 $previousDataDir = $env:LOL_REPLAY_TOOL_DATA_DIR
 $selfCheckDir = Join-Path $repoRoot ("dist\installer-self-check-" + [guid]::NewGuid().ToString("N"))
@@ -118,6 +151,7 @@ try {
 } finally {
   $env:LOL_REPLAY_TOOL_DATA_DIR = $previousDataDir
 }
+Assert-BuildProvenance
 
 $isccCandidates = @()
 $isccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
@@ -152,5 +186,6 @@ if ($LASTEXITCODE -ne 0) {
 if (-not (Test-Path $installerPath)) {
   throw "インストーラーが生成されませんでした: $installerPath"
 }
+Assert-BuildProvenance
 
 Write-Host "Installer build complete: $installerPath"

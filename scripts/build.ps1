@@ -1,6 +1,7 @@
 param(
   [string]$PythonExe = "",
-  [string]$BuildProvenance = ""
+  [string]$BuildProvenance = "",
+  [string]$BuildProvenanceSha256 = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -35,6 +36,24 @@ if (-not [string]::IsNullOrWhiteSpace($BuildProvenance)) {
     throw "build provenance が見つかりません: $BuildProvenance"
   }
 }
+if (-not $resolvedBuildProvenance -and -not [string]::IsNullOrWhiteSpace($BuildProvenanceSha256)) {
+  throw "build provenance を指定せずに固定SHA256だけを指定することはできません。"
+}
+
+function Assert-BuildProvenance {
+  if (-not $resolvedBuildProvenance) {
+    return
+  }
+  if ($BuildProvenanceSha256 -cnotmatch '^[0-9a-f]{64}$') {
+    throw "build provenance の固定SHA256が不正です。"
+  }
+  $actual = (Get-FileHash -LiteralPath $resolvedBuildProvenance -Algorithm SHA256).Hash.ToLowerInvariant()
+  if ($actual -cne $BuildProvenanceSha256) {
+    throw "build provenance が固定SHA256と一致しません。"
+  }
+}
+
+Assert-BuildProvenance
 
 $makeIconScript = "scripts\make_icon.py"
 if (Test-Path $makeIconScript) {
@@ -74,6 +93,7 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
+Assert-BuildProvenance
 
 $distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
 $distObsDir = Join-Path $distRootDir "obs-portable"
@@ -100,28 +120,50 @@ foreach ($archive in $bundledSetupArchives) {
 $licensesDir = Join-Path $distRootDir "licenses"
 $licenseArgs = @("scripts\collect_licenses.py", "--destination", $licensesDir)
 if ($resolvedBuildProvenance) {
-  $licenseArgs += @("--build-provenance", $resolvedBuildProvenance)
+  $licenseArgs += @(
+    "--build-provenance", $resolvedBuildProvenance,
+    "--build-provenance-sha256", $BuildProvenanceSha256
+  )
 }
+Assert-BuildProvenance
 & $selectedPython @licenseArgs
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
+Assert-BuildProvenance
 
 $collectToc = Join-Path (Get-Location) "build\\LoLReplayTool\\COLLECT-00.toc"
 if (-not (Test-Path $collectToc)) {
   throw "PyInstaller COLLECT TOC が見つかりません: $collectToc"
 }
-& $selectedPython -m scripts.check_license_compliance $distRootDir `
-  --toc $collectToc `
-  --write-manifest
+$writeComplianceArgs = @(
+  "-m", "scripts.check_license_compliance", $distRootDir,
+  "--toc", $collectToc,
+  "--write-manifest"
+)
+if ($resolvedBuildProvenance) {
+  $writeComplianceArgs += @(
+    "--build-provenance-sha256", $BuildProvenanceSha256
+  )
+}
+& $selectedPython @writeComplianceArgs
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
 
-& $selectedPython -m scripts.check_license_compliance $distRootDir
+$verifyComplianceArgs = @(
+  "-m", "scripts.check_license_compliance", $distRootDir
+)
+if ($resolvedBuildProvenance) {
+  $verifyComplianceArgs += @(
+    "--build-provenance-sha256", $BuildProvenanceSha256
+  )
+}
+& $selectedPython @verifyComplianceArgs
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }
+Assert-BuildProvenance
 
 Write-Host "Build complete. Runtime dependencies are stored under dist\\LoLReplayTool\\_internal."
 Write-Host "Project and third-party license materials are stored under dist\\LoLReplayTool and its licenses directory."

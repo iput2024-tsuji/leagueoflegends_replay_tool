@@ -159,27 +159,3 @@ jobs:
       - name: Build installer
         shell: pwsh
         run: .\scripts\build_installer.ps1 -SkipTests -SkipBuild
-
-      - name: Package build output
-        shell: pwsh
-        run: |
-          if (-not (Test-Path .\dist\LoLReplayTool)) {
-            throw "dist\LoLReplayTool was not generated."
-          }
-          Compress-Archive -Path .\dist\LoLReplayTool -DestinationPath .\dist\LoLReplayTool-windows.zip -Force
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: LoLReplayTool-windows
-          path: dist/LoLReplayTool-windows.zip
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload Windows installer
-        uses: actions/upload-artifact@v7
-        with:
-          name: LoLReplayTool-installer
-          path: dist/installer/LoLReplayTool-Setup-*.exe
-          if-no-files-found: error
-          retention-days: 14

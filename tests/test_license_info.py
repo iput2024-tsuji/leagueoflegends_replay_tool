@@ -1,3 +1,5 @@
+import importlib
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +18,17 @@ def test_read_app_version_uses_packaged_version_file(tmp_path):
     (root / "VERSION").write_text("1.2.3\n", encoding="utf-8")
 
     assert read_app_version(root) == "1.2.3"
+
+
+def test_license_info_supports_top_level_import(monkeypatch):
+    source_root = Path(__file__).resolve().parents[1] / "src"
+    monkeypatch.syspath_prepend(str(source_root))
+    sys.modules.pop("license_info", None)
+    try:
+        module = importlib.import_module("license_info")
+        assert module.PROJECT_LICENSE == "GPL-3.0-only"
+    finally:
+        sys.modules.pop("license_info", None)
 
 
 def test_build_about_html_explains_license_source_and_warranty():

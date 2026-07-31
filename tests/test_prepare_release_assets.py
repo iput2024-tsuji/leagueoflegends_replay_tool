@@ -633,6 +633,49 @@ def test_repository_lock_requires_exact_ruff_windows_wheel():
     }
 
 
+def test_repository_lock_uses_exact_pyinstaller_hooks_contrib_source_archive():
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+    component = next(
+        item
+        for item in lock["build_components"]
+        if item["component"] == "pyinstaller-hooks-contrib"
+    )
+
+    assert component["source_archives"] == [
+        {
+            "filename": "pyinstaller_hooks_contrib-2026.0.tar.gz",
+            "url": "https://files.pythonhosted.org/packages/31/8f/8052ff65067697ee80fde45b9731842e160751c41ac5690ba232c22030e8/pyinstaller_hooks_contrib-2026.0.tar.gz",
+            "sha256": "0120893de491a000845470ca9c0b39284731ac6bace26f6849dea9627aaed48e",
+            "size": 170311,
+        }
+    ]
+
+
+def test_repository_lock_uses_stable_exact_libaom_release_archive():
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+    component = next(
+        item
+        for item in lock["runtime_components"]
+        if item["component"] == "opencv-ffmpeg"
+    )
+    archive = next(
+        item
+        for item in component["source_archives"]
+        if "aom" in item["filename"]
+    )
+
+    assert archive == {
+        "filename": "libaom-3.13.1.tar.gz",
+        "url": "https://storage.googleapis.com/aom-releases/libaom-3.13.1.tar.gz",
+        "sha256": "19e45a5a7192d690565229983dad900e76b513a02306c12053fb9a262cbeca7d",
+        "size": 6253958,
+    }
+
+
 def test_binary_install_plan_binds_requirements_and_locked_wheel(
     monkeypatch,
     tmp_path,

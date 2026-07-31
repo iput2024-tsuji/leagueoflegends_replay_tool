@@ -8,6 +8,7 @@ import os
 import shutil
 import struct
 import sys
+import types
 import zipfile
 import zlib
 from importlib import metadata
@@ -61,6 +62,7 @@ def _verified_stdlib_pyc(
     *,
     source_bytes: bytes | None = None,
     magic: bytes | None = None,
+    optimization: int = 0,
     trailing: bytes = b"",
 ) -> bytes:
     relative = str(source_record["path"])
@@ -71,7 +73,7 @@ def _verified_stdlib_pyc(
         relative,
         "exec",
         dont_inherit=True,
-        optimize=0,
+        optimize=optimization,
     )
     return (
         (magic if magic is not None else importlib.util.MAGIC_NUMBER)
@@ -560,6 +562,36 @@ def test_complete_pyinstaller_toc_parser_rejects_cross_link_tampering(
         compliance._parse_pyinstaller_tocs(paths["COLLECT-00.toc"])
 
 
+@pytest.mark.parametrize(
+    ("index", "value"),
+    [
+        (4, {"demo": {}}),
+        (5, ["demo"]),
+        (6, ["runtime-hook.py"]),
+        (7, True),
+        (8, {"demo": "py"}),
+        (9, 1),
+    ],
+)
+def test_pyinstaller_analysis_rejects_nondefault_build_options(
+    tmp_path,
+    index,
+    value,
+):
+    paths = _write_minimal_pyinstaller_tocs(tmp_path)
+    analysis = list(
+        ast.literal_eval(paths["Analysis-00.toc"].read_text(encoding="utf-8"))
+    )
+    analysis[index] = value
+    paths["Analysis-00.toc"].write_text(
+        repr(tuple(analysis)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="build options differ"):
+        compliance._parse_pyinstaller_tocs(paths["COLLECT-00.toc"])
+
+
 @pytest.mark.parametrize("mutation", ["omit-main", "rogue-script"])
 def test_pyinstaller_pkg_and_analysis_joint_script_tampering_fails(
     tmp_path,
@@ -674,9 +706,9 @@ def test_pyinstaller_carchive_chain_rejects_archive_tampering(
         )
 
 
-def _synthetic_carchive(tmp_path: Path):
+def _synthetic_carchive(tmp_path: Path, *, compressed_suffix: bytes = b""):
     code = b"bootstrap-code"
-    compressed_code = zlib.compress(code)
+    compressed_code = zlib.compress(code) + compressed_suffix
     pyz = b"PYZ-data"
     payload = compressed_code + pyz
     toc_entry_format = "!IIIIBc"
@@ -768,6 +800,21 @@ def test_carchive_layout_independently_parses_cookie_toc_and_payloads(tmp_path):
 
     assert summary["archive_size"] == len(raw)
     assert summary["toc_offset"] > 0
+
+
+def test_carchive_layout_rejects_trailing_compressed_stream_bytes(tmp_path):
+    raw, fake_type, final_exe, _offsets = _synthetic_carchive(
+        tmp_path,
+        compressed_suffix=b"rogue",
+    )
+
+    with pytest.raises(ValueError, match="compressed stream is not exact"):
+        compliance._verify_carchive_layout(
+            fake_type(raw),
+            final_exe,
+            python_library="python314.dll",
+            options=["pyi-contents-directory _internal"],
+        )
 
 
 @pytest.mark.parametrize("mutation", ["cookie", "member-length", "option-offset"])
@@ -909,10 +956,14 @@ def test_final_pe_is_derived_from_locked_bootloader(monkeypatch, tmp_path):
 
     assert summary["overlay_start"] == archive_start
     assert set(summary["section_hashes"]) >= {".text", ".rdata", ".reloc"}
+    assert summary["resource_layout"]["verified_padding_bytes"] > 0
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PE resource construction is Windows-only")
-@pytest.mark.parametrize("tamper", ["text", "manifest", "overlay"])
+@pytest.mark.parametrize(
+    "tamper",
+    ["text", "manifest", "resource-padding", "overlay"],
+)
 def test_final_pe_rejects_code_resource_and_overlay_tampering(
     monkeypatch,
     tmp_path,
@@ -943,6 +994,18 @@ def test_final_pe_rejects_code_resource_and_overlay_tampering(
         record = manifest_entry.directory.entries[0].directory.entries[0].data.struct
         offset = pe.get_offset_from_rva(record.OffsetToData)
         pe.close()
+    elif tamper == "resource-padding":
+        pe = pefile.PE(str(executable))
+        resource_section = next(
+            section
+            for section in pe.sections
+            if section.Name.rstrip(b"\0") == b".rsrc"
+        )
+        assert resource_section.Misc_VirtualSize < resource_section.SizeOfRawData
+        offset = (
+            resource_section.PointerToRawData + resource_section.SizeOfRawData - 1
+        )
+        pe.close()
     else:
         offset = None
         archive_start += 1
@@ -950,6 +1013,8 @@ def test_final_pe_rejects_code_resource_and_overlay_tampering(
         with executable.open("r+b") as stream:
             stream.seek(offset)
             original = stream.read(1)
+            if tamper == "resource-padding":
+                assert original == b"G"
             stream.seek(offset)
             stream.write(bytes([original[0] ^ 1]))
         winutils.update_exe_pe_checksum(str(executable))
@@ -978,11 +1043,22 @@ def test_pyinstaller_pyz_member_set_rejects_omission_and_rogue(actual_names):
 def test_embedded_marshaled_code_rejects_trailing_and_source_tampering(tmp_path):
     source = tmp_path / "module.py"
     source.write_bytes(b"VALUE = 1\n")
-    code = compile(source.read_bytes(), "module.py", "exec", dont_inherit=True)
+    expected_filename = "module.py"
+    code = compile(
+        source.read_bytes(),
+        expected_filename,
+        "exec",
+        dont_inherit=True,
+    )
     raw = marshal.dumps(code)
 
     assert (
-        compliance._verified_marshaled_code(raw, source, label="test payload")
+        compliance._verified_marshaled_code(
+            raw,
+            source,
+            label="test payload",
+            expected_filename=expected_filename,
+        )
         == code
     )
     with pytest.raises(ValueError, match="trailing bytes"):
@@ -990,10 +1066,69 @@ def test_embedded_marshaled_code_rejects_trailing_and_source_tampering(tmp_path)
             raw + b"rogue",
             source,
             label="test payload",
+            expected_filename=expected_filename,
         )
     source.write_bytes(b"VALUE = 2\n")
     with pytest.raises(ValueError, match="differs from verified source"):
-        compliance._verified_marshaled_code(raw, source, label="test payload")
+        compliance._verified_marshaled_code(
+            raw,
+            source,
+            label="test payload",
+            expected_filename=expected_filename,
+        )
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_embedded_marshaled_code_rejects_unexpected_filenames(tmp_path, nested):
+    source = tmp_path / "module.py"
+    source.write_bytes(b"def value():\n    return 1\n")
+    expected_filename = "module.py"
+    code = compile(
+        source.read_bytes(),
+        expected_filename,
+        "exec",
+        dont_inherit=True,
+        optimize=0,
+    )
+    if nested:
+        constants = tuple(
+            value.replace(co_filename=r"\\attacker\share\module.py")
+            if isinstance(value, types.CodeType)
+            else value
+            for value in code.co_consts
+        )
+        code = code.replace(co_consts=constants)
+    else:
+        code = code.replace(co_filename=r"C:\untrusted\module.py")
+
+    with pytest.raises(ValueError, match="differs from verified source"):
+        compliance._verified_marshaled_code(
+            marshal.dumps(code),
+            source,
+            label="test payload",
+            expected_filename=expected_filename,
+        )
+
+
+def test_embedded_marshaled_code_rejects_optimized_payload(tmp_path):
+    source = tmp_path / "module.py"
+    source.write_bytes(b'"""module docs"""\nassert True\nVALUE = 1\n')
+    expected_filename = "module.py"
+    optimized = compile(
+        source.read_bytes(),
+        expected_filename,
+        "exec",
+        dont_inherit=True,
+        optimize=2,
+    )
+
+    with pytest.raises(ValueError, match="differs from verified source"):
+        compliance._verified_marshaled_code(
+            marshal.dumps(optimized),
+            source,
+            label="test payload",
+            expected_filename=expected_filename,
+        )
 
 
 def test_toc_and_dist_are_bidirectionally_inventoried(monkeypatch, tmp_path):
@@ -1444,6 +1579,10 @@ def test_base_library_members_require_verified_stdlib_sources(tmp_path):
                 record,
                 source_bytes=b"raise RuntimeError('rogue')\n",
             ),
+            "bytecode differs from verified stdlib source",
+        ),
+        (
+            lambda record: _verified_stdlib_pyc(record, optimization=2),
             "bytecode differs from verified stdlib source",
         ),
     ],

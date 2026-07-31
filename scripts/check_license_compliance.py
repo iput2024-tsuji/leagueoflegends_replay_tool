@@ -551,6 +551,8 @@ def _parse_pyinstaller_tocs(collect_path: Path) -> dict[str, Any]:
         or analysis[10] != []
     ):
         raise ValueError("PyInstaller Analysis application inputs differ from the spec.")
+    if analysis[4:10] != ({}, [], [], False, {}, 0):
+        raise ValueError("PyInstaller Analysis build options differ from the spec.")
     scripts = _typed_toc_entries(
         analysis[13], label="Analysis scripts", allowed_types={"PYSOURCE"}
     )
@@ -970,21 +972,45 @@ def _module_source_component(
     raise ValueError(f"Python module source has no verified owner: {source}")
 
 
-def _code_matches_source(code: types.CodeType, source: Path) -> bool:
+def _code_tree_matches(
+    actual: types.CodeType,
+    expected: types.CodeType,
+) -> bool:
+    if actual != expected or actual.co_filename != expected.co_filename:
+        return False
+    actual_nested = [
+        value for value in actual.co_consts if isinstance(value, types.CodeType)
+    ]
+    expected_nested = [
+        value for value in expected.co_consts if isinstance(value, types.CodeType)
+    ]
+    return len(actual_nested) == len(expected_nested) and all(
+        _code_tree_matches(actual_code, expected_code)
+        for actual_code, expected_code in zip(
+            actual_nested,
+            expected_nested,
+            strict=True,
+        )
+    )
+
+
+def _code_matches_source(
+    code: types.CodeType,
+    source: Path,
+    *,
+    expected_filename: str,
+) -> bool:
     if not is_safe_regular_file(source):
         return False
     source_bytes = source.read_bytes()
-    return any(
-        code
-        == compile(
-            source_bytes,
-            code.co_filename,
-            "exec",
-            dont_inherit=True,
-            optimize=optimization,
-        )
-        for optimization in (0, 1, 2)
+    expected = compile(
+        source_bytes,
+        expected_filename,
+        "exec",
+        dont_inherit=True,
+        optimize=0,
     )
+    return _code_tree_matches(code, expected)
 
 
 def _verified_marshaled_code(
@@ -992,6 +1018,7 @@ def _verified_marshaled_code(
     source: Path,
     *,
     label: str,
+    expected_filename: str,
     expected_code: types.CodeType | None = None,
 ) -> types.CodeType:
     marshaled = io.BytesIO(raw_payload)
@@ -1003,7 +1030,11 @@ def _verified_marshaled_code(
         raise ValueError(f"{label} code payload has a non-code value or trailing bytes.")
     if expected_code is not None and code != expected_code:
         raise ValueError(f"{label} raw and decoded code objects differ.")
-    if not _code_matches_source(code, source):
+    if not _code_matches_source(
+        code,
+        source,
+        expected_filename=expected_filename,
+    ):
         raise ValueError(f"{label} bytecode differs from verified source.")
     return code
 
@@ -1144,11 +1175,20 @@ def _verify_carchive_layout(
                 raise ValueError("CArchive TOC member range is invalid or duplicated.")
             raw_payload = pkg_data[entry_offset : entry_offset + data_length]
             try:
-                unpacked = (
-                    zlib.decompress(raw_payload)
-                    if compression_flag
-                    else raw_payload
-                )
+                if compression_flag:
+                    decompressor = zlib.decompressobj()
+                    unpacked = decompressor.decompress(raw_payload)
+                    unpacked += decompressor.flush()
+                    if (
+                        not decompressor.eof
+                        or decompressor.unused_data
+                        or decompressor.unconsumed_tail
+                    ):
+                        raise ValueError(
+                            f"CArchive compressed stream is not exact: {name}"
+                        )
+                else:
+                    unpacked = raw_payload
             except zlib.error as exc:
                 raise ValueError(f"CArchive member decompression failed: {name}") from exc
             if (
@@ -1378,6 +1418,157 @@ def _pe_resource_payloads(
                 payloads[key] = payload
                 ranges.append((offset, end))
     return payloads
+
+
+def _verify_pe_resource_layout(
+    pe: Any,
+    resource_section: Any,
+    expected_payloads: dict[tuple[int, int, int], bytes],
+) -> dict[str, Any]:
+    raw_start = resource_section.PointerToRawData
+    raw_size = resource_section.SizeOfRawData
+    virtual_size = resource_section.Misc_VirtualSize
+    raw = bytes(pe.__data__[raw_start : raw_start + raw_size])
+    if (
+        len(raw) != raw_size
+        or virtual_size <= 0
+        or virtual_size > raw_size
+    ):
+        raise ValueError("Final EXE resource section bytes are truncated or invalid.")
+
+    claimed = bytearray(raw_size)
+    payloads: dict[tuple[int, int, int], bytes] = {}
+    directory_count = 0
+    data_entry_count = 0
+
+    def claim(offset: int, size: int, *, label: str) -> None:
+        end = offset + size
+        if (
+            offset < 0
+            or size <= 0
+            or end > virtual_size
+            or any(claimed[offset:end])
+        ):
+            raise ValueError(f"Final EXE resource {label} range is invalid or overlaps.")
+        claimed[offset:end] = b"\1" * size
+
+    def parse_directory(
+        offset: int,
+        level: int,
+        identifiers: tuple[int, ...],
+    ) -> None:
+        nonlocal data_entry_count, directory_count
+        directory_header_size = struct.calcsize("<IIHHHH")
+        if offset % 4 or offset + directory_header_size > virtual_size:
+            raise ValueError("Final EXE resource directory offset is invalid.")
+        (
+            characteristics,
+            timestamp,
+            major_version,
+            minor_version,
+            named_count,
+            identifier_count,
+        ) = struct.unpack_from("<IIHHHH", raw, offset)
+        directory_size = directory_header_size + identifier_count * 8
+        claim(offset, directory_size, label="directory")
+        if (
+            (characteristics, timestamp, major_version, minor_version)
+            != (0, 0, 4, 0)
+            or named_count != 0
+            or identifier_count <= 0
+        ):
+            raise ValueError("Final EXE resource directory metadata differs.")
+        directory_count += 1
+        previous_identifier = -1
+        for index in range(identifier_count):
+            entry_offset = offset + directory_header_size + index * 8
+            raw_identifier, raw_target = struct.unpack_from("<II", raw, entry_offset)
+            if (
+                raw_identifier & 0x80000000
+                or raw_identifier > 0xFFFF
+                or raw_identifier <= previous_identifier
+            ):
+                raise ValueError(
+                    "Final EXE resource identifiers must be unique sorted numeric IDs."
+                )
+            previous_identifier = raw_identifier
+            target_offset = raw_target & 0x7FFFFFFF
+            if level < 2:
+                if (raw_target & 0x80000000) == 0:
+                    raise ValueError("Final EXE resource tree ends before language level.")
+                parse_directory(
+                    target_offset,
+                    level + 1,
+                    (*identifiers, raw_identifier),
+                )
+                continue
+            if raw_target & 0x80000000:
+                raise ValueError("Final EXE resource tree exceeds three levels.")
+            if target_offset % 4 or target_offset + 16 > virtual_size:
+                raise ValueError("Final EXE resource data-entry offset is invalid.")
+            claim(target_offset, 16, label="data entry")
+            data_rva, data_size, code_page, reserved = struct.unpack_from(
+                "<IIII",
+                raw,
+                target_offset,
+            )
+            payload_offset = data_rva - resource_section.VirtualAddress
+            if (
+                data_size <= 0
+                or payload_offset % 4
+                or code_page != 1252
+                or reserved != 0
+            ):
+                raise ValueError("Final EXE resource data-entry metadata differs.")
+            claim(payload_offset, data_size, label="payload")
+            key = (*identifiers, raw_identifier)
+            if len(key) != 3 or key in payloads:
+                raise ValueError("Final EXE resource key is duplicated or malformed.")
+            payloads[key] = raw[payload_offset : payload_offset + data_size]
+            data_entry_count += 1
+
+    parse_directory(0, 0, ())
+    if payloads != expected_payloads:
+        raise ValueError("Final EXE raw resource payloads differ from build inputs.")
+    interior_padding_bytes = 0
+    cursor = 0
+    while cursor < virtual_size:
+        if claimed[cursor]:
+            cursor += 1
+            continue
+        end = cursor + 1
+        while end < virtual_size and not claimed[end]:
+            end += 1
+        padding = raw[cursor:end]
+        if len(padding) > 3 or padding != b"PADDING"[: len(padding)]:
+            raise ValueError(
+                "Final EXE resource section contains unexpected internal padding."
+            )
+        interior_padding_bytes += len(padding)
+        cursor = end
+    raw_alignment_padding = raw[virtual_size:]
+    raw_alignment_pattern = b"PADDINGXXPADDING"
+    expected_raw_alignment_padding = (
+        raw_alignment_pattern
+        * (
+            (len(raw_alignment_padding) + len(raw_alignment_pattern) - 1)
+            // len(raw_alignment_pattern)
+        )
+    )[: len(raw_alignment_padding)]
+    if raw_alignment_padding != expected_raw_alignment_padding:
+        raise ValueError(
+            "Final EXE resource section raw-alignment padding differs."
+        )
+    return {
+        "directory_count": directory_count,
+        "data_entry_count": data_entry_count,
+        "virtual_size": virtual_size,
+        "raw_size": raw_size,
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "verified_padding_bytes": raw_size - sum(claimed),
+        "interior_padding_bytes": interior_padding_bytes,
+        "raw_alignment_padding_bytes": len(raw_alignment_padding),
+    }
 
 
 def _expected_icon_resources(icon_path: Path) -> dict[tuple[int, int, int], bytes]:
@@ -1623,11 +1814,17 @@ def _verify_bootloader_pe(
         expected_resources[(24, 1, 0)] = manifest
         if actual_resources != expected_resources:
             raise ValueError("Final EXE icon/manifest resources differ from build inputs.")
+        resource_layout = _verify_pe_resource_layout(
+            final_pe,
+            resource_section,
+            expected_resources,
+        )
         return {
             "overlay_start": carchive_start,
             "entry_point": final_pe.OPTIONAL_HEADER.AddressOfEntryPoint,
             "image_base": final_pe.OPTIONAL_HEADER.ImageBase,
             "section_hashes": section_hashes,
+            "resource_layout": resource_layout,
             "resource_sha256": hashlib.sha256(resource_section.get_data()).hexdigest(),
             "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
             "icon_sha256": sha256_file(icon_path),
@@ -1873,6 +2070,7 @@ def _validate_pyinstaller_build(
                 raw_code,
                 source,
                 label=f"CArchive {name}",
+                expected_filename=f"{name}.py",
             )
             module_records.append(
                 {
@@ -1925,10 +2123,17 @@ def _validate_pyinstaller_build(
                 source_owners,
                 stdlib_sources,
             )
+            archive_module_path = name.replace(".", "\\")
+            archive_filename = (
+                f"{archive_module_path}\\__init__.py"
+                if type_code == 1
+                else f"{archive_module_path}.py"
+            )
             _verified_marshaled_code(
                 raw_marshaled,
                 source,
                 label=f"Embedded PYZ {name}",
+                expected_filename=archive_filename,
                 expected_code=code,
             )
             module_components[name] = component
@@ -2497,22 +2702,14 @@ def _validate_base_library_archive(
                     )
                     continue
                 source_bytes = source.read_bytes()
-                matched_optimization = next(
-                    (
-                        optimization
-                        for optimization in (0, 1, 2)
-                        if code
-                        == compile(
-                            source_bytes,
-                            code.co_filename,
-                            "exec",
-                            dont_inherit=True,
-                            optimize=optimization,
-                        )
-                    ),
-                    None,
+                expected_code = compile(
+                    source_bytes,
+                    code.co_filename,
+                    "exec",
+                    dont_inherit=True,
+                    optimize=0,
                 )
-                if matched_optimization is None:
+                if not _code_tree_matches(code, expected_code):
                     errors.append(
                         f"base_library.zip bytecode differs from verified stdlib source: "
                         f"{relative}"
@@ -2526,7 +2723,7 @@ def _validate_base_library_archive(
                         "source_path": source_record["path"],
                         "source_size": source_record["size"],
                         "source_sha256": source_record["sha256"],
-                        "optimization": matched_optimization,
+                        "optimization": 0,
                     }
                 )
     except (OSError, RuntimeError, zipfile.BadZipFile, KeyError) as exc:

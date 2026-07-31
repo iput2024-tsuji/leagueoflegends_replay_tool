@@ -39,6 +39,17 @@ def write_ffmpeg_archive(
     return path
 
 
+def test_ffmpeg_download_prefers_the_pinned_github_release_asset():
+    assert setup_env.FFMPEG_PACKAGE.url == (
+        "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/"
+        "ffmpeg-8.1.1-essentials_build.zip"
+    )
+    assert setup_env.FFMPEG_PACKAGE.fallback_urls == (
+        "https://www.gyan.dev/ffmpeg/builds/packages/"
+        "ffmpeg-8.1.1-essentials_build.zip",
+    )
+
+
 def test_extract_obs_flattens_top_level_zip_directory(monkeypatch):
     tmp_path = runtime_dir("setup_env_obs_extract")
     zip_path = tmp_path / "obs.zip"

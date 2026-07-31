@@ -5,7 +5,10 @@ import stat
 from html import escape
 from pathlib import Path
 
-from .app_paths import get_app_root, get_resource_root
+try:
+    from .app_paths import get_app_root, get_resource_root
+except ImportError:
+    from app_paths import get_app_root, get_resource_root
 
 PROJECT_NAME = "LoL Replay Tool"
 PROJECT_LICENSE = "GPL-3.0-only"

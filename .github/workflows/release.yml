@@ -41,7 +41,7 @@ jobs:
           ref: ${{ inputs.tag }}
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6 post-6.0.0; Windows pip cache fix (#1040)
         with:
           python-version: "3.14.6"
 
@@ -328,7 +328,7 @@ jobs:
           ref: ${{ inputs.tag }}
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6 post-6.0.0; Windows pip cache fix (#1040)
         with:
           python-version: "3.14.6"
 

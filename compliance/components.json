@@ -651,7 +651,7 @@
       "source_status": "verified_corresponding_source",
       "license_materials": [{"path": "licenses/python-packages/pyinstaller-hooks-contrib/pyinstaller_hooks_contrib-2026.0.dist-info/licenses/LICENSE", "sha256": "91d0baaff00773038e72c0a1fc9d5d2d38706b7a2b9c04f34296608f931b9cd0"}],
       "binary_archive": {"filename": "pyinstaller_hooks_contrib-2026.0-py3-none-any.whl", "url": "https://files.pythonhosted.org/packages/d5/b1/9da6ec3e88696018ee7bb9dc4a7310c2cfaebf32923a19598cd342767c10/pyinstaller_hooks_contrib-2026.0-py3-none-any.whl", "sha256": "0590db8edeba3e6c30c8474937021f5cd39c0602b4d10f74a064c73911efaca5", "size": 452318},
-      "source_archives": [{"filename": "pyinstaller-hooks-contrib-2026.0.tar.gz", "url": "https://files.pythonhosted.org/packages/31/8f/8052ff65067697ee80fde45b9731842e160751c41ac5690ba232c22030e8/pyinstaller-hooks-contrib-2026.0.tar.gz", "sha256": "0120893de491a000845470ca9c0b39284731ac6bace26f6849dea9627aaed48e", "size": 170311}]
+      "source_archives": [{"filename": "pyinstaller_hooks_contrib-2026.0.tar.gz", "url": "https://files.pythonhosted.org/packages/31/8f/8052ff65067697ee80fde45b9731842e160751c41ac5690ba232c22030e8/pyinstaller_hooks_contrib-2026.0.tar.gz", "sha256": "0120893de491a000845470ca9c0b39284731ac6bace26f6849dea9627aaed48e", "size": 170311}]
     },
     {
       "component": "pytest",
@@ -1505,10 +1505,10 @@
           "size": 5636157
         },
         {
-          "filename": "aom-v3.13.1.tar.gz",
-          "url": "https://aomedia.googlesource.com/aom/+archive/3837fd0a1f709e99417adf1ebe9b9ffd606ea1ff.tar.gz",
-          "sha256": "7da96fe360c71e381d6c9491d79677359a7f7dac677b5c6756d06f81aacded24",
-          "size": 6323795
+          "filename": "libaom-3.13.1.tar.gz",
+          "url": "https://storage.googleapis.com/aom-releases/libaom-3.13.1.tar.gz",
+          "sha256": "19e45a5a7192d690565229983dad900e76b513a02306c12053fb9a262cbeca7d",
+          "size": 6253958
         },
         {
           "filename": "openh264-v1.8.0.tar.gz",
@@ -2108,10 +2108,10 @@
     {
       "component": "gyan-ffmpeg",
       "version": "8.1.1",
-      "archive_url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip",
+      "archive_url": "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip",
       "archive_sha256": "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541",
       "fallback_urls": [
-        "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip"
+        "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip"
       ],
       "bundled_in_installer": false,
       "release_legal_review_required": true

@@ -42,9 +42,13 @@ LEGACY_OBS_EXE = LEGACY_OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
 
 FFMPEG_VERSION = "8.1.1"
 FFMPEG_LICENSE_DIR = DATA_DIR / "licenses" / f"FFmpeg-{FFMPEG_VERSION}"
-FFMPEG_ZIP_URL = "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip"
+FFMPEG_ZIP_URL = (
+    "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/"
+    "ffmpeg-8.1.1-essentials_build.zip"
+)
 FFMPEG_ZIP_MIRROR_URL = (
-    "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip"
+    "https://www.gyan.dev/ffmpeg/builds/packages/"
+    "ffmpeg-8.1.1-essentials_build.zip"
 )
 FFMPEG_ZIP_SHA256 = "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541"
 FFMPEG_INSTALL_MANIFEST = "_installed.json"

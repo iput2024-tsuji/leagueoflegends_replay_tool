@@ -29,6 +29,7 @@ def test_self_check_passes_with_missing_optional_binaries(monkeypatch, tmp_path)
 
     assert report["ok"] is True
     statuses = {check["name"]: check["status"] for check in report["checks"]}
+    assert statuses["analytics_runtime"] == "ok"
     assert statuses["config"] == "ok"
     assert statuses["recording_dirs"] == "ok"
     assert statuses["mpv_dll"] == "warning"

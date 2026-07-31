@@ -63,33 +63,11 @@ if (Test-Path $makeIconScript) {
   }
 }
 
-$pyArgs = @(
-  "-y",
-  "--noconsole",
-  "--onedir",
-  "--contents-directory", "_internal",
-  "--name", "LoLReplayTool",
-  "--clean",
-  "--hidden-import", "mpv",
-  "--add-data", "config\\setting.sample.json;config",
-  "--add-data", "config\\champion_aliases.json;config"
-)
-
-$iconCandidates = @("assets\\icon.ico", "assets\\app\\app.ico")
-$iconPath = $iconCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-if ($iconPath -and (Test-Path $iconPath)) {
-  $pyArgs += "--icon=$iconPath"
-  $iconDest = if ($iconPath -eq "assets\\icon.ico") { "assets" } else { "assets\\app" }
-  $pyArgs += "--add-data"
-  $pyArgs += "$iconPath;$iconDest"
-}
-
-$pyArgs += "main.py"
 & $selectedPython -c "import PyInstaller" 2>$null
 if ($LASTEXITCODE -ne 0) {
   throw "選択した Python 環境に PyInstaller がありません。pip install pyinstaller を実行してください。"
 }
-& $selectedPython -m PyInstaller @pyArgs
+& $selectedPython -m PyInstaller --noconfirm --clean "LoLReplayTool.spec"
 if ($LASTEXITCODE -ne 0) {
   exit $LASTEXITCODE
 }

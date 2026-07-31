@@ -2139,6 +2139,7 @@ def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
 def test_build_scripts_accept_verified_python_and_provenance():
     build = Path("scripts/build.ps1").read_text(encoding="utf-8")
     installer = Path("scripts/build_installer.ps1").read_text(encoding="utf-8")
+    spec = Path("LoLReplayTool.spec").read_text(encoding="utf-8")
 
     for script in (build, installer):
         assert "[string]$PythonExe" in script
@@ -2152,3 +2153,6 @@ def test_build_scripts_accept_verified_python_and_provenance():
     assert '$buildArgs += @("-PythonExe", $selectedPython)' in installer
     assert '"-BuildProvenance", $resolvedBuildProvenance' in installer
     assert '"-BuildProvenanceSha256", $BuildProvenanceSha256' in installer
+    assert '-m PyInstaller --noconfirm --clean "LoLReplayTool.spec"' in build
+    assert "apply_windows_runtime_policy(a.binaries)" in spec
+    assert "a._save_guts()" in spec

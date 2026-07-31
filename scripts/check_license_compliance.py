@@ -35,6 +35,10 @@ from scripts.collect_licenses import (
     parse_requirement_pins,
     probe_python_native_runtime,
 )
+from scripts.pyinstaller_runtime_policy import (
+    is_root_vcomp_name,
+    is_windows_os_runtime_name,
+)
 from src.license_info import validate_distribution_documents
 
 MANIFEST_RELATIVE_PATH = "licenses/distribution-manifest.json"
@@ -583,6 +587,16 @@ def _parse_pyinstaller_tocs(collect_path: Path) -> dict[str, Any]:
         label="Analysis binaries",
         allowed_types={"BINARY", "EXTENSION"},
     )
+    unexpected_windows_runtime = [
+        name
+        for name, _source, _entry_type in binaries
+        if is_windows_os_runtime_name(name) or is_root_vcomp_name(name)
+    ]
+    if unexpected_windows_runtime:
+        raise ValueError(
+            "PyInstaller Analysis contains excluded host Windows runtime binaries: "
+            + ", ".join(sorted(unexpected_windows_runtime, key=str.casefold))
+        )
     datas = _typed_toc_entries(
         analysis[18], label="Analysis datas", allowed_types={"DATA"}
     )
@@ -2231,6 +2245,12 @@ def _validate_pyinstaller_build(
             key=lambda item: (str(item["container"]), str(item["name"]).casefold()),
         )
         owners = Counter(str(record["component"]) for record in module_records)
+        build_policy_sources = [
+            _tracked_git_source_record(repository_root / "LoLReplayTool.spec"),
+            _tracked_git_source_record(
+                repository_root / "scripts" / "pyinstaller_runtime_policy.py"
+            ),
+        ]
         summary = {
             "toc_files": toc_files,
             "build_executable": {
@@ -2265,6 +2285,7 @@ def _validate_pyinstaller_build(
                 "size": python_library.stat().st_size,
                 "sha256": sha256_file(python_library),
             },
+            "build_policy_sources": build_policy_sources,
         }
         return [], summary
     except (
@@ -2318,16 +2339,6 @@ def _python_core_source_locks(
     return result
 
 
-def _is_trusted_windows_system_runtime_source(source: Path) -> bool:
-    system_root = os.environ.get("SystemRoot")
-    if not system_root:
-        return False
-    try:
-        return source.resolve().parent == (Path(system_root) / "System32").resolve()
-    except OSError:
-        return False
-
-
 def _microsoft_runtime_owner_matches(
     owner: str | None,
     final_path: str,
@@ -2337,12 +2348,6 @@ def _microsoft_runtime_owner_matches(
     final_lower = final_path.casefold()
     if _path_key(source) in python_core_sources:
         return final_lower == f"_internal/{source.name.casefold()}"
-    if _is_trusted_windows_system_runtime_source(source):
-        return (
-            owner is None
-            and source.name.casefold() == "vcomp140.dll"
-            and final_lower == "_internal/vcomp140.dll"
-        )
     allowed_prefixes = {
         "qt": "_internal/pyqt6/qt6/bin/",
         "numpy": "_internal/numpy.libs/",
@@ -3569,9 +3574,11 @@ def validate_distribution(
             python_core_sources,
         )
         if component is None:
+            owner = source_owners.get(_path_key(Path(entry["source"])))
             errors.append(
                 f"Unclassified packaged file: {entry['path']} "
-                f"(TOC type {entry['type']})"
+                f"(TOC type {entry['type']}, source {entry['source']}, "
+                f"owner {owner or 'none'})"
             )
             continue
         ownership[key] = component

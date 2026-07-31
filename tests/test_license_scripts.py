@@ -20,6 +20,7 @@ import pytest
 from scripts import (
     check_license_compliance as compliance,
     collect_licenses as license_collector,
+    pyinstaller_runtime_policy as runtime_policy,
 )
 from scripts.check_license_compliance import (
     canonicalize_distribution_name,
@@ -511,6 +512,39 @@ def test_complete_pyinstaller_toc_parser_accepts_exact_cross_links(tmp_path):
     assert set(parsed["paths"]) == set(compliance.PYINSTALLER_TOC_FILES)
     assert parsed["pyz_entries"][0][0] == "demo"
     assert parsed["pkg_entries"] == parsed["exe"][15]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "api-ms-win-core-file-l1-2-0.dll",
+        "api-ms-win-crt-runtime-l1-1-0.dll",
+        "ucrtbase.dll",
+        "VCOMP140.DLL",
+    ],
+)
+def test_complete_pyinstaller_toc_parser_rejects_excluded_host_runtime(
+    tmp_path,
+    name,
+):
+    paths = _write_minimal_pyinstaller_tocs(tmp_path)
+    analysis = list(
+        ast.literal_eval(paths["Analysis-00.toc"].read_text(encoding="utf-8"))
+    )
+    collect = ast.literal_eval(
+        paths["COLLECT-00.toc"].read_text(encoding="utf-8")
+    )
+    runtime = (name, str(tmp_path / name), "BINARY")
+    analysis[15] = [*analysis[15], runtime]
+    collect[0].append(runtime)
+    paths["Analysis-00.toc"].write_text(
+        repr(tuple(analysis)),
+        encoding="utf-8",
+    )
+    paths["COLLECT-00.toc"].write_text(repr(collect), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="excluded host Windows runtime"):
+        compliance._parse_pyinstaller_tocs(paths["COLLECT-00.toc"])
 
 
 @pytest.mark.parametrize(
@@ -1737,7 +1771,7 @@ def test_native_runtime_override_requires_owner_and_final_path(tmp_path):
     )
 
 
-def test_system_vcomp_requires_system32_source_and_exact_final_path(
+def test_system_vcomp_is_not_accepted_as_a_redistributable_source(
     monkeypatch,
     tmp_path,
 ):
@@ -1757,17 +1791,60 @@ def test_system_vcomp_requires_system32_source_and_exact_final_path(
             },
             {},
         )
-        == "microsoft-vc-runtime"
-    )
-    assert (
-        compliance._classify_toc_entry(
-            {
-                "path": "_internal/PyQt6/Qt6/bin/VCOMP140.DLL",
-                "source": str(source),
-                "toc_name": source.name,
-                "type": "BINARY",
-            },
-            {},
-        )
         is None
     )
+
+
+def test_windows_runtime_policy_excludes_host_runtime_and_retains_wheel_vcomp(
+    tmp_path,
+):
+    wheel_vcomp = tmp_path / "sklearn" / ".libs" / "vcomp140.dll"
+    binaries = [
+        (
+            "api-ms-win-core-file-l1-2-0.dll",
+            r"C:\Windows\System32\api.dll",
+            "BINARY",
+        ),
+        (
+            "api-ms-win-crt-runtime-l1-1-0.dll",
+            r"C:\Windows\System32\crt.dll",
+            "BINARY",
+        ),
+        ("ucrtbase.dll", r"C:\Windows\System32\ucrtbase.dll", "BINARY"),
+        ("VCOMP140.DLL", r"C:\Windows\System32\VCOMP140.DLL", "BINARY"),
+        (
+            r"sklearn\.libs\vcomp140.dll",
+            str(wheel_vcomp),
+            "BINARY",
+        ),
+        ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION"),
+    ]
+
+    filtered = runtime_policy.apply_windows_runtime_policy(binaries)
+
+    assert filtered == [
+        (r"sklearn\.libs\vcomp140.dll", str(wheel_vcomp), "BINARY"),
+        ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION"),
+    ]
+    assert runtime_policy.is_windows_os_runtime_name("ucrtbase.dll")
+    assert runtime_policy.is_windows_os_runtime_name(
+        "API-MS-WIN-CORE-FILE-L1-2-0.DLL"
+    )
+    assert not runtime_policy.is_windows_os_runtime_name(
+        r"package\ucrtbase.dll"
+    )
+
+
+def test_windows_runtime_policy_fails_without_exact_wheel_vcomp(tmp_path):
+    with pytest.raises(RuntimeError, match="exactly one locked scikit-learn"):
+        runtime_policy.apply_windows_runtime_policy(
+            [("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION")]
+        )
+
+    duplicate = (
+        r"sklearn\.libs\vcomp140.dll",
+        str(tmp_path / "vcomp140.dll"),
+        "BINARY",
+    )
+    with pytest.raises(RuntimeError, match="duplicate binary destination"):
+        runtime_policy.apply_windows_runtime_policy([duplicate, duplicate])

@@ -1540,15 +1540,35 @@ def test_runtime_download_lock_must_be_empty_for_user_provided_tools():
 
 
 def test_installer_build_self_check_has_an_explicit_timeout():
-    script = Path("scripts/build_installer.ps1").read_text(encoding="utf-8")
+    installer = Path("scripts/build_installer.ps1").read_text(encoding="utf-8")
+    runner = Path("scripts/run_packaged_self_check.ps1").read_text(encoding="utf-8")
 
-    assert "[switch]$SkipSelfCheck" in script
-    assert "if (-not $SkipSelfCheck)" in script
-    assert "$SkipSelfCheck -and -not $SkipBuild" in script
-    assert ".WaitForExit(60000)" in script
-    assert ".Kill($true)" in script
-    assert "-RedirectStandardOutput" in script
-    assert "-Wait `" not in script
+    assert "[switch]$SkipSelfCheck" in installer
+    assert "if (-not $SkipSelfCheck)" in installer
+    assert "$SkipSelfCheck -and -not $SkipBuild" in installer
+    assert 'Join-Path $scriptDir "run_packaged_self_check.ps1"' in installer
+    assert "-TimeoutSeconds 60" in installer
+    assert "Start-Process" not in installer
+
+    assert '[int]$TimeoutSeconds = 60' in runner
+    assert '[guid]::NewGuid().ToString("N")' in runner
+    assert "$env:LOL_REPLAY_TOOL_DATA_DIR = $selfCheckDir" in runner
+    assert ".WaitForExit($TimeoutSeconds * 1000)" in runner
+    assert "taskkill.exe" in runner
+    assert '[int]$TaskkillTimeoutSeconds = 10' in runner
+    assert ".WaitForExit($TaskkillTimeout * 1000)" in runner
+    assert '"/PID"' in runner
+    assert '"/T"' in runner
+    assert '"/F"' in runner
+    assert ".Kill($true)" in runner
+    assert "catch [System.Management.Automation.MethodException]" in runner
+    assert "$Process.Kill()" in runner
+    assert "& taskkill" not in runner
+    assert "-RedirectStandardOutput" in runner
+    assert "-RedirectStandardError" in runner
+    assert "Remove-Item -LiteralPath $selfCheckDir -Recurse -Force" in runner
+    assert "finally" in runner
+    assert "-Wait `" not in runner
 
 
 @pytest.mark.parametrize(

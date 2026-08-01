@@ -1061,9 +1061,21 @@ class _OBSDirectoryLease:
                 flags |= os.O_CREAT | os.O_EXCL
             descriptor = os.open(name, flags, 0o600, dir_fd=self.native_handle)
             opened = os.fstat(descriptor)
-            if _is_reparse_point(opened) or not stat.S_ISREG(opened.st_mode) or int(opened.st_nlink) != 1:
+            if _is_reparse_point(opened):
                 os.close(descriptor)
-                raise _UnsafeOBSMigrationPathError(f"安全な通常ファイルではありません: {self.path / name}")
+                raise _UnsafeOBSMigrationPathError(
+                    f"symbolic link／reparse pointは利用できません: {self.path / name}"
+                )
+            if not stat.S_ISREG(opened.st_mode):
+                os.close(descriptor)
+                raise _UnsafeOBSMigrationPathError(
+                    f"通常ファイルではありません: {self.path / name}"
+                )
+            if int(opened.st_nlink) != 1:
+                os.close(descriptor)
+                raise _UnsafeOBSMigrationPathError(
+                    f"hardlinkされたファイルは利用できません: {self.path / name}"
+                )
         try:
             opened_identity = _file_identity(os.fstat(descriptor))
             lexical = _validate_existing_entry(self.path / name, expected_kind="file")

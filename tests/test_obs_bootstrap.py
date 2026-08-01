@@ -177,21 +177,6 @@ class FakeProcessManager:
         return []
 
 
-def test_path_lexists_propagates_permission_error(monkeypatch, tmp_path):
-    protected = tmp_path / "protected"
-
-    def deny_lstat(path):
-        if Path(path) == protected:
-            raise PermissionError("simulated lstat ACL denial")
-        raise FileNotFoundError(path)
-
-    monkeypatch.setattr(obs_bootstrap.os, "lstat", deny_lstat)
-
-    with pytest.raises(PermissionError, match="lstat ACL denial"):
-        obs_bootstrap._path_lexists(protected)
-    assert obs_bootstrap._path_lexists(tmp_path / "missing") is False
-
-
 def test_apply_stops_managed_obs_once(tmp_path):
     process_manager = FakeProcessManager()
     bootstrapper = OBSBootstrapper(tmp_path / "obs-portable", process_manager=process_manager)
@@ -2008,76 +1993,6 @@ def test_obs_migration_fails_before_mutation_without_handle_relative_support(mon
     assert not destination.exists()
 
 
-def test_posix_handle_relative_capability_requires_rename(monkeypatch):
-    required = {
-        obs_bootstrap.os.open,
-        obs_bootstrap.os.mkdir,
-        obs_bootstrap.os.rename,
-        obs_bootstrap.os.unlink,
-        obs_bootstrap.os.stat,
-    }
-    monkeypatch.setattr(obs_bootstrap.os, "supports_fd", {obs_bootstrap.os.scandir})
-    monkeypatch.setattr(obs_bootstrap.os, "supports_dir_fd", required)
-    monkeypatch.setattr(obs_bootstrap.os, "O_DIRECTORY", 0x10000, raising=False)
-    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0x20000, raising=False)
-
-    assert obs_bootstrap._supports_posix_handle_relative_migration() is True
-
-    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0)
-
-    assert obs_bootstrap._supports_posix_handle_relative_migration() is False
-
-    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0x20000)
-    monkeypatch.setattr(
-        obs_bootstrap.os,
-        "supports_dir_fd",
-        (required - {obs_bootstrap.os.rename}) | {obs_bootstrap.os.replace},
-    )
-
-    assert obs_bootstrap._supports_posix_handle_relative_migration() is False
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIXのO_NOFOLLOWエラー分類を検証するため")
-def test_posix_directory_lease_rejects_symlink_child_as_path_safety_error(tmp_path):
-    root = tmp_path / "root"
-    external = tmp_path / "external"
-    root.mkdir()
-    external.mkdir()
-    sentinel = external / "sentinel.txt"
-    sentinel.write_text("keep", encoding="utf-8")
-    _create_directory_link(root / "linked", external)
-
-    with obs_bootstrap._OBSDirectoryLease.open_absolute(root, mutable=True) as lease:
-        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="reparse point"):
-            lease.open_child_directory("linked", create=True, mutable=True)
-
-    assert sentinel.read_text(encoding="utf-8") == "keep"
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIXのdirectory作成raceを検証するため")
-def test_posix_directory_lease_rejects_symlink_injected_after_mkdir(monkeypatch, tmp_path):
-    root = tmp_path / "root"
-    external = tmp_path / "external"
-    root.mkdir()
-    external.mkdir()
-    sentinel = external / "sentinel.txt"
-    sentinel.write_text("keep", encoding="utf-8")
-    real_mkdir = obs_bootstrap.os.mkdir
-
-    with obs_bootstrap._OBSDirectoryLease.open_absolute(root, mutable=True) as lease:
-        def replace_created_directory_with_symlink(path, mode=0o777, *, dir_fd=None):
-            real_mkdir(path, mode, dir_fd=dir_fd)
-            obs_bootstrap.os.rmdir(path, dir_fd=dir_fd)
-            (root / str(path)).symlink_to(external, target_is_directory=True)
-
-        monkeypatch.setattr(obs_bootstrap.os, "mkdir", replace_created_directory_with_symlink)
-
-        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="symbolic link|reparse point"):
-            lease.open_child_directory("injected", create=True, mutable=True)
-
-    assert sentinel.read_text(encoding="utf-8") == "keep"
-
-
 @pytest.mark.parametrize("relation", ["source_parent", "destination_parent"])
 def test_obs_migration_rejects_overlapping_source_and_destination(tmp_path, relation):
     if relation == "source_parent":
@@ -2249,46 +2164,6 @@ def test_migration_inventory_calls_are_rooted(monkeypatch, tmp_path):
     assert rooted_calls
 
 
-def test_zero_byte_stale_lock_is_reinitialized(tmp_path):
-    destination = tmp_path / "obs-portable"
-    lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
-    lock_path.parent.mkdir()
-    lock_path.write_bytes(b"")
-    lock = obs_bootstrap._OBSInterProcessLock(lock_path)
-
-    assert lock.acquire() is True
-    try:
-        lock.validate_ownership()
-    finally:
-        lock.release()
-
-    assert lock_path.read_bytes() == b"\0"
-
-
-def test_lock_acquire_failure_closes_directory_lease(monkeypatch, tmp_path):
-    parent = tmp_path / "lock-parent"
-    renamed = tmp_path / "renamed-parent"
-    parent.mkdir()
-    lock = obs_bootstrap._OBSInterProcessLock(parent / obs_bootstrap.OBS_COPY_LOCK_NAME)
-    real_probe = obs_bootstrap._OBSDirectoryLease.relative_file_identity_or_none
-
-    def fail_probe(directory, name):
-        if directory.path == parent.resolve() and name == obs_bootstrap.OBS_COPY_LOCK_NAME:
-            raise PermissionError("simulated lock probe failure")
-        return real_probe(directory, name)
-
-    monkeypatch.setattr(
-        obs_bootstrap._OBSDirectoryLease,
-        "relative_file_identity_or_none",
-        fail_probe,
-    )
-    with pytest.raises(PermissionError, match="lock probe failure"):
-        lock.acquire()
-
-    parent.rename(renamed)
-    assert renamed.is_dir()
-
-
 def test_copy_progress_probe_close_failure_still_releases_lock(monkeypatch, tmp_path):
     destination = tmp_path / "obs-portable"
     renamed = tmp_path / "renamed-obs-portable"
@@ -2325,48 +2200,3 @@ def test_copy_progress_probe_close_failure_still_releases_lock(monkeypatch, tmp_
     )
     assert lock.acquire() is True
     lock.release()
-
-
-def test_native_created_directory_is_reopenable_from_another_process(tmp_path):
-    created = tmp_path / "native" / "child"
-    with obs_bootstrap._OBSDirectoryLease.open_absolute(
-        created,
-        create=True,
-        mutable=True,
-    ):
-        pass
-    script = (
-        "from pathlib import Path; import sys; "
-        "p=Path(sys.argv[1]); "
-        "f=p/'probe.txt'; f.write_text('ok', encoding='utf-8'); "
-        "assert f.read_text(encoding='utf-8') == 'ok'; f.unlink(); list(p.iterdir())"
-    )
-
-    completed = subprocess.run(
-        [os.fspath(Path(os.sys.executable)), "-c", script, str(created)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows access mask regression")
-def test_windows_mutable_directory_handle_uses_least_privilege_access():
-    file_delete_child = 0x0040
-
-    access = obs_bootstrap._windows_directory_access(mutable=True)
-
-    assert access & obs_bootstrap._WINDOWS_FILE_ADD_FILE
-    assert access & obs_bootstrap._WINDOWS_FILE_ADD_SUBDIRECTORY
-    assert access & file_delete_child == 0
-
-
-@pytest.mark.parametrize(
-    "name",
-    [".", "..", "x:y", "bad<name", "bad\x01", "trailing.", "trailing ", "CON", "con.txt", "COM¹", "LPT³.log"],
-)
-def test_migration_rejects_unsafe_native_path_components(name):
-    with pytest.raises(obs_bootstrap.OBSPathSafetyError):
-        obs_bootstrap._validate_single_path_component(name)

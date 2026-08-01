@@ -248,4 +248,5 @@ jobs:
           .\scripts\build_installer.ps1 `
             -PythonExe $env:WINDOWS_PYTHON `
             -SkipTests `
-            -SkipBuild
+            -SkipBuild `
+            -SkipSelfCheck

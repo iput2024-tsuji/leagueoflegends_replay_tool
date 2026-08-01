@@ -44,6 +44,7 @@ try:
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
+        is_obs_copy_in_progress,
         new_obs_ini_parser as shared_new_obs_ini_parser,
         read_obs_ini_parser as shared_read_obs_ini_parser,
     )
@@ -95,6 +96,7 @@ except ImportError:
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
+        is_obs_copy_in_progress,
         new_obs_ini_parser as shared_new_obs_ini_parser,
         read_obs_ini_parser as shared_read_obs_ini_parser,
     )
@@ -511,7 +513,12 @@ def obs_executable_path(base_dir: str | Path | None) -> Path | None:
 
 def is_valid_obs_dir(base_dir: str | Path | None) -> bool:
     obs_exe = obs_executable_path(base_dir)
-    return bool(obs_exe and obs_exe.exists())
+    return bool(
+        obs_exe
+        and obs_exe.is_file()
+        and base_dir is not None
+        and not is_obs_copy_in_progress(base_dir)
+    )
 
 
 def legacy_managed_obs_dirs() -> tuple[Path, ...]:
@@ -2213,7 +2220,14 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     obs_dir_abs = os.path.abspath(str(config.obs.obs_dir))
     obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
 
-    if not os.path.exists(obs_exe):
+    if is_obs_copy_in_progress(obs_dir_abs):
+        raise RecorderError(
+            "OBSのコピー移行が完了していません。旧配置を保持したまま再検査するか、"
+            "現在のobs-portableを別の場所へ退避して空にしてから、"
+            "公式ReleaseのWindows x64 ZIPを専用obs-portableへ再展開してください。"
+        )
+
+    if not is_valid_obs_dir(obs_dir_abs):
         detected = detect_obs_dir()
         hint = f"\n自動検出候補: {detected}" if detected else ""
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")

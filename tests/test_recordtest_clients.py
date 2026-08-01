@@ -1542,6 +1542,12 @@ def test_preflight_migrates_legacy_obs_studio_to_managed_portable(monkeypatch):
         "[General]\nFirstRun=false\n\n[BasicWindow]\nSysTrayEnabled=true\n",
         encoding="utf-8",
     )
+    partial_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
+    partial_exe.parent.mkdir(parents=True, exist_ok=True)
+    partial_exe.write_text("partial", encoding="utf-8")
+    (managed_dir / ".lol_replay_obs_copy_in_progress").write_text(
+        str(legacy_dir), encoding="utf-8"
+    )
 
     monkeypatch.setattr(recordtest, "ROOT_DIR", root.resolve())
     monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
@@ -1566,6 +1572,7 @@ def test_preflight_migrates_legacy_obs_studio_to_managed_portable(monkeypatch):
     migrated_ini = managed_dir / "config" / "obs-studio" / "global.ini"
     migrated_user_ini = managed_dir / "config" / "obs-studio" / "user.ini"
     assert (managed_dir / "bin" / "64bit" / "obs64.exe").exists()
+    assert not (managed_dir / ".lol_replay_obs_copy_in_progress").exists()
     text = migrated_ini.read_text(encoding="utf-8")
     assert "FirstRun=true" in text
     assert "SysTrayEnabled=false" in text
@@ -1662,6 +1669,29 @@ def test_launch_obs_refuses_unmanaged_obs_process(monkeypatch):
 
     with pytest.raises(recordtest.RecorderError, match="管理対象外のOBS"):
         recordtest.launch_obs(recordtest.AppConfig.from_dict({}))
+
+
+def test_launch_obs_rejects_incomplete_managed_obs_copy(monkeypatch, tmp_path):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("partial", encoding="utf-8")
+    (obs_dir / ".lol_replay_obs_copy_in_progress").write_text(
+        "missing legacy source", encoding="utf-8"
+    )
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "missing-legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+
+    class UnexpectedProcessManager:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("incomplete OBS must not reach process startup")
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", UnexpectedProcessManager)
+
+    with pytest.raises(recordtest.RecorderError, match="obs-portableを別の場所へ退避"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
 
 
 def test_storage_limit_only_deletes_json_referenced_app_video():

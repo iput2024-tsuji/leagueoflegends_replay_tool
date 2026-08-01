@@ -74,9 +74,17 @@ if ($LASTEXITCODE -ne 0) {
 Assert-BuildProvenance
 
 $distRootDir = Join-Path (Get-Location) "dist\\LoLReplayTool"
-$distObsDir = Join-Path $distRootDir "obs-portable"
-if (Test-Path $distObsDir) {
-  Remove-Item -Path $distObsDir -Recurse -Force -ErrorAction SilentlyContinue
+$forbiddenRuntimePaths = @()
+$forbiddenRuntimePaths += Get-ChildItem -Path $distRootDir -Recurse -Directory -ErrorAction SilentlyContinue | Where-Object {
+  $_.Name -in @('obs-portable', 'OBS-Studio')
+}
+$forbiddenRuntimePaths += Get-ChildItem -Path $distRootDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+  $_.Name -in @('obs64.exe', 'ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe') -or
+  $_.Name -match '^(OBS-Studio-.*\.(exe|msi|zip|7z)|ffmpeg-.*\.(zip|7z))$'
+}
+if ($forbiddenRuntimePaths.Count -gt 0) {
+  $runtimeList = ($forbiddenRuntimePaths | ForEach-Object { $_.FullName }) -join [Environment]::NewLine
+  throw "利用者が用意するOBS／standalone FFmpegが成果物へ混入しています。ビルドを中止します。`n$runtimeList"
 }
 
 # Keep distribution clean: OBS, mpv DLLs, and third-party game assets must be user-provided.
@@ -86,13 +94,6 @@ $bundledMpvDlls = Get-ChildItem -Path $distRootDir -Recurse -File -ErrorAction S
 }
 foreach ($dll in $bundledMpvDlls) {
   Remove-Item -Path $dll.FullName -Force -ErrorAction SilentlyContinue
-}
-
-$bundledSetupArchives = Get-ChildItem -Path $distRootDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-  $_.Name -match '^(OBS-Studio|ffmpeg)-.*\.(zip|7z)$'
-}
-foreach ($archive in $bundledSetupArchives) {
-  Remove-Item -Path $archive.FullName -Force -ErrorAction SilentlyContinue
 }
 
 $licensesDir = Join-Path $distRootDir "licenses"
@@ -147,6 +148,7 @@ Write-Host "Build complete. Runtime dependencies are stored under dist\\LoLRepla
 Write-Host "Project and third-party license materials are stored under dist\\LoLReplayTool and its licenses directory."
 Write-Host "Portable OBS, mpv DLLs, the standalone FFmpeg executable, and game assets are not bundled."
 Write-Host "The OpenCV wheel includes its own FFmpeg DLL and notices."
-Write-Host "OBS is downloaded on first launch. The standalone FFmpeg executable is downloaded on first clip export. Downloads use pinned SHA256 verification."
+Write-Host "Users explicitly obtain and place portable OBS and standalone FFmpeg; the application does not download or mirror them."
+Write-Host "FFmpeg search order: explicit setting, data bin, application-root fallbacks, then safe absolute PATH entries."
 Write-Host "Place mpv DLLs under %LOCALAPPDATA%\\LoLReplayTool\\bin manually."
 

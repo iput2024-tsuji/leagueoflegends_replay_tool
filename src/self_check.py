@@ -9,12 +9,14 @@ try:
     from . import config_schema, recordtest
     from .app_paths import get_app_root, get_user_data_root
     from .config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from .ffmpeg_support import manual_setup_message, resolve_ffmpeg_executable
     from .mpv_support import has_mpv_dll
 except ImportError:
     import config_schema
     import recordtest
     from app_paths import get_app_root, get_user_data_root
     from config_store import CONFIG_PATH, SAMPLE_CONFIG_PATH, ConfigRepository
+    from ffmpeg_support import manual_setup_message, resolve_ffmpeg_executable
     from mpv_support import has_mpv_dll
 
 
@@ -78,11 +80,21 @@ def run_self_check() -> dict[str, Any]:
             fatal=False,
             level="warning",
         )
+        ffmpeg_path = resolve_ffmpeg_executable(
+            explicit_path=app_config.paths.ffmpeg_executable,
+            bin_dir=app_config.paths.bin_dir,
+            app_root=app_root,
+        )
+        ffmpeg_message = (
+            f"ffmpeg={ffmpeg_path}"
+            if ffmpeg_path
+            else manual_setup_message(app_config.paths.bin_dir).replace("\n", " ")
+        )
         _add_check(
             checks,
             "ffmpeg",
-            (app_config.paths.bin_dir / "ffmpeg.exe").exists(),
-            f"ffmpeg={app_config.paths.bin_dir / 'ffmpeg.exe'}",
+            ffmpeg_path is not None,
+            ffmpeg_message,
             fatal=False,
             level="warning",
         )
@@ -95,7 +107,11 @@ def run_self_check() -> dict[str, Any]:
             checks,
             "obs_portable",
             obs_ready,
-            f"obs_dir={setup_env.OBS_PORTABLE_DIR}",
+            (
+                f"obs_dir={setup_env.OBS_PORTABLE_DIR}"
+                if obs_ready
+                else setup_env.obs_manual_setup_message().replace("\n", " ")
+            ),
             fatal=False,
             level="warning",
         )

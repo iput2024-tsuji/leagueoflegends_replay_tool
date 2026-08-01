@@ -15,14 +15,15 @@ LoL Replay Tool は、League of Legends の試合を自動録画し、試合イ�
 推奨しません。v0.5.2について記載するSHA-256は撤回済みバイナリの履歴識別情報
 であり、現在入手できるバイナリや再現ビルドの保証ではありません。元のActions
 成果物は保持されていないため、当時の全ファイルを独立検証できない監査上の制約が
-あります。履歴資料の正確性と遡及対応の十分性に関する専門家確認も未完了です。
+あります。管理者はこの制約と残余リスクを認識した上で、v0.5.2の撤回を維持する
+方針を決定しています。
 
 次の公開版では、インストーラー、対応するプロジェクトソース、第三者ソース、
-ライセンス資料、全資産の`SHA256SUMS.txt`を同じReleaseへ添付します。OBSと
-Gyan.dev FFmpegはインストーラーへ同梱せず、必要になった時点で固定した
-取得元から別途ダウンロードします。全runtime依存とwheel内native codeの
-source coverage、PyQt6-Qt6 wheelのbuild provenance、この自動取得に関する
-専門家確認が完了するまで、新しい公開Releaseは行いません。
+ライセンス資料、全資産の`SHA256SUMS.txt`を同じReleaseへ添付します。OBS Studioと
+standalone FFmpegは利用者が明示的に入手・配置する外部ツールとし、本プロジェクトは
+自動取得、ミラー、同梱、再配布を行いません。全runtime依存とwheel内native codeの
+source coverage、PyQt6-Qt6 wheelのbuild provenanceなど、配布物自体に残るgateを
+満たすまで新しい公開Releaseは行いません。公開は管理者の明示指示がある場合に限ります。
 
 リプレイ再生に必要なmpv DLLも同梱しないため、利用者が別途入手し、
 `%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。
@@ -197,15 +198,21 @@ tests/
 
 - Windows
 - Python 3.14（CI と配布ビルドの検証対象）
+- ポータブル版 OBS Studio
+- クリップ出力を利用する場合は standalone FFmpeg
 - mpv DLL
 
 このリポジトリおよびビルド成果物には、OBS Studio本体、クリップ出力用の
-Gyan.dev FFmpeg、mpv DLL、Riot Gamesの画像アセットを同梱しません。
+standalone FFmpeg、mpv DLL、Riot Gamesの画像アセットを同梱しません。
 
-- OBS Studio は初回起動時に固定バージョンを自動取得し、開発実行時は `obs-portable`、配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable` に配置します。
+- OBS Studioは利用者が[OBS Project公式Release](https://github.com/obsproject/obs-studio/releases)からWindows x64 ZIPを取得して展開し、開発実行時は`obs-portable`、配布版では`%LOCALAPPDATA%\LoLReplayTool\obs-portable`に`bin\64bit\obs64.exe`が存在するように配置してください。
 - mpv DLL は利用者が正規の配布元から取得し、開発実行時は `bin/`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin` に配置してください。
-- FFmpeg は初回クリップ出力時に固定バージョンを自動取得し、開発実行時は `bin/ffmpeg.exe`、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe` に配置します。システム PATH 上の FFmpeg には依存しません。
+- standalone FFmpegは利用者が[FFmpeg公式入手案内](https://ffmpeg.org/download.html)から適切なWindows buildを入手し、設定画面で`ffmpeg.exe`を選択するか、開発実行時は`bin/ffmpeg.exe`、配布版では`%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe`へ配置してください。安全な絶対ディレクトリだけで構成されたシステム`PATH`も探索します。
 - Riot Games のチャンピオンアイコンは同梱せず、自動ダウンロードも行いません。
+
+本プロジェクトはOBS Studio、standalone FFmpeg、mpv DLLを自動取得、ミラー、
+同梱、再配布しません。アプリ内の公式ページボタンは、利用者が押した場合だけ
+ブラウザーで上流の案内ページを開きます。
 
 ## セットアップ
 
@@ -221,14 +228,12 @@ python main.py
 
 - OBS は `obs-portable` に配置されたポータブル版のみ利用します
 - ユーザー環境にインストール済みの OBS は利用しません
-- 初回起動時、メインウィンドウ表示前にGUIブートストラッパーがOBSを自動取得します
-- FFmpegはクリップ出力を初めて実行した時点で必要な場合のみ取得します
-- 同時起動を抑止し、セットアップ処理もプロセス間ロックで直列化します
-- ダウンロードは接続待ちと全体時間に上限を設け、失敗時はミラーへ切り替えて再試行します
-- ダウンロード対象は固定バージョンで、SHA256ハッシュ検証に失敗したファイルは展開しません
+- OBSが未配置でもアプリは起動し、公式Releaseと専用配置先を案内します
+- FFmpegは`paths.ffmpeg_executable`、設定済みの`bin_dir`、アプリルートの`bin/ffmpeg.exe`と`ffmpeg.exe`、安全な絶対ディレクトリのシステム`PATH`の順で探索します
+- 同時起動を抑止します
 - 起動時に `obs-portable/obs_portable_mode.txt` と OBS の `global.ini` を自動生成・補正します
 - OBS WebSocket は初回設定時にローカル用パスワードを自動生成し、認証必須で構成します
-- 初回セットアップで「環境を自動修復」を実行すると、WebSocket、シーン、同期用色ソースを自動構成します
+- 初回セットアップで「OBS設定を構成・再検査」を実行すると、WebSocket、シーン、同期用色ソースを構成します
 - 音声デバイス、録画保存先、FPS、容量制限、Windows通知はアプリの設定画面から変更できます
 
 `config/setting.json` は `.gitignore` 済みです。配布版では設定、録画、ログ、OBS/FFmpeg などの可変データを `%LOCALAPPDATA%\LoLReplayTool` に保存します。旧配布フォルダ内の `config/setting.json`、`obs-portable`、`bin/OBS-Studio` は初回起動時に新しい保存先へコピー移行されます。
@@ -330,7 +335,7 @@ dist\installer\LoLReplayTool-Setup-<version>.exe
 
 インストール先は`%LOCALAPPDATA%\Programs\LoLReplayTool`です。管理者権限は不要で、スタートメニューのショートカットとアンインストーラーが登録されます。設定、ログ、OBS、FFmpeg、録画は従来どおり`%LOCALAPPDATA%\LoLReplayTool`に保存されるため、アプリ更新で上書きされません。
 
-アンインストール時は、設定・ログ・ダウンロード済みOBS/FFmpeg/mpvと、録画ファイルを削除するチェックボックスを個別に表示します。どちらも初期状態はOFFです。録画削除の対象は`%LOCALAPPDATA%\LoLReplayTool\recordings`だけで、設定で指定した外部録画保存先は削除しません。
+アンインストール時は、設定・ログ・利用者がアプリデータ内へ配置したOBS/FFmpeg/mpvと、録画ファイルを削除するチェックボックスを個別に表示します。どちらも初期状態はOFFです。録画削除の対象は`%LOCALAPPDATA%\LoLReplayTool\recordings`だけで、設定で指定した外部録画保存先は削除しません。
 
 ### GitHub Releaseの公開
 
@@ -363,8 +368,9 @@ SHA256SUMS.txt
 
 第三者sourceは2 GiB未満の複数資産へ分割できます。公開済みReleaseの編集、
 資産の上書き、tagの移動・削除は行わず、修正版は新しいバージョンとして
-公開します。OBS StudioとGyan.dev FFmpegはインストーラー内の資産ではなく、
-インストール後の自動取得対象として別に扱います。
+公開します。OBS Studioとstandalone FFmpegはインストーラー内の資産ではなく、
+利用者が明示的に用意する外部ツールです。本プロジェクトは
+これらを自動取得、ミラー、同梱、再配布しません。
 
 ## ライセンス
 
@@ -385,11 +391,11 @@ LoL Replay Toolは`GPL-3.0-only`で公開しています。商用PyQtを利用�
   - `LoLReplayTool.exe --self-check` を実行してください。GUIを開かずに設定ファイル、保存先の書き込み、OBS/FFmpeg/mpv配置状況を確認します。
   - OBS、FFmpeg、mpv DLL が未配置でも診断自体は失敗扱いにせず、警告として表示します。
 - `ポータブルOBSが見つかりません`
-  - 配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable\bin\64bit\obs64.exe`、開発実行時は `obs-portable\bin\64bit\obs64.exe` が存在するように配置してください。
+  - OBS公式ReleaseからWindows x64 ZIPを利用者が取得・展開し、配布版では `%LOCALAPPDATA%\LoLReplayTool\obs-portable\bin\64bit\obs64.exe`、開発実行時は `obs-portable\bin\64bit\obs64.exe` が存在するように配置してください。通常版OBSのインストール先は管理対象にしません。
 - `mpv DLL が見つかりません`
   - 配布版では`%LOCALAPPDATA%\LoLReplayTool\bin`、開発実行時はリポジトリの`bin/`に`mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, `libmpv-2.dll`のいずれかを配置してください。
 - `FFmpegが見つかりません`
-  - 通常は初回クリップ出力時に自動取得します。手動配置する場合、配布版では `%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe`、開発実行時は `bin\ffmpeg.exe` を配置してください。クリップ出力はシステム PATH の FFmpeg を使用しません。
+  - 設定画面で`ffmpeg.exe`を選択するか、配布版では`%LOCALAPPDATA%\LoLReplayTool\bin\ffmpeg.exe`、開発実行時は`bin\ffmpeg.exe`へ配置してください。探索順は明示設定、データ用`bin`、アプリルートの`bin`とルート、安全な絶対ディレクトリのシステム`PATH`です。
 - `OBS WebSocketポートが既に使用されています`
   - 通常版 OBS や手動起動した OBS が動いている場合は終了してください。このアプリは `obs-portable` 配下の管理対象 OBS だけを起動・制御します。
 - OBS がタスクトレイに表示される
@@ -400,5 +406,5 @@ LoL Replay Toolは`GPL-3.0-only`で公開しています。商用PyQtを利用�
   - 勝敗が判定できる JSON が複数件あるか確認してください。
   - 決定木分析には勝敗両方を含むデータが必要です。
 - 同期が合わない
-  - 設定画面から同期補正を行うか、「環境を自動修復」を再実行してください。
+  - 設定画面から同期補正を行うか、「OBS設定を構成・再検査」を再実行してください。
 

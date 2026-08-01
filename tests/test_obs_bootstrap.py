@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from src import obs_bootstrap
 from src.obs_bootstrap import OBSBootstrapper
 
 
@@ -54,3 +57,28 @@ def test_websocket_config_rejects_empty_password(tmp_path):
         assert "password" in str(exc)
     else:
         raise AssertionError("empty obs-websocket password should be rejected")
+
+
+def test_obs_tree_copy_keeps_retry_marker_until_copy_completes(monkeypatch, tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    source_file = source / "bin" / "64bit" / "obs64.exe"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_bytes(b"obs")
+    original_copytree = obs_bootstrap.shutil.copytree
+
+    def fail_copytree(*_args, **_kwargs):
+        raise OSError("simulated copy failure")
+
+    monkeypatch.setattr(obs_bootstrap.shutil, "copytree", fail_copytree)
+    with pytest.raises(OSError, match="copy failure"):
+        obs_bootstrap.copy_obs_tree_contents(source, destination)
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
+    assert source_file.is_file()
+
+    monkeypatch.setattr(obs_bootstrap.shutil, "copytree", original_copytree)
+    obs_bootstrap.copy_obs_tree_contents(source, destination)
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert (destination / "bin" / "64bit" / "obs64.exe").read_bytes() == b"obs"

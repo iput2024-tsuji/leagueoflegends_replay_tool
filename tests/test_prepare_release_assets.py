@@ -1776,6 +1776,44 @@ def test_application_source_runs_crc_test(tmp_path):
         validate_application_source(source, "1.2.3")
 
 
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "obs-portable/bin/64bit/obs64.exe",
+        "vendor/OBS-Studio/data.txt",
+        "ffmpeg.exe",
+        "tools/ffprobe.exe",
+        "downloads/OBS-Studio-32.1.2-Windows-x64.zip",
+        "downloads/OBS-Studio-32.1.2-Windows-x64-Installer.exe",
+        "downloads/OBS-Studio-32.1.2-Windows-x64.msi",
+        "downloads/ffmpeg-8.1.1-essentials_build.7z",
+    ],
+)
+def test_application_source_rejects_user_provided_runtimes(tmp_path, relative):
+    source = tmp_path / "source.zip"
+    _write_source_zip(source)
+    with zipfile.ZipFile(source, "a") as archive:
+        archive.writestr(relative, b"external runtime")
+
+    with pytest.raises(
+        ReleaseAssetError,
+        match="User-provided OBS/standalone FFmpeg",
+    ):
+        validate_application_source(source, "1.2.3")
+
+
+def test_application_source_allows_opencv_ffmpeg_library_name(tmp_path):
+    source = tmp_path / "source.zip"
+    _write_source_zip(source)
+    with zipfile.ZipFile(source, "a") as archive:
+        archive.writestr(
+            "tests/fixtures/opencv_videoio_ffmpeg4140_64.dll",
+            b"fixture",
+        )
+
+    validate_application_source(source, "1.2.3")
+
+
 def test_application_source_commit_and_blob_must_match(monkeypatch, tmp_path):
     source = tmp_path / "source.zip"
     _write_source_zip(source)
@@ -2131,6 +2169,18 @@ def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
     )
     assert "-PythonExe $env:WINDOWS_PYTHON `" in windows_workflow
     assert "Run packaged self-check" in windows_workflow
+    assert (
+        "run: .\\dist\\LoLReplayTool\\LoLReplayTool.exe --self-check"
+        in windows_workflow
+    )
+    assert windows_workflow.count("-SkipSelfCheck") == 1
+    assert "-SkipBuild `\n            -SkipSelfCheck" in windows_workflow
+    assert windows_workflow.index("Run packaged self-check") < windows_workflow.index(
+        "-SkipSelfCheck"
+    )
+    assert "-SkipSelfCheck" not in Path(".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
     assert "actions/upload-artifact@" not in workflow
     assert "Compress-Archive" not in workflow
     assert "LoLReplayTool-installer" not in workflow

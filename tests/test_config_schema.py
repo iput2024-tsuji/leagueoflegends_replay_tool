@@ -175,3 +175,30 @@ def test_normalize_config_adds_independent_notification_defaults():
         "recording_failed": True,
         "minimized_to_tray": True,
     }
+
+
+def test_empty_ffmpeg_path_is_a_valid_optional_setting():
+    initial = config_schema.normalize_config({"obs": {"password": "secret"}})
+
+    assert initial.config["paths"]["ffmpeg_executable"] == ""
+
+    repeated = config_schema.normalize_config(initial.config)
+    read_only = config_schema.normalize_config(initial.config, auto_fix=False)
+
+    assert repeated.changed is False
+    assert not any("ffmpeg_executable" in error for error in read_only.errors)
+
+
+def test_ffmpeg_path_normalization_repairs_null_and_trims_text():
+    null_value = config_schema.normalize_config(
+        {"obs": {"password": "secret"}, "paths": {"ffmpeg_executable": None}}
+    )
+    padded = config_schema.normalize_config(
+        {
+            "obs": {"password": "secret"},
+            "paths": {"ffmpeg_executable": "  tools/ffmpeg.exe  "},
+        }
+    )
+
+    assert null_value.config["paths"]["ffmpeg_executable"] == ""
+    assert padded.config["paths"]["ffmpeg_executable"] == "tools/ffmpeg.exe"

@@ -22,6 +22,7 @@
     },
     "paths": {
         "bin_dir": "bin",
+        "ffmpeg_executable": "",
         "recordings_dir": "recordings",
         "json_dir": "recordings/json",
         "champion_icons_dir": "assets/champions/icons",

@@ -31,6 +31,7 @@ STARTUP_SETTINGS = {
 }
 STARTUP_SETTINGS_SECTION = "General"
 OBS_COPY_SKIP_NAMES = frozenset({".lol_replay_obs_lease.json", "temp_appdata"})
+OBS_COPY_IN_PROGRESS_MARKER_NAME = ".lol_replay_obs_copy_in_progress"
 
 
 @dataclass(frozen=True)
@@ -149,18 +150,33 @@ def apply_ini_settings(
     return changed
 
 
+def get_obs_copy_in_progress_marker(base_dir: str | Path) -> Path:
+    return Path(base_dir) / OBS_COPY_IN_PROGRESS_MARKER_NAME
+
+
+def is_obs_copy_in_progress(base_dir: str | Path) -> bool:
+    return get_obs_copy_in_progress_marker(base_dir).is_file()
+
+
 def copy_obs_tree_contents(src_dir: str | Path, dest_dir: str | Path) -> None:
     src_path = Path(src_dir)
     dest_path = Path(dest_dir)
     dest_path.mkdir(parents=True, exist_ok=True)
-    for item in src_path.iterdir():
-        if item.name in OBS_COPY_SKIP_NAMES:
-            continue
-        target = dest_path / item.name
-        if item.is_dir():
-            shutil.copytree(item, target, dirs_exist_ok=True)
-        else:
-            shutil.copy2(item, target)
+    marker = get_obs_copy_in_progress_marker(dest_path)
+    marker.write_text(str(src_path.resolve()), encoding="utf-8")
+    try:
+        for item in src_path.iterdir():
+            if item.name in OBS_COPY_SKIP_NAMES or item.name == marker.name:
+                continue
+            target = dest_path / item.name
+            if item.is_dir():
+                shutil.copytree(item, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, target)
+    except Exception:
+        raise
+    else:
+        marker.unlink()
 
 
 class OBSBootstrapper:

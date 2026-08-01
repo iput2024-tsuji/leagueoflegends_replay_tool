@@ -21,14 +21,20 @@ licenses/distribution-manifest.json は実際のビルド成果物を記録す�
 技術的な inventory です。ライセンス本文や法的判断に代わるものでは
 ありません。
 
-OBS Studio と Gyan.dev の FFmpeg は、このインストーラーには含まれません。
-機能を初めて利用するときに、固定された配布元からアプリケーションが
-別途取得します。libmpv DLL も同梱されず、利用者が別途用意します。
+OBS Studio、standalone FFmpeg、libmpv DLL は、このインストーラーには
+含まれません。利用者が各ツールのライセンス条件を確認し、明示的に入手・
+配置してください。本プロジェクトはこれらを自動取得、ミラー、同梱、
+再配布しません。OBS は専用の obs-portable だけを管理し、通常版 OBS の
+インストール先は利用しません。
 
-新しい公開 Release は、OBS Studio と Gyan.dev FFmpeg の自動取得に
-関する法的確認、および撤回済み v0.5.2 の履歴資料と遡及対応に関する
-専門家確認が完了するまで行いません。v0.5.2 の SHA-256 は撤回済み
+v0.5.2 インストーラーは撤回を維持します。v0.5.2 の SHA-256 は撤回済み
 バイナリの履歴識別情報に限られ、元の Actions 成果物は残っていません。
+管理者はこの監査上の制約と残余リスクを認識して受け入れています。ただし、
+この決定だけで履歴是正の compliance gate を完了扱いにはしません。新しい
+配布物に関する source、provenance、履歴、配布条件の gate は維持します。
+
+OBS公式Release: https://github.com/obsproject/obs-studio/releases
+FFmpeg公式入手案内: https://ffmpeg.org/download.html
 
 Third-party software and license notice
 
@@ -45,13 +51,18 @@ QT_RELINKING.md, and the licenses directory. The generated
 licenses/distribution-manifest.json is a technical inventory of the actual
 build. It does not replace license texts or legal analysis.
 
-OBS Studio and the Gyan.dev FFmpeg build are not included in this installer.
-The application downloads them separately from pinned locations when their
-features are first needed. A libmpv DLL is also not included and must be
-supplied by the user.
+OBS Studio, standalone FFmpeg, and libmpv DLLs are not included in this
+installer. Users explicitly obtain and place these tools after reviewing the
+license terms for their chosen builds. This project does not automatically
+download, mirror, bundle, or redistribute them. The application manages only
+its dedicated portable OBS directory, not a normally installed OBS instance.
 
-No new public Release will be made until the legal review of the automatic
-OBS Studio and Gyan.dev FFmpeg downloads, and specialist review of the
-withdrawn v0.5.2 historical materials and retrospective remediation, are
-complete. A v0.5.2 SHA-256 is only a historical identifier for the withdrawn
-binary; its original Actions artifact is no longer retained.
+The v0.5.2 installer remains withdrawn. A v0.5.2 SHA-256 is only a historical
+identifier for the withdrawn binary; its original Actions artifact is no
+longer retained. The maintainer has accepted this audit limitation and the
+associated residual risk. That decision does not by itself complete the
+historical-remediation compliance gate. Source, provenance, historical, and
+distribution gates for a new release remain in force.
+
+OBS Project Releases: https://github.com/obsproject/obs-studio/releases
+FFmpeg download guidance: https://ffmpeg.org/download.html

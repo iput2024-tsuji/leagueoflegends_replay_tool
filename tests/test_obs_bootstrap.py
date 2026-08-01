@@ -1528,8 +1528,8 @@ def test_obs_migration_rejects_backslash_component_without_writing_outside_desti
 
     assert external.read_bytes() == b"keep external"
     lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
-    assert {path.name for path in destination.iterdir()} == {lock_path.name}
-    assert lock_path.read_bytes() == b"\0"
+    assert not destination.exists()
+    assert not lock_path.exists()
     assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
     assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
 

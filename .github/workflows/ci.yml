@@ -243,7 +243,11 @@ jobs:
 
       - name: Run packaged self-check
         shell: pwsh
-        run: .\dist\LoLReplayTool\LoLReplayTool.exe --self-check
+        run: |
+          .\scripts\run_packaged_self_check.ps1 `
+            -AppExe .\dist\LoLReplayTool\LoLReplayTool.exe `
+            -TempRoot $env:RUNNER_TEMP `
+            -TimeoutSeconds 60
 
       - name: Build installer
         shell: pwsh

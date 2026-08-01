@@ -2274,10 +2274,21 @@ def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
     )
     assert "-PythonExe $env:WINDOWS_PYTHON `" in windows_workflow
     assert "Run packaged self-check" in windows_workflow
-    assert (
-        "run: .\\dist\\LoLReplayTool\\LoLReplayTool.exe --self-check"
-        in windows_workflow
-    )
+    self_check_step = windows_workflow.split(
+        "      - name: Run packaged self-check", maxsplit=1
+    )[1].split("      - name: Build installer", maxsplit=1)[0]
+    assert ".\\scripts\\run_packaged_self_check.ps1 `" in self_check_step
+    assert "-AppExe .\\dist\\LoLReplayTool\\LoLReplayTool.exe `" in self_check_step
+    assert "-TempRoot $env:RUNNER_TEMP `" in self_check_step
+    assert "-TimeoutSeconds 60" in self_check_step
+    assert "continue-on-error" not in self_check_step
+    assert "if: always()" not in self_check_step
+    installer_step = windows_workflow.split(
+        "      - name: Build installer", maxsplit=1
+    )[1].split("\n      - name:", maxsplit=1)[0]
+    assert "if: always()" not in installer_step
+    assert "if: failure()" not in installer_step
+    assert "continue-on-error" not in installer_step
     assert windows_workflow.count("-SkipSelfCheck") == 1
     assert "-SkipBuild `\n            -SkipSelfCheck" in windows_workflow
     assert windows_workflow.index("Run packaged self-check") < windows_workflow.index(

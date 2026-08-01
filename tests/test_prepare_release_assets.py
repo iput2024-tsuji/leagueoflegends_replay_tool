@@ -259,15 +259,7 @@ def _lock(first: bytes, second: bytes, *, legal_gate: bool = False):
             }
         ],
         "build_components": [],
-        "runtime_downloads": [
-            {
-                "component": "download-only",
-                "version": "2.0",
-                "bundled_in_installer": False,
-                "release_legal_review_required": legal_gate,
-                "legal_review": _review(),
-            }
-        ],
+        "runtime_downloads": [],
     }
 
 
@@ -297,11 +289,16 @@ def _create_asset_set(
     monkeypatch,
     *,
     provenance_seal: str | None = "actual",
+    runtime_downloads: list[dict[str, object]] | None = None,
+    enforce_release_gates: bool = False,
 ) -> tuple[dict[str, object], Path]:
     first = b"python source"
     second = b"demo source"
     lock_path = tmp_path / "components.json"
-    lock_path.write_text(json.dumps(_lock(first, second)), encoding="utf-8")
+    lock = _lock(first, second)
+    if runtime_downloads is not None:
+        lock["runtime_downloads"] = runtime_downloads
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
     monkeypatch.setattr(release_assets, "COMPONENTS_FILE", lock_path)
     cache = tmp_path / "cache"
     cache.mkdir()
@@ -362,7 +359,7 @@ def _create_asset_set(
         output_dir=output,
         components_file=lock_path,
         cache_dir=cache,
-        enforce_release_gates=False,
+        enforce_release_gates=enforce_release_gates,
         build_provenance_sha256=build_provenance_sha256,
     )
     return payload, output
@@ -412,7 +409,7 @@ def test_create_release_assets_uses_fixed_names_and_hashes(monkeypatch, tmp_path
             "python",
             "demo",
         }
-        assert index["runtime_downloads_not_bundled"][0]["bundled_in_installer"] is False
+        assert "runtime_downloads_not_bundled" not in index
         assert archive.read("sources/python-source.tar.gz") == b"python source"
     with zipfile.ZipFile(output / "LoLReplayTool-license-materials-1.2.3.zip") as archive:
         assert "QT_RELINKING.md" in archive.namelist()
@@ -965,7 +962,6 @@ def test_release_legal_gate_is_explicit():
     errors = release_gate_errors(_lock(b"one", b"two", legal_gate=True))
 
     assert any(error.startswith("python:") for error in errors)
-    assert any(error.startswith("download-only:") for error in errors)
 
 
 def test_missing_runtime_and_vendored_sources_are_release_gates():
@@ -1658,19 +1654,128 @@ def test_structural_qt_gates_cannot_be_cleared_by_legal_flag():
     assert "qt: Qt third-party notices are not verified" in errors
 
 
-def test_runtime_download_review_requires_complete_evidence():
+@pytest.mark.parametrize("legal_gate", [False, True])
+def test_runtime_downloads_are_rejected_regardless_of_legal_review(legal_gate):
     lock = _lock(b"one", b"two")
-    lock["runtime_downloads"][0]["legal_review"] = {
-        "review_completed": True,
-        "evidence": "",
-        "scope": "download",
-        "reviewer": "admin",
-        "date": "2026-07-31",
-    }
+    lock["runtime_downloads"] = [
+        {
+            "component": "download-only",
+            "version": "2.0",
+            "bundled_in_installer": False,
+            "release_legal_review_required": legal_gate,
+            "legal_review": _review(),
+        }
+    ]
 
     errors = release_gate_errors(lock)
 
-    assert any("runtime download legal review evidence" in error for error in errors)
+    assert any("runtime_downloads must be an empty list" in error for error in errors)
+    assert any("does not download or redistribute" in error for error in errors)
+    assert not any("runtime download legal review" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("present", "runtime_downloads"),
+    [
+        pytest.param(False, None, id="missing"),
+        pytest.param(True, None, id="none"),
+        pytest.param(True, "disabled", id="string"),
+        pytest.param(True, {}, id="mapping"),
+    ],
+)
+def test_runtime_downloads_requires_an_explicit_empty_list(
+    tmp_path,
+    present,
+    runtime_downloads,
+):
+    lock = _lock(b"one", b"two")
+    if present:
+        lock["runtime_downloads"] = runtime_downloads
+    else:
+        del lock["runtime_downloads"]
+
+    errors = release_gate_errors(lock)
+
+    assert any("runtime_downloads must be an empty list" in error for error in errors)
+    assert any("Remove every runtime_downloads entry" in error for error in errors)
+
+    lock_path = tmp_path / "components.json"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    with pytest.raises(
+        ReleaseAssetError,
+        match="Release runtime policy violation: .*runtime_downloads must be an empty list",
+    ):
+        release_assets.verify_release_asset_payload(
+            {},
+            components_file=lock_path,
+        )
+
+
+def test_release_asset_creation_cannot_bypass_disabled_runtime_downloads(
+    monkeypatch,
+    tmp_path,
+):
+    runtime_downloads = [
+        {
+            "component": "download-only",
+            "version": "2.0",
+            "bundled_in_installer": False,
+            "release_legal_review_required": False,
+            "legal_review": _review(),
+        }
+    ]
+
+    with pytest.raises(
+        ReleaseAssetError,
+        match="Release runtime policy violation: .*does not download or redistribute",
+    ):
+        _create_asset_set(
+            tmp_path,
+            monkeypatch,
+            runtime_downloads=runtime_downloads,
+            enforce_release_gates=False,
+        )
+
+    assert not (tmp_path / "release").exists()
+
+
+def test_release_asset_verification_rejects_disabled_runtime_downloads(
+    monkeypatch,
+    tmp_path,
+):
+    payload, _output = _create_asset_set(tmp_path, monkeypatch)
+    lock_path = tmp_path / "components.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["runtime_downloads"] = [
+        {
+            "component": "download-only",
+            "version": "2.0",
+            "bundled_in_installer": False,
+            "release_legal_review_required": False,
+            "legal_review": _review(),
+        }
+    ]
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    with pytest.raises(
+        ReleaseAssetError,
+        match="Release runtime policy violation: .*does not download or redistribute",
+    ):
+        verify_release_asset_list(
+            Path(payload["asset_list"]),
+            components_file=lock_path,
+        )
+
+
+def test_repository_lock_disables_runtime_downloads():
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+
+    assert lock["runtime_downloads"] == []
+    assert not any(
+        "runtime_downloads" in error for error in release_gate_errors(lock)
+    )
 
 
 def test_source_exception_requires_structured_completed_review():

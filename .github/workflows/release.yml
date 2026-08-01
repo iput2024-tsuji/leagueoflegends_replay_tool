@@ -490,7 +490,7 @@ jobs:
 
           - 本ソフトウェアはGPL-3.0-onlyです。
           - アプリソース、検証済みのcomponent source資産、第三者ライセンス資料を添付しています。
-          - OBS StudioとGyan.dev FFmpegはインストーラーに含まれず、利用時に固定URL・SHA256で取得します。これらは添付source資産の対象ではありません。
+          - OBS Studioとstandalone FFmpegは利用者が明示的に入手・配置する外部ツールです。本プロジェクトはこれらを自動取得、ミラー、同梱、再配布せず、添付source資産の対象にも含めません。
           - `SHA256SUMS.txt`で他の全公開ファイルを検証できます。
           - リプレイ再生には64bit版mpv DLLを別途用意し、`%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。
 
@@ -504,7 +504,7 @@ jobs:
 
           - This software is GPL-3.0-only.
           - Application source, verified component-source assets, and third-party license materials are attached.
-          - OBS Studio and the Gyan.dev FFmpeg build are not in the installer. The application downloads them from pinned URLs with SHA256 verification, and they are not represented as bundled-source assets.
+          - OBS Studio and standalone FFmpeg are external tools that users explicitly obtain and place. This project does not automatically download, mirror, bundle, or redistribute them, and they are not represented as bundled-source assets.
           - Verify every other published file with `SHA256SUMS.txt`.
           - Replay playback requires a separate 64-bit mpv DLL in `%LOCALAPPDATA%\LoLReplayTool\bin`.
           "@

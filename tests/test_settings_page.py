@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 from src import app
 from src.app import SettingsPage
 
@@ -42,6 +44,30 @@ def test_settings_page_audio_auto_apply_auto_launches_managed_obs():
     SettingsPage._apply_audio_settings_auto(page)
 
     assert page.calls == [{"show_success": False, "show_error": False, "auto_launch": True}]
+
+
+def test_successful_quick_setup_notifies_main_window(monkeypatch):
+    emitted = []
+    page = SimpleNamespace(
+        load_settings=lambda: None,
+        refresh_audio_devices=lambda **_kwargs: None,
+        setup_completed=SimpleNamespace(emit=lambda: emitted.append(True)),
+    )
+    monkeypatch.setattr(app.QMessageBox, "information", lambda *_args, **_kwargs: None)
+
+    SettingsPage._on_quick_setup_finished(
+        page,
+        {"errors": [], "warnings": []},
+        {
+            "scene_name": "LoL Replay",
+            "window_capture_name": "League of Legends",
+            "source_name": "Replay Sync",
+            "source_color": 0xFF0000,
+            "obs_launched": False,
+        },
+    )
+
+    assert emitted == [True]
 
 
 def test_settings_page_supports_fractional_high_fps(qtbot, monkeypatch):

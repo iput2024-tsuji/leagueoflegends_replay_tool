@@ -35,6 +35,7 @@ from scripts.collect_licenses import (
     parse_requirement_pins,
     probe_python_native_runtime,
 )
+from scripts.external_runtime_policy import is_user_provided_runtime_path
 from scripts.pyinstaller_runtime_policy import (
     is_root_vcomp_name,
     is_windows_os_runtime_name,
@@ -2521,6 +2522,21 @@ def _physical_files(distribution_root: Path) -> dict[str, Path]:
     return result
 
 
+def _forbidden_user_runtime_errors(
+    distribution_root: Path,
+    physical: dict[str, Path],
+) -> list[str]:
+    errors: list[str] = []
+    for path in physical.values():
+        relative = path.relative_to(distribution_root).as_posix()
+        if is_user_provided_runtime_path(relative):
+            errors.append(
+                "User-provided OBS/standalone FFmpeg must not be bundled: "
+                f"{relative}"
+            )
+    return errors
+
+
 def _package_license_paths(package_manifest: dict[str, Any] | None) -> set[str]:
     result: set[str] = set()
     if not package_manifest:
@@ -3085,22 +3101,6 @@ def _validate_project_documents(distribution_root: Path) -> list[str]:
 
 
 def _validate_runtime_download_lock(lock: dict[str, Any]) -> list[str]:
-    from scripts import setup_env
-
-    expected = {
-        "obs-studio": {
-            "version": setup_env.OBS_PACKAGE.version,
-            "archive_url": setup_env.OBS_PACKAGE.url,
-            "archive_sha256": setup_env.OBS_PACKAGE.sha256,
-            "fallback_urls": list(setup_env.OBS_PACKAGE.fallback_urls),
-        },
-        "gyan-ffmpeg": {
-            "version": setup_env.FFMPEG_PACKAGE.version,
-            "archive_url": setup_env.FFMPEG_PACKAGE.url,
-            "archive_sha256": setup_env.FFMPEG_PACKAGE.sha256,
-            "fallback_urls": list(setup_env.FFMPEG_PACKAGE.fallback_urls),
-        },
-    }
     actual_entries = lock.get("runtime_downloads")
     if not isinstance(actual_entries, list):
         return ["Component lock runtime_downloads must be a list."]
@@ -3114,18 +3114,8 @@ def _validate_runtime_download_lock(lock: dict[str, Any]) -> list[str]:
         if component in actual:
             errors.append(f"Duplicate runtime download lock: {component}")
         actual[component] = entry
-    if set(actual) != set(expected):
-        errors.append("Runtime download component set differs from setup_env constants.")
-    for component, fields in expected.items():
-        entry = actual.get(component)
-        if entry is None:
-            continue
-        for field, value in fields.items():
-            if entry.get(field, [] if field == "fallback_urls" else None) != value:
-                errors.append(
-                    f"Runtime download lock differs from setup_env for "
-                    f"{component}.{field}."
-                )
+    if actual:
+        errors.append("Runtime download component set must be empty for user-provided tools.")
     return errors
 
 
@@ -3406,6 +3396,7 @@ def validate_distribution(
     except (OSError, ValueError) as exc:
         errors.append(str(exc))
         return errors
+    errors.extend(_forbidden_user_runtime_errors(distribution_root, physical))
     lock_path = distribution_root / "licenses" / "components.json"
     package_manifest_path = distribution_root / "licenses" / "python-packages.json"
     if not _regular_nonempty_file(lock_path):
@@ -3700,8 +3691,8 @@ def main() -> int:
             if open_gates:
                 print(
                     f"WARNING: {len(open_gates)} release legal/source gates remain, "
-                    "including incomplete runtime source coverage, unverified "
-                    "PyQt6-Qt6 wheel build provenance, and runtime downloads."
+                    "including incomplete bundled native source coverage, "
+                    "unverified build provenance, and legal evidence."
                 )
         except (OSError, json.JSONDecodeError, KeyError, ValueError):
             pass

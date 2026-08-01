@@ -83,8 +83,13 @@ begin
     'mpv-2.dll / libmpv-2.dll / mpv-1.dll / libmpv-1.dll' +
     NewLine + NewLine +
     'セットアップ完了画面から配置フォルダーを開くこともできます。' +
+    NewLine + NewLine +
+    'OBS と standalone FFmpeg も利用者が明示的に入手・配置してください。' +
     NewLine +
-    'OBS と FFmpeg は必要になった時点でアプリが自動取得します。'
+    '本アプリはこれらを自動取得、ミラー、同梱、再配布しません。' +
+    NewLine + NewLine +
+    'OBS: https://github.com/obsproject/obs-studio/releases' + NewLine +
+    'FFmpeg: https://ffmpeg.org/download.html'
   );
 end;
 

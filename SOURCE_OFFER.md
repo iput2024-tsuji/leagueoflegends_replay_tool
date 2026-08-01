@@ -92,27 +92,40 @@ procedure and complete application rebuild instructions.
 互換性条件、交換手順、アプリケーション全体の再ビルド方法は
 `QT_RELINKING.md`を参照してください。
 
-## Components acquired after installation
+## User-provided external tools
 
-OBS Studio 32.1.2 and the Gyan.dev FFmpeg 8.1.1 essentials build are not
-included in the installer or packaged application. The application downloads
-them separately from pinned locations after installation when their features
-are needed. libmpv is also not distributed by this project and must be supplied
-by the user.
+OBS Studio, standalone FFmpeg and libmpv are not included in the installer or
+packaged application. This project does not automatically download, mirror,
+bundle, or redistribute them. The user explicitly obtains each required tool
+and remains responsible for the license information accompanying that build.
 
-The legal treatment of the automatic OBS Studio and Gyan.dev FFmpeg downloads,
-including whether the project is acting as a distributor and what source
-delivery is required, remains under specialist review. These runtime downloads
-are therefore documented separately from the source assets for files actually
-contained in the installer. No new public Release will be made until that review
-is recorded.
+OBS Studio 32.1.2 is the currently tested version. The application manages
+only a portable copy that the user extracts into its dedicated `obs-portable`
+directory; it does not manage a normally installed OBS instance. Standalone
+FFmpeg 8.1.1 x64 is the currently tested clip-export tool. It is resolved from
+the explicit setting, the application-data `bin` directory, application-root
+fallbacks, and then safe absolute directories in the system `PATH`. This
+standalone executable is distinct from the OpenCV FFmpeg DLL contained in the
+packaged application.
 
-OBS Studio 32.1.2とGyan.dev FFmpeg 8.1.1 essentials buildはインストーラーや
-インストール直後の配布物には含まれず、必要になった時点で固定した取得元から
-別途ダウンロードされます。この自動取得を本プロジェクトによる配布として
-扱うべきか、どのsource提供が必要かは専門家確認中です。このため、
-インストーラーに実際に含まれるファイルのsource assetsとは分けて記録し、
-確認完了までは新しい公開Releaseを行いません。
+Because these external tools are not distributed by this project, they are not
+represented as corresponding-source assets for the installer. The application
+opens an upstream information page only after an explicit user action.
+
+- OBS Project Releases: https://github.com/obsproject/obs-studio/releases
+- FFmpeg download guidance: https://ffmpeg.org/download.html
+
+OBS Studio、standalone FFmpeg、libmpvはインストーラーや配布アプリケーションに
+含めません。本プロジェクトはこれらを自動取得、ミラー、同梱、再配布せず、
+利用者が各ツールとそのライセンス資料を明示的に入手・配置します。
+
+現在の検証対象はOBS Studio 32.1.2とstandalone FFmpeg 8.1.1 x64です。OBSは
+利用者が専用`obs-portable`へ展開したポータブル版だけを管理し、通常版OBSの
+インストール先は利用しません。FFmpegは明示設定、アプリデータの`bin`、
+アプリルートのfallback、安全な絶対ディレクトリのシステム`PATH`の順で探索します。
+standalone FFmpegは配布アプリケーション内のOpenCV FFmpeg DLLとは別物です。
+これらの外部ツールは本プロジェクトの配布物ではないため、インストーラーの
+corresponding-source assetsには含めません。
 
 ## v0.5.2 historical limitation
 
@@ -123,9 +136,12 @@ installer. Any source or hash retained for v0.5.2 is historical identification,
 not a replacement installer or proof of a newly reproduced binary. The known
 build reference is Actions run `28287427901` at commit
 `c88ded675accf403f4d5e2bfee1bc53247c14af7`. No binary will be restored,
-replaced, or overwritten. Specialist review of the accuracy of any reconstructed
-materials and the sufficiency of the retrospective remediation remains
-incomplete and is an explicit gate for every new public Release.
+replaced, or overwritten. The maintainer has recorded acceptance of this audit
+limitation and the associated residual risk while keeping the installer
+withdrawn. That maintainer decision does not by itself mark the recorded
+historical-remediation compliance gate complete. Every technical, source,
+provenance, historical, and licensing gate for a new distribution remains in
+force until its explicit completion criteria are satisfied.
 
 v0.5.2インストーラーは撤回され、現在ダウンロードできません。元の
 GitHub Actions成果物は保持されていないため、後から追加する履歴資料だけでは
@@ -133,9 +149,11 @@ GitHub Actions成果物は保持されていないため、後から追加する
 残すsourceやhashは履歴識別情報であり、インストーラーの復元・差し替えや
 再現ビルドの証明ではありません。既知のビルド基準はActions run
 `28287427901`、commit `c88ded675accf403f4d5e2bfee1bc53247c14af7`です。
-バイナリの復元・差し替え・上書きは行いません。再構成した資料の正確性と
-遡及対応の十分性に関する専門家確認は未完了であり、すべての新しい公開Releaseを
-止める明示的なgateです。
+バイナリの復元・差し替え・上書きは行いません。管理者はこの監査上の制約と
+残余リスクを認識して受け入れ、インストーラーの撤回を維持する決定を記録しています。
+ただし、この管理者決定だけで記録済みの履歴是正compliance gateを完了扱いには
+しません。新しい配布物の技術、source、provenance、履歴、ライセンスに関する
+各gateは、それぞれの完了条件が明示的に満たされるまで維持します。
 
 ## Future OBS bundling
 

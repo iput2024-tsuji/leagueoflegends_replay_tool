@@ -111,7 +111,7 @@ AnalyticsPage
 
 ### OBS
 
-アプリ管理のportable OBSだけを対象とし、通常版OBSや他プロセスが使用するWebSocketポートを制御しません。WebSocketはローカル接続でもパスワード認証を必須とします。シーン、音声、録画エンコーダ、起動・終了を変更した場合は実際のOBSログと録画ファイルを確認します。
+OBS Studioは利用者が公式Releaseから明示的に入手し、専用`obs-portable`へ配置します。本プロジェクトは自動取得、ミラー、同梱、再配布を行いません。アプリ管理のportable OBSだけを対象とし、通常版OBSや他プロセスが使用するWebSocketポートを制御しません。WebSocketはローカル接続でもパスワード認証を必須とします。シーン、音声、録画エンコーダ、起動・終了を変更した場合は実際のOBSログと録画ファイルを確認します。
 
 ### LCU / Live Client API
 
@@ -123,7 +123,7 @@ mpv DLLはリポジトリと配布物へ同梱しません。開発環境では 
 
 ### FFmpeg
 
-FFmpegはクリップ出力時に固定バージョンをSHA256検証付きで取得し、システムPATHには依存しません。取得、再試行、キャンセル、既存ファイル、部分出力の削除を確認します。FFmpeg本体を成果物へ混入させないでください。
+standalone FFmpegは利用者が明示的に入手・配置し、本プロジェクトは自動取得、ミラー、同梱、再配布を行いません。探索順は明示設定、データ用`bin`、アプリルートの`bin/ffmpeg.exe`と`ffmpeg.exe`、安全な絶対ディレクトリのシステム`PATH`です。設定、fallback、未配置時の案内、クリップ出力、キャンセルを確認し、standalone FFmpeg本体を成果物へ混入させないでください。配布物に含まれるOpenCV FFmpeg DLLは別componentです。
 
 ### PyInstaller
 

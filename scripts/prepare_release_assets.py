@@ -35,6 +35,7 @@ from scripts.collect_licenses import (
     probe_python_native_runtime,
     verified_wheel_record_inventory,
 )
+from scripts.external_runtime_policy import is_user_provided_runtime_path
 
 MAX_GITHUB_ASSET_SIZE = 2_000_000_000
 TARGET_SOURCE_PART_SIZE = 1_500_000_000
@@ -2547,6 +2548,19 @@ def validate_application_source(
                 archive,
                 label="application source archive",
             )
+            forbidden_runtime = next(
+                (
+                    name
+                    for name, info in names.items()
+                    if not info.is_dir() and is_user_provided_runtime_path(name)
+                ),
+                None,
+            )
+            if forbidden_runtime is not None:
+                raise ReleaseAssetError(
+                    "User-provided OBS/standalone FFmpeg must not be included "
+                    f"in the application source archive: {forbidden_runtime}"
+                )
             folded_names = {name.casefold(): name for name in names}
             for required in ("LICENSE", "VERSION"):
                 if required.casefold() not in folded_names:

@@ -2,8 +2,9 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QDialog
 
-from src import player as player_module
+from src import app as app_module, player as player_module, recorder_config
 from src.app import MainWindow, PlayerPage
 from src.player import ClipExportWorker, PlayerWidget, build_ban_pick_view_model
 
@@ -423,54 +424,121 @@ def test_clip_export_preserves_source_frame_timing_and_uses_quality_encoder_sett
     assert command[command.index("-cq") + 1] == "19"
 
 
-def test_export_clip_starts_lazy_ffmpeg_setup_when_binary_is_missing(monkeypatch):
+def test_export_clip_shows_manual_setup_when_binary_is_missing(monkeypatch):
     widget = SimpleNamespace(
-        ffmpeg_setup_worker=None,
         clip_worker=None,
         current_video_path="replay.mp4",
         clip_start=1.0,
         clip_end=2.0,
-        start_ffmpeg_setup=Mock(),
+        show_ffmpeg_setup_required=Mock(),
+        start_clip_export=Mock(),
     )
     monkeypatch.setattr(player_module, "find_ffmpeg_executable", lambda: None)
 
     PlayerWidget.export_clip(widget)
 
-    widget.start_ffmpeg_setup.assert_called_once_with()
+    widget.show_ffmpeg_setup_required.assert_called_once_with()
+    widget.start_clip_export.assert_not_called()
 
 
-def test_ffmpeg_setup_completion_resumes_clip_export():
-    progress = FakeProgress()
-    label = FakeLabel()
+def test_export_clip_uses_resolved_ffmpeg_without_setup(monkeypatch):
     widget = SimpleNamespace(
-        _pending_clip_export=True,
-        clip_progress=progress,
-        info_label=label,
+        clip_worker=None,
+        current_video_path="replay.mp4",
+        clip_start=1.0,
+        clip_end=2.0,
+        show_ffmpeg_setup_required=Mock(),
         start_clip_export=Mock(),
     )
+    monkeypatch.setattr(player_module, "find_ffmpeg_executable", lambda: "tools/ffmpeg.exe")
 
-    PlayerWidget.on_ffmpeg_setup_installed(widget, "bin/ffmpeg.exe")
+    PlayerWidget.export_clip(widget)
 
-    assert widget._pending_clip_export is False
-    assert progress.value == 100
-    assert progress.text == "FFmpegの準備完了"
-    assert label.text == "FFmpegの準備が完了しました。"
-    widget.start_clip_export.assert_called_once_with("bin/ffmpeg.exe")
+    widget.show_ffmpeg_setup_required.assert_not_called()
+    widget.start_clip_export.assert_called_once_with("tools/ffmpeg.exe")
 
 
-def test_cancel_background_tasks_requests_ffmpeg_setup_stop():
-    ffmpeg_worker = FakeRunningWorker(wait_result=True)
+def test_player_uses_normalized_ffmpeg_and_bin_paths(monkeypatch, tmp_path):
+    data_root = tmp_path / "data"
+    explicit = data_root / "tools" / "ffmpeg.exe"
+    explicit.parent.mkdir(parents=True)
+    explicit.write_bytes(b"ffmpeg")
+    monkeypatch.setattr(recorder_config, "get_user_data_root", lambda: data_root)
+    monkeypatch.setattr(
+        player_module,
+        "load_app_config",
+        lambda: {
+            "obs": {"password": "secret"},
+            "paths": {
+                "bin_dir": "custom-bin",
+                "ffmpeg_executable": "  tools/ffmpeg.exe  ",
+            },
+        },
+    )
+
+    paths = player_module.get_ffmpeg_runtime_paths()
+
+    assert paths.bin_dir == (data_root / "custom-bin").resolve()
+    assert paths.ffmpeg_executable == explicit.resolve()
+    assert player_module.find_ffmpeg_executable() == str(explicit.resolve())
+
+
+def test_startup_setup_can_be_cancelled_without_hard_exit(monkeypatch):
+    report = {
+        "changed": False,
+        "config": {"app": {"setup_completed": False}},
+        "errors": ["ポータブルOBSが見つかりません。"],
+    }
+    monkeypatch.setattr(app_module, "load_config", lambda: report["config"])
+    monkeypatch.setattr(app_module, "run_preflight", lambda *_args, **_kwargs: report)
+    monkeypatch.setattr(app_module.QMessageBox, "warning", Mock())
+
+    class CancelledWizard:
+        def __init__(self, parent, startup_mode):
+            assert parent is window
+            assert startup_mode is True
+
+        def exec(self):
+            return QDialog.DialogCode.Rejected
+
+    window = SimpleNamespace(settings_page=SimpleNamespace(load_settings=Mock()))
+    monkeypatch.setattr(app_module, "SetupWizardDialog", CancelledWizard)
+
+    assert MainWindow.run_startup_setup(window) is False
+    window.settings_page.load_settings.assert_not_called()
+
+
+def test_later_setup_completion_reenables_recorder_when_returning_home():
+    start_background_recorder = Mock()
+    window = SimpleNamespace(
+        _recorder_autostart_enabled=False,
+        _closing=False,
+        start_background_recorder=start_background_recorder,
+        _stop_player=Mock(),
+        stack=SimpleNamespace(setCurrentWidget=Mock()),
+        home_page=object(),
+    )
+
+    MainWindow._on_setup_completed(window)
+
+    assert window._recorder_autostart_enabled is True
+    start_background_recorder.assert_not_called()
+
+    MainWindow.show_home(window)
+
+    start_background_recorder.assert_called_once_with()
+
+
+def test_cancel_background_tasks_stops_only_sync_and_clip_workers():
+    clip_worker = FakeRunningWorker(wait_result=True)
     widget = SimpleNamespace(
-        _pending_clip_export=True,
-        ffmpeg_setup_worker=ffmpeg_worker,
-        clip_worker=None,
+        clip_worker=clip_worker,
         cancel_sync_worker=lambda timeout_ms: True,
     )
 
     stopped = PlayerWidget.cancel_background_tasks(widget, timeout_ms=50)
 
     assert stopped is True
-    assert widget._pending_clip_export is False
-    assert widget.ffmpeg_setup_worker is None
-    assert ffmpeg_worker.cancel_called == 1
-    assert ffmpeg_worker.wait_calls == [50]
+    assert widget.clip_worker is None
+    assert clip_worker.cancel_called == 1
+    assert clip_worker.wait_calls == [50]

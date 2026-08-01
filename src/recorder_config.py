@@ -53,6 +53,7 @@ class OBSSettings:
 @dataclass(frozen=True)
 class PathsSettings:
     bin_dir: Path
+    ffmpeg_executable: Path | None
     recordings_dir: Path
     json_dir: Path
     champion_icons_dir: Path
@@ -145,6 +146,8 @@ class AppConfig:
         )
         json_dir = resolve_path(paths.get("json_dir"), data_root) or (recordings_dir / "json").resolve()
         bin_dir = resolve_path(paths.get("bin_dir"), data_root) or (data_root / config_schema.DEFAULT_BIN_DIR).resolve()
+        ffmpeg_value = str(paths.get("ffmpeg_executable") or "").strip()
+        ffmpeg_executable = resolve_path(ffmpeg_value, data_root) if ffmpeg_value else None
         icons_dir = (
             resolve_path(paths.get("champion_icons_dir"), data_root)
             or (data_root / config_schema.DEFAULT_CHAMPION_ICONS_DIR).resolve()
@@ -178,7 +181,14 @@ class AppConfig:
                 recording_encoder=str(obs["recording_encoder"]),
                 obs_dir=(data_root / config_schema.DEFAULT_OBS_DIR).resolve(),
             ),
-            paths=PathsSettings(bin_dir, recordings_dir, json_dir, icons_dir, aliases),
+            paths=PathsSettings(
+                bin_dir,
+                ffmpeg_executable,
+                recordings_dir,
+                json_dir,
+                icons_dir,
+                aliases,
+            ),
             polling=PollingSettings(
                 _int(polling["end_error_limit"], config_schema.DEFAULT_END_ERROR_LIMIT),
                 _float(polling["end_missing_grace_sec"], config_schema.DEFAULT_END_MISSING_GRACE_SEC),

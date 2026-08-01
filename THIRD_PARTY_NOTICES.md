@@ -56,32 +56,43 @@ replacing the dynamically linked Qt libraries are in `QT_RELINKING.md`.
 対応ソースの情報は`SOURCE_OFFER.md`、動的リンクされたQtライブラリの
 交換手順は`QT_RELINKING.md`を参照してください。
 
-## Components acquired after installation / インストール後に取得するもの
+## User-provided external components / 利用者が用意する外部コンポーネント
 
-The following components are not included in the installer or its packaged
-application directory:
+The following components are not included in the installer or packaged
+application. This project does not automatically download, mirror, bundle, or
+redistribute them:
 
-- **OBS Studio 32.1.2** is downloaded from a pinned official OBS Project
-  Release when recording support is first prepared.
-- **Gyan.dev FFmpeg 8.1.1 essentials build** is downloaded from a pinned
-  location when clip export first requires it. This executable is separate
-  from the OpenCV FFmpeg DLL already present in the installer. License and
-  README materials from the downloaded archive are stored in the application
-  data directory.
+- **OBS Studio 32.1.2** is the currently tested version. The user explicitly
+  obtains the Windows x64 ZIP from the
+  [official OBS Project Release page](https://github.com/obsproject/obs-studio/releases) and
+  extracts it into the application's dedicated `obs-portable` directory. A
+  normally installed OBS instance is not managed by this application.
+- **Standalone FFmpeg 8.1.1 x64** is the currently tested clip-export tool.
+  The user explicitly obtains a suitable build through the
+  [official FFmpeg download guidance](https://ffmpeg.org/download.html) and either selects its
+  `ffmpeg.exe` in Settings, places it in the application data `bin` directory,
+  or makes it available through a safe absolute system `PATH`. This executable
+  is separate from the OpenCV FFmpeg DLL already present in the installer.
 - **libmpv** is supplied separately by the user. The user must retain the
   license information supplied with that build.
 - Riot Games artwork and champion icons are neither bundled nor downloaded.
 
-上記OBS StudioとGyan.dev FFmpegは、インストーラーおよびインストール直後の
-アプリケーション配布ディレクトリには含まれず、必要になった時点で固定した
-取得元から別途ダウンロードされます。この自動取得が本プロジェクトによる
-配布に当たるか、および必要な対応は専門家確認中です。その確認が完了するまで
-新しい公開Releaseは行いません。
+上記のOBS Studio、standalone FFmpeg、libmpvは、利用者がライセンス条件を
+確認して明示的に入手・配置する外部ツールです。本プロジェクトはこれらを
+自動取得、ミラー、同梱、再配布しません。アプリ内の公式ページボタンは、
+利用者が押した場合に限って上流の案内ページをブラウザーで開きます。
+OBSは専用`obs-portable`だけを管理し、通常版OBSのインストール先は利用しません。
 
-Whether those automatic OBS Studio and Gyan.dev FFmpeg downloads constitute
-distribution by this project, and what additional measures may be required,
-remain subject to specialist review. No new public Release will be made until
-that review is recorded.
+The maintainer has recorded acceptance of the audit limitation and residual
+risk associated with the withdrawn v0.5.2 installer. That decision does not by
+itself mark the historical-remediation compliance gate complete. All recorded
+source, provenance, historical, and distribution gates remain in force until
+their explicit completion criteria are satisfied.
+
+管理者は、撤回済みv0.5.2インストーラーに関する監査上の制約と残余リスクを
+認識し、受け入れる決定を記録しています。ただし、この決定だけで履歴是正の
+compliance gateを完了扱いにはしません。source、provenance、履歴、配布条件に
+関する各gateは、それぞれの完了条件が明示的に満たされるまで維持します。
 
 ## Upstream license information / 一次情報
 

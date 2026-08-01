@@ -156,6 +156,22 @@ def normalize_config(
         },
         auto_fix=auto_fix,
     )
+    ffmpeg_value = paths_cfg.get("ffmpeg_executable")
+    if ffmpeg_value is None and auto_fix:
+        paths_cfg["ffmpeg_executable"] = ""
+        result.changed = True
+        result.notes.append("ffmpeg_executable を任意設定として補完しました。")
+    elif isinstance(ffmpeg_value, str):
+        normalized_ffmpeg_value = ffmpeg_value.strip()
+        if auto_fix and ffmpeg_value != normalized_ffmpeg_value:
+            paths_cfg["ffmpeg_executable"] = normalized_ffmpeg_value
+            result.changed = True
+            result.notes.append("ffmpeg_executable の前後空白を削除しました。")
+    elif ffmpeg_value is not None:
+        if auto_fix:
+            paths_cfg["ffmpeg_executable"] = ""
+            result.changed = True
+        result.warnings.append("ffmpeg_executable が文字列ではないため無視します。")
     _apply_defaults(
         result,
         poll_cfg,

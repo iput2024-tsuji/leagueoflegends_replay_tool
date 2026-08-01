@@ -6,8 +6,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QAction, QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,7 +25,6 @@ from PyQt6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
-    QProgressDialog,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -43,6 +42,7 @@ try:
     from . import recordtest
     from .app_paths import get_app_root, get_resource_root, get_user_data_root
     from .controllers import AnalyticsController, AudioSettingsController, ConfigController
+    from .ffmpeg_support import FFMPEG_DOWNLOAD_PAGE
     from .license_info import build_about_html
     from .notifications import (
         DEFAULT_NOTIFICATION_SETTINGS,
@@ -60,6 +60,7 @@ except ImportError:
     import recordtest
     from app_paths import get_app_root, get_resource_root, get_user_data_root
     from controllers import AnalyticsController, AudioSettingsController, ConfigController
+    from ffmpeg_support import FFMPEG_DOWNLOAD_PAGE
     from license_info import build_about_html
     from notifications import DEFAULT_NOTIFICATION_SETTINGS, NotificationEvent, NotificationService
     from player import PlayerWidget
@@ -206,21 +207,6 @@ class AnalyticsWorker(QThread):
             self.error.emit(f"{type(e).__name__}: {e}")
 
 
-class EnvironmentSetupWorker(QThread):
-    progress = pyqtSignal(int, str)
-    completed = pyqtSignal()
-    failed = pyqtSignal(str)
-
-    def run(self) -> None:
-        try:
-            from scripts import setup_env
-
-            setup_env.run_setup(lambda percent, message: self.progress.emit(percent, message))
-            self.completed.emit()
-        except Exception as e:
-            self.failed.emit(f"{type(e).__name__}: {e}")
-
-
 class AudioDeviceRefreshWorker(QThread):
     loaded = pyqtSignal(dict)
     failed = pyqtSignal(str)
@@ -302,61 +288,6 @@ class QuickSetupWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
-def run_environment_bootstrap(parent: QWidget | None = None) -> bool:
-    try:
-        from scripts import setup_env
-    except Exception as e:
-        QMessageBox.critical(parent, "環境構築エラー", f"セットアップモジュールを読み込めません。\n{e}")
-        return False
-
-    setup_env.cleanup_stale_temporary_workspaces()
-    if setup_env.is_environment_ready():
-        return True
-
-    dialog = QProgressDialog("初回環境を構築しています...", None, 0, 100, parent)
-    dialog.setWindowTitle("初回セットアップ")
-    dialog.setCancelButton(None)
-    dialog.setAutoClose(False)
-    dialog.setAutoReset(False)
-    dialog.setMinimumDuration(0)
-    dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
-    dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
-    dialog.setValue(0)
-
-    worker = EnvironmentSetupWorker()
-    result = {"ok": False, "error": None}
-
-    def on_progress(percent: int, message: str) -> None:
-        dialog.setValue(int(percent))
-        dialog.setLabelText(str(message))
-
-    def on_completed() -> None:
-        result["ok"] = True
-        dialog.setValue(100)
-        dialog.close()
-
-    def on_failed(message: str) -> None:
-        result["error"] = message
-        dialog.close()
-
-    worker.progress.connect(on_progress)
-    worker.completed.connect(on_completed)
-    worker.failed.connect(on_failed)
-    worker.start()
-    dialog.exec()
-    worker.wait()
-
-    if result["ok"]:
-        return True
-
-    QMessageBox.critical(
-        parent,
-        "環境構築エラー",
-        f"必要な実行ファイルの自動セットアップに失敗しました。\n\n{result.get('error') or 'unknown error'}",
-    )
-    return False
-
-
 class SetupWizardDialog(QDialog):
     def __init__(self, parent: QWidget | None = None, startup_mode: bool = False) -> None:
         super().__init__(parent)
@@ -366,8 +297,9 @@ class SetupWizardDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "obs-portable に配置されたポータブルOBSを前提に、必要な設定を自動構成します。\n"
-            "保存先だけ確認して「環境を自動修復」を実行してください。"
+            "OBS Studioは自動取得・同梱されません。公式ReleaseからWindows x64 ZIPを取得し、\n"
+            f"{DATA_DIR / 'obs-portable'} に手動展開してください。\n"
+            "配置後に「OBS設定を構成・再検査」を実行します。通常版OBSは管理対象にしません。"
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -395,7 +327,7 @@ class SetupWizardDialog(QDialog):
         self.fields["obs.dir"].setReadOnly(True)
 
         action_row = QHBoxLayout()
-        self.quick_fix_btn = QPushButton("環境を自動修復")
+        self.quick_fix_btn = QPushButton("OBS設定を構成・再検査")
         self.quick_fix_btn.clicked.connect(self.run_quick_setup)
         action_row.addWidget(self.quick_fix_btn)
 
@@ -404,6 +336,15 @@ class SetupWizardDialog(QDialog):
         action_row.addWidget(self.test_btn)
 
         layout.addLayout(action_row)
+
+        manual_row = QHBoxLayout()
+        self.obs_download_btn = QPushButton("OBS公式ページを開く")
+        self.obs_download_btn.clicked.connect(self.open_obs_download_page)
+        manual_row.addWidget(self.obs_download_btn)
+        self.obs_folder_btn = QPushButton("OBS配置先を開く")
+        self.obs_folder_btn.clicked.connect(self.open_obs_folder)
+        manual_row.addWidget(self.obs_folder_btn)
+        layout.addLayout(manual_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.save_and_accept)
@@ -419,7 +360,7 @@ class SetupWizardDialog(QDialog):
         data = load_config()
         obs = data.get("obs", {})
         paths = data.get("paths", {})
-        self.fields["obs.dir"].setText(recordtest.DEFAULT_OBS_DIR)
+        self.fields["obs.dir"].setText(str(DATA_DIR / recordtest.DEFAULT_OBS_DIR))
         self.fields["obs.scene_name"].setText(str(obs.get("scene_name", "")))
         self.fields["obs.source_name"].setText(str(obs.get("source_name", "")))
         self.fields["obs.source_color"].setText(recordtest.obs_color_to_hex(obs.get("source_color")))
@@ -427,6 +368,16 @@ class SetupWizardDialog(QDialog):
         self.fields["obs.window_capture_window"].setText(str(obs.get("window_capture_window", "")))
         self.fields["paths.recordings_dir"].setText(str(paths.get("recordings_dir", "")))
         self.fields["paths.json_dir"].setText(str(paths.get("json_dir", "")))
+
+    def open_obs_download_page(self) -> None:
+        from scripts.setup_env import OBS_DOWNLOAD_PAGE
+
+        QDesktopServices.openUrl(QUrl(OBS_DOWNLOAD_PAGE))
+
+    def open_obs_folder(self) -> None:
+        destination = DATA_DIR / recordtest.DEFAULT_OBS_DIR
+        destination.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(destination)))
 
     def collect_data(self) -> dict[str, Any]:
         data = load_config()
@@ -471,25 +422,31 @@ class SetupWizardDialog(QDialog):
         data = self.collect_data()
         report, info = run_guided_auto_setup(data)
         if report.get("errors"):
-            QMessageBox.critical(self, "環境修復", format_report_lines(report.get("errors", [])))
+            from scripts.setup_env import obs_manual_setup_message
+
+            QMessageBox.critical(
+                self,
+                "OBS設定",
+                f"{format_report_lines(report.get('errors', []))}\n\n{obs_manual_setup_message()}",
+            )
             return False
 
         if info is None:
-            QMessageBox.critical(self, "環境修復", "初期化に失敗しました。")
+            QMessageBox.critical(self, "OBS設定", "初期化に失敗しました。")
             return False
 
         self.load_values()
         color_hex = recordtest.obs_color_to_hex(info.get("source_color"))
         launch_note = "（セットアップのためポータブルOBSを自動起動しました）" if info.get("obs_launched") else ""
         message = (
-            "環境修復が完了しました。\n"
+            "OBS設定の構成と再検査が完了しました。\n"
             f"シーン: {info.get('scene_name')}\n"
             f"ウィンドウキャプチャ: {info.get('window_capture_name')}\n"
             f"色ソース: {info.get('source_name')} ({color_hex})"
         )
         if launch_note:
             message += f"\n{launch_note}"
-        QMessageBox.information(self, "環境修復", message)
+        QMessageBox.information(self, "OBS設定", message)
         return True
 
     def run_diagnosis(self) -> None:
@@ -794,6 +751,8 @@ class AnalyticsPage(QWidget):
 
 
 class SettingsPage(QWidget):
+    setup_completed = pyqtSignal()
+
     def __init__(self, on_back: Callable[[], None]) -> None:
         super().__init__()
         root_layout = QVBoxLayout(self)
@@ -862,6 +821,7 @@ class SettingsPage(QWidget):
 
         self.fields["paths.recordings_dir"] = QLineEdit()
         self.fields["paths.json_dir"] = QLineEdit()
+        self.fields["paths.ffmpeg_executable"] = QLineEdit()
         self.fields["paths.champion_icons_dir"] = QLineEdit()
         self.fields["storage.max_size_gb"] = QLineEdit()
         self.fields["polling.end_error_limit"] = QLineEdit()
@@ -874,6 +834,21 @@ class SettingsPage(QWidget):
         self.fields["obs.port"].setReadOnly(True)
 
         general_form.addRow("OBSフォルダ(固定)", self.fields["obs.dir"])
+        self.ffmpeg_row = QWidget()
+        ffmpeg_layout = QHBoxLayout(self.ffmpeg_row)
+        ffmpeg_layout.setContentsMargins(0, 0, 0, 0)
+        ffmpeg_layout.setSpacing(8)
+        self.fields["paths.ffmpeg_executable"].setPlaceholderText(
+            "未指定時はユーザーデータのbinとシステムPATHを検索"
+        )
+        ffmpeg_layout.addWidget(self.fields["paths.ffmpeg_executable"], stretch=1)
+        self.ffmpeg_browse_btn = QPushButton("参照...")
+        self.ffmpeg_browse_btn.clicked.connect(self.browse_ffmpeg_executable)
+        ffmpeg_layout.addWidget(self.ffmpeg_browse_btn)
+        self.ffmpeg_download_btn = QPushButton("公式ページ")
+        self.ffmpeg_download_btn.clicked.connect(self.open_ffmpeg_download_page)
+        ffmpeg_layout.addWidget(self.ffmpeg_download_btn)
+        general_form.addRow("FFmpeg実行ファイル", self.ffmpeg_row)
         self.recordings_dir_row = QWidget()
         recordings_dir_layout = QHBoxLayout(self.recordings_dir_row)
         recordings_dir_layout.setContentsMargins(0, 0, 0, 0)
@@ -982,7 +957,7 @@ class SettingsPage(QWidget):
         self.preflight_btn.clicked.connect(self.run_preflight_fix)
         advanced_form.addRow(self.preflight_btn)
 
-        self.quick_fix_btn = QPushButton("環境を自動修復")
+        self.quick_fix_btn = QPushButton("OBS設定を構成・再検査")
         self.quick_fix_btn.clicked.connect(self.run_quick_setup)
         advanced_form.addRow(self.quick_fix_btn)
 
@@ -1053,6 +1028,21 @@ class SettingsPage(QWidget):
         if selected:
             self.fields["paths.champion_icons_dir"].setText(selected)
 
+    def browse_ffmpeg_executable(self) -> None:
+        current = self.fields["paths.ffmpeg_executable"].text().strip()
+        start_dir = resolve_settings_start_dir(current)
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "ffmpeg.exeを選択",
+            start_dir,
+            "FFmpeg executable (ffmpeg.exe);;Executable files (*.exe);;All files (*)",
+        )
+        if selected:
+            self.fields["paths.ffmpeg_executable"].setText(selected)
+
+    def open_ffmpeg_download_page(self) -> None:
+        QDesktopServices.openUrl(QUrl(FFMPEG_DOWNLOAD_PAGE))
+
     def update_storage_progress(self, data: dict[str, Any] | None = None) -> None:
         cfg = data if isinstance(data, dict) else load_config()
         storage_cfg = cfg.get("storage", {}) if isinstance(cfg, dict) else {}
@@ -1112,6 +1102,7 @@ class SettingsPage(QWidget):
             self._select_combo_by_data(self.recording_encoder_combo, recordtest.DEFAULT_OBS_RECORDING_ENCODER)
         self.fields["paths.recordings_dir"].setText(str(paths.get("recordings_dir", "")))
         self.fields["paths.json_dir"].setText(str(paths.get("json_dir", "")))
+        self.fields["paths.ffmpeg_executable"].setText(str(paths.get("ffmpeg_executable", "")))
         self.fields["paths.champion_icons_dir"].setText(str(paths.get("champion_icons_dir", "")))
         self.fields["storage.max_size_gb"].setText(str(storage.get("max_size_gb", "")))
         self.fields["polling.end_error_limit"].setText(str(polling.get("end_error_limit", "")))
@@ -1172,6 +1163,7 @@ class SettingsPage(QWidget):
         save_config(report["config"])
         self.apply_runtime_output_settings_to_obs(report["config"], show_error=False)
         self.load_settings()
+        self.setup_completed.emit()
         QMessageBox.information(self, "設定保存", "設定を保存しました。")
 
     def _get_audio_widgets(self, key: str) -> tuple[QComboBox, QSlider, QCheckBox]:
@@ -1273,6 +1265,7 @@ class SettingsPage(QWidget):
 
         data["paths"]["recordings_dir"] = self.fields["paths.recordings_dir"].text().strip()
         data["paths"]["json_dir"] = self.fields["paths.json_dir"].text().strip()
+        data["paths"]["ffmpeg_executable"] = self.fields["paths.ffmpeg_executable"].text().strip()
         data["paths"]["champion_icons_dir"] = self.fields["paths.champion_icons_dir"].text().strip()
         try:
             data["storage"]["max_size_gb"] = float(self.fields["storage.max_size_gb"].text().strip())
@@ -1523,14 +1516,15 @@ class SettingsPage(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.load_settings()
             self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
+            self.setup_completed.emit()
 
     def run_quick_setup(self) -> bool:
         if self._quick_setup_worker and self._quick_setup_worker.isRunning():
-            QMessageBox.information(self, "環境修復", "環境修復を実行中です。完了まで待ってください。")
+            QMessageBox.information(self, "OBS設定", "OBS設定の構成を実行中です。完了まで待ってください。")
             return False
         data = load_config()
         self.quick_fix_btn.setEnabled(False)
-        self.quick_fix_btn.setText("修復中...")
+        self.quick_fix_btn.setText("構成・再検査中...")
         worker = self.worker_registry.register(QuickSetupWorker(data))
         self._quick_setup_worker = worker
         worker.loaded.connect(self._on_quick_setup_finished)
@@ -1541,19 +1535,20 @@ class SettingsPage(QWidget):
 
     def _on_quick_setup_finished(self, report: dict[str, Any], info: object) -> None:
         if report.get("errors"):
-            QMessageBox.critical(self, "環境修復", format_report_lines(report.get("errors", [])))
+            QMessageBox.critical(self, "OBS設定", format_report_lines(report.get("errors", [])))
             return
 
         if info is None:
-            QMessageBox.critical(self, "環境修復", "初期化に失敗しました。")
+            QMessageBox.critical(self, "OBS設定", "初期化に失敗しました。")
             return
 
         self.load_settings()
         self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
+        self.setup_completed.emit()
         color_hex = recordtest.obs_color_to_hex(info.get("source_color"))
         launch_note = "（セットアップのためポータブルOBSを自動起動しました）" if info.get("obs_launched") else ""
         message = (
-            "環境修復が完了しました。\n"
+            "OBS設定の構成と再検査が完了しました。\n"
             f"シーン: {info.get('scene_name')}\n"
             f"ウィンドウキャプチャ: {info.get('window_capture_name')}\n"
             f"色ソース: {info.get('source_name')} ({color_hex})"
@@ -1562,14 +1557,14 @@ class SettingsPage(QWidget):
             message += f"\n{launch_note}"
         if report.get("warnings"):
             message += f"\n\n警告:\n{format_report_lines(report.get('warnings', []))}"
-        QMessageBox.information(self, "環境修復", message)
+        QMessageBox.information(self, "OBS設定", message)
 
     def _on_quick_setup_failed(self, message: str) -> None:
-        QMessageBox.critical(self, "環境修復", f"環境修復に失敗しました。\n{message}")
+        QMessageBox.critical(self, "OBS設定", f"OBS設定の構成に失敗しました。\n{message}")
 
     def _on_quick_setup_worker_finished(self) -> None:
         self.quick_fix_btn.setEnabled(True)
-        self.quick_fix_btn.setText("環境を自動修復")
+        self.quick_fix_btn.setText("OBS設定を構成・再検査")
         if self._quick_setup_worker:
             self._quick_setup_worker.deleteLater()
             self._quick_setup_worker = None
@@ -1618,6 +1613,7 @@ class MainWindow(QMainWindow):
         self.player_page = PlayerPage(on_back=self.show_home)
         self.analytics_page = AnalyticsPage(on_back=self.show_home)
         self.settings_page = SettingsPage(on_back=self.show_home)
+        self.settings_page.setup_completed.connect(self._on_setup_completed)
         app = QApplication.instance()
         if app:
             app.aboutToQuit.connect(self._stop_player_before_app_quit)
@@ -1745,6 +1741,9 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.home_page)
         if self._recorder_autostart_enabled and not self._closing:
             self.start_background_recorder()
+
+    def _on_setup_completed(self) -> None:
+        self._recorder_autostart_enabled = True
 
     def show_player(self) -> None:
         # MPV native window focus issues are avoided by showing player page first.
@@ -1957,8 +1956,6 @@ def main() -> None:
         icon = get_app_icon()
         if icon:
             app.setWindowIcon(icon)
-        if not run_environment_bootstrap():
-            return
         app.setStyleSheet("""
             QWidget { background-color: #1e1e1e; color: #e0e0e0; }
             QLabel { color: #e0e0e0; }

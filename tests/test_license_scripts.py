@@ -1315,6 +1315,59 @@ def test_unknown_toc_file_and_extra_dist_file_fail(monkeypatch, tmp_path):
     assert any("missing from TOC: extra.bin" in error for error in errors)
 
 
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "obs-portable/bin/64bit/obs64.exe",
+        "_internal/OBS-Studio/data.txt",
+        "ffmpeg.exe",
+        "tools/ffprobe.exe",
+        "downloads/OBS-Studio-32.1.2-Windows-x64.zip",
+        "downloads/OBS-Studio-32.1.2-Windows-x64-Installer.exe",
+        "downloads/OBS-Studio-32.1.2-Windows-x64.msi",
+        "downloads/ffmpeg-8.1.1-essentials_build.7z",
+    ],
+)
+def test_user_provided_runtime_is_rejected_with_or_without_toc(tmp_path, relative):
+    root = tmp_path / "distribution"
+    _write_distribution_materials(root)
+    runtime = root / Path(relative)
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    runtime.write_bytes(b"external runtime")
+    _write_existing_inventory(root)
+    toc = tmp_path / "COLLECT-00.toc"
+    toc.write_text(repr(([],)), encoding="utf-8")
+
+    for errors in (
+        validate_distribution(root),
+        validate_distribution(root, toc_path=toc),
+    ):
+        assert any(
+            "User-provided OBS/standalone FFmpeg must not be bundled" in error
+            for error in errors
+        )
+
+
+def test_opencv_ffmpeg_dll_is_not_treated_as_standalone_ffmpeg(tmp_path):
+    root = tmp_path / "distribution"
+    bundled_library = root / "_internal" / "cv2" / "opencv_videoio_ffmpeg4140_64.dll"
+    bundled_library.parent.mkdir(parents=True)
+    bundled_library.write_bytes(b"opencv library")
+    physical = compliance._physical_files(root)
+
+    assert compliance._forbidden_user_runtime_errors(root, physical) == []
+
+
+def test_build_script_fails_closed_on_user_provided_runtime_artifacts():
+    script = Path("scripts/build.ps1").read_text(encoding="utf-8")
+
+    assert "forbiddenRuntimePaths" in script
+    assert "ffmpeg.exe" in script
+    assert "obs64.exe" in script
+    assert "exe|msi|zip|7z" in script
+    assert "throw \"利用者が用意するOBS／standalone FFmpeg" in script
+
+
 def test_existing_distribution_manifest_detects_missing_record(tmp_path):
     root = tmp_path / "distribution"
     _write_distribution_materials(root)
@@ -1342,7 +1395,6 @@ def test_release_mode_enforces_python_and_legal_gates(tmp_path):
         assert any("Release build Python must be 3.14.6" in error for error in errors)
     assert any("requires the exact PyInstaller COLLECT TOC" in error for error in errors)
     assert any("gate remains for qt:" in error for error in errors)
-    assert any("gate remains for obs-studio:" in error for error in errors)
     assert any("numpy: native_source_coverage_verified" in error for error in errors)
     assert "Release build provenance is missing." in errors
     assert (
@@ -1473,13 +1525,18 @@ def test_distribution_rejects_symlinked_material(tmp_path):
     assert any("links and reparse points" in error.casefold() for error in errors)
 
 
-def test_runtime_download_lock_must_match_setup_constants():
+def test_runtime_download_lock_must_be_empty_for_user_provided_tools():
     lock = _component_lock()
-    lock["runtime_downloads"][1]["archive_sha256"] = "0" * 64
+    lock["runtime_downloads"] = [
+        {
+            "component": "unexpected-runtime",
+            "url": "https://example.invalid/runtime.zip",
+        }
+    ]
 
     errors = compliance._validate_runtime_download_lock(lock)
 
-    assert any("gyan-ffmpeg.archive_sha256" in error for error in errors)
+    assert errors == ["Runtime download component set must be empty for user-provided tools."]
 
 
 def test_installer_build_self_check_has_an_explicit_timeout():

@@ -1,693 +1,169 @@
 import asyncio
-import json
-import os
-import shutil
-import time
-import zipfile
-from contextlib import contextmanager
+import inspect
 from pathlib import Path
 
 import pytest
 
 from scripts import setup_env
+from src import obs_bootstrap
 
 
-def runtime_dir(name):
-    root = Path(os.environ.get("PYTEST_BASETEMP", Path("tests") / "_tmp"))
-    path = root / "setup-env-runtime" / name
-    shutil.rmtree(path, ignore_errors=True)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def write_ffmpeg_archive(
-    path,
-    *,
-    executable=b"new ffmpeg",
-    license_text="GPL license text",
-    readme_text="build and source information",
-    extra_members=(),
-):
-    with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("ffmpeg-build/bin/ffmpeg.exe", executable)
-        if license_text is not None:
-            archive.writestr("ffmpeg-build/LICENSE", license_text)
-        if readme_text is not None:
-            archive.writestr("ffmpeg-build/README.txt", readme_text)
-        for name, content in extra_members:
-            archive.writestr(name, content)
-    return path
-
-
-def test_ffmpeg_download_prefers_the_pinned_github_release_asset():
-    assert setup_env.FFMPEG_PACKAGE.url == (
-        "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/"
-        "ffmpeg-8.1.1-essentials_build.zip"
-    )
-    assert setup_env.FFMPEG_PACKAGE.fallback_urls == (
-        "https://www.gyan.dev/ffmpeg/builds/packages/"
-        "ffmpeg-8.1.1-essentials_build.zip",
-    )
-
-
-def test_extract_obs_flattens_top_level_zip_directory(monkeypatch):
-    tmp_path = runtime_dir("setup_env_obs_extract")
-    zip_path = tmp_path / "obs.zip"
-    dest = tmp_path / "obs-portable"
-
-    with zipfile.ZipFile(zip_path, "w") as archive:
-        archive.writestr("OBS-Studio-Portable/bin/64bit/obs64.exe", "fake")
-        archive.writestr("OBS-Studio-Portable/data/obs-plugins/plugin.txt", "plugin")
-
-    setup_env._extract_obs(zip_path, dest)
-
-    assert (dest / "bin" / "64bit" / "obs64.exe").exists()
-    assert (dest / "data" / "obs-plugins" / "plugin.txt").exists()
-    assert not (dest / "OBS-Studio-Portable" / "bin" / "64bit" / "obs64.exe").exists()
-
-
-def test_extract_obs_rejects_zip_member_outside_destination():
-    tmp_path = runtime_dir("setup_env_obs_extract_zip_slip")
-    zip_path = tmp_path / "obs.zip"
-    dest = tmp_path / "obs-portable"
-    outside = tmp_path / "evil.txt"
-
-    with zipfile.ZipFile(zip_path, "w") as archive:
-        archive.writestr("OBS-Studio-Portable/bin/64bit/obs64.exe", "fake")
-        archive.writestr("../evil.txt", "must not be written")
-
-    with pytest.raises(RuntimeError, match="Unsafe ZIP member path"):
-        setup_env._extract_obs(zip_path, dest)
-
-    assert not outside.exists()
-    assert not (dest / "bin" / "64bit" / "obs64.exe").exists()
-
-
-def test_safe_extractall_rejects_windows_absolute_member():
-    tmp_path = runtime_dir("setup_env_obs_extract_windows_absolute")
-    zip_path = tmp_path / "obs.zip"
-    dest = tmp_path / "extract"
-
-    with zipfile.ZipFile(zip_path, "w") as archive:
-        archive.writestr("C:/Windows/System32/evil.txt", "must not be written")
-
-    with zipfile.ZipFile(zip_path) as archive:
-        with pytest.raises(RuntimeError, match="Unsafe ZIP member path"):
-            setup_env._safe_extractall(archive, dest)
-
-
-def test_extract_ffmpeg_preserves_license_materials():
-    tmp_path = runtime_dir("setup_env_ffmpeg_extract")
-    zip_path = tmp_path / "ffmpeg.zip"
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-    license_dir = tmp_path / "licenses" / "FFmpeg"
-
-    write_ffmpeg_archive(zip_path, executable=b"fake")
-
-    result = setup_env._extract_ffmpeg(zip_path, dest, license_dir)
-
-    assert result == dest
-    assert dest.read_text(encoding="utf-8") == "fake"
-    assert (license_dir / "LICENSE").read_text(encoding="utf-8") == "GPL license text"
-    assert (license_dir / "README.txt").read_text(encoding="utf-8") == "build and source information"
-    manifest = json.loads((license_dir / setup_env.FFMPEG_INSTALL_MANIFEST).read_text(encoding="utf-8"))
-    assert manifest["version"] == setup_env.FFMPEG_VERSION
-    assert manifest["archive_sha256"] == setup_env._sha256(zip_path)
-    assert manifest["executable"]["sha256"] == setup_env._sha256(dest)
-    assert [entry["path"] for entry in manifest["license_files"]] == ["LICENSE"]
-    assert [entry["path"] for entry in manifest["documentation_files"]] == ["README.txt"]
-    setup_env._validate_ffmpeg_installation(
-        dest,
-        license_dir,
-        archive_sha256=setup_env._sha256(zip_path),
-    )
-
-
-def test_ffmpeg_installation_readiness_rejects_modified_material():
-    tmp_path = runtime_dir("setup_env_ffmpeg_modified_material")
-    zip_path = write_ffmpeg_archive(tmp_path / "ffmpeg.zip")
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-    license_dir = tmp_path / "licenses" / "FFmpeg"
-    archive_sha256 = setup_env._sha256(zip_path)
-    setup_env._extract_ffmpeg(zip_path, dest, license_dir)
-
-    (license_dir / "README.txt").write_text("modified", encoding="utf-8")
-
-    assert not setup_env._is_ffmpeg_installation_ready(
-        dest,
-        license_dir,
-        archive_sha256=archive_sha256,
-    )
-
-
-def test_extract_ffmpeg_rejects_archive_without_license_materials():
-    tmp_path = runtime_dir("setup_env_ffmpeg_missing_license")
-    zip_path = tmp_path / "ffmpeg.zip"
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-
-    write_ffmpeg_archive(zip_path, license_text=None)
-
-    with pytest.raises(RuntimeError, match="real FFmpeg license"):
-        setup_env._extract_ffmpeg(zip_path, dest)
-
-    assert not dest.exists()
-
-
-def test_extract_ffmpeg_rejects_authors_without_real_license():
-    tmp_path = runtime_dir("setup_env_ffmpeg_authors_only")
-    zip_path = tmp_path / "ffmpeg.zip"
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-
-    write_ffmpeg_archive(
-        zip_path,
-        license_text=None,
-        extra_members=(("ffmpeg-build/AUTHORS", "contributors"),),
-    )
-
-    with pytest.raises(RuntimeError, match="real FFmpeg license"):
-        setup_env._extract_ffmpeg(zip_path, dest)
-
-    assert not dest.exists()
-
-
-def test_extract_ffmpeg_rejects_archive_without_build_information():
-    tmp_path = runtime_dir("setup_env_ffmpeg_missing_readme")
-    zip_path = tmp_path / "ffmpeg.zip"
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-
-    write_ffmpeg_archive(zip_path, readme_text=None)
-
-    with pytest.raises(RuntimeError, match="README or build information"):
-        setup_env._extract_ffmpeg(zip_path, dest)
-
-    assert not dest.exists()
-
-
-def test_extract_ffmpeg_rejects_zip_member_outside_destination():
-    tmp_path = runtime_dir("setup_env_ffmpeg_extract_zip_slip")
-    zip_path = tmp_path / "ffmpeg.zip"
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-    outside = tmp_path / "evil.txt"
-
-    write_ffmpeg_archive(
-        zip_path,
-        extra_members=(("../evil.txt", "must not be written"),),
-    )
-
-    with pytest.raises(RuntimeError, match="Unsafe ZIP member path"):
-        setup_env._extract_ffmpeg(zip_path, dest)
-
-    assert not outside.exists()
-    assert not dest.exists()
-
-
-def test_extract_ffmpeg_rejects_zip_symlink():
-    tmp_path = runtime_dir("setup_env_ffmpeg_extract_symlink")
-    zip_path = tmp_path / "ffmpeg.zip"
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-
-    write_ffmpeg_archive(zip_path)
-    symlink = zipfile.ZipInfo("ffmpeg-build/docs-link")
-    symlink.create_system = 3
-    symlink.external_attr = 0o120777 << 16
-    with zipfile.ZipFile(zip_path, "a") as archive:
-        archive.writestr(symlink, "../outside")
-
-    with pytest.raises(RuntimeError, match="symbolic links"):
-        setup_env._extract_ffmpeg(zip_path, dest)
-
-    assert not dest.exists()
-
-
-def test_extract_ffmpeg_rejects_case_insensitive_collision():
-    tmp_path = runtime_dir("setup_env_ffmpeg_extract_case_collision")
-    zip_path = tmp_path / "ffmpeg.zip"
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-
-    write_ffmpeg_archive(
-        zip_path,
-        extra_members=(("FFMPEG-BUILD/license", "duplicate license path"),),
-    )
-
-    with pytest.raises(RuntimeError, match="Case-insensitive ZIP member collision"):
-        setup_env._extract_ffmpeg(zip_path, dest)
-
-    assert not dest.exists()
-
-
-def test_extract_ffmpeg_rolls_back_partial_replace_and_can_retry(monkeypatch):
-    tmp_path = runtime_dir("setup_env_ffmpeg_transaction_retry")
-    zip_path = write_ffmpeg_archive(tmp_path / "ffmpeg.zip")
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-    license_dir = tmp_path / "licenses" / "FFmpeg"
-    dest.parent.mkdir(parents=True)
-    license_dir.mkdir(parents=True)
-    dest.write_text("old ffmpeg", encoding="utf-8")
-    (license_dir / "old.txt").write_text("old materials", encoding="utf-8")
-
-    real_replace = os.replace
-    failed = False
-
-    def fail_material_replace_once(source, target):
-        nonlocal failed
-        if Path(source).name == "materials" and not failed:
-            failed = True
-            raise OSError("simulated replace failure")
-        return real_replace(source, target)
-
-    monkeypatch.setattr(setup_env.os, "replace", fail_material_replace_once)
-
-    with pytest.raises(RuntimeError, match="rollback was attempted"):
-        setup_env._extract_ffmpeg(zip_path, dest, license_dir)
-
-    assert dest.read_text(encoding="utf-8") == "old ffmpeg"
-    assert (license_dir / "old.txt").read_text(encoding="utf-8") == "old materials"
-    assert not (license_dir / setup_env.FFMPEG_INSTALL_MANIFEST).exists()
-
-    monkeypatch.setattr(setup_env.os, "replace", real_replace)
-    setup_env._extract_ffmpeg(zip_path, dest, license_dir)
-
-    assert dest.read_bytes() == b"new ffmpeg"
-    assert not (license_dir / "old.txt").exists()
-    setup_env._validate_ffmpeg_installation(
-        dest,
-        license_dir,
-        archive_sha256=setup_env._sha256(zip_path),
-    )
-
-
-def test_ffmpeg_startup_recovers_backups_after_process_interruption():
-    tmp_path = runtime_dir("setup_env_ffmpeg_crash_recovery")
-    dest = tmp_path / "bin" / "ffmpeg.exe"
-    license_dir = tmp_path / "licenses" / "FFmpeg"
-    dest.parent.mkdir(parents=True)
-    license_dir.mkdir(parents=True)
-    dest.write_text("old ffmpeg", encoding="utf-8")
-    (license_dir / "old.txt").write_text("old materials", encoding="utf-8")
-
-    token = "1" * 32
-    executable_backup = dest.with_name(f".{dest.name}.{token}.bak")
-    license_backup = license_dir.with_name(f".{license_dir.name}.{token}.bak")
-    os.replace(dest, executable_backup)
-    os.replace(license_dir, license_backup)
-    dest.write_text("partial new ffmpeg", encoding="utf-8")
-    license_dir.mkdir()
-    (license_dir / "partial.txt").write_text("partial", encoding="utf-8")
-    journal_path = setup_env._ffmpeg_transaction_journal_path(dest, license_dir)
-    setup_env._write_json_atomically(
-        journal_path,
-        {
-            "schema_version": setup_env.FFMPEG_TRANSACTION_SCHEMA_VERSION,
-            "token": token,
-            "executable": dest.name,
-            "license_directory": license_dir.name,
-            "executable_backup": executable_backup.name,
-            "license_backup": license_backup.name,
-            "had_executable": True,
-            "had_licenses": True,
-        },
-    )
-
-    assert not setup_env._is_ffmpeg_installation_ready(dest, license_dir)
-    setup_env._recover_interrupted_ffmpeg_transaction(dest, license_dir)
-    assert dest.read_text(encoding="utf-8") == "old ffmpeg"
-    assert (license_dir / "old.txt").read_text(encoding="utf-8") == "old materials"
-    assert not journal_path.exists()
-    assert not executable_backup.exists()
-    assert not license_backup.exists()
-
-
-def test_bootstrap_obs_portable_config_writes_marker_and_tray_settings(monkeypatch):
-    obs_dir = runtime_dir("setup_env_obs_bootstrap") / "obs-portable"
-
-    setup_env.bootstrap_obs_portable_config(obs_dir)
-
-    global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
-    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
-    text = global_ini.read_text(encoding="utf-8")
-    user_text = user_ini.read_text(encoding="utf-8")
-
-    assert (obs_dir / "obs_portable_mode.txt").exists()
-    assert "[General]" in text
-    assert "FirstRun=true" in text
-    assert "[BasicWindow]" in text
-    assert "SysTrayEnabled=false" in text
-    assert "SysTrayWhenStarted=false" in text
-    assert "SysTrayMinimizeToTray=false" in text
-    assert "HideTrayIcon" not in text
-    assert "FirstRun=true" in user_text
-    assert "SysTrayEnabled=false" in user_text
-    assert "SysTrayWhenStarted=false" in user_text
-    assert "SysTrayMinimizeToTray=false" in user_text
-
-
-def test_cleanup_legacy_archives_removes_setup_zips():
-    root = runtime_dir("setup_env_cleanup_archives")
-    bin_dir = root / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    obs_zip = bin_dir / "OBS-Studio-32.1.2-Windows-x64.zip"
-    ffmpeg_zip = bin_dir / "ffmpeg-8.1.1-essentials_build.zip"
-    keep_file = bin_dir / "mpv-1.dll"
-    obs_zip.write_bytes(b"obs")
-    ffmpeg_zip.write_bytes(b"ffmpeg")
-    keep_file.write_bytes(b"mpv")
-
-    removed = setup_env.cleanup_legacy_archives(bin_dir)
-
-    assert {path.name for path in removed} == {ffmpeg_zip.name, obs_zip.name}
-    assert not obs_zip.exists()
-    assert not ffmpeg_zip.exists()
-    assert keep_file.exists()
-
-
-def test_cleanup_obs_debug_symbols_removes_pdb_files():
-    root = runtime_dir("setup_env_cleanup_pdb")
-    obs_dir = root / "obs-portable"
-    pdb = obs_dir / "bin" / "64bit" / "obs64.pdb"
-    dll = obs_dir / "bin" / "64bit" / "obs.dll"
-    pdb.parent.mkdir(parents=True, exist_ok=True)
-    pdb.write_bytes(b"debug")
-    dll.write_bytes(b"dll")
-
-    removed = setup_env.cleanup_obs_debug_symbols(obs_dir)
-
-    assert removed == [pdb]
-    assert not pdb.exists()
-    assert dll.exists()
-
-
-def test_environment_ready_requires_bootstrapped_obs_global_ini(monkeypatch):
-    root = runtime_dir("setup_env_ready_requires_bootstrap")
-    ffmpeg = root / "bin" / "ffmpeg.exe"
-    obs_dir = root / "obs-portable"
+def _configure_paths(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "install"
+    data = tmp_path / "data"
+    obs_dir = data / "obs-portable"
     obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
-    global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
-    ffmpeg.parent.mkdir(parents=True, exist_ok=True)
-    obs_exe.parent.mkdir(parents=True, exist_ok=True)
-    global_ini.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg.write_text("fake", encoding="utf-8")
-    obs_exe.write_text("fake", encoding="utf-8")
-    global_ini.write_text("[BasicWindow]\nSysTrayEnabled=true\n", encoding="utf-8")
-
-    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
-    monkeypatch.setattr(setup_env, "OBS_EXE", obs_exe)
+    monkeypatch.setattr(setup_env, "ROOT_DIR", root)
+    monkeypatch.setattr(setup_env, "DATA_DIR", data)
+    monkeypatch.setattr(setup_env, "BIN_DIR", data / "bin")
     monkeypatch.setattr(setup_env, "OBS_PORTABLE_DIR", obs_dir)
-
-    assert setup_env.is_environment_ready() is False
-
-    setup_env.bootstrap_obs_portable_config(obs_dir)
-
-    assert setup_env.is_environment_ready() is True
-
-
-def test_environment_ready_requires_obs_first_run_initialized(monkeypatch):
-    root = runtime_dir("setup_env_ready_requires_first_run")
-    ffmpeg = root / "bin" / "ffmpeg.exe"
-    obs_dir = root / "obs-portable"
-    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
-    global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
-    ffmpeg.parent.mkdir(parents=True, exist_ok=True)
-    obs_exe.parent.mkdir(parents=True, exist_ok=True)
-    global_ini.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg.write_text("fake", encoding="utf-8")
-    obs_exe.write_text("fake", encoding="utf-8")
-    global_ini.write_text(
-        "[General]\n"
-        "FirstRun=false\n\n"
-        "[BasicWindow]\n"
-        "SysTrayEnabled=false\n"
-        "SysTrayWhenStarted=false\n"
-        "SysTrayMinimizeToTray=false\n",
-        encoding="utf-8",
+    monkeypatch.setattr(setup_env, "OBS_EXE", obs_exe)
+    monkeypatch.setattr(setup_env, "LEGACY_ROOT_OBS_PORTABLE_DIR", root / "obs-portable")
+    monkeypatch.setattr(setup_env, "LEGACY_OBS_PORTABLE_DIR", root / "bin" / "OBS-Studio")
+    monkeypatch.setattr(
+        setup_env,
+        "LEGACY_DATA_BIN_OBS_PORTABLE_DIR",
+        data / "bin" / "OBS-Studio",
     )
-
-    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
-    monkeypatch.setattr(setup_env, "OBS_EXE", obs_exe)
-    monkeypatch.setattr(setup_env, "OBS_PORTABLE_DIR", obs_dir)
-
-    assert setup_env.is_environment_ready() is False
-
-    setup_env.bootstrap_obs_portable_config(obs_dir)
-
-    assert setup_env.is_environment_ready() is True
+    return obs_dir, obs_exe
 
 
-def test_environment_ready_requires_bootstrapped_obs_user_ini(monkeypatch):
-    root = runtime_dir("setup_env_ready_requires_user_ini")
-    ffmpeg = root / "bin" / "ffmpeg.exe"
-    obs_dir = root / "obs-portable"
-    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
-    global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
-    ffmpeg.parent.mkdir(parents=True, exist_ok=True)
+def _write_fake_obs(obs_exe: Path) -> None:
     obs_exe.parent.mkdir(parents=True, exist_ok=True)
-    global_ini.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg.write_text("fake", encoding="utf-8")
-    obs_exe.write_text("fake", encoding="utf-8")
-    global_ini.write_text(
-        "[General]\n"
-        "FirstRun=true\n\n"
-        "[BasicWindow]\n"
-        "SysTrayEnabled=false\n"
-        "SysTrayWhenStarted=false\n"
-        "SysTrayMinimizeToTray=false\n",
-        encoding="utf-8",
-    )
+    obs_exe.write_bytes(b"fake obs")
 
-    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
-    monkeypatch.setattr(setup_env, "OBS_EXE", obs_exe)
-    monkeypatch.setattr(setup_env, "OBS_PORTABLE_DIR", obs_dir)
 
-    assert setup_env.is_environment_ready() is False
+def test_setup_module_has_no_network_or_archive_install_path():
+    source = inspect.getsource(setup_env)
 
-    setup_env.bootstrap_obs_portable_config(obs_dir)
+    assert "urllib" not in source
+    assert "urlopen" not in source
+    assert "zipfile" not in source
+    assert "unpack_archive" not in source
+    assert not hasattr(setup_env, "download_file")
+    assert not hasattr(setup_env, "ensure_ffmpeg")
 
+
+def test_manual_setup_message_identifies_upstream_and_exact_destination(monkeypatch, tmp_path):
+    _obs_dir, obs_exe = _configure_paths(monkeypatch, tmp_path)
+
+    message = setup_env.obs_manual_setup_message()
+
+    assert setup_env.OBS_ARCHIVE_NAME in message
+    assert str(obs_exe) in message
+    assert setup_env.OBS_DOWNLOAD_PAGE in message
+    assert "自動取得されません" in message
+
+
+def test_missing_obs_requires_manual_setup_without_creating_a_runtime(monkeypatch, tmp_path):
+    obs_dir, _obs_exe = _configure_paths(monkeypatch, tmp_path)
+
+    with pytest.raises(setup_env.ManualSetupRequiredError, match="自動取得されません"):
+        asyncio.run(setup_env.ensure_obs_portable())
+
+    assert not obs_dir.exists()
+
+
+def test_user_provided_obs_is_bootstrapped_and_reported_ready(monkeypatch, tmp_path):
+    obs_dir, obs_exe = _configure_paths(monkeypatch, tmp_path)
+    _write_fake_obs(obs_exe)
+    progress: list[tuple[int, str]] = []
+
+    result = asyncio.run(setup_env.ensure_obs_portable(lambda percent, text: progress.append((percent, text))))
+
+    assert result == obs_dir
     assert setup_env.is_environment_ready() is True
+    assert (obs_dir / "obs_portable_mode.txt").is_file()
+    assert (obs_dir / "config" / "obs-studio" / "global.ini").is_file()
+    assert (obs_dir / "config" / "obs-studio" / "user.ini").is_file()
+    assert progress[-1] == (100, f"OBS is ready: {obs_dir}")
 
 
-def test_bootstrap_obs_portable_config_regenerates_corrupt_global_ini():
-    obs_dir = runtime_dir("setup_env_obs_bootstrap_corrupt") / "obs-portable"
-    global_ini = obs_dir / "config" / "obs-studio" / "global.ini"
-    global_ini.parent.mkdir(parents=True, exist_ok=True)
-    global_ini.write_text("[General\nbroken", encoding="utf-8")
-
-    setup_env.bootstrap_obs_portable_config(obs_dir)
-
-    text = global_ini.read_text(encoding="utf-8")
-    assert "FirstRun=true" in text
-    assert "SysTrayEnabled=false" in text
-    assert "SysTrayWhenStarted=false" in text
-    assert "SysTrayMinimizeToTray=false" in text
-    user_text = (obs_dir / "config" / "obs-studio" / "user.ini").read_text(encoding="utf-8")
-    assert "FirstRun=true" in user_text
-    assert "SysTrayEnabled=false" in user_text
-
-
-def test_ensure_obs_portable_migrates_legacy_obs_studio(monkeypatch):
-    root = runtime_dir("setup_env_legacy_obs_migration")
-    legacy_dir = root / "bin" / "OBS-Studio"
-    obs_dir = root / "obs-portable"
+def test_legacy_obs_is_copied_without_deleting_user_files(monkeypatch, tmp_path):
+    obs_dir, _obs_exe = _configure_paths(monkeypatch, tmp_path)
+    legacy_dir = setup_env.LEGACY_OBS_PORTABLE_DIR
     legacy_exe = legacy_dir / "bin" / "64bit" / "obs64.exe"
-    legacy_ini = legacy_dir / "config" / "obs-studio" / "global.ini"
-    legacy_exe.parent.mkdir(parents=True, exist_ok=True)
-    legacy_ini.parent.mkdir(parents=True, exist_ok=True)
-    legacy_exe.write_text("fake", encoding="utf-8")
-    legacy_ini.write_text(
-        "[General]\n"
-        "FirstRun=false\n\n"
-        "[BasicWindow]\n"
-        "SysTrayEnabled=true\n",
-        encoding="utf-8",
-    )
-
-    monkeypatch.setattr(setup_env, "OBS_PORTABLE_DIR", obs_dir)
-    monkeypatch.setattr(setup_env, "LEGACY_OBS_PORTABLE_DIR", legacy_dir)
-    monkeypatch.setattr(setup_env, "OBS_EXE", obs_dir / "bin" / "64bit" / "obs64.exe")
-    monkeypatch.setattr(setup_env, "LEGACY_OBS_EXE", legacy_exe)
+    _write_fake_obs(legacy_exe)
+    user_file = legacy_dir / "config" / "obs-studio" / "basic" / "profiles" / "user.txt"
+    user_file.parent.mkdir(parents=True, exist_ok=True)
+    user_file.write_text("keep me", encoding="utf-8")
+    (legacy_dir / ".lol_replay_obs_lease.json").write_text("{}", encoding="utf-8")
+    (legacy_dir / "temp_appdata").mkdir()
 
     assert setup_env.migrate_legacy_obs_portable() is True
 
-    migrated_ini = obs_dir / "config" / "obs-studio" / "global.ini"
-    migrated_user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
-    assert (obs_dir / "bin" / "64bit" / "obs64.exe").exists()
-    text = migrated_ini.read_text(encoding="utf-8")
-    assert "FirstRun=true" in text
-    assert "SysTrayEnabled=false" in text
-    user_text = migrated_user_ini.read_text(encoding="utf-8")
-    assert "FirstRun=true" in user_text
-    assert "SysTrayEnabled=false" in user_text
-
-
-def test_environment_ready_does_not_require_ffmpeg(monkeypatch):
-    root = runtime_dir("setup_env_ready_without_ffmpeg")
-    ffmpeg = root / "bin" / "ffmpeg.exe"
-    obs_dir = root / "obs-portable"
-    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
-    obs_exe.parent.mkdir(parents=True, exist_ok=True)
-    obs_exe.write_text("fake", encoding="utf-8")
-
-    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
-    monkeypatch.setattr(setup_env, "OBS_EXE", obs_exe)
-    monkeypatch.setattr(setup_env, "OBS_PORTABLE_DIR", obs_dir)
-
-    setup_env.bootstrap_obs_portable_config(obs_dir)
-
-    assert not ffmpeg.exists()
+    assert legacy_exe.is_file()
+    assert user_file.read_text(encoding="utf-8") == "keep me"
+    assert (obs_dir / "bin" / "64bit" / "obs64.exe").is_file()
+    assert (obs_dir / user_file.relative_to(legacy_dir)).read_text(encoding="utf-8") == "keep me"
+    assert not (obs_dir / ".lol_replay_obs_lease.json").exists()
+    assert not (obs_dir / "temp_appdata").exists()
     assert setup_env.is_environment_ready() is True
 
 
-def test_cleanup_stale_temporary_workspaces_removes_old_directories_only():
-    root = runtime_dir("setup_env_cleanup_tmp")
-    tmp_dir = root / "downloads" / "_tmp"
-    old_workspace = tmp_dir / "old"
-    current_workspace = tmp_dir / "current"
-    old_workspace.mkdir(parents=True)
-    current_workspace.mkdir(parents=True)
-    (old_workspace / "archive.zip").write_bytes(b"old")
-    (current_workspace / "archive.zip").write_bytes(b"current")
-    old_time = time.time() - 7200
-    os.utime(old_workspace, (old_time, old_time))
+def test_existing_destination_prevents_legacy_copy(monkeypatch, tmp_path):
+    obs_dir, obs_exe = _configure_paths(monkeypatch, tmp_path)
+    _write_fake_obs(obs_exe)
+    legacy_exe = setup_env.LEGACY_OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
+    _write_fake_obs(legacy_exe)
 
-    removed = setup_env.cleanup_stale_temporary_workspaces(max_age_sec=3600, base_dir=tmp_dir)
-
-    assert removed == [old_workspace]
-    assert not old_workspace.exists()
-    assert current_workspace.exists()
+    assert setup_env.migrate_legacy_obs_portable() is False
+    assert obs_exe.read_bytes() == b"fake obs"
+    assert obs_dir.is_dir()
 
 
-def test_setup_lock_rejects_concurrent_setup():
-    root = runtime_dir("setup_env_lock")
-    lock_path = root / ".setup.lock"
+def test_cancelled_setup_does_not_copy_legacy_obs(monkeypatch, tmp_path):
+    obs_dir, _obs_exe = _configure_paths(monkeypatch, tmp_path)
+    legacy_exe = setup_env.LEGACY_OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
+    _write_fake_obs(legacy_exe)
 
-    with setup_env.setup_lock(lock_path=lock_path, timeout_sec=0):
-        with pytest.raises(setup_env.SetupLockTimeoutError):
-            with setup_env.setup_lock(lock_path=lock_path, timeout_sec=0):
-                pass
+    with pytest.raises(RuntimeError, match="キャンセル"):
+        asyncio.run(setup_env.ensure_obs_portable(cancel_cb=lambda: True))
 
-    assert not lock_path.exists()
-
-
-def test_download_retries_with_fallback_url(monkeypatch):
-    root = runtime_dir("setup_env_download_fallback")
-    dest = root / "package.zip"
-    package = setup_env.BinaryPackage(
-        name="Package",
-        version="1",
-        url="https://primary.invalid/package.zip",
-        sha256="unused",
-        archive_name="package.zip",
-        progress_start=0,
-        progress_end=100,
-        fallback_urls=("https://mirror.invalid/package.zip",),
-    )
-    calls = []
-
-    def fake_download_once(package_arg, url, dest_arg, progress_cb=None, cancel_cb=None):
-        calls.append(url)
-        if url == package.url:
-            raise TimeoutError("primary timed out")
-        dest_arg.write_bytes(b"mirror")
-
-    monkeypatch.setattr(setup_env, "_download_once", fake_download_once)
-
-    setup_env._download(package, dest)
-
-    assert calls == [package.url, package.fallback_urls[0]]
-    assert dest.read_bytes() == b"mirror"
+    assert not obs_dir.exists()
+    assert legacy_exe.is_file()
 
 
-def test_ensure_ffmpeg_rechecks_after_setup_lock(monkeypatch):
-    root = runtime_dir("setup_env_ffmpeg_recheck")
-    ffmpeg = root / "bin" / "ffmpeg.exe"
-    license_dir = root / "licenses" / "FFmpeg"
-    zip_path = write_ffmpeg_archive(root / "ffmpeg.zip")
-    package = setup_env.BinaryPackage(
-        name="FFmpeg",
-        version=setup_env.FFMPEG_VERSION,
-        url="https://example.invalid/ffmpeg.zip",
-        sha256=setup_env._sha256(zip_path),
-        archive_name="ffmpeg.zip",
-        progress_start=0,
-        progress_end=95,
-    )
+def test_partial_legacy_copy_is_retried_without_deleting_source(monkeypatch, tmp_path):
+    obs_dir, obs_exe = _configure_paths(monkeypatch, tmp_path)
+    legacy_dir = setup_env.LEGACY_OBS_PORTABLE_DIR
+    legacy_exe = legacy_dir / "bin" / "64bit" / "obs64.exe"
+    _write_fake_obs(legacy_exe)
+    real_copy = setup_env.copy_obs_tree_contents
 
-    @contextmanager
-    def fake_setup_lock(**kwargs):
-        setup_env._extract_ffmpeg(
-            zip_path,
-            ffmpeg,
-            license_dir,
-            version=package.version,
-            expected_archive_sha256=package.sha256,
+    def fail_after_executable(_source, destination):
+        destination.mkdir(parents=True, exist_ok=True)
+        obs_bootstrap.get_obs_copy_in_progress_marker(destination).write_text(
+            str(legacy_dir), encoding="utf-8"
         )
-        yield root / ".setup.lock"
+        _write_fake_obs(destination / "bin" / "64bit" / "obs64.exe")
+        raise OSError("simulated interrupted copy")
 
-    async def fail_download(*args, **kwargs):
-        raise AssertionError("download must not run after another process installed FFmpeg")
+    monkeypatch.setattr(setup_env, "copy_obs_tree_contents", fail_after_executable)
+    with pytest.raises(OSError, match="interrupted"):
+        setup_env.migrate_legacy_obs_portable()
 
-    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
-    monkeypatch.setattr(setup_env, "FFMPEG_LICENSE_DIR", license_dir)
-    monkeypatch.setattr(setup_env, "FFMPEG_PACKAGE", package)
-    monkeypatch.setattr(setup_env, "setup_lock", fake_setup_lock)
-    monkeypatch.setattr(setup_env, "download_file", fail_download)
+    assert obs_exe.is_file()
+    assert legacy_exe.is_file()
+    assert obs_bootstrap.is_obs_copy_in_progress(obs_dir) is True
+    assert setup_env.is_environment_ready() is False
 
-    result = asyncio.run(setup_env.ensure_ffmpeg())
+    monkeypatch.setattr(setup_env, "copy_obs_tree_contents", real_copy)
+    assert setup_env.migrate_legacy_obs_portable() is True
 
-    assert result == ffmpeg
-
-
-def test_ensure_ffmpeg_repairs_executable_without_license_manifest(monkeypatch):
-    root = runtime_dir("setup_env_ffmpeg_repairs_exe_only")
-    ffmpeg = root / "bin" / "ffmpeg.exe"
-    license_dir = root / "licenses" / "FFmpeg"
-    source_zip = write_ffmpeg_archive(root / "source.zip")
-    package = setup_env.BinaryPackage(
-        name="FFmpeg",
-        version=setup_env.FFMPEG_VERSION,
-        url="https://example.invalid/ffmpeg.zip",
-        sha256=setup_env._sha256(source_zip),
-        archive_name="ffmpeg.zip",
-        progress_start=0,
-        progress_end=95,
-    )
-    ffmpeg.parent.mkdir(parents=True)
-    ffmpeg.write_text("legacy executable", encoding="utf-8")
-    downloads = []
-
-    async def fake_download(package_arg, dest, progress_cb=None, cancel_cb=None):
-        downloads.append(package_arg)
-        shutil.copyfile(source_zip, dest)
-
-    monkeypatch.setattr(setup_env, "DATA_DIR", root)
-    monkeypatch.setattr(setup_env, "FFMPEG_EXE", ffmpeg)
-    monkeypatch.setattr(setup_env, "FFMPEG_LICENSE_DIR", license_dir)
-    monkeypatch.setattr(setup_env, "FFMPEG_PACKAGE", package)
-    monkeypatch.setattr(setup_env, "download_file", fake_download)
-
-    result = asyncio.run(setup_env.ensure_ffmpeg())
-
-    assert result == ffmpeg
-    assert downloads == [package]
-    assert ffmpeg.read_bytes() == b"new ffmpeg"
-    assert setup_env._is_ffmpeg_installation_ready(
-        ffmpeg,
-        license_dir,
-        version=package.version,
-        archive_sha256=package.sha256,
-    )
+    assert obs_bootstrap.is_obs_copy_in_progress(obs_dir) is False
+    assert legacy_exe.is_file()
+    assert setup_env.is_environment_ready() is True
 
 
-def test_ensure_environment_skips_optional_ffmpeg(monkeypatch):
-    calls = []
+def test_ensure_environment_only_validates_obs(monkeypatch):
+    calls: list[str] = []
 
     async def fake_ensure_obs(progress_cb=None, cancel_cb=None):
         calls.append("obs")
-
-    async def fail_ensure_ffmpeg(*args, **kwargs):
-        raise AssertionError("FFmpeg must be installed lazily during clip export")
+        return Path("obs-portable")
 
     monkeypatch.setattr(setup_env, "ensure_obs_portable", fake_ensure_obs)
-    monkeypatch.setattr(setup_env, "ensure_ffmpeg", fail_ensure_ffmpeg)
-    monkeypatch.setattr(setup_env, "cleanup_setup_archives", lambda: [])
 
     asyncio.run(setup_env.ensure_environment())
 

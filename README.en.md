@@ -16,18 +16,17 @@ Use of any locally retained v0.5.2 installer is not recommended. Any SHA-256
 recorded for v0.5.2 is only a historical identifier for the withdrawn binary;
 it does not identify a currently downloadable binary or prove a reproducible
 build. The original Actions artifact is no longer retained, so every file in
-that installer cannot now be independently audited. Specialist review of the
-historical materials and the sufficiency of the retrospective remediation is
-also incomplete.
+that installer cannot now be independently audited. The maintainer has accepted
+this audit limitation and the residual risk while keeping v0.5.2 withdrawn.
 
 The next public version will attach its installer, exact project source,
 third-party sources, license materials, and a `SHA256SUMS.txt` covering every
-asset to the same Release. OBS Studio and the Gyan.dev FFmpeg build will not be
-inside the installer; the application downloads them separately from pinned
-locations when needed. No new public Release will be made until source coverage
-for every runtime dependency and wheel-vendored native component, PyQt6-Qt6
-wheel build provenance, and specialist review of those automatic downloads are
-complete.
+asset to the same Release. OBS Studio and standalone FFmpeg are external tools
+that users explicitly obtain and place. This project does not automatically
+download, mirror, bundle, or redistribute them. No new public Release will be
+made until the remaining gates for the distributed files, including runtime and
+wheel-vendored native source coverage and PyQt6-Qt6 wheel build provenance, are
+complete. Publication also requires an explicit maintainer instruction.
 
 An mpv DLL is also not bundled. Obtain a supported 64-bit DLL separately and
 place it in `%LOCALAPPDATA%\LoLReplayTool\bin`.
@@ -150,16 +149,21 @@ tests/
 
 - Windows
 - Python 3.14 for the currently tested development and build environment
+- A portable OBS Studio installation
+- Standalone FFmpeg when using clip export
 - A supported 64-bit mpv DLL
 
-OBS Studio, the standalone Gyan.dev FFmpeg build used for clip export, mpv
-DLLs, and Riot Games image assets are not included in this repository or the
-packaged application.
+OBS Studio, standalone FFmpeg used for clip export, mpv DLLs, and Riot Games
+image assets are not included in this repository or the packaged application.
 
-- OBS Studio is downloaded at first startup. Development uses `obs-portable`; packaged builds use `%LOCALAPPDATA%\LoLReplayTool\obs-portable`.
+- Obtain the Windows x64 ZIP from the [official OBS Project Releases](https://github.com/obsproject/obs-studio/releases) and extract it so that `obs-portable\bin\64bit\obs64.exe` exists for development, or `%LOCALAPPDATA%\LoLReplayTool\obs-portable\bin\64bit\obs64.exe` exists for an installed build.
 - Place an mpv DLL in `bin/` for development or `%LOCALAPPDATA%\LoLReplayTool\bin` for an installed build.
-- FFmpeg is downloaded when clip export is first used. The application does not depend on FFmpeg from the system `PATH`.
+- Obtain a suitable Windows build through the [official FFmpeg download guidance](https://ffmpeg.org/download.html). Select `ffmpeg.exe` in Settings, place it in `bin/` for development or `%LOCALAPPDATA%\LoLReplayTool\bin` for an installed build, or expose it through a system `PATH` containing only safe absolute directories.
 - Champion icons are neither bundled nor downloaded.
+
+This project does not automatically download, mirror, bundle, or redistribute
+OBS Studio, standalone FFmpeg, or mpv DLLs. The in-application upstream-page
+buttons open the provider's page only after an explicit user action.
 
 ## Development Setup
 
@@ -174,13 +178,11 @@ Direct dependencies are maintained in `requirements.in` and `requirements-dev.in
 Manual editing of `config/setting.json` is normally unnecessary. The application:
 
 - Uses only the managed portable OBS installation
-- Downloads OBS before displaying the main window when required
-- Downloads FFmpeg only when clip export requires it
+- Starts without OBS and shows the official Release page and dedicated placement path when it is missing
+- Resolves FFmpeg in this order: `paths.ffmpeg_executable`, configured `bin_dir`, `bin/ffmpeg.exe` and `ffmpeg.exe` under the application root, then safe absolute directories from the system `PATH`
 - Prevents simultaneous application startup
-- Serializes setup with an inter-process lock
-- Uses fixed dependency versions and SHA256 verification
 - Configures OBS portable mode and authenticated local WebSocket access
-- Provides automatic environment repair for scenes and synchronization sources
+- Provides an explicit OBS configuration and recheck action for scenes and synchronization sources
 - Exposes recording, audio, storage, and notification settings in the GUI
 
 Packaged builds store mutable data under `%LOCALAPPDATA%\LoLReplayTool`.
@@ -297,9 +299,9 @@ SHA256SUMS.txt
 
 Third-party sources may be split into multiple assets smaller than 2 GiB.
 Published Releases are not edited, assets are not overwritten, and tags are
-not moved or deleted; a correction uses a new version. OBS Studio and the
-Gyan.dev FFmpeg build are post-install downloads, not files bundled in these
-installer assets.
+not moved or deleted; a correction uses a new version. OBS Studio and standalone
+FFmpeg are user-provided external tools. This project does not automatically
+download, mirror, bundle, or redistribute them.
 
 ## License
 
@@ -318,11 +320,11 @@ GPL dependencies obtained where necessary.
 ## Troubleshooting
 
 - Run `LoLReplayTool.exe --self-check` to inspect configuration, writable paths, and OBS/FFmpeg/mpv availability without opening the GUI.
-- If portable OBS is missing, verify `%LOCALAPPDATA%\LoLReplayTool\obs-portable\bin\64bit\obs64.exe` for an installed build or `obs-portable\bin\64bit\obs64.exe` for development.
+- If portable OBS is missing, obtain and extract the Windows x64 ZIP from the official OBS Project Release page. Verify `%LOCALAPPDATA%\LoLReplayTool\obs-portable\bin\64bit\obs64.exe` for an installed build or `obs-portable\bin\64bit\obs64.exe` for development. A normally installed OBS instance is not managed.
 - If the mpv DLL is missing, place one of `mpv-1.dll`, `libmpv-1.dll`, `mpv-2.dll`, or `libmpv-2.dll` in the appropriate `bin` directory.
-- FFmpeg is normally downloaded on first clip export. A manually supplied executable must be placed in the application data `bin` directory or the development `bin` directory.
+- If FFmpeg is missing, select `ffmpeg.exe` in Settings or place it in the application-data or development `bin` directory. The search order is the explicit setting, data `bin`, application-root `bin` and root fallbacks, then safe absolute directories from the system `PATH`.
 - If the OBS WebSocket port is already in use, close any normal or manually started OBS instance. This application controls only its managed portable OBS.
 - If OBS appears in the system tray, close all existing OBS processes before restarting the application.
 - If events are missing, inspect the JSON `events` and `events_all` fields.
 - Analytics requires multiple JSON files containing both wins and losses.
-- If synchronization is incorrect, use synchronization correction or run automatic environment repair again.
+- If synchronization is incorrect, use synchronization correction or run the OBS configuration and recheck action again.

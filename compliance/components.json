@@ -2097,26 +2097,5 @@
       ]
     }
   ],
-  "runtime_downloads": [
-    {
-      "component": "obs-studio",
-      "version": "32.1.2",
-      "archive_url": "https://github.com/obsproject/obs-studio/releases/download/32.1.2/OBS-Studio-32.1.2-Windows-x64.zip",
-      "archive_sha256": "8d97e4563bd8d22d03e63042aa7dccede1d555c9bd35ce8a9e5019b0d0201bf6",
-      "fallback_urls": [],
-      "bundled_in_installer": false,
-      "release_legal_review_required": true
-    },
-    {
-      "component": "gyan-ffmpeg",
-      "version": "8.1.1",
-      "archive_url": "https://github.com/GyanD/codexffmpeg/releases/download/8.1.1/ffmpeg-8.1.1-essentials_build.zip",
-      "archive_sha256": "6f58ce889f59c311410f7d2b18895b33c03456463486f3b1ebc93d97a0f54541",
-      "fallback_urls": [
-        "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-essentials_build.zip"
-      ],
-      "bundled_in_installer": false,
-      "release_legal_review_required": true
-    }
-  ]
+  "runtime_downloads": []
 }

@@ -688,7 +688,10 @@ def test_actual_migration_read_amplification_and_handles_are_bounded(
     assert migrated == source.resolve()
     source_inventory = obs_bootstrap._build_obs_tree_inventory(source)
     destination_inventory = obs_bootstrap._build_obs_tree_inventory(destination)
-    assert destination_inventory == source_inventory
+    assert obs_bootstrap._inventory_content_matches(
+        destination_inventory,
+        source_inventory,
+    )
     source_files = [entry for entry in source_inventory if entry.kind == "file"]
     assert len(source_files) == expected_file_count
     assert sum(entry.size or 0 for entry in source_files) == expected_total_bytes

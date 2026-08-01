@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import os
 import stat
 from collections.abc import Iterable
@@ -51,6 +52,39 @@ class _OBSTransactionTemporaryDescriptor:
     path: Path
 
 
+@dataclass(frozen=True)
+class _OBSFilesystemMetadata:
+    """Stable security metadata captured from an already-open entry.
+
+    Directory timestamps are deliberately excluded because ordinary child
+    creation/removal changes them.  Access time is excluded for every kind
+    because inventory reads may update it.
+    """
+
+    permissions: int
+    owner: int | None
+    group: int | None
+    attributes: int | None
+    creation_time: int | None
+    modification_time: int | None
+    change_time: int | None
+    security_descriptor_sha256: str | None
+    extended_attributes_sha256: str | None
+
+
+@dataclass(frozen=True)
+class _OBSPhysicalDirectoryComponent:
+    identity: tuple[int, int, int]
+    mount_id: int | None
+
+
+@dataclass(frozen=True)
+class _OBSPhysicalDirectoryChain:
+    components: tuple[_OBSPhysicalDirectoryComponent, ...]
+    complete: bool
+    last_existing_path: Path
+
+
 class OBSPathSafetyError(RuntimeError):
     """Raised when an OBS path could escape the managed lexical boundary."""
 
@@ -68,6 +102,7 @@ if os.name == "nt":
     _WINDOWS_GENERIC_READ = 0x80000000
     _WINDOWS_GENERIC_WRITE = 0x40000000
     _WINDOWS_DELETE = 0x00010000
+    _WINDOWS_READ_CONTROL = 0x00020000
     _WINDOWS_SYNCHRONIZE = 0x00100000
     _WINDOWS_MAXIMUM_ALLOWED = 0x02000000
     _WINDOWS_FILE_READ_DATA = 0x0001
@@ -95,7 +130,14 @@ if os.name == "nt":
     _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
     _WINDOWS_FILE_RENAME_INFO = 3
     _WINDOWS_FILE_DISPOSITION_INFO = 4
+    _WINDOWS_FILE_STREAM_INFO = 7
     _WINDOWS_NT_FILE_RENAME_INFORMATION = 10
+    _WINDOWS_ERROR_HANDLE_EOF = 38
+    _WINDOWS_ERROR_MORE_DATA = 234
+    _WINDOWS_SE_FILE_OBJECT = 1
+    _WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
+    _WINDOWS_GROUP_SECURITY_INFORMATION = 0x00000002
+    _WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
 
     class _WindowsUnicodeString(ctypes.Structure):
         _fields_ = [
@@ -145,6 +187,15 @@ if os.name == "nt":
             ("FileName", wintypes.WCHAR * 1),
         ]
 
+    class _WindowsFileStreamInfo(ctypes.Structure):
+        _fields_ = [
+            ("NextEntryOffset", wintypes.DWORD),
+            ("StreamNameLength", wintypes.DWORD),
+            ("StreamSize", ctypes.c_longlong),
+            ("StreamAllocationSize", ctypes.c_longlong),
+            ("StreamName", wintypes.WCHAR * 1),
+        ]
+
 
 def _is_windows_lock_contention_error(error: OSError) -> bool:
     return getattr(error, "winerror", None) in WINDOWS_LOCK_CONTENTION_ERRORS
@@ -179,6 +230,7 @@ def _file_identity(file_stat: os.stat_result) -> tuple[int, int, int]:
 if os.name == "nt":
     _WINDOWS_KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _WINDOWS_NTDLL = ctypes.WinDLL("ntdll", use_last_error=True)
+    _WINDOWS_ADVAPI32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
     _WINDOWS_KERNEL32.CreateFileW.argtypes = [
         wintypes.LPCWSTR,
@@ -197,6 +249,13 @@ if os.name == "nt":
         ctypes.POINTER(_WindowsByHandleFileInformation),
     ]
     _WINDOWS_KERNEL32.GetFileInformationByHandle.restype = wintypes.BOOL
+    _WINDOWS_KERNEL32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    _WINDOWS_KERNEL32.GetFileInformationByHandleEx.restype = wintypes.BOOL
     _WINDOWS_KERNEL32.SetFileInformationByHandle.argtypes = [
         wintypes.HANDLE,
         ctypes.c_int,
@@ -206,6 +265,8 @@ if os.name == "nt":
     _WINDOWS_KERNEL32.SetFileInformationByHandle.restype = wintypes.BOOL
     _WINDOWS_KERNEL32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
     _WINDOWS_KERNEL32.FlushFileBuffers.restype = wintypes.BOOL
+    _WINDOWS_KERNEL32.LocalFree.argtypes = [wintypes.HLOCAL]
+    _WINDOWS_KERNEL32.LocalFree.restype = wintypes.HLOCAL
     _WINDOWS_NTDLL.NtCreateFile.argtypes = [
         ctypes.POINTER(wintypes.HANDLE),
         wintypes.DWORD,
@@ -230,6 +291,19 @@ if os.name == "nt":
     _WINDOWS_NTDLL.NtSetInformationFile.restype = ctypes.c_long
     _WINDOWS_NTDLL.RtlNtStatusToDosError.argtypes = [ctypes.c_long]
     _WINDOWS_NTDLL.RtlNtStatusToDosError.restype = wintypes.ULONG
+    _WINDOWS_ADVAPI32.GetSecurityInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+        ctypes.POINTER(wintypes.LPVOID),
+    ]
+    _WINDOWS_ADVAPI32.GetSecurityInfo.restype = wintypes.DWORD
+    _WINDOWS_ADVAPI32.GetSecurityDescriptorLength.argtypes = [wintypes.LPVOID]
+    _WINDOWS_ADVAPI32.GetSecurityDescriptorLength.restype = wintypes.DWORD
 
 
 def _validate_single_path_component(name: str) -> None:
@@ -260,6 +334,7 @@ def _windows_directory_access(*, mutable: bool) -> int:
         _WINDOWS_FILE_LIST_DIRECTORY
         | _WINDOWS_FILE_TRAVERSE
         | _WINDOWS_FILE_READ_ATTRIBUTES
+        | _WINDOWS_READ_CONTROL
         | _WINDOWS_SYNCHRONIZE
     )
     if mutable:
@@ -359,6 +434,119 @@ def _windows_handle_details(handle: int) -> tuple[tuple[int, int, int], int, int
     return identity, size, int(information.nNumberOfLinks), attributes
 
 
+def _windows_filetime_value(value: Any) -> int:
+    return (int(value.dwHighDateTime) << 32) | int(value.dwLowDateTime)
+
+
+def _windows_security_descriptor_sha256(handle: int) -> str:
+    security_descriptor = wintypes.LPVOID()
+    result = int(
+        _WINDOWS_ADVAPI32.GetSecurityInfo(
+            wintypes.HANDLE(handle),
+            _WINDOWS_SE_FILE_OBJECT,
+            _WINDOWS_OWNER_SECURITY_INFORMATION
+            | _WINDOWS_GROUP_SECURITY_INFORMATION
+            | _WINDOWS_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            ctypes.byref(security_descriptor),
+        )
+    )
+    if result != 0:
+        raise ctypes.WinError(result)
+    if not security_descriptor.value:
+        raise _UnsafeOBSMigrationPathError(
+            "security descriptorの取得結果が空です"
+        )
+    try:
+        length = int(
+            _WINDOWS_ADVAPI32.GetSecurityDescriptorLength(security_descriptor)
+        )
+        if length <= 0:
+            raise _UnsafeOBSMigrationPathError(
+                "security descriptorの長さが不正です"
+            )
+        return hashlib.sha256(
+            ctypes.string_at(security_descriptor.value, length)
+        ).hexdigest()
+    finally:
+        _WINDOWS_KERNEL32.LocalFree(security_descriptor)
+
+
+def _windows_stream_names(handle: int) -> tuple[str, ...]:
+    buffer_size = 4096
+    while True:
+        buffer = ctypes.create_string_buffer(buffer_size)
+        if _WINDOWS_KERNEL32.GetFileInformationByHandleEx(
+            wintypes.HANDLE(handle),
+            _WINDOWS_FILE_STREAM_INFO,
+            buffer,
+            buffer_size,
+        ):
+            break
+        error_code = ctypes.get_last_error()
+        if error_code == _WINDOWS_ERROR_MORE_DATA:
+            buffer_size *= 2
+            if buffer_size > 16 * 1024 * 1024:
+                raise _UnsafeOBSMigrationPathError(
+                    "alternate data stream一覧が大きすぎます"
+                )
+            continue
+        if error_code == _WINDOWS_ERROR_HANDLE_EOF:
+            return ()
+        raise ctypes.WinError(error_code)
+
+    names: list[str] = []
+    offset = 0
+    minimum_size = _WindowsFileStreamInfo.StreamName.offset
+    while True:
+        if offset < 0 or offset + minimum_size > buffer_size:
+            raise _UnsafeOBSMigrationPathError(
+                "alternate data stream一覧の形式が不正です"
+            )
+        information = _WindowsFileStreamInfo.from_buffer(buffer, offset)
+        name_length = int(information.StreamNameLength)
+        if name_length < 0 or name_length % ctypes.sizeof(wintypes.WCHAR) != 0:
+            raise _UnsafeOBSMigrationPathError(
+                "alternate data stream名の長さが不正です"
+            )
+        name_offset = offset + _WindowsFileStreamInfo.StreamName.offset
+        if name_offset + name_length > buffer_size:
+            raise _UnsafeOBSMigrationPathError(
+                "alternate data stream名が取得buffer外を参照しています"
+            )
+        names.append(
+            ctypes.wstring_at(
+                ctypes.addressof(buffer) + name_offset,
+                name_length // ctypes.sizeof(wintypes.WCHAR),
+            )
+        )
+        next_offset = int(information.NextEntryOffset)
+        if next_offset == 0:
+            break
+        if next_offset < minimum_size or offset + next_offset <= offset:
+            raise _UnsafeOBSMigrationPathError(
+                "alternate data stream一覧のoffsetが不正です"
+            )
+        offset += next_offset
+    return tuple(names)
+
+
+def _windows_reject_named_data_streams(handle: int, *, path: Path) -> None:
+    named_streams = tuple(
+        name
+        for name in _windows_stream_names(handle)
+        if name.casefold().endswith(":$data") and name.casefold() != "::$data"
+    )
+    if named_streams:
+        raise _UnsafeOBSMigrationPathError(
+            "NTFS alternate data streamは利用できません: "
+            f"{path} ({', '.join(named_streams)})"
+        )
+
+
 def _windows_close_handle(handle: int) -> None:
     if not _WINDOWS_KERNEL32.CloseHandle(wintypes.HANDLE(handle)):
         raise ctypes.WinError(ctypes.get_last_error())
@@ -416,6 +604,134 @@ def _is_reparse_point(file_stat: os.stat_result) -> bool:
     return stat.S_ISLNK(file_stat.st_mode) or bool(attributes & reparse_flag)
 
 
+def _posix_extended_attributes_sha256(descriptor: int, *, path: Path) -> str:
+    listxattr = getattr(os, "listxattr", None)
+    getxattr = getattr(os, "getxattr", None)
+    if not callable(listxattr) or not callable(getxattr):
+        raise _UnsafeOBSMigrationPathError(
+            f"このPOSIX runtimeはxattr/ACL inventoryを提供しません: {path}"
+        )
+    try:
+        names_before = tuple(sorted(listxattr(descriptor)))
+        digest = hashlib.sha256()
+        for name in names_before:
+            encoded_name = os.fsencode(name)
+            value = getxattr(descriptor, name)
+            digest.update(len(encoded_name).to_bytes(4, "big"))
+            digest.update(encoded_name)
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+        names_after = tuple(sorted(listxattr(descriptor)))
+    except OSError as exc:
+        raise _UnsafeOBSMigrationPathError(
+            f"xattr/ACL metadataをhandleから検査できません: {path} ({exc})"
+        ) from exc
+    if names_after != names_before:
+        raise _UnsafeOBSMigrationPathError(
+            f"xattr/ACL一覧が検査中に変化しました: {path}"
+        )
+    return digest.hexdigest()
+
+
+def _snapshot_open_entry_metadata(
+    descriptor: int,
+    *,
+    path: Path,
+    kind: str,
+    native_windows_handle: bool = False,
+) -> _OBSFilesystemMetadata:
+    if kind not in {"file", "directory"}:
+        raise ValueError(f"unsupported metadata kind: {kind}")
+    if os.name == "nt":
+        handle = descriptor if native_windows_handle else msvcrt.get_osfhandle(descriptor)
+        information = _WindowsByHandleFileInformation()
+        if not _WINDOWS_KERNEL32.GetFileInformationByHandle(
+            wintypes.HANDLE(handle),
+            ctypes.byref(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = int(information.dwFileAttributes)
+        actual_kind = (
+            "directory"
+            if attributes
+            & int(getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10))
+            else "file"
+        )
+        if actual_kind != kind:
+            raise _UnsafeOBSMigrationPathError(
+                f"metadata検査中にentry kindが変化しました: {path}"
+            )
+        _windows_reject_named_data_streams(handle, path=path)
+        return _OBSFilesystemMetadata(
+            permissions=0,
+            owner=None,
+            group=None,
+            attributes=attributes,
+            creation_time=(
+                _windows_filetime_value(information.ftCreationTime)
+                if kind == "file"
+                else None
+            ),
+            modification_time=(
+                _windows_filetime_value(information.ftLastWriteTime)
+                if kind == "file"
+                else None
+            ),
+            change_time=None,
+            security_descriptor_sha256=_windows_security_descriptor_sha256(handle),
+            extended_attributes_sha256=None,
+        )
+
+    opened = os.fstat(descriptor)
+    expected_mode = stat.S_IFREG if kind == "file" else stat.S_IFDIR
+    if stat.S_IFMT(opened.st_mode) != expected_mode:
+        raise _UnsafeOBSMigrationPathError(
+            f"metadata検査中にentry kindが変化しました: {path}"
+        )
+    return _OBSFilesystemMetadata(
+        permissions=stat.S_IMODE(opened.st_mode),
+        owner=int(opened.st_uid),
+        group=int(opened.st_gid),
+        attributes=None,
+        creation_time=None,
+        modification_time=(int(opened.st_mtime_ns) if kind == "file" else None),
+        change_time=(int(opened.st_ctime_ns) if kind == "file" else None),
+        security_descriptor_sha256=None,
+        extended_attributes_sha256=_posix_extended_attributes_sha256(
+            descriptor,
+            path=path,
+        ),
+    )
+
+
+def _probe_open_directory_metadata_capability(
+    directory: _OBSDirectoryLease,
+    *,
+    reject_named_streams: bool,
+) -> None:
+    if os.name == "nt":
+        handle = directory.native_handle
+        _windows_security_descriptor_sha256(handle)
+        if reject_named_streams:
+            _windows_reject_named_data_streams(handle, path=directory.path)
+        else:
+            _windows_stream_names(handle)
+        return
+    listxattr = getattr(os, "listxattr", None)
+    if not callable(listxattr):
+        raise _UnsafeOBSMigrationPathError(
+            "このPOSIX runtimeはxattr/ACL inventoryを提供しません: "
+            f"{directory.path}"
+        )
+    try:
+        listxattr(directory.native_handle)
+    except OSError as exc:
+        raise _UnsafeOBSMigrationPathError(
+            "xattr/ACL metadata capabilityをhandleから確認できません: "
+            f"{directory.path} ({exc})"
+        ) from exc
+
+
 def _validate_existing_entry(
     path: Path,
     *,
@@ -447,12 +763,63 @@ class _OBSDirectoryLease:
         identity: tuple[int, int, int],
         *,
         mutable: bool,
+        mount_boundary: tuple[int, int] | None = None,
     ) -> None:
         self.path = _absolute_path(path)
         self._native_handle = native_handle
         self.identity = identity
         self.mutable = mutable
+        self.mount_id = (
+            None
+            if os.name == "nt"
+            else _posix_mount_id_for_descriptor(native_handle, path=self.path)
+        )
+        self._mount_boundary = mount_boundary
         self._closed = False
+
+    @property
+    def mount_identity(self) -> tuple[int, int] | None:
+        if os.name == "nt":
+            return None
+        if self.mount_id is None:
+            raise _UnsafeOBSMigrationPathError(
+                f"managed rootのmount identityを取得できません: {self.path}"
+            )
+        return (self.identity[0], self.mount_id)
+
+    def _pin_mount_boundary(self) -> None:
+        if os.name != "nt":
+            self._mount_boundary = self.mount_identity
+
+    def _validate_mount_boundary(
+        self,
+        identity: tuple[int, int, int],
+        mount_id: int | None,
+        *,
+        path: Path,
+    ) -> None:
+        if os.name == "nt" or self._mount_boundary is None:
+            return
+        current = (identity[0], mount_id)
+        if current != self._mount_boundary:
+            raise _UnsafeOBSMigrationPathError(
+                "managed root配下のmount境界を横断できません: "
+                f"{path} ({self._mount_boundary} != {current})"
+            )
+
+    def _validate_descriptor_mount_boundary(
+        self,
+        descriptor: int,
+        *,
+        path: Path,
+    ) -> None:
+        if os.name == "nt" or self._mount_boundary is None:
+            return
+        self._validate_mount_boundary(
+            _file_identity(os.fstat(descriptor)),
+            _posix_mount_id_for_descriptor(descriptor, path=path),
+            path=path,
+        )
 
     @classmethod
     def open_absolute(
@@ -461,6 +828,7 @@ class _OBSDirectoryLease:
         *,
         create: bool = False,
         mutable: bool = False,
+        reject_directory_identities: frozenset[tuple[int, int, int]] = frozenset(),
     ) -> _OBSDirectoryLease:
         absolute = _absolute_path(path)
         anchor = Path(absolute.anchor)
@@ -468,10 +836,19 @@ class _OBSDirectoryLease:
             raise _UnsafeOBSMigrationPathError(f"absolute directoryではありません: {absolute}")
         lease = cls._open_anchor(anchor)
         try:
+            if lease.identity in reject_directory_identities:
+                raise _UnsafeOBSMigrationPathError(
+                    f"作成先ancestorが禁止されたphysical tree内です: {lease.path}"
+                )
             for part in absolute.parts[1:]:
                 child = lease.open_child_directory(part, create=create)
                 lease.close()
                 lease = child
+                if lease.identity in reject_directory_identities:
+                    raise _UnsafeOBSMigrationPathError(
+                        f"作成先が禁止されたphysical tree内です: {lease.path}"
+                    )
+            lease._pin_mount_boundary()
             if mutable and not lease.mutable:
                 mutable_lease = lease.mutable_clone()
                 lease.close()
@@ -498,11 +875,16 @@ class _OBSDirectoryLease:
                 raise
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         descriptor = os.open(anchor, flags)
-        opened = os.fstat(descriptor)
-        if not stat.S_ISDIR(opened.st_mode):
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                raise _UnsafeOBSMigrationPathError(
+                    f"通常ディレクトリではありません: {anchor}"
+                )
+            return cls(anchor, descriptor, _file_identity(opened), mutable=False)
+        except Exception:
             os.close(descriptor)
-            raise _UnsafeOBSMigrationPathError(f"通常ディレクトリではありません: {anchor}")
-        return cls(anchor, descriptor, _file_identity(opened), mutable=False)
+            raise
 
     def mutable_clone(self) -> _OBSDirectoryLease:
         self.validate_lexical_binding()
@@ -525,7 +907,34 @@ class _OBSDirectoryLease:
             else:
                 os.close(handle)
             raise _UnsafeOBSMigrationPathError(f"mutable lease取得中にancestorが入れ替わりました: {self.path}")
-        return _OBSDirectoryLease(self.path, handle, identity, mutable=True)
+        try:
+            clone = _OBSDirectoryLease(
+                self.path,
+                handle,
+                identity,
+                mutable=True,
+                mount_boundary=self._mount_boundary,
+            )
+        except Exception:
+            if os.name == "nt":
+                _windows_close_handle(handle)
+            else:
+                os.close(handle)
+            raise
+        try:
+            if clone.mount_id != self.mount_id:
+                raise _UnsafeOBSMigrationPathError(
+                    f"mutable lease取得中にmount identityが変化しました: {self.path}"
+                )
+            clone._validate_mount_boundary(
+                clone.identity,
+                clone.mount_id,
+                path=clone.path,
+            )
+            return clone
+        except Exception:
+            clone.close()
+            raise
 
     @property
     def native_handle(self) -> int:
@@ -559,13 +968,38 @@ class _OBSDirectoryLease:
             if attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
                 raise _UnsafeOBSMigrationPathError(f"reparse pointは利用できません: {self.path}")
         else:
-            current = os.stat(self.path, follow_symlinks=False)
-            if _is_reparse_point(current) or not stat.S_ISDIR(current.st_mode):
-                raise _UnsafeOBSMigrationPathError(f"通常ディレクトリではありません: {self.path}")
-            identity = _file_identity(current)
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                current_descriptor = os.open(self.path, flags)
+            except OSError as exc:
+                raise _UnsafeOBSMigrationPathError(
+                    f"directory pathをhandleで再検査できません: {self.path} ({exc})"
+                ) from exc
+            try:
+                current = os.fstat(current_descriptor)
+                if _is_reparse_point(current) or not stat.S_ISDIR(current.st_mode):
+                    raise _UnsafeOBSMigrationPathError(
+                        f"通常ディレクトリではありません: {self.path}"
+                    )
+                identity = _file_identity(current)
+                current_mount_id = _posix_mount_id_for_descriptor(
+                    current_descriptor,
+                    path=self.path,
+                )
+            finally:
+                os.close(current_descriptor)
             opened = os.fstat(self.native_handle)
             if _file_identity(opened) != self.identity:
                 raise _UnsafeOBSMigrationPathError(f"directory handle identityが変化しました: {self.path}")
+            if current_mount_id != self.mount_id:
+                raise _UnsafeOBSMigrationPathError(
+                    f"directory mount identityが変化しました: {self.path}"
+                )
+            self._validate_mount_boundary(
+                identity,
+                current_mount_id,
+                path=self.path,
+            )
         if identity != self.identity:
             raise _UnsafeOBSMigrationPathError(f"ancestor directoryが入れ替わりました: {self.path}")
 
@@ -663,6 +1097,12 @@ class _OBSDirectoryLease:
                 handle,
                 identity,
                 mutable=mutable,
+                mount_boundary=self._mount_boundary,
+            )
+            child._validate_mount_boundary(
+                child.identity,
+                child.mount_id,
+                path=child_path,
             )
             child.validate_lexical_binding()
             self.validate_lexical_binding()
@@ -736,7 +1176,11 @@ class _OBSDirectoryLease:
             )
         self.validate_lexical_binding()
         if os.name == "nt":
-            desired_access = _WINDOWS_FILE_READ_DATA | _WINDOWS_FILE_READ_ATTRIBUTES
+            desired_access = (
+                _WINDOWS_FILE_READ_DATA
+                | _WINDOWS_FILE_READ_ATTRIBUTES
+                | _WINDOWS_READ_CONTROL
+            )
             if write:
                 desired_access |= _WINDOWS_FILE_WRITE_DATA | _WINDOWS_FILE_WRITE_ATTRIBUTES
             if delete:
@@ -787,6 +1231,10 @@ class _OBSDirectoryLease:
                 )
         try:
             opened_identity = _file_identity(os.fstat(descriptor))
+            self._validate_descriptor_mount_boundary(
+                descriptor,
+                path=self.path / name,
+            )
             lexical = _validate_existing_entry(self.path / name, expected_kind="file")
             if _file_identity(lexical) != opened_identity:
                 raise _UnsafeOBSMigrationPathError(f"relative open後にidentityが変化しました: {self.path / name}")
@@ -869,6 +1317,238 @@ class _OBSDirectoryLease:
         os.fsync(self.native_handle)
         return True
 
+
+def _posix_mount_id_for_descriptor(descriptor: int, *, path: Path) -> int | None:
+    if os.name == "nt":
+        return None
+    fdinfo_root = Path("/proc/self/fdinfo")
+    if not fdinfo_root.is_dir():
+        raise _UnsafeOBSMigrationPathError(
+            f"このPOSIX runtimeはopen handleのmount identityを提供しません: {path}"
+        )
+    fdinfo = fdinfo_root / str(descriptor)
+    try:
+        with fdinfo.open("r", encoding="ascii") as stream:
+            for line in stream:
+                key, separator, value = line.partition(":")
+                if separator and key == "mnt_id":
+                    return int(value.strip())
+    except (OSError, ValueError) as exc:
+        raise _UnsafeOBSMigrationPathError(
+            f"mount identityをopen handleから検査できません: {path} ({exc})"
+        ) from exc
+    raise _UnsafeOBSMigrationPathError(
+        f"mount identityがopen handle情報にありません: {path}"
+    )
+
+
+def _physical_directory_component(
+    directory: _OBSDirectoryLease,
+) -> _OBSPhysicalDirectoryComponent:
+    directory.validate_lexical_binding()
+    return _OBSPhysicalDirectoryComponent(
+        identity=directory.identity,
+        mount_id=_posix_mount_id_for_descriptor(
+            directory.native_handle,
+            path=directory.path,
+        ),
+    )
+
+
+def _physical_directory_chain(
+    path: str | Path,
+    *,
+    allow_missing: bool,
+) -> _OBSPhysicalDirectoryChain:
+    absolute = _absolute_path(path)
+    anchor = Path(absolute.anchor)
+    if not anchor.anchor:
+        raise _UnsafeOBSMigrationPathError(
+            f"absolute directoryではありません: {absolute}"
+        )
+    directory = _OBSDirectoryLease._open_anchor(anchor)
+    components: list[_OBSPhysicalDirectoryComponent] = []
+    complete = True
+    last_existing_path = anchor
+    try:
+        components.append(_physical_directory_component(directory))
+        parts = absolute.parts[1:]
+        for index, part in enumerate(parts):
+            _validate_single_path_component(part)
+            try:
+                child = directory.open_child_directory(part)
+            except FileNotFoundError:
+                if not allow_missing:
+                    raise
+                for remaining in parts[index + 1 :]:
+                    _validate_single_path_component(remaining)
+                complete = False
+                break
+            directory.close()
+            directory = child
+            last_existing_path = directory.path
+            components.append(_physical_directory_component(directory))
+        return _OBSPhysicalDirectoryChain(
+            components=tuple(components),
+            complete=complete,
+            last_existing_path=last_existing_path,
+        )
+    finally:
+        directory.close()
+
+
+def _physical_directory_tree_identities(
+    root: _OBSDirectoryLease,
+    *,
+    inspect_files: bool = True,
+) -> frozenset[tuple[int, int, int]]:
+    """Preflight a tree without reading content or following lexical aliases."""
+
+    identities: set[tuple[int, int, int]] = set()
+
+    def visit(directory: _OBSDirectoryLease) -> None:
+        directory.validate_lexical_binding()
+        if directory.identity in identities:
+            raise _UnsafeOBSMigrationPathError(
+                f"同じphysical directoryがtree内に複数回現れます: {directory.path}"
+            )
+        identities.add(directory.identity)
+        _snapshot_open_entry_metadata(
+            directory.native_handle,
+            path=directory.path,
+            kind="directory",
+            native_windows_handle=os.name == "nt",
+        )
+        scan_descriptor: int | None = None
+        scan_target: str | Path | int
+        if os.name == "nt":
+            scan_target = directory.path
+        else:
+            scan_descriptor = os.open(
+                ".",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory.native_handle,
+            )
+            scan_target = scan_descriptor
+        try:
+            with os.scandir(scan_target) as iterator:
+                for entry in iterator:
+                    _validate_single_path_component(entry.name)
+                    child_path = directory.path / entry.name
+                    try:
+                        child_stat = entry.stat(follow_symlinks=False)
+                        if os.name == "nt":
+                            child_stat = os.stat(child_path, follow_symlinks=False)
+                    except OSError as exc:
+                        raise _UnsafeOBSMigrationPathError(
+                            f"preflight entryを検査できません: {child_path} ({exc})"
+                        ) from exc
+                    if _is_reparse_point(child_stat):
+                        raise _UnsafeOBSMigrationPathError(
+                            f"reparse pointは利用できません: {child_path}"
+                        )
+                    if stat.S_ISDIR(child_stat.st_mode):
+                        with directory.open_child_directory(entry.name) as child:
+                            visit(child)
+                    elif stat.S_ISREG(child_stat.st_mode):
+                        if not inspect_files:
+                            continue
+                        descriptor = directory.open_file(
+                            entry.name,
+                            write=False,
+                            create_exclusive=False,
+                            share_delete=False,
+                        )
+                        try:
+                            _snapshot_open_entry_metadata(
+                                descriptor,
+                                path=child_path,
+                                kind="file",
+                            )
+                        finally:
+                            os.close(descriptor)
+                    else:
+                        raise _UnsafeOBSMigrationPathError(
+                            f"特殊entryは利用できません: {child_path}"
+                        )
+        finally:
+            if scan_descriptor is not None:
+                os.close(scan_descriptor)
+        directory.validate_lexical_binding()
+
+    visit(root)
+    return frozenset(identities)
+
+
+def _validate_distinct_physical_directory_trees(
+    source_lease: _OBSDirectoryLease,
+    destination: str | Path,
+    *,
+    destination_lease: _OBSDirectoryLease | None,
+) -> frozenset[tuple[int, int, int]]:
+    """Reject equal/ancestor trees using open-handle identities, not spelling."""
+
+    source_lease.validate_lexical_binding()
+    if destination_lease is not None:
+        destination_lease.validate_lexical_binding()
+    source_chain = _physical_directory_chain(source_lease.path, allow_missing=False)
+    destination_chain = _physical_directory_chain(destination, allow_missing=True)
+    if not source_chain.complete:
+        raise _UnsafeOBSMigrationPathError(
+            f"移行元のphysical chainが不完全です: {source_lease.path}"
+        )
+    if source_chain.components[-1].identity != source_lease.identity:
+        raise _UnsafeOBSMigrationPathError(
+            f"移行元のphysical identityがleaseと一致しません: {source_lease.path}"
+        )
+    if destination_lease is not None:
+        if not destination_chain.complete:
+            raise _UnsafeOBSMigrationPathError(
+                f"destinationのphysical chainが不完全です: {destination}"
+            )
+        if destination_chain.components[-1].identity != destination_lease.identity:
+            raise _UnsafeOBSMigrationPathError(
+                "destinationのphysical identityがleaseと一致しません: "
+                f"{destination}"
+            )
+
+    source_tree_identities = _physical_directory_tree_identities(source_lease)
+    destination_endpoint_identity = destination_chain.components[-1].identity
+    source_is_destination_ancestor = (
+        destination_endpoint_identity in source_tree_identities
+    )
+    destination_is_source_ancestor = False
+    if destination_lease is not None:
+        destination_tree_identities = _physical_directory_tree_identities(
+            destination_lease,
+            inspect_files=False,
+        )
+        destination_is_source_ancestor = (
+            source_lease.identity in destination_tree_identities
+        )
+    if source_is_destination_ancestor or destination_is_source_ancestor:
+        source_mount = source_chain.components[-1].mount_id
+        destination_mount = destination_chain.components[-1].mount_id
+        mount_note = (
+            f" mount_id={source_mount}/{destination_mount}"
+            if source_mount is not None or destination_mount is not None
+            else ""
+        )
+        raise _UnsafeOBSMigrationPathError(
+            "移行元とdestinationは同一physical directoryまたはancestor aliasです: "
+            f"{source_lease.path} / {_absolute_path(destination)}{mount_note}"
+        )
+
+    if destination_lease is None:
+        with _OBSDirectoryLease.open_absolute(
+            destination_chain.last_existing_path
+        ) as existing_parent:
+            _probe_open_directory_metadata_capability(
+                existing_parent,
+                reject_named_streams=False,
+            )
+    return source_tree_identities
+
 def _supports_posix_handle_relative_migration() -> bool:
     required_dir_fd_functions = (os.open, os.mkdir, os.rename, os.unlink, os.stat)
     return (
@@ -886,12 +1566,20 @@ def _supports_handle_relative_migration() -> bool:
             for name in (
                 "_WINDOWS_KERNEL32",
                 "_WINDOWS_NTDLL",
+                "_WINDOWS_ADVAPI32",
                 "_windows_open_relative_handle",
                 "_windows_rename_open_file",
                 "_windows_mark_open_file_for_deletion",
+                "_windows_stream_names",
+                "_windows_security_descriptor_sha256",
             )
         )
-    return _supports_posix_handle_relative_migration()
+    return (
+        _supports_posix_handle_relative_migration()
+        and Path("/proc/self/fdinfo").is_dir()
+        and callable(getattr(os, "listxattr", None))
+        and callable(getattr(os, "getxattr", None))
+    )
 
 
 class _OBSInterProcessLock:
@@ -908,6 +1596,9 @@ class _OBSInterProcessLock:
         create_parent: bool = True,
         directory_lease: _OBSDirectoryLease | None = None,
         initialize_empty: bool = True,
+        reject_directory_identities: frozenset[
+            tuple[int, int, int]
+        ] = frozenset(),
     ) -> bool:
         if not create_parent and not _path_lexists(self.path.parent):
             return True
@@ -922,12 +1613,18 @@ class _OBSInterProcessLock:
                         f"{directory_lease.path} != {self.path.parent}"
                     )
                 directory_lease.validate_lexical_binding()
+                if directory_lease.identity in reject_directory_identities:
+                    raise _UnsafeOBSMigrationPathError(
+                        "lock parentが禁止されたphysical tree内です: "
+                        f"{directory_lease.path}"
+                    )
                 directory = directory_lease.mutable_clone()
             else:
                 directory = _OBSDirectoryLease.open_absolute(
                     self.path.parent,
                     create=create_parent,
                     mutable=True,
+                    reject_directory_identities=reject_directory_identities,
                 )
             if (
                 not create_parent

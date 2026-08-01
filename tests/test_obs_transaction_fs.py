@@ -7,12 +7,24 @@ import pytest
 
 from src import obs_bootstrap, obs_transaction_fs
 
+_POSIX_MOUNT_ID_AVAILABLE = (
+    os.name != "nt" and Path("/proc/self/fdinfo").is_dir()
+)
+
 
 def test_obs_bootstrap_reexports_filesystem_compatibility_api():
     assert obs_bootstrap.OBSPathSafetyError is obs_transaction_fs.OBSPathSafetyError
     assert obs_bootstrap._OBSDirectoryLease is obs_transaction_fs._OBSDirectoryLease
     assert obs_bootstrap._OBSInterProcessLock is obs_transaction_fs._OBSInterProcessLock
     assert obs_bootstrap.lexical_absolute_path is obs_transaction_fs.lexical_absolute_path
+    assert (
+        obs_bootstrap._OBSFilesystemMetadata
+        is obs_transaction_fs._OBSFilesystemMetadata
+    )
+    assert (
+        obs_bootstrap._validate_distinct_physical_directory_trees
+        is obs_transaction_fs._validate_distinct_physical_directory_trees
+    )
 
 
 def test_path_lexists_propagates_permission_error(monkeypatch, tmp_path):
@@ -61,6 +73,77 @@ def test_posix_handle_relative_capability_requires_rename(monkeypatch):
     )
 
     assert obs_transaction_fs._supports_posix_handle_relative_migration() is False
+
+
+@pytest.mark.skipif(
+    not _POSIX_MOUNT_ID_AVAILABLE,
+    reason="Linux /proc mount identityのFD close回帰",
+)
+def test_posix_anchor_constructor_failure_closes_descriptor(monkeypatch, tmp_path):
+    captured_descriptors = []
+
+    def deny_mount_identity(descriptor, *, path):
+        captured_descriptors.append(descriptor)
+        raise obs_transaction_fs.OBSPathSafetyError(
+            f"simulated mount identity denial: {path}"
+        )
+
+    monkeypatch.setattr(
+        obs_transaction_fs,
+        "_posix_mount_id_for_descriptor",
+        deny_mount_identity,
+    )
+
+    with pytest.raises(
+        obs_transaction_fs.OBSPathSafetyError,
+        match="mount identity denial",
+    ):
+        obs_transaction_fs._OBSDirectoryLease.open_absolute(tmp_path)
+
+    assert captured_descriptors
+    with pytest.raises(OSError):
+        os.fstat(captured_descriptors[-1])
+
+
+@pytest.mark.skipif(
+    not _POSIX_MOUNT_ID_AVAILABLE,
+    reason="Linux /proc mutable clone FD close回帰",
+)
+def test_posix_mutable_clone_constructor_failure_closes_descriptor(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "managed"
+    root.mkdir()
+    captured_descriptors = []
+
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(root) as root_lease:
+
+        def fail_constructor(
+            _self,
+            _path,
+            native_handle,
+            _identity,
+            *,
+            mutable,
+            mount_boundary=None,
+        ):
+            del mutable, mount_boundary
+            captured_descriptors.append(native_handle)
+            raise RuntimeError("simulated lease constructor failure")
+
+        monkeypatch.setattr(
+            obs_transaction_fs._OBSDirectoryLease,
+            "__init__",
+            fail_constructor,
+        )
+
+        with pytest.raises(RuntimeError, match="constructor failure"):
+            root_lease.mutable_clone()
+
+        assert captured_descriptors
+        with pytest.raises(OSError):
+            os.fstat(captured_descriptors[-1])
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIXのO_NOFOLLOWエラー分類を検証するため")

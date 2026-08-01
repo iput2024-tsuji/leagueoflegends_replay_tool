@@ -318,6 +318,23 @@ def _completed_review(component: dict[str, Any], field: str) -> bool:
     )
 
 
+def _runtime_download_policy_errors(lock: dict[str, Any]) -> list[str]:
+    runtime_downloads = lock.get("runtime_downloads")
+    if isinstance(runtime_downloads, list) and not runtime_downloads:
+        return []
+    return [
+        "runtime_downloads must be an empty list: this project does not download "
+        "or redistribute user-provided OBS/standalone FFmpeg. Remove every "
+        "runtime_downloads entry and keep external tools outside Release assets."
+    ]
+
+
+def _assert_runtime_downloads_disabled(lock: dict[str, Any]) -> None:
+    errors = _runtime_download_policy_errors(lock)
+    if errors:
+        raise ReleaseAssetError("Release runtime policy violation: " + " | ".join(errors))
+
+
 def _source_exception_reviewed(component: dict[str, Any]) -> bool:
     legacy_exception = bool(
         component.get("source_archive_exception_reviewed") is True
@@ -847,17 +864,14 @@ def _python_native_profile_errors(lock: dict[str, Any]) -> list[str]:
 
 
 def release_gate_errors(lock: dict[str, Any]) -> list[str]:
-    errors = []
+    errors = _runtime_download_policy_errors(lock)
     if not _completed_review(lock, "historical_remediation"):
         errors.append(
             "v0.5.2-historical-remediation: review evidence is incomplete"
         )
     errors.extend(_release_binary_policy_errors(lock))
     errors.extend(_python_native_profile_errors(lock))
-    for component in [
-        *_component_entries(lock),
-        *lock.get("runtime_downloads", []),
-    ]:
+    for component in _component_entries(lock):
         if component.get("release_legal_review_required"):
             errors.append(
                 f"{component['component']}: {component.get('release_gate_reason', 'expert legal review is required')}"
@@ -925,9 +939,6 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
                     wheel_required=True,
                 )
             )
-    for component in lock.get("runtime_downloads", []):
-        if not _completed_review(component, "legal_review"):
-            errors.append(f"{component['component']}: runtime download legal review evidence is incomplete")
     return errors
 
 
@@ -2641,7 +2652,6 @@ def create_source_parts(
     version: str,
     sources: list[tuple[dict[str, Any], Path]],
     output_dir: Path,
-    runtime_downloads: list[dict[str, Any]],
 ) -> list[Path]:
     parts = partition_sources(sources)
     output_paths = []
@@ -2655,15 +2665,6 @@ def create_source_parts(
                 "are not asserted to be exact build provenance."
             ),
             "sources": [record for record, _source_path in part],
-            "runtime_downloads_not_bundled": [
-                {
-                    "component": item["component"],
-                    "version": item["version"],
-                    "bundled_in_installer": item["bundled_in_installer"],
-                    "release_legal_review_required": item["release_legal_review_required"],
-                }
-                for item in runtime_downloads
-            ],
         }
         with zipfile.ZipFile(
             path,
@@ -2941,6 +2942,8 @@ def verify_release_asset_payload(
     components_file: Path | None = None,
 ) -> None:
     components_file = components_file or COMPONENTS_FILE
+    lock = _load_lock(components_file)
+    _assert_runtime_downloads_disabled(lock)
     version = payload.get("version")
     if not isinstance(version, str) or not VERSION_PATTERN.fullmatch(version):
         raise ReleaseAssetError("Release asset list contains an invalid version.")
@@ -3052,7 +3055,7 @@ def verify_release_asset_payload(
     observed_source_records: list[dict[str, Any]] = []
     for source_part in source_parts_by_number.values():
         observed_source_records.extend(verify_source_part(source_part))
-    expected_source_records = source_archive_records(_load_lock(components_file))
+    expected_source_records = source_archive_records(lock)
     def source_sort_key(item: dict[str, Any]) -> str:
         return str(item.get("filename", "")).casefold()
     if sorted(observed_source_records, key=source_sort_key) != sorted(
@@ -3144,6 +3147,7 @@ def create_release_assets(
         )
 
     lock = _load_lock(components_file)
+    _assert_runtime_downloads_disabled(lock)
     gates = release_gate_errors(lock)
     if enforce_release_gates and gates:
         raise ReleaseAssetError("Release legal gates remain: " + " | ".join(gates))
@@ -3157,7 +3161,6 @@ def create_release_assets(
         version,
         sources,
         output_dir,
-        lock.get("runtime_downloads", []),
     )
     license_archive = create_license_archive(version, distribution_root, output_dir)
     assets = [installer, application_source, *source_parts, license_archive]

@@ -164,6 +164,28 @@ class BootstrapReport:
         return not self.ready
 
 
+@dataclass(frozen=True)
+class OBSConfigFileSnapshot:
+    """Lexical OBS config target captured before a guarded update."""
+
+    path: Path
+    payload: bytes | None
+    identity: tuple[int, int, int] | None
+    label: str
+
+    @property
+    def exists(self) -> bool:
+        return self.payload is not None
+
+
+@dataclass(frozen=True)
+class OBSConfigDirectoryEntry:
+    """A non-reparse child found below a validated OBS config directory."""
+
+    name: str
+    kind: str
+
+
 def get_obs_executable_path(base_dir: str | Path) -> Path:
     return Path(base_dir) / "bin" / "64bit" / "obs64.exe"
 
@@ -366,6 +388,78 @@ def _validate_safe_directory_chain(path: Path) -> None:
     for part in absolute.parts[1:]:
         current /= part
         _validate_existing_entry(current, expected_kind="directory", reject_hardlinks=False)
+
+
+def preflight_obs_config_directory(path: str | Path) -> bool:
+    """Validate every existing lexical component without creating directories."""
+
+    return _validate_existing_path_chain(_absolute_path(path), expected_kind="directory")
+
+
+def ensure_safe_obs_config_directory(path: str | Path) -> Path:
+    """Create a config directory while rejecting reparse components."""
+
+    absolute = _absolute_path(path)
+    _ensure_safe_directory_chain(absolute)
+    return absolute
+
+
+def list_safe_obs_config_directory(path: str | Path) -> tuple[OBSConfigDirectoryEntry, ...]:
+    """List a validated directory without following reparse or special children."""
+
+    absolute = _absolute_path(path)
+    if not preflight_obs_config_directory(absolute):
+        return ()
+
+    before = _validate_existing_entry(
+        absolute,
+        expected_kind="directory",
+        reject_hardlinks=False,
+    )
+    entries: list[OBSConfigDirectoryEntry] = []
+    try:
+        with os.scandir(absolute) as iterator:
+            for entry in iterator:
+                child = absolute / entry.name
+                try:
+                    child_stat = entry.stat(follow_symlinks=False)
+                except OSError as exc:
+                    raise _UnsafeOBSMigrationPathError(
+                        f"directory entryを検査できません: {child} ({exc})"
+                    ) from exc
+                if _is_reparse_point(child_stat):
+                    raise _UnsafeOBSMigrationPathError(f"reparse pointは利用できません: {child}")
+                if stat.S_ISDIR(child_stat.st_mode):
+                    kind = "directory"
+                    expected_kind = "directory"
+                elif stat.S_ISREG(child_stat.st_mode):
+                    kind = "file"
+                    expected_kind = "file"
+                else:
+                    raise _UnsafeOBSMigrationPathError(f"特殊entryは利用できません: {child}")
+                _validate_existing_entry(
+                    child,
+                    expected_kind=expected_kind,
+                    reject_hardlinks=False,
+                )
+                entries.append(OBSConfigDirectoryEntry(name=entry.name, kind=kind))
+    except _UnsafeOBSMigrationPathError:
+        raise
+    except OSError as exc:
+        raise _UnsafeOBSMigrationPathError(
+            f"directoryを安全に列挙できません: {absolute} ({exc})"
+        ) from exc
+
+    after = _validate_existing_entry(
+        absolute,
+        expected_kind="directory",
+        reject_hardlinks=False,
+    )
+    if _file_identity(after) != _file_identity(before):
+        raise _UnsafeOBSMigrationPathError(
+            f"directory列挙中にidentityが変化しました: {absolute}"
+        )
+    return tuple(sorted(entries, key=lambda item: (item.name.casefold(), item.name)))
 
 
 def _open_flags(*, write: bool = False, create_exclusive: bool = False) -> int:
@@ -642,6 +736,70 @@ def _read_safe_file_bytes(
         os.close(descriptor)
 
 
+def preflight_obs_config_file(
+    path: str | Path,
+    *,
+    label: str,
+    max_bytes: int = OBS_BOOTSTRAP_CONFIG_MAX_BYTES,
+) -> OBSConfigFileSnapshot:
+    """Capture a config file without following links or creating missing parents."""
+
+    absolute = _absolute_path(path)
+    preflight_obs_config_directory(absolute.parent)
+    if not _path_lexists(absolute):
+        return OBSConfigFileSnapshot(
+            path=absolute,
+            payload=None,
+            identity=None,
+            label=label,
+        )
+    payload, identity = _read_safe_file_bytes(
+        absolute,
+        max_bytes=max_bytes,
+        label=label,
+    )
+    return OBSConfigFileSnapshot(
+        path=absolute,
+        payload=payload,
+        identity=identity,
+        label=label,
+    )
+
+
+def revalidate_obs_config_file(
+    snapshot: OBSConfigFileSnapshot,
+    *,
+    max_bytes: int = OBS_BOOTSTRAP_CONFIG_MAX_BYTES,
+) -> None:
+    """Require a target to retain its preflight existence, identity, and bytes."""
+
+    path = _absolute_path(snapshot.path)
+    if path != snapshot.path:
+        raise OBSPathSafetyError(f"config snapshot pathがlexical absoluteではありません: {snapshot.path}")
+    preflight_obs_config_directory(path.parent)
+    if snapshot.payload is None:
+        if _path_lexists(path):
+            _validate_existing_entry(path, expected_kind="file")
+            raise OBSPathSafetyError(f"preflight後にconfig fileが作成されました: {path}")
+        if snapshot.identity is not None:
+            raise OBSPathSafetyError(f"missing config snapshotにidentityがあります: {path}")
+        return
+
+    if snapshot.identity is None:
+        raise OBSPathSafetyError(f"existing config snapshotにidentityがありません: {path}")
+    if not _path_lexists(path):
+        raise OBSPathSafetyError(f"preflight後にconfig fileが消失しました: {path}")
+    payload, identity = _read_safe_file_bytes(
+        path,
+        max_bytes=max_bytes,
+        label=snapshot.label,
+    )
+    if identity != snapshot.identity:
+        raise OBSPathSafetyError(f"preflight後にconfig file identityが変化しました: {path}")
+    if payload != snapshot.payload:
+        raise OBSPathSafetyError(f"preflight後にconfig file内容が変化しました: {path}")
+
+
 def _read_safe_regular_file(path: Path) -> tuple[bytes, tuple[int, int, int]]:
     return _read_safe_file_bytes(
         path,
@@ -707,8 +865,19 @@ def _safe_write_temporary_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.{uuid.uuid4().hex}.write.tmp")
 
 
-def _write_safe_file_bytes(path: Path, payload: bytes) -> None:
+def _write_safe_file_bytes(
+    path: Path,
+    payload: bytes,
+    *,
+    expected_snapshot: OBSConfigFileSnapshot | None = None,
+) -> None:
     path = _absolute_path(path)
+    if expected_snapshot is not None:
+        if expected_snapshot.path != path:
+            raise OBSPathSafetyError(
+                f"config snapshotと書き込み先が一致しません: {expected_snapshot.path} != {path}"
+            )
+        revalidate_obs_config_file(expected_snapshot)
     temporary = _safe_write_temporary_path(path)
     _ensure_safe_directory_chain(path.parent)
     destination_before = _validate_existing_entry(path, expected_kind="file") if _path_lexists(path) else None
@@ -727,6 +896,8 @@ def _write_safe_file_bytes(path: Path, payload: bytes) -> None:
         os.close(descriptor)
         descriptor = None
 
+        if expected_snapshot is not None:
+            revalidate_obs_config_file(expected_snapshot)
         if destination_before is None:
             if _path_lexists(path):
                 _validate_existing_entry(path, expected_kind="file")
@@ -754,6 +925,20 @@ def _write_safe_file_bytes(path: Path, payload: bytes) -> None:
                     temporary.unlink()
             except _UnsafeOBSMigrationPathError:
                 pass
+
+
+def write_preflighted_obs_config_file(
+    snapshot: OBSConfigFileSnapshot,
+    payload: bytes,
+) -> Path:
+    """Atomically replace a config file only if its preflight snapshot still matches."""
+
+    _write_safe_file_bytes(
+        snapshot.path,
+        payload,
+        expected_snapshot=snapshot,
+    )
+    return snapshot.path
 
 
 def _write_obs_migration_journal(
@@ -917,6 +1102,14 @@ def _guard_obs_bootstrap_mutation(method: Callable[..., Any]) -> Callable[..., A
             return method(bootstrapper, *args, **kwargs)
 
     return guarded
+
+
+@contextmanager
+def obs_config_mutation_guard(base_dir: str | Path):
+    """Share the migration/bootstrap lock with additional OBS config writers."""
+
+    with _obs_bootstrap_mutation_guard(_absolute_path(base_dir)):
+        yield
 
 
 def _inventory_fingerprint(entries: tuple[OBSMigrationInventoryEntry, ...]) -> str:
@@ -1457,6 +1650,13 @@ class OBSBootstrapper:
                 get_obs_websocket_config_path(self.base_dir),
                 label="obs-websocket設定file",
             )
+
+    def preflight_apply(self, port: int | None = None) -> None:
+        """Validate every full-bootstrap target without creating or changing it."""
+
+        include_websocket = port is not None
+        self.validate_layout(include_websocket=include_websocket)
+        self._preflight_existing_config_reads(include_websocket=include_websocket)
 
     def check(self) -> BootstrapReport:
         obs_exe_exists = self.validate_layout()

@@ -29,6 +29,15 @@
 - [ ] 「OBS設定を構成・再検査」で専用`obs-portable`の設定を構成・復旧できる
 - [ ] standalone FFmpegの明示設定を保存し、再起動後も同じ実行ファイルを利用できる
 
+### OBS録画profileのpath安全性（破棄可能なNTFS環境）
+
+実際の設定を退避し、外部sentinelと変更前のINI bytes、起動中の管理対象OBS PIDを記録してから確認します。
+
+- [ ] `config/obs-studio/basic/profiles`を外部directoryへのjunctionにした場合、「OBS設定を構成・再検査」とOBS起動を拒否し、外部sentinel・既存INI・管理対象OBS processを変更しない
+- [ ] profiles配下のprofile directoryを外部directoryへのjunctionにした場合、同じく全profile書き込み前かつOBS停止前に拒否する
+- [ ] `basic.ini`または`user.ini`を外部fileへのhardlinkにした場合、link元・link先・先行する安全なprofileのbytesを変更せず、OBSを停止しない
+- [ ] junction／hardlinkを除去した通常配置では、既存の未知設定を保ったままprofileを修復し、管理対象OBSを起動できる
+
 ## LoLクライアント未起動時
 
 - [ ] アプリが異常終了せず、試合待機状態を継続する

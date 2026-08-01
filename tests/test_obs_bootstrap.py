@@ -224,6 +224,95 @@ def test_bootstrapper_rejects_hardlinked_ini_before_process_stop_or_write(tmp_pa
     assert not (managed / obs_bootstrap.PORTABLE_OBS_MARKER_NAME).exists()
 
 
+def test_preflighted_config_write_rejects_in_place_content_change(tmp_path):
+    target = tmp_path / "user.ini"
+    target.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(target, label="user.ini")
+    target.write_bytes(b"changed in place")
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="内容が変化"):
+        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+
+    assert target.read_bytes() == b"changed in place"
+
+
+def test_preflighted_config_write_rejects_identity_swap(tmp_path):
+    target = tmp_path / "basic.ini"
+    original = tmp_path / "original-basic.ini"
+    target.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(target, label="basic.ini")
+    os.replace(target, original)
+    target.write_bytes(b"intruder")
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="identityが変化"):
+        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+
+    assert target.read_bytes() == b"intruder"
+    assert original.read_bytes() == b"original"
+
+
+def test_preflighted_config_replace_failure_preserves_old_bytes_and_cleans_temp(monkeypatch, tmp_path):
+    target = tmp_path / "basic.ini"
+    target.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(target, label="basic.ini")
+    real_replace = obs_bootstrap.os.replace
+
+    def fail_target_replace(source, destination):
+        if Path(destination) == target:
+            raise PermissionError("simulated replace denial")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(obs_bootstrap.os, "replace", fail_target_replace)
+
+    with pytest.raises(PermissionError, match="replace denial"):
+        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+
+    assert target.read_bytes() == b"original"
+    assert list(tmp_path.glob(".basic.ini.*.write.tmp")) == []
+
+
+def test_preflighted_config_write_rejects_existing_temp_without_touching_external(monkeypatch, tmp_path):
+    target = tmp_path / "basic.ini"
+    target.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(target, label="basic.ini")
+    external = tmp_path / "external.ini"
+    external.write_bytes(b"external")
+    temporary = tmp_path / ".basic.ini.collision.write.tmp"
+    os.link(external, temporary)
+    monkeypatch.setattr(obs_bootstrap, "_safe_write_temporary_path", lambda _path: temporary)
+
+    with pytest.raises(FileExistsError):
+        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+
+    assert target.read_bytes() == b"original"
+    assert external.read_bytes() == b"external"
+    assert temporary.read_bytes() == b"external"
+
+
+def test_preflighted_config_temp_identity_failure_preserves_destination(monkeypatch, tmp_path):
+    target = tmp_path / "user.ini"
+    target.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(target, label="user.ini")
+    real_validate = obs_bootstrap._validate_open_identity
+    temporary_validations = 0
+
+    def fail_second_temp_validation(path, descriptor, before):
+        nonlocal temporary_validations
+        if Path(path).name.startswith(".user.ini."):
+            temporary_validations += 1
+            if temporary_validations == 2:
+                raise obs_bootstrap.OBSPathSafetyError("simulated temp identity race")
+        return real_validate(path, descriptor, before)
+
+    monkeypatch.setattr(obs_bootstrap, "_validate_open_identity", fail_second_temp_validation)
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="temp identity race"):
+        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+
+    assert target.read_bytes() == b"original"
+    assert list(tmp_path.glob(".user.ini.*.write.tmp")) == []
+
+
 def test_bootstrap_mutations_are_blocked_while_migration_lock_is_live(tmp_path):
     source = tmp_path / "legacy"
     destination = tmp_path / "obs-portable"

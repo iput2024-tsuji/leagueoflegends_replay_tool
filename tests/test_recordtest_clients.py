@@ -530,6 +530,231 @@ def test_recording_profile_ini_creates_managed_profile_when_missing(tmp_path):
     assert parser.get("General", "Name") == "LoLReplayTool"
 
 
+def test_recording_profile_rejects_profiles_root_reparse_without_external_write(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    config_dir = obs_dir / "config" / "obs-studio"
+    config_dir.mkdir(parents=True)
+    user_ini = config_dir / "user.ini"
+    user_ini.write_text("[Basic]\nProfileDir=safe\n", encoding="utf-8")
+    user_before = user_ini.read_bytes()
+
+    external_profiles = tmp_path / "external-profiles"
+    external_profile = external_profiles / "safe"
+    external_profile.mkdir(parents=True)
+    external_ini = external_profile / "basic.ini"
+    external_ini.write_text("[General]\nName=external\n", encoding="utf-8")
+    external_before = external_ini.read_bytes()
+    sentinel = external_profiles / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    (config_dir / "basic").mkdir()
+    _create_directory_link(config_dir / "basic" / "profiles", external_profiles)
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="reparse point"):
+        recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
+
+    assert external_ini.read_bytes() == external_before
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert user_ini.read_bytes() == user_before
+
+
+def test_recording_profile_rejects_later_profile_reparse_before_any_write(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profiles_root = obs_dir / "config" / "obs-studio" / "basic" / "profiles"
+    safe_ini = profiles_root / "aaa-safe" / "basic.ini"
+    safe_ini.parent.mkdir(parents=True)
+    safe_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
+    safe_before = safe_ini.read_bytes()
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
+    user_ini.write_text("[Basic]\nProfileDir=aaa-safe\n", encoding="utf-8")
+    user_before = user_ini.read_bytes()
+
+    external_profile = tmp_path / "external-profile"
+    external_profile.mkdir()
+    external_ini = external_profile / "basic.ini"
+    external_ini.write_text("[General]\nName=external\n", encoding="utf-8")
+    external_before = external_ini.read_bytes()
+    _create_directory_link(profiles_root / "zzz-unsafe", external_profile)
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="reparse point"):
+        recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
+
+    assert safe_ini.read_bytes() == safe_before
+    assert user_ini.read_bytes() == user_before
+    assert external_ini.read_bytes() == external_before
+    assert not (profiles_root / recordtest.MANAGED_OBS_PROFILE_DIR_NAME).exists()
+
+
+def test_recording_profile_rejects_later_basic_ini_hardlink_before_any_write(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profiles_root = obs_dir / "config" / "obs-studio" / "basic" / "profiles"
+    safe_ini = profiles_root / "aaa-safe" / "basic.ini"
+    safe_ini.parent.mkdir(parents=True)
+    safe_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
+    safe_before = safe_ini.read_bytes()
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
+    user_ini.write_text("[Basic]\nProfileDir=aaa-safe\n", encoding="utf-8")
+    user_before = user_ini.read_bytes()
+
+    external_ini = tmp_path / "external-basic.ini"
+    external_ini.write_text("[General]\nName=external\n", encoding="utf-8")
+    external_before = external_ini.read_bytes()
+    linked_ini = profiles_root / "zzz-linked" / "basic.ini"
+    linked_ini.parent.mkdir()
+    os.link(external_ini, linked_ini)
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="hardlink"):
+        recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
+
+    assert safe_ini.read_bytes() == safe_before
+    assert user_ini.read_bytes() == user_before
+    assert external_ini.read_bytes() == external_before
+    assert linked_ini.read_bytes() == external_before
+
+
+def test_recording_profile_rejects_user_ini_hardlink_before_profile_write(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profile_ini = obs_dir / "config" / "obs-studio" / "basic" / "profiles" / "safe" / "basic.ini"
+    profile_ini.parent.mkdir(parents=True)
+    profile_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
+    profile_before = profile_ini.read_bytes()
+    external_user = tmp_path / "external-user.ini"
+    external_user.write_text("[Basic]\nProfileDir=safe\n", encoding="utf-8")
+    external_before = external_user.read_bytes()
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
+    os.link(external_user, user_ini)
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="hardlink"):
+        recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
+
+    assert profile_ini.read_bytes() == profile_before
+    assert external_user.read_bytes() == external_before
+    assert user_ini.read_bytes() == external_before
+
+
+@pytest.mark.parametrize(
+    "profile_name",
+    [
+        ".",
+        "..",
+        "../outside",
+        "..\\outside",
+        "C:\\outside",
+        "name:stream",
+        "bad<name",
+        "bad>name",
+        'bad"name',
+        "bad|name",
+        "bad?name",
+        "bad*name",
+        "CON",
+        "NUL.txt",
+        "trailing.",
+        "trailing ",
+    ],
+)
+def test_recording_profile_rejects_unsafe_profile_dir_component(profile_name, tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profiles_root = obs_dir / "config" / "obs-studio" / "basic" / "profiles"
+    safe_ini = profiles_root / "safe" / "basic.ini"
+    safe_ini.parent.mkdir(parents=True)
+    safe_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
+    safe_before = safe_ini.read_bytes()
+    outside_ini = profiles_root.parent / "basic.ini"
+    outside_ini.write_text("outside", encoding="utf-8")
+    outside_before = outside_ini.read_bytes()
+    user_ini = obs_dir / "config" / "obs-studio" / "user.ini"
+    user_ini.write_text(f"[Basic]\nProfileDir={profile_name}\n", encoding="utf-8")
+    user_before = user_ini.read_bytes()
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="単一component"):
+        recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
+
+    assert safe_ini.read_bytes() == safe_before
+    assert outside_ini.read_bytes() == outside_before
+    assert user_ini.read_bytes() == user_before
+    assert not (profiles_root / recordtest.MANAGED_OBS_PROFILE_DIR_NAME).exists()
+
+
+def test_recording_profile_rejects_casefold_colliding_discovered_names(monkeypatch, tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profiles_root = obs_dir / "config" / "obs-studio" / "basic" / "profiles"
+    profile_dir = profiles_root / "Replay"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "basic.ini").write_text("[General]\nName=Replay\n", encoding="utf-8")
+    monkeypatch.setattr(
+        recordtest,
+        "list_safe_obs_config_directory",
+        lambda _path: (
+            obs_bootstrap.OBSConfigDirectoryEntry("Replay", "directory"),
+            obs_bootstrap.OBSConfigDirectoryEntry("replay", "directory"),
+        ),
+    )
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="case-insensitive"):
+        recordtest.preflight_obs_recording_profile_ini(obs_dir)
+
+
+def test_recording_profile_rejects_special_basic_ini_before_any_write(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profiles_root = obs_dir / "config" / "obs-studio" / "basic" / "profiles"
+    safe_ini = profiles_root / "aaa-safe" / "basic.ini"
+    safe_ini.parent.mkdir(parents=True)
+    safe_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
+    safe_before = safe_ini.read_bytes()
+    special_ini = profiles_root / "zzz-special" / "basic.ini"
+    special_ini.mkdir(parents=True)
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="通常ファイル"):
+        recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
+
+    assert safe_ini.read_bytes() == safe_before
+
+
+def test_recording_profile_propagates_acl_error_without_reset_or_write(monkeypatch, tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profile_ini = obs_dir / "config" / "obs-studio" / "basic" / "profiles" / "safe" / "basic.ini"
+    profile_ini.parent.mkdir(parents=True)
+    profile_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
+    before = profile_ini.read_bytes()
+    real_preflight = recordtest.preflight_obs_config_file
+    writes = []
+
+    def deny_profile_read(path, **kwargs):
+        if Path(path) == profile_ini:
+            raise PermissionError("simulated profile ACL denial")
+        return real_preflight(path, **kwargs)
+
+    def track_write(*args, **kwargs):
+        writes.append((args, kwargs))
+        raise AssertionError("ACL failure must prevent every profile write")
+
+    monkeypatch.setattr(recordtest, "preflight_obs_config_file", deny_profile_read)
+    monkeypatch.setattr(recordtest, "write_preflighted_obs_config_file", track_write)
+
+    with pytest.raises(PermissionError, match="ACL denial"):
+        recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
+
+    assert writes == []
+    assert profile_ini.read_bytes() == before
+
+
+def test_recording_profile_uses_shared_mutation_lock(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    profile_ini = obs_dir / "config" / "obs-studio" / "basic" / "profiles" / "safe" / "basic.ini"
+    profile_ini.parent.mkdir(parents=True)
+    profile_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
+    before = profile_ini.read_bytes()
+    lock = obs_bootstrap._OBSInterProcessLock(obs_bootstrap.get_obs_copy_lock_path(obs_dir))
+    assert lock.acquire() is True
+    try:
+        with pytest.raises(recordtest.OBSMigrationInProgressError):
+            recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
+    finally:
+        lock.release()
+
+    assert profile_ini.read_bytes() == before
+
+
 def test_record_status_details_include_obs_profile_and_output_diagnostics():
     class RawClient:
         def get_record_status(self):
@@ -696,6 +921,50 @@ def test_preflight_rejects_config_reparse_before_profile_or_external_write(monke
     assert any("reparse point" in warning for warning in report["warnings"])
     assert sentinel.read_text(encoding="utf-8") == "keep"
     assert not (external / "obs-studio").exists()
+    assert not (managed_dir / obs_bootstrap.PORTABLE_OBS_MARKER_NAME).exists()
+
+
+def test_preflight_rejects_nested_profile_reparse_before_bootstrap_write(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").absolute()
+    obs_executable = managed_dir / "bin" / "64bit" / "obs64.exe"
+    obs_executable.parent.mkdir(parents=True)
+    obs_executable.write_bytes(b"fake obs")
+    config_dir = managed_dir / "config" / "obs-studio"
+    config_dir.mkdir(parents=True)
+    global_ini = config_dir / "global.ini"
+    global_ini.write_text("[General]\nFirstRun=false\n", encoding="utf-8")
+    global_before = global_ini.read_bytes()
+    user_ini = config_dir / "user.ini"
+    user_ini.write_text("[Basic]\nProfileDir=safe\n", encoding="utf-8")
+    user_before = user_ini.read_bytes()
+    profiles_root = config_dir / "basic" / "profiles"
+    safe_ini = profiles_root / "aaa-safe" / "basic.ini"
+    safe_ini.parent.mkdir(parents=True)
+    safe_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
+    safe_before = safe_ini.read_bytes()
+    external_profile = tmp_path / "external-profile"
+    external_profile.mkdir()
+    sentinel = external_profile / "basic.ini"
+    sentinel.write_text("external", encoding="utf-8")
+    sentinel_before = sentinel.read_bytes()
+    _create_directory_link(profiles_root / "zzz-unsafe", external_profile)
+
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "missing-legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+
+    report = recordtest.run_preflight_checks(
+        _preflight_config(managed_dir, tmp_path),
+        auto_fix=True,
+        ensure_dirs=True,
+    )
+
+    assert any("reparse point" in warning for warning in report["warnings"])
+    assert global_ini.read_bytes() == global_before
+    assert user_ini.read_bytes() == user_before
+    assert safe_ini.read_bytes() == safe_before
+    assert sentinel.read_bytes() == sentinel_before
     assert not (managed_dir / obs_bootstrap.PORTABLE_OBS_MARKER_NAME).exists()
 
 
@@ -1425,6 +1694,9 @@ def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_enco
         def __init__(self, base_dir):
             self.base_dir = Path(base_dir)
 
+        def preflight_apply(self, port=None):
+            return None
+
         def apply(self, *args, **kwargs):
             return {
                 "global_ini_changed": False,
@@ -1447,6 +1719,84 @@ def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_enco
     monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: False)
     monkeypatch.setattr(recordtest.time, "sleep", lambda *args, **kwargs: None)
     return FakeProcessManager
+
+
+def test_launch_obs_rejects_profile_reparse_before_stopping_process(monkeypatch, tmp_path):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    profiles_root = obs_dir / "config" / "obs-studio" / "basic" / "profiles"
+    profiles_root.mkdir(parents=True)
+    external_profile = tmp_path / "external-profile"
+    external_profile.mkdir()
+    sentinel = external_profile / "basic.ini"
+    sentinel.write_text("external", encoding="utf-8")
+    sentinel_before = sentinel.read_bytes()
+    _create_directory_link(profiles_root / "unsafe", external_profile)
+
+    class TrackingProcessManager:
+        kill_calls = 0
+        start_calls = 0
+
+        def __init__(self, obs_dir_arg, logger=None):
+            self.obs_dir = Path(obs_dir_arg)
+            self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            type(self).kill_calls += 1
+            return []
+
+        def unmanaged_processes(self):
+            return []
+
+        def start_obs(self, *args, **kwargs):
+            type(self).start_calls += 1
+            raise AssertionError("unsafe profile must not reach OBS startup")
+
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "missing-legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+    monkeypatch.setattr(recordtest, "OBSProcessManager", TrackingProcessManager)
+
+    with pytest.raises(recordtest.RecorderError, match="安全性検査"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert TrackingProcessManager.kill_calls == 0
+    assert TrackingProcessManager.start_calls == 0
+    assert sentinel.read_bytes() == sentinel_before
+
+
+def test_launch_obs_gpu_repair_preflights_before_terminating_process(monkeypatch, tmp_path):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    real_preflight = recordtest.preflight_obs_recording_profile_ini
+    preflight_calls = 0
+
+    def fail_gpu_restart_preflight(base_dir):
+        nonlocal preflight_calls
+        preflight_calls += 1
+        if preflight_calls == 3:
+            raise obs_bootstrap.OBSPathSafetyError("GPU restart unsafe profile")
+        return real_preflight(base_dir)
+
+    monkeypatch.setattr(recordtest, "preflight_obs_recording_profile_ini", fail_gpu_restart_preflight)
+
+    with pytest.raises(recordtest.RecorderError, match="再起動前安全性検査"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert preflight_calls == 3
+    assert manager.start_count == 1
+    assert manager.terminated_pids == []
 
 
 def test_launch_obs_uses_startup_log_gpu_encoder_without_restart(monkeypatch, tmp_path):

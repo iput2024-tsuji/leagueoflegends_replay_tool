@@ -2008,6 +2008,76 @@ def test_obs_migration_fails_before_mutation_without_handle_relative_support(mon
     assert not destination.exists()
 
 
+def test_posix_handle_relative_capability_requires_rename(monkeypatch):
+    required = {
+        obs_bootstrap.os.open,
+        obs_bootstrap.os.mkdir,
+        obs_bootstrap.os.rename,
+        obs_bootstrap.os.unlink,
+        obs_bootstrap.os.stat,
+    }
+    monkeypatch.setattr(obs_bootstrap.os, "supports_fd", {obs_bootstrap.os.scandir})
+    monkeypatch.setattr(obs_bootstrap.os, "supports_dir_fd", required)
+    monkeypatch.setattr(obs_bootstrap.os, "O_DIRECTORY", 0x10000, raising=False)
+    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0x20000, raising=False)
+
+    assert obs_bootstrap._supports_posix_handle_relative_migration() is True
+
+    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0)
+
+    assert obs_bootstrap._supports_posix_handle_relative_migration() is False
+
+    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0x20000)
+    monkeypatch.setattr(
+        obs_bootstrap.os,
+        "supports_dir_fd",
+        (required - {obs_bootstrap.os.rename}) | {obs_bootstrap.os.replace},
+    )
+
+    assert obs_bootstrap._supports_posix_handle_relative_migration() is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIXのO_NOFOLLOWエラー分類を検証するため")
+def test_posix_directory_lease_rejects_symlink_child_as_path_safety_error(tmp_path):
+    root = tmp_path / "root"
+    external = tmp_path / "external"
+    root.mkdir()
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    _create_directory_link(root / "linked", external)
+
+    with obs_bootstrap._OBSDirectoryLease.open_absolute(root, mutable=True) as lease:
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="reparse point"):
+            lease.open_child_directory("linked", create=True, mutable=True)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIXのdirectory作成raceを検証するため")
+def test_posix_directory_lease_rejects_symlink_injected_after_mkdir(monkeypatch, tmp_path):
+    root = tmp_path / "root"
+    external = tmp_path / "external"
+    root.mkdir()
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    real_mkdir = obs_bootstrap.os.mkdir
+
+    with obs_bootstrap._OBSDirectoryLease.open_absolute(root, mutable=True) as lease:
+        def replace_created_directory_with_symlink(path, mode=0o777, *, dir_fd=None):
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            obs_bootstrap.os.rmdir(path, dir_fd=dir_fd)
+            (root / str(path)).symlink_to(external, target_is_directory=True)
+
+        monkeypatch.setattr(obs_bootstrap.os, "mkdir", replace_created_directory_with_symlink)
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="symbolic link|reparse point"):
+            lease.open_child_directory("injected", create=True, mutable=True)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
 @pytest.mark.parametrize("relation", ["source_parent", "destination_parent"])
 def test_obs_migration_rejects_overlapping_source_and_destination(tmp_path, relation):
     if relation == "source_parent":

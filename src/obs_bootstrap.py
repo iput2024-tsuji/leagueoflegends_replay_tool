@@ -897,14 +897,31 @@ class _OBSDirectoryLease:
                     if mutable_parent is not self:
                         mutable_parent.close()
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+        def open_directory_handle() -> int:
+            try:
+                return os.open(name, flags, dir_fd=self.native_handle)
+            except OSError as exc:
+                if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                    raise _UnsafeOBSMigrationPathError(
+                        "symbolic link／reparse pointまたは通常ディレクトリではありません: "
+                        f"{self.path / name}"
+                    ) from exc
+                raise
+
         try:
-            return os.open(name, flags, dir_fd=self.native_handle)
+            return open_directory_handle()
         except FileNotFoundError:
             if not create:
                 raise
-            os.mkdir(name, dir_fd=self.native_handle)
+            try:
+                os.mkdir(name, dir_fd=self.native_handle)
+            except FileExistsError as exc:
+                raise _UnsafeOBSMigrationPathError(
+                    f"directory作成中に別entryが挿入されました: {self.path / name}"
+                ) from exc
             self.flush_metadata()
-            return os.open(name, flags, dir_fd=self.native_handle)
+            return open_directory_handle()
 
     def open_child_directory(
         self,
@@ -1078,7 +1095,7 @@ class _OBSDirectoryLease:
                 target_name,
             )
         else:
-            os.replace(
+            os.rename(
                 temporary_name,
                 target_name,
                 src_dir_fd=self.native_handle,
@@ -1334,6 +1351,16 @@ def _open_flags(*, write: bool = False, create_exclusive: bool = False) -> int:
     return flags
 
 
+def _supports_posix_handle_relative_migration() -> bool:
+    required_dir_fd_functions = (os.open, os.mkdir, os.rename, os.unlink, os.stat)
+    return (
+        bool(getattr(os, "O_DIRECTORY", 0))
+        and bool(getattr(os, "O_NOFOLLOW", 0))
+        and os.scandir in os.supports_fd
+        and all(function in os.supports_dir_fd for function in required_dir_fd_functions)
+    )
+
+
 def _supports_handle_relative_migration() -> bool:
     if os.name == "nt":
         return all(
@@ -1346,13 +1373,7 @@ def _supports_handle_relative_migration() -> bool:
                 "_windows_mark_open_file_for_deletion",
             )
         )
-    required_dir_fd_functions = (os.open, os.mkdir, os.replace, os.unlink, os.stat)
-    return (
-        hasattr(os, "O_DIRECTORY")
-        and hasattr(os, "O_NOFOLLOW")
-        and os.scandir in os.supports_fd
-        and all(function in os.supports_dir_fd for function in required_dir_fd_functions)
-    )
+    return _supports_posix_handle_relative_migration()
 
 
 class _OBSInterProcessLock:

@@ -2316,9 +2316,14 @@ def test_build_scripts_accept_verified_python_and_provenance():
         assert "Assert-BuildProvenance" in script
     assert '"--build-provenance", $resolvedBuildProvenance' in build
     assert '"--build-provenance-sha256", $BuildProvenanceSha256' in build
-    assert '$buildArgs += @("-PythonExe", $selectedPython)' in installer
-    assert '"-BuildProvenance", $resolvedBuildProvenance' in installer
-    assert '"-BuildProvenanceSha256", $BuildProvenanceSha256' in installer
+    assert '$buildArgs["PythonExe"] = $selectedPython' in installer
+    assert '$buildArgs["BuildProvenance"] = $resolvedBuildProvenance' in installer
+    assert (
+        '$buildArgs["BuildProvenanceSha256"] = $BuildProvenanceSha256'
+        in installer
+    )
+    assert '$buildArgs = @{}' in installer
+    assert '@("-PythonExe", $selectedPython)' not in installer
     assert '-m PyInstaller --noconfirm --clean "LoLReplayTool.spec"' in build
     assert "apply_windows_runtime_policy(a.binaries)" in spec
     assert "a._save_guts()" in spec

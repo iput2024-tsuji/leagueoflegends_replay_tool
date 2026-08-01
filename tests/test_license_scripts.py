@@ -1542,6 +1542,9 @@ def test_runtime_download_lock_must_be_empty_for_user_provided_tools():
 def test_installer_build_self_check_has_an_explicit_timeout():
     script = Path("scripts/build_installer.ps1").read_text(encoding="utf-8")
 
+    assert "[switch]$SkipSelfCheck" in script
+    assert "if (-not $SkipSelfCheck)" in script
+    assert "$SkipSelfCheck -and -not $SkipBuild" in script
     assert ".WaitForExit(60000)" in script
     assert ".Kill($true)" in script
     assert "-RedirectStandardOutput" in script

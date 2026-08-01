@@ -2169,6 +2169,18 @@ def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
     )
     assert "-PythonExe $env:WINDOWS_PYTHON `" in windows_workflow
     assert "Run packaged self-check" in windows_workflow
+    assert (
+        "run: .\\dist\\LoLReplayTool\\LoLReplayTool.exe --self-check"
+        in windows_workflow
+    )
+    assert windows_workflow.count("-SkipSelfCheck") == 1
+    assert "-SkipBuild `\n            -SkipSelfCheck" in windows_workflow
+    assert windows_workflow.index("Run packaged self-check") < windows_workflow.index(
+        "-SkipSelfCheck"
+    )
+    assert "-SkipSelfCheck" not in Path(".github/workflows/release.yml").read_text(
+        encoding="utf-8"
+    )
     assert "actions/upload-artifact@" not in workflow
     assert "Compress-Archive" not in workflow
     assert "LoLReplayTool-installer" not in workflow

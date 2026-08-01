@@ -37,6 +37,9 @@ _filesystem_name_key = _transaction_fs._filesystem_name_key
 _filesystem_parts_key = _transaction_fs._filesystem_parts_key
 _filesystem_path_key = _transaction_fs._filesystem_path_key
 _OBSTransactionTemporaryDescriptor = _transaction_fs._OBSTransactionTemporaryDescriptor
+_OBSFilesystemMetadata = _transaction_fs._OBSFilesystemMetadata
+_OBSPhysicalDirectoryComponent = _transaction_fs._OBSPhysicalDirectoryComponent
+_OBSPhysicalDirectoryChain = _transaction_fs._OBSPhysicalDirectoryChain
 OBSPathSafetyError = _transaction_fs.OBSPathSafetyError
 _UnsafeOBSMigrationPathError = _transaction_fs._UnsafeOBSMigrationPathError
 _OBSMigrationLockBusyError = _transaction_fs._OBSMigrationLockBusyError
@@ -58,6 +61,11 @@ _windows_mark_open_file_for_deletion = _transaction_fs._windows_mark_open_file_f
 _is_reparse_point = _transaction_fs._is_reparse_point
 _validate_existing_entry = _transaction_fs._validate_existing_entry
 _OBSDirectoryLease = _transaction_fs._OBSDirectoryLease
+_snapshot_open_entry_metadata = _transaction_fs._snapshot_open_entry_metadata
+_physical_directory_chain = _transaction_fs._physical_directory_chain
+_validate_distinct_physical_directory_trees = (
+    _transaction_fs._validate_distinct_physical_directory_trees
+)
 _supports_posix_handle_relative_migration = (
     _transaction_fs._supports_posix_handle_relative_migration
 )
@@ -77,6 +85,7 @@ if os.name == "nt":
     _WINDOWS_GENERIC_READ = _transaction_fs._WINDOWS_GENERIC_READ
     _WINDOWS_GENERIC_WRITE = _transaction_fs._WINDOWS_GENERIC_WRITE
     _WINDOWS_DELETE = _transaction_fs._WINDOWS_DELETE
+    _WINDOWS_READ_CONTROL = _transaction_fs._WINDOWS_READ_CONTROL
     _WINDOWS_SYNCHRONIZE = _transaction_fs._WINDOWS_SYNCHRONIZE
     _WINDOWS_MAXIMUM_ALLOWED = _transaction_fs._WINDOWS_MAXIMUM_ALLOWED
     _WINDOWS_FILE_READ_DATA = _transaction_fs._WINDOWS_FILE_READ_DATA
@@ -112,6 +121,7 @@ if os.name == "nt":
     )
     _WINDOWS_FILE_RENAME_INFO = _transaction_fs._WINDOWS_FILE_RENAME_INFO
     _WINDOWS_FILE_DISPOSITION_INFO = _transaction_fs._WINDOWS_FILE_DISPOSITION_INFO
+    _WINDOWS_FILE_STREAM_INFO = _transaction_fs._WINDOWS_FILE_STREAM_INFO
     _WINDOWS_NT_FILE_RENAME_INFORMATION = (
         _transaction_fs._WINDOWS_NT_FILE_RENAME_INFORMATION
     )
@@ -121,8 +131,10 @@ if os.name == "nt":
     _WindowsByHandleFileInformation = _transaction_fs._WindowsByHandleFileInformation
     _WindowsFileDispositionInfo = _transaction_fs._WindowsFileDispositionInfo
     _WindowsFileRenameInfoHeader = _transaction_fs._WindowsFileRenameInfoHeader
+    _WindowsFileStreamInfo = _transaction_fs._WindowsFileStreamInfo
     _WINDOWS_KERNEL32 = _transaction_fs._WINDOWS_KERNEL32
     _WINDOWS_NTDLL = _transaction_fs._WINDOWS_NTDLL
+    _WINDOWS_ADVAPI32 = _transaction_fs._WINDOWS_ADVAPI32
 
 
 def _parse_transaction_temporary(
@@ -164,7 +176,8 @@ OBS_FINALIZE_INVENTORY_SKIP_NAMES = frozenset(
     {OBS_COPY_IN_PROGRESS_MARKER_NAME, OBS_COPY_LOCK_NAME}
 )
 OBS_FINALIZER_CALLBACK_INVENTORY_SKIP_NAMES = frozenset({OBS_COPY_LOCK_NAME})
-OBS_COPY_JOURNAL_SCHEMA_VERSION = 3
+OBS_COPY_JOURNAL_SCHEMA_VERSION = 4
+OBS_COPY_JOURNAL_COMPATIBLE_SCHEMA_VERSIONS = frozenset({3, 4})
 OBS_MIGRATION_PHASE_COPYING = "copying"
 OBS_MIGRATION_PHASE_FINALIZE_PENDING = "finalize_pending"
 OBS_COPY_JOURNAL_MAX_BYTES = 64 * 1024
@@ -250,6 +263,7 @@ class OBSMigrationInventoryEntry:
     kind: str
     size: int | None = None
     sha256: str | None = None
+    metadata: _OBSFilesystemMetadata | None = None
 
     @property
     def relative_path(self) -> str:
@@ -783,7 +797,7 @@ def _read_obs_migration_journal(
         ):
             raise ValueError("source_fingerprint is missing or invalid")
         schema_version = int(payload.get("schema_version"))
-        if schema_version != OBS_COPY_JOURNAL_SCHEMA_VERSION:
+        if schema_version not in OBS_COPY_JOURNAL_COMPATIBLE_SCHEMA_VERSIONS:
             raise ValueError(f"unsupported schema_version: {schema_version}")
         phase = str(payload.get("phase", ""))
         if phase not in {OBS_MIGRATION_PHASE_COPYING, OBS_MIGRATION_PHASE_FINALIZE_PENDING}:
@@ -1423,6 +1437,38 @@ def obs_config_mutation_guard(base_dir: str | Path):
 
 
 def _inventory_fingerprint(entries: tuple[OBSMigrationInventoryEntry, ...]) -> str:
+    def metadata_payload(metadata: _OBSFilesystemMetadata | None) -> dict[str, object] | None:
+        if metadata is None:
+            return None
+        return {
+            "permissions": metadata.permissions,
+            "owner": metadata.owner,
+            "group": metadata.group,
+            "attributes": metadata.attributes,
+            "creation_time": metadata.creation_time,
+            "modification_time": metadata.modification_time,
+            "change_time": metadata.change_time,
+            "security_descriptor_sha256": metadata.security_descriptor_sha256,
+            "extended_attributes_sha256": metadata.extended_attributes_sha256,
+        }
+
+    payload = [
+        {
+            "path": entry.relative_path,
+            "kind": entry.kind,
+            "size": entry.size,
+            "sha256": entry.sha256,
+            "metadata": metadata_payload(entry.metadata),
+        }
+        for entry in entries
+    ]
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _legacy_inventory_fingerprint(
+    entries: tuple[OBSMigrationInventoryEntry, ...],
+) -> str:
     payload = [
         {
             "path": entry.relative_path,
@@ -1432,8 +1478,43 @@ def _inventory_fingerprint(entries: tuple[OBSMigrationInventoryEntry, ...]) -> s
         }
         for entry in entries
     ]
-    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _inventory_fingerprint_for_schema(
+    entries: tuple[OBSMigrationInventoryEntry, ...],
+    schema_version: int | None,
+) -> str:
+    if schema_version == 3:
+        return _legacy_inventory_fingerprint(entries)
+    return _inventory_fingerprint(entries)
+
+
+def _inventory_content_key(
+    entry: OBSMigrationInventoryEntry,
+) -> tuple[str, int | None, str | None]:
+    """Cross-tree equality excludes metadata that copy does not preserve."""
+
+    return (entry.kind, entry.size, entry.sha256)
+
+
+def _inventory_content_matches(
+    left: tuple[OBSMigrationInventoryEntry, ...],
+    right: tuple[OBSMigrationInventoryEntry, ...],
+) -> bool:
+    return {
+        _filesystem_parts_key(entry.relative_parts): _inventory_content_key(entry)
+        for entry in left
+    } == {
+        _filesystem_parts_key(entry.relative_parts): _inventory_content_key(entry)
+        for entry in right
+    }
 
 
 def _hash_safe_file(path: Path) -> tuple[int, str]:
@@ -1779,7 +1860,13 @@ def _recover_prejournal_transaction_temporaries(
             root_lease=source_root_lease,
         )
         validate_recovery_transaction()
-        if _inventory_fingerprint(source_entries) != journal.source_fingerprint:
+        if (
+            _inventory_fingerprint_for_schema(
+                source_entries,
+                journal.schema_version,
+            )
+            != journal.source_fingerprint
+        ):
             raise _UnsafeOBSMigrationPathError(
                 "pre-journal一時fileのsource fingerprintが現在の移行元と一致しません"
             )
@@ -1979,7 +2066,9 @@ def _build_obs_tree_inventory(
 
     def list_children(
         directory: _OBSDirectoryLease,
-    ) -> tuple[tuple[str, str, tuple[int, int, int]], ...]:
+    ) -> tuple[
+        tuple[str, str, tuple[int, int, int], _OBSFilesystemMetadata], ...
+    ]:
         directory.validate_lexical_binding()
         scan_descriptor: int | None = None
         scan_target: str | Path | int
@@ -1994,7 +2083,9 @@ def _build_obs_tree_inventory(
             scan_target = scan_descriptor
         try:
             with os.scandir(scan_target) as iterator:
-                children: list[tuple[str, str, tuple[int, int, int]]] = []
+                children: list[
+                    tuple[str, str, tuple[int, int, int], _OBSFilesystemMetadata]
+                ] = []
                 for entry in iterator:
                     _validate_single_path_component(entry.name)
                     child_path = directory.path / entry.name
@@ -2035,6 +2126,12 @@ def _build_obs_tree_inventory(
                                 raise _UnsafeOBSMigrationPathError(
                                     f"列挙中にdirectory identityが変化しました: {child_path}"
                                 )
+                            child_metadata = _snapshot_open_entry_metadata(
+                                child_directory.native_handle,
+                                path=child_path,
+                                kind="directory",
+                                native_windows_handle=os.name == "nt",
+                            )
                     else:
                         child_descriptor = directory.open_file(
                             entry.name,
@@ -2049,9 +2146,16 @@ def _build_obs_tree_inventory(
                                 raise _UnsafeOBSMigrationPathError(
                                     f"列挙中にfile identityが変化しました: {child_path}"
                                 )
+                            child_metadata = _snapshot_open_entry_metadata(
+                                child_descriptor,
+                                path=child_path,
+                                kind="file",
+                            )
                         finally:
                             os.close(child_descriptor)
-                    children.append((entry.name, kind, child_identity))
+                    children.append(
+                        (entry.name, kind, child_identity, child_metadata)
+                    )
         except _UnsafeOBSMigrationPathError:
             raise
         except OSError as exc:
@@ -2068,7 +2172,8 @@ def _build_obs_tree_inventory(
         directory: _OBSDirectoryLease,
         name: str,
         expected_identity: tuple[int, int, int],
-    ) -> tuple[int, str]:
+        expected_metadata: _OBSFilesystemMetadata,
+    ) -> tuple[int, str, _OBSFilesystemMetadata]:
         descriptor = directory.open_file(
             name,
             write=False,
@@ -2082,6 +2187,15 @@ def _build_obs_tree_inventory(
                 raise _UnsafeOBSMigrationPathError(
                     f"列挙後にfile identityが変化しました: {directory.path / name}"
                 )
+            metadata_before = _snapshot_open_entry_metadata(
+                descriptor,
+                path=directory.path / name,
+                kind="file",
+            )
+            if metadata_before != expected_metadata:
+                raise _UnsafeOBSMigrationPathError(
+                    f"列挙後にfile metadataが変化しました: {directory.path / name}"
+                )
             digest = hashlib.sha256()
             size = 0
             while True:
@@ -2091,15 +2205,21 @@ def _build_obs_tree_inventory(
                 digest.update(chunk)
                 size += len(chunk)
             after = os.fstat(descriptor)
+            metadata_after = _snapshot_open_entry_metadata(
+                descriptor,
+                path=directory.path / name,
+                kind="file",
+            )
             if (
                 _file_identity(after) != identity
                 or int(after.st_size) != size
                 or directory._relative_file_identity(name) != identity
+                or metadata_after != metadata_before
             ):
                 raise _UnsafeOBSMigrationPathError(
                     f"hash中にfileが変化しました: {directory.path / name}"
                 )
-            return size, digest.hexdigest()
+            return size, digest.hexdigest(), metadata_after
         finally:
             os.close(descriptor)
 
@@ -2110,7 +2230,7 @@ def _build_obs_tree_inventory(
         include: bool = True,
     ) -> None:
         children_before = list_children(directory)
-        for child_name, child_kind, child_identity in children_before:
+        for child_name, child_kind, child_identity, child_metadata in children_before:
             child_path = directory.path / child_name
             relative_parts = (*relative_parent, child_name)
             _validate_inventory_parts(relative_parts, child_path)
@@ -2144,9 +2264,23 @@ def _build_obs_tree_inventory(
                         raise _UnsafeOBSMigrationPathError(
                             f"列挙後にdirectory identityが変化しました: {child_path}"
                         )
+                    opened_metadata = _snapshot_open_entry_metadata(
+                        child_directory.native_handle,
+                        path=child_path,
+                        kind="directory",
+                        native_windows_handle=os.name == "nt",
+                    )
+                    if opened_metadata != child_metadata:
+                        raise _UnsafeOBSMigrationPathError(
+                            f"列挙後にdirectory metadataが変化しました: {child_path}"
+                        )
                     if child_include:
                         inventory.append(
-                            OBSMigrationInventoryEntry(relative_parts, "directory")
+                            OBSMigrationInventoryEntry(
+                                relative_parts,
+                                "directory",
+                                metadata=opened_metadata,
+                            )
                         )
                     visit(
                         child_directory,
@@ -2155,10 +2289,11 @@ def _build_obs_tree_inventory(
                     )
             else:
                 if child_include:
-                    size, sha256 = hash_relative_file(
+                    size, sha256, metadata = hash_relative_file(
                         directory,
                         child_name,
                         child_identity,
+                        child_metadata,
                     )
                     inventory.append(
                         OBSMigrationInventoryEntry(
@@ -2166,6 +2301,7 @@ def _build_obs_tree_inventory(
                             "file",
                             size,
                             sha256,
+                            metadata,
                         )
                     )
         if list_children(directory) != children_before:
@@ -2222,12 +2358,12 @@ def _validate_finalize_pending_destination(
     destination: Path,
 ) -> None:
     source_unmanaged = {
-        _filesystem_parts_key(entry.relative_parts): entry
+        _filesystem_parts_key(entry.relative_parts): _inventory_content_key(entry)
         for entry in source_entries
         if not _is_finalize_managed_entry(entry)
     }
     destination_unmanaged = {
-        _filesystem_parts_key(entry.relative_parts): entry
+        _filesystem_parts_key(entry.relative_parts): _inventory_content_key(entry)
         for entry in destination_entries
         if not _is_finalize_managed_entry(entry)
     }
@@ -2342,6 +2478,18 @@ def _copy_inventory_file(
         )
         resources.callback(os.close, source_descriptor)
         source_before = os.fstat(source_descriptor)
+        source_metadata_before = _snapshot_open_entry_metadata(
+            source_descriptor,
+            path=source,
+            kind="file",
+        )
+        if (
+            expected.metadata is None
+            or source_metadata_before != expected.metadata
+        ):
+            raise _UnsafeOBSMigrationPathError(
+                f"コピー中または直前に移行元file metadataが変化しました: {source}"
+            )
         temporary_descriptor: int | None = None
         temporary_identity: tuple[int, int, int] | None = None
         try:
@@ -2366,9 +2514,18 @@ def _copy_inventory_file(
                 size += len(chunk)
                 _write_all(temporary_descriptor, chunk)
             os.fsync(temporary_descriptor)
+            source_metadata_after = _snapshot_open_entry_metadata(
+                source_descriptor,
+                path=source,
+                kind="file",
+            )
             if _file_identity(os.fstat(source_descriptor)) != _file_identity(source_before):
                 raise _UnsafeOBSMigrationPathError(
                     f"コピー中に移行元file identityが変化しました: {source}"
+                )
+            if source_metadata_after != source_metadata_before:
+                raise _UnsafeOBSMigrationPathError(
+                    f"コピー中に移行元file metadataが変化しました: {source}"
                 )
             if source_parent._relative_file_identity(source.name) != _file_identity(
                 source_before
@@ -2381,6 +2538,11 @@ def _copy_inventory_file(
                     f"コピー中に移行元fileが変化しました: {source}"
                 )
             written = os.fstat(temporary_descriptor)
+            temporary_metadata = _snapshot_open_entry_metadata(
+                temporary_descriptor,
+                path=temporary,
+                kind="file",
+            )
             if int(written.st_size) != size:
                 raise _UnsafeOBSMigrationPathError(
                     f"一時コピーのsizeが一致しません: {temporary}"
@@ -2408,6 +2570,14 @@ def _copy_inventory_file(
             if _file_identity(os.fstat(temporary_descriptor)) != temporary_identity:
                 raise _UnsafeOBSMigrationPathError(
                     f"一時コピーのreopen中にidentityが変化しました: {temporary}"
+                )
+            if _snapshot_open_entry_metadata(
+                temporary_descriptor,
+                path=temporary,
+                kind="file",
+            ) != temporary_metadata:
+                raise _UnsafeOBSMigrationPathError(
+                    f"一時コピーのreopen中にmetadataが変化しました: {temporary}"
                 )
             if validate_transaction is not None:
                 validate_transaction()
@@ -2519,6 +2689,7 @@ def migrate_legacy_obs_installation(
                 and not marker_exists
                 and _is_valid_obs_installation_lease(destination_probe)
             )
+            source_tree_identities: frozenset[tuple[int, int, int]] = frozenset()
             if not marker_exists and not destination_appeared_valid:
                 for candidate in allowed_sources:
                     try:
@@ -2546,8 +2717,18 @@ def migrate_legacy_obs_installation(
                 if source_probe is None and destination_probe is None:
                     return None
 
+            if source_probe is not None:
+                source_tree_identities = _validate_distinct_physical_directory_trees(
+                    source_probe,
+                    destination,
+                    destination_lease=destination_probe,
+                )
+
             lock = _OBSInterProcessLock(get_obs_copy_lock_path(destination))
-            if not lock.acquire(directory_lease=destination_probe):
+            if not lock.acquire(
+                directory_lease=destination_probe,
+                reject_directory_identities=source_tree_identities,
+            ):
                 raise OBSMigrationInProgressError(
                     "別のプロセスがOBSのコピー移行を実行中です。完了後に再検査してください。"
                 )
@@ -2608,6 +2789,11 @@ def migrate_legacy_obs_installation(
                     destination,
                     f"markerの移行元に有効なポータブルOBSがありません: {get_obs_executable_path(source)}",
                 )
+            _validate_distinct_physical_directory_trees(
+                source_probe,
+                destination,
+                destination_lease=destination_root_lease,
+            )
             source_marker = get_obs_copy_in_progress_marker(source)
             if source_probe.relative_file_identity_or_none(source_marker.name) is not None:
                 raise _migration_recovery_error(
@@ -2670,7 +2856,14 @@ def migrate_legacy_obs_installation(
             )
             source_root_lease.validate_lexical_binding()
             source_fingerprint = _inventory_fingerprint(source_entries)
-            if stale_journal is not None and source_fingerprint != stale_journal.source_fingerprint:
+            if (
+                stale_journal is not None
+                and _inventory_fingerprint_for_schema(
+                    source_entries,
+                    stale_journal.schema_version,
+                )
+                != stale_journal.source_fingerprint
+            ):
                 raise _migration_recovery_error(
                     destination,
                     "marker作成後に移行元の内容が変化したため、部分配置へoverlayできません。",
@@ -2729,7 +2922,7 @@ def migrate_legacy_obs_installation(
                     root_lease=destination_root_lease,
                 )
                 destination_root_lease.validate_lexical_binding()
-                if copied_entries != source_entries:
+                if not _inventory_content_matches(copied_entries, source_entries):
                     raise _migration_recovery_error(
                         destination,
                         "コピー後inventoryが移行元と双方向一致しません。余剰または不完全なentryがあります。",

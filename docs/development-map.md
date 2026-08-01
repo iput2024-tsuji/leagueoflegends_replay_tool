@@ -14,6 +14,7 @@ LoL Replay Toolの変更箇所を判断するための開発者向け地図で�
 | `src/obs_runtime.py` | OBSプロセス所有権とRecorder生成 | 管理対象OBSだけを制御・終了すること |
 | `src/obs_process.py` | OBS起動、プロセス探索、ログ診断、終了 | Windows実機、既存OBSとの衝突、プロセス取り違え |
 | `src/obs_bootstrap.py` | portable OBSの設定ファイル生成・補正 | 既存設定の移行、WebSocket認証、INI互換性 |
+| `src/obs_transaction_fs.py` | OBS移行のhandle相対filesystem primitive、物理identity、metadata検査 | alias、ADS、ACL、unsupported filesystemのfail-closed |
 | `src/recording_state.py` | 録画状態、終了理由、終了判定 | API一時障害と本当の試合終了を区別すること |
 | `src/session_log.py` | JSONスキーマ、読み込み、移行、原子的保存 | 後方互換性、破損ファイル、保存失敗 |
 | `src/recording_library.py` | 動画、JSON、関連クリップの安全な削除 | 設定ディレクトリ外を削除しないこと |
@@ -112,6 +113,10 @@ AnalyticsPage
 ### OBS
 
 OBS Studioは利用者が公式Releaseから明示的に入手し、専用`obs-portable`へ配置します。本プロジェクトは自動取得、ミラー、同梱、再配布を行いません。アプリ管理のportable OBSだけを対象とし、通常版OBSや他プロセスが使用するWebSocketポートを制御しません。WebSocketはローカル接続でもパスワード認証を必須とします。シーン、音声、録画エンコーダ、起動・終了を変更した場合は実際のOBSログと録画ファイルを確認します。
+
+OBSコピー移行は、表示上のpath文字列ではなくopen済みdirectory handleの物理identityを境界にします。Windowsではvolume serialとfile IDを使い、8.3名、SUBST、volume GUIDなどの別表記がsource／destinationの同一directoryまたはancestor treeを指す場合に拒否します。junctionとsymbolic linkはreparse pointとして拒否します。POSIXではdevice／inodeを使い、Linuxで`/proc/self/fdinfo`が利用できる場合はmount IDも検査します。Linux bind mountが同じdevice／inodeを公開する範囲は検出対象です。これらのidentityを保持しない特殊なmount／namespace、またはhandle相対I/O・xattr検査を提供しないruntime／filesystemでは自動移行を行わず、実pathへ戻してRecoveryする必要があります。
+
+Windowsの管理treeでは、handleからowner／group／DACL、file attributes、regular fileのcreation／last-write timeを取得し、名前付き`:$DATA` streamがあれば拒否します。pathへ`:stream`を連結して内容を開くことはありません。POSIXではmode、uid、gid、xattr（POSIX ACLを含む）、regular fileのmtime／ctimeを検査します。読み取りで変わり得るatimeと、子entry操作で正当に変わるdirectory時刻は不変条件に含めません。WindowsのSACL／監査情報は通常権限で安定して取得できないため不変条件の対象外です。sourceとdestinationの間ではcontentだけを照合し、metadataはコピーしたものとして扱いません。同一treeの再走査とfinalizer前後ではmetadataも比較し、transaction管理fileと明示されたfinalizer allowlist以外のmetadata-only変更を拒否します。
 
 ### LCU / Live Client API
 

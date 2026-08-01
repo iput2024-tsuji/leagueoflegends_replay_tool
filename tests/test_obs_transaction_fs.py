@@ -13,6 +13,14 @@ def test_obs_bootstrap_reexports_filesystem_compatibility_api():
     assert obs_bootstrap._OBSDirectoryLease is obs_transaction_fs._OBSDirectoryLease
     assert obs_bootstrap._OBSInterProcessLock is obs_transaction_fs._OBSInterProcessLock
     assert obs_bootstrap.lexical_absolute_path is obs_transaction_fs.lexical_absolute_path
+    assert (
+        obs_bootstrap._OBSFilesystemMetadata
+        is obs_transaction_fs._OBSFilesystemMetadata
+    )
+    assert (
+        obs_bootstrap._validate_distinct_physical_directory_trees
+        is obs_transaction_fs._validate_distinct_physical_directory_trees
+    )
 
 
 def test_path_lexists_propagates_permission_error(monkeypatch, tmp_path):

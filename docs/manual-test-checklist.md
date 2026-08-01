@@ -39,9 +39,14 @@
 - [ ] 許可された最終化fileと同名の大文字小文字違い、未知のfile、`temp_appdata`、lease情報を最終化処理が変更した場合は検知する
 - [ ] 非管理者のWindowsユーザーで移行先directoryを作成し、終了後に別processから作成・読み書き・一覧・renameできる
 - [ ] Windowsで保持中のnested directoryは外部からrename／junction差し替えできず、relative replace／unlink後も別processから正常に再openできる
+- [ ] NTFS上でsourceを指すSUBST drive、volume GUID path、8.3 short nameをdestinationまたはそのancestorとして指定し、source内／destination内の両方向aliasをmarker・lock・一時file作成前に拒否する
+- [ ] sourceまたはdestination配下のdirectoryをjunction／symbolic linkにした場合、外部sentinelを読まず変更せず、marker・lock・一時fileを作成しない
+- [ ] regular fileとdirectoryへ名前付きNTFS ADS（例`:issue83-test:$DATA`）を付け、default streamと外部sentinelを変更せずRecovery案内にする
+- [ ] allowlist外fileのDACL、read-only／hidden属性、last-write timeだけをfinalizer中に変更し、content hashが同じでも変更を検知してmarkerを維持する。directoryのchild操作による時刻変更だけでは誤検知しない
+- [ ] security descriptor／ADS列挙を拒否するACL、または必要なmetadata APIを提供しないfilesystemで、copy確定fileを作らずRecovery案内にする
 - [ ] 3,000～5,000 fileのsynthetic treeを移行し、file数・総bytes・経過時間・process handle数の開始値／最大値／終了値・source read倍率をPRへ記録する。時間の固定合否値は設けず、handleがfile数に比例して残存しないことと、source全体の反復読み込み回数が設計値を超えないことを確認する
 
-POSIXでの同一権限processによるpath差し替え防止は協調lockが前提です。Windowsでdirectory metadata flushがruntime／filesystemから提供されない場合も、各fileの`fsync`、journalの順序、再起動時検証で復旧できることを記録します。
+Linuxでmount権限のある破棄可能な環境では、source rootとsource内のchildをそれぞれ別pathへbind mountし、そのalias配下をdestinationにした場合に永続transaction file作成前で拒否することも確認します。POSIXでの同一権限processによるpath差し替え防止は協調lockが前提です。device／inodeを保持しない特殊mount、`/proc/self/fdinfo`が存在するのにmount IDを読めないLinux環境、handleからxattr／ACLを取得できないfilesystemは自動移行の非対応条件です。Windowsでdirectory metadata flushがruntime／filesystemから提供されない場合も、各fileの`fsync`、journalの順序、再起動時検証で復旧できることを記録します。
 
 ## 設定画面
 

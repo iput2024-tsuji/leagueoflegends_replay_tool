@@ -1,7 +1,10 @@
 import asyncio
 import configparser
 import json
+import multiprocessing
+import os
 import shutil
+import subprocess
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,8 +13,48 @@ from unittest.mock import patch
 import aiohttp
 import pytest
 
-from src import recordtest
+from src import obs_bootstrap, recordtest
 from src.lcu_client import LCUConnectionInfo
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise OSError(completed.stderr or completed.stdout or "mklink /J failed")
+        return
+    os.symlink(target, link, target_is_directory=True)
+
+
+def _hold_preflight_migration_during_copy(source: str, destination: str, entered, release) -> None:
+    original_write_all = obs_bootstrap._write_all
+
+    def hold_after_copy_write(descriptor: int, payload: bytes) -> None:
+        original_write_all(descriptor, payload)
+        if payload == b"preflight-live-copy":
+            entered.set()
+            if not release.wait(15):
+                raise TimeoutError("test did not release migration")
+
+    obs_bootstrap._write_all = hold_after_copy_write
+    obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+
+def _preflight_config(managed_dir: Path, tmp_path: Path) -> dict:
+    return {
+        "obs": {"dir": str(managed_dir), "port": 4455, "password": "secret"},
+        "paths": {
+            "bin_dir": str(tmp_path / "bin"),
+            "recordings_dir": str(tmp_path / "recordings"),
+            "json_dir": str(tmp_path / "recordings" / "json"),
+            "champion_icons_dir": str(tmp_path / "assets" / "champions" / "icons"),
+        },
+    }
 
 
 class FakeResponse:
@@ -619,6 +662,41 @@ def test_preflight_generates_and_persists_obs_password(monkeypatch, tmp_path):
     assert report["errors"] == []
     assert len(report["config"]["obs"]["password"]) >= 12
     assert any("WebSocketパスワード" in note for note in report["notes"])
+
+
+def test_preflight_rejects_config_reparse_before_profile_or_external_write(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").absolute()
+    obs_executable = managed_dir / "bin" / "64bit" / "obs64.exe"
+    obs_executable.parent.mkdir(parents=True)
+    obs_executable.write_bytes(b"fake obs")
+    external = tmp_path / "external-config"
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    _create_directory_link(managed_dir / "config", external)
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "missing-legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+
+    report = recordtest.run_preflight_checks(
+        {
+            "obs": {"dir": str(managed_dir), "port": 4455, "password": "secret"},
+            "paths": {
+                "bin_dir": str(tmp_path / "bin"),
+                "recordings_dir": str(tmp_path / "recordings"),
+                "json_dir": str(tmp_path / "recordings" / "json"),
+                "champion_icons_dir": str(tmp_path / "assets" / "champions" / "icons"),
+            },
+        },
+        auto_fix=True,
+        ensure_dirs=True,
+    )
+
+    assert any("reparse point" in warning for warning in report["warnings"])
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not (external / "obs-studio").exists()
+    assert not (managed_dir / obs_bootstrap.PORTABLE_OBS_MARKER_NAME).exists()
 
 
 def test_preflight_migrates_legacy_game_capture_keys_to_window_capture(monkeypatch, tmp_path):
@@ -1542,13 +1620,6 @@ def test_preflight_migrates_legacy_obs_studio_to_managed_portable(monkeypatch):
         "[General]\nFirstRun=false\n\n[BasicWindow]\nSysTrayEnabled=true\n",
         encoding="utf-8",
     )
-    partial_exe = managed_dir / "bin" / "64bit" / "obs64.exe"
-    partial_exe.parent.mkdir(parents=True, exist_ok=True)
-    partial_exe.write_text("partial", encoding="utf-8")
-    (managed_dir / ".lol_replay_obs_copy_in_progress").write_text(
-        str(legacy_dir), encoding="utf-8"
-    )
-
     monkeypatch.setattr(recordtest, "ROOT_DIR", root.resolve())
     monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
     monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", legacy_dir)
@@ -1690,7 +1761,245 @@ def test_launch_obs_rejects_incomplete_managed_obs_copy(monkeypatch, tmp_path):
 
     monkeypatch.setattr(recordtest, "OBSProcessManager", UnexpectedProcessManager)
 
-    with pytest.raises(recordtest.RecorderError, match="obs-portableを別の場所へ退避"):
+    with pytest.raises(recordtest.RecorderError, match="旧形式.*fingerprint"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+
+def test_preflight_preserves_live_migration_message(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").resolve()
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "legacy-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "legacy-data")
+
+    def raise_live(*_args, **_kwargs):
+        raise obs_bootstrap.OBSMigrationInProgressError("LIVE MIGRATION DETAIL")
+
+    monkeypatch.setattr(recordtest, "migrate_legacy_obs_installation", raise_live)
+    report = recordtest.run_preflight_checks(
+        {
+            "obs": {"dir": str(managed_dir), "port": 4455, "password": "secret"},
+            "paths": {
+                "bin_dir": str(tmp_path / "bin"),
+                "recordings_dir": str(tmp_path / "recordings"),
+                "json_dir": str(tmp_path / "recordings" / "json"),
+                "champion_icons_dir": str(tmp_path / "assets" / "champions" / "icons"),
+            },
+        },
+        auto_fix=True,
+        ensure_dirs=True,
+    )
+
+    assert any("LIVE MIGRATION DETAIL" in warning for warning in report["warnings"])
+
+
+def test_preflight_preserves_stale_migration_recovery_message(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").resolve()
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "legacy-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "legacy-data")
+
+    def raise_stale(*_args, **_kwargs):
+        raise obs_bootstrap.OBSMigrationRecoveryRequiredError("STALE MIGRATION DETAIL")
+
+    forbidden_calls = []
+
+    def track_legacy_repair(*_args, **_kwargs):
+        forbidden_calls.append("legacy repair")
+        return None
+
+    class TrackingBootstrapper:
+        def __init__(self, *_args, **_kwargs):
+            forbidden_calls.append("bootstrap")
+
+    class TrackingProcessManager:
+        def __init__(self, *_args, **_kwargs):
+            forbidden_calls.append("process manager")
+
+    def track_profile_repair(*_args, **_kwargs):
+        forbidden_calls.append("profile repair")
+        return ()
+
+    monkeypatch.setattr(recordtest, "migrate_legacy_obs_installation", raise_stale)
+    monkeypatch.setattr(recordtest, "repair_legacy_managed_obs_if_present", track_legacy_repair)
+    monkeypatch.setattr(recordtest, "OBSBootstrapper", TrackingBootstrapper)
+    monkeypatch.setattr(recordtest, "OBSProcessManager", TrackingProcessManager)
+    monkeypatch.setattr(recordtest, "ensure_obs_recording_profile_ini", track_profile_repair)
+    report = recordtest.run_preflight_checks(
+        {
+            "obs": {"dir": str(managed_dir), "port": 4455, "password": "secret"},
+            "paths": {
+                "bin_dir": str(tmp_path / "bin"),
+                "recordings_dir": str(tmp_path / "recordings"),
+                "json_dir": str(tmp_path / "recordings" / "json"),
+                "champion_icons_dir": str(tmp_path / "assets" / "champions" / "icons"),
+            },
+        },
+        auto_fix=True,
+        ensure_dirs=True,
+    )
+
+    assert any("STALE MIGRATION DETAIL" in warning for warning in report["warnings"])
+    assert forbidden_calls == []
+
+
+def test_preflight_partial_copy_failure_keeps_source_fingerprint_resumable(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").absolute()
+    legacy_dir = (tmp_path / "legacy-obs").absolute()
+    legacy_executable = legacy_dir / "bin" / "64bit" / "obs64.exe"
+    legacy_global_ini = legacy_dir / "config" / "obs-studio" / "global.ini"
+    legacy_executable.parent.mkdir(parents=True)
+    legacy_global_ini.parent.mkdir(parents=True)
+    legacy_executable.write_bytes(b"fake legacy obs")
+    legacy_global_ini.write_text(
+        "[General]\nFirstRun=false\n\n[BasicWindow]\nSysTrayEnabled=true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", legacy_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+    source_inventory = obs_bootstrap._build_obs_tree_inventory(legacy_dir)
+    source_fingerprint = obs_bootstrap._inventory_fingerprint(source_inventory)
+    real_copy = obs_bootstrap._copy_inventory_file
+    failed_once = False
+
+    def copy_then_fail(source_path, destination_path, expected, owner_token):
+        nonlocal failed_once
+        real_copy(source_path, destination_path, expected, owner_token)
+        if not failed_once:
+            failed_once = True
+            raise OSError("simulated partial copy failure")
+
+    monkeypatch.setattr(obs_bootstrap, "_copy_inventory_file", copy_then_fail)
+    report = recordtest.run_preflight_checks(
+        _preflight_config(managed_dir, tmp_path),
+        auto_fix=True,
+        ensure_dirs=False,
+    )
+
+    assert any("partial copy failure" in warning for warning in report["warnings"])
+    assert obs_bootstrap._build_obs_tree_inventory(legacy_dir) == source_inventory
+    marker = obs_bootstrap.get_obs_copy_in_progress_marker(managed_dir)
+    journal = json.loads(marker.read_text(encoding="utf-8"))
+    assert journal["source_fingerprint"] == source_fingerprint
+
+    monkeypatch.setattr(obs_bootstrap, "_copy_inventory_file", real_copy)
+    assert recordtest.migrate_legacy_managed_obs_if_needed(port=4455, password="secret") == legacy_dir
+
+    assert obs_bootstrap._build_obs_tree_inventory(legacy_dir) == source_inventory
+    assert (managed_dir / "bin" / "64bit" / "obs64.exe").read_bytes() == b"fake legacy obs"
+    assert not marker.exists()
+
+
+def test_preflight_does_not_mutate_live_copy_and_normalizes_after_completion(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").absolute()
+    legacy_dir = (tmp_path / "legacy-obs").absolute()
+    legacy_executable = legacy_dir / "bin" / "64bit" / "obs64.exe"
+    legacy_executable.parent.mkdir(parents=True)
+    legacy_executable.write_bytes(b"preflight-live-copy")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", legacy_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    release = context.Event()
+    process = context.Process(
+        target=_hold_preflight_migration_during_copy,
+        args=(str(legacy_dir), str(managed_dir), entered, release),
+    )
+    process.start()
+    child_exitcode = None
+    try:
+        assert entered.wait(15), "migration did not pause with its marker and copy temporary"
+        marker = obs_bootstrap.get_obs_copy_in_progress_marker(managed_dir)
+        marker_before = marker.read_bytes()
+        owner_token = json.loads(marker_before)["owner_token"]
+        copy_temporary = obs_bootstrap._transaction_copy_temporary_path(
+            managed_dir / legacy_executable.relative_to(legacy_dir),
+            owner_token,
+        )
+        temporary_before = copy_temporary.read_bytes()
+
+        report = recordtest.run_preflight_checks(
+            _preflight_config(managed_dir, tmp_path),
+            auto_fix=True,
+            ensure_dirs=False,
+        )
+
+        assert any("別のプロセス" in warning for warning in report["warnings"])
+        assert marker.read_bytes() == marker_before
+        assert copy_temporary.read_bytes() == temporary_before
+        assert legacy_executable.read_bytes() == b"preflight-live-copy"
+        assert not obs_bootstrap.get_portable_marker_path(managed_dir).exists()
+        assert not obs_bootstrap.get_obs_global_ini_path(managed_dir).exists()
+        assert not obs_bootstrap.get_obs_user_ini_path(managed_dir).exists()
+        assert not obs_bootstrap.get_obs_websocket_config_path(managed_dir).exists()
+    finally:
+        release.set()
+        process.join(15)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+        child_exitcode = process.exitcode
+        process.close()
+
+    assert child_exitcode == 0
+    completed_report = recordtest.run_preflight_checks(
+        _preflight_config(managed_dir, tmp_path),
+        auto_fix=True,
+        ensure_dirs=False,
+    )
+
+    assert completed_report["errors"] == []
+    assert obs_bootstrap.get_portable_marker_path(managed_dir).is_file()
+    assert obs_bootstrap.get_obs_global_ini_path(managed_dir).is_file()
+    assert obs_bootstrap.get_obs_user_ini_path(managed_dir).is_file()
+    assert obs_bootstrap.get_obs_websocket_config_path(managed_dir).is_file()
+
+
+def test_preflight_does_not_dirty_empty_obs_destination_before_legacy_appears(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").absolute()
+    legacy_dir = (tmp_path / "legacy-obs").absolute()
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", legacy_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+
+    first_report = recordtest.run_preflight_checks(
+        _preflight_config(managed_dir, tmp_path),
+        auto_fix=True,
+        ensure_dirs=False,
+    )
+
+    assert first_report["errors"]
+    assert not managed_dir.exists()
+
+    legacy_executable = legacy_dir / "bin" / "64bit" / "obs64.exe"
+    legacy_executable.parent.mkdir(parents=True)
+    legacy_executable.write_bytes(b"late legacy obs")
+    second_report = recordtest.run_preflight_checks(
+        _preflight_config(managed_dir, tmp_path),
+        auto_fix=True,
+        ensure_dirs=False,
+    )
+
+    assert second_report["errors"] == []
+    assert (managed_dir / "bin" / "64bit" / "obs64.exe").read_bytes() == b"late legacy obs"
+    assert obs_bootstrap.get_portable_marker_path(managed_dir).is_file()
+
+
+def test_launch_obs_preserves_live_migration_message(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").resolve()
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+
+    def raise_live(*_args, **_kwargs):
+        raise obs_bootstrap.OBSMigrationInProgressError("LIVE MIGRATION DETAIL")
+
+    monkeypatch.setattr(recordtest, "migrate_legacy_obs_installation", raise_live)
+    with pytest.raises(recordtest.RecorderError, match="LIVE MIGRATION DETAIL"):
         recordtest.launch_obs(_fake_launch_config(tmp_path))
 
 

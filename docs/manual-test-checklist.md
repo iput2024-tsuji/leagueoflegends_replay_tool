@@ -86,10 +86,11 @@
 
 ## ビルドとself-check
 
-- [ ] `.\scripts\build.ps1` が成功する
+- [ ] 利用者管理のOBS、standalone FFmpeg、mpv DLLを含まない通常成果物で`.\scripts\build.ps1`が成功する
 - [ ] `.\dist\LoLReplayTool\LoLReplayTool.exe --self-check` が終了コード0になる
 - [ ] OBS、mpv、FFmpeg未配置の警告が想定どおりで、必須診断は成功する
 - [ ] ビルド成果物へOBSまたはstandalone FFmpegが混入した場合は検査が失敗する
+- [ ] ビルド成果物のrootまたは下位directoryへ`libmpv-*.dll`／`mpv-*.dll`が混入した場合は、対象pathと`%LOCALAPPDATA%\LoLReplayTool\bin`への利用者配置方針を表示して検査が失敗する
 
 ## インストーラー確認が必要なケース
 

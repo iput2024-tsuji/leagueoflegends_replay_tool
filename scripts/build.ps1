@@ -88,13 +88,8 @@ if ($forbiddenRuntimePaths.Count -gt 0) {
 }
 
 # Keep distribution clean: OBS, mpv DLLs, and third-party game assets must be user-provided.
-$mpvDllPattern = '^(lib)?mpv-\d+\.dll$'
-$bundledMpvDlls = Get-ChildItem -Path $distRootDir -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
-  $_.Name -match $mpvDllPattern
-}
-foreach ($dll in $bundledMpvDlls) {
-  Remove-Item -Path $dll.FullName -Force -ErrorAction SilentlyContinue
-}
+& (Join-Path $scriptDir "check_mpv_distribution.ps1") `
+  -DistributionRoot $distRootDir
 
 $licensesDir = Join-Path $distRootDir "licenses"
 $licenseArgs = @("scripts\collect_licenses.py", "--destination", $licensesDir)

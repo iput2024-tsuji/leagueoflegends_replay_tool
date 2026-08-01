@@ -5,6 +5,10 @@ from pathlib import Path
 APP_NAME = "LoLReplayTool"
 
 
+def _lexical_absolute(path: str | Path) -> Path:
+    return Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+
+
 def get_app_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -22,12 +26,12 @@ def get_resource_root() -> Path:
 def get_user_data_root() -> Path:
     override = os.environ.get("LOL_REPLAY_TOOL_DATA_DIR")
     if override:
-        return Path(override).expanduser().resolve()
+        return _lexical_absolute(override)
 
     if getattr(sys, "frozen", False) and os.name == "nt":
         local_appdata = os.environ.get("LOCALAPPDATA")
         if local_appdata:
-            return (Path(local_appdata) / APP_NAME).resolve()
-        return (Path.home() / "AppData" / "Local" / APP_NAME).resolve()
+            return _lexical_absolute(Path(local_appdata) / APP_NAME)
+        return _lexical_absolute(Path.home() / "AppData" / "Local" / APP_NAME)
 
     return get_app_root()

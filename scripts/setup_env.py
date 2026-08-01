@@ -13,7 +13,13 @@ from collections.abc import Callable
 from pathlib import Path
 
 from src.app_paths import get_app_root, get_user_data_root
-from src.obs_bootstrap import OBSBootstrapper, copy_obs_tree_contents, is_obs_copy_in_progress
+from src.obs_bootstrap import (
+    OBSBootstrapper,
+    is_obs_copy_in_progress,
+    lexical_absolute_path,
+    migrate_legacy_obs_installation,
+    validate_obs_installation_path,
+)
 from src.obs_process import OBSProcessManager
 
 ProgressCallback = Callable[[int, str], None]
@@ -54,9 +60,11 @@ def obs_manual_setup_message() -> str:
 
 
 def is_environment_ready() -> bool:
-    if not OBS_EXE.is_file() or is_obs_copy_in_progress(OBS_PORTABLE_DIR):
-        return False
     try:
+        if not validate_obs_installation_path(OBS_PORTABLE_DIR):
+            return False
+        if is_obs_copy_in_progress(OBS_PORTABLE_DIR):
+            return False
         return OBSBootstrapper(OBS_PORTABLE_DIR).check().ready
     except Exception:
         return False
@@ -66,10 +74,8 @@ def _dedupe_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
     result: list[Path] = []
     seen: set[str] = set()
     for path in paths:
-        try:
-            key = str(path.resolve()).casefold()
-        except Exception:
-            key = str(path).casefold()
+        path = lexical_absolute_path(path)
+        key = str(path).casefold()
         if key in seen:
             continue
         seen.add(key)
@@ -78,10 +84,7 @@ def _dedupe_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
 
 
 def legacy_obs_portable_dirs() -> tuple[Path, ...]:
-    try:
-        current_obs_dir = str(OBS_PORTABLE_DIR.resolve()).casefold()
-    except Exception:
-        current_obs_dir = str(OBS_PORTABLE_DIR).casefold()
+    current_obs_dir = str(lexical_absolute_path(OBS_PORTABLE_DIR)).casefold()
     return tuple(
         path
         for path in _dedupe_paths(
@@ -91,7 +94,7 @@ def legacy_obs_portable_dirs() -> tuple[Path, ...]:
                 LEGACY_DATA_BIN_OBS_PORTABLE_DIR,
             )
         )
-        if str(path.resolve()).casefold() != current_obs_dir
+        if str(lexical_absolute_path(path)).casefold() != current_obs_dir
     )
 
 
@@ -102,20 +105,19 @@ def bootstrap_obs_portable_config(obs_dir: Path = OBS_PORTABLE_DIR) -> None:
 def migrate_legacy_obs_portable(progress_cb: ProgressCallback | None = None) -> bool:
     """Copy an existing legacy portable OBS without deleting the source."""
 
-    if OBS_EXE.is_file() and not is_obs_copy_in_progress(OBS_PORTABLE_DIR):
-        return False
-
-    for legacy_dir in legacy_obs_portable_dirs():
-        legacy_exe = legacy_dir / "bin" / "64bit" / "obs64.exe"
-        if not legacy_exe.is_file():
-            continue
+    def prepare_source(legacy_dir: Path) -> None:
         report(progress_cb, 10, f"旧OBS配置をローカル移行しています: {legacy_dir}")
         OBSProcessManager(legacy_dir).kill_stale_managed_processes()
-        copy_obs_tree_contents(legacy_dir, OBS_PORTABLE_DIR)
-        bootstrap_obs_portable_config(OBS_PORTABLE_DIR)
+
+    migrated_from = migrate_legacy_obs_installation(
+        OBS_PORTABLE_DIR,
+        legacy_obs_portable_dirs(),
+        prepare_source=prepare_source,
+        finalize_destination=bootstrap_obs_portable_config,
+    )
+    if migrated_from is not None:
         report(progress_cb, 90, f"OBS migrated: {OBS_PORTABLE_DIR}")
         return True
-
     return False
 
 
@@ -128,9 +130,10 @@ async def ensure_obs_portable(
     if cancel_cb and cancel_cb():
         raise RuntimeError("セットアップをキャンセルしました。")
 
-    if not OBS_EXE.is_file() or is_obs_copy_in_progress(OBS_PORTABLE_DIR):
+    obs_is_valid = validate_obs_installation_path(OBS_PORTABLE_DIR)
+    if not obs_is_valid or is_obs_copy_in_progress(OBS_PORTABLE_DIR):
         await asyncio.to_thread(migrate_legacy_obs_portable, progress_cb)
-    if not OBS_EXE.is_file() or is_obs_copy_in_progress(OBS_PORTABLE_DIR):
+    if not validate_obs_installation_path(OBS_PORTABLE_DIR) or is_obs_copy_in_progress(OBS_PORTABLE_DIR):
         raise ManualSetupRequiredError(obs_manual_setup_message())
 
     if cancel_cb and cancel_cb():

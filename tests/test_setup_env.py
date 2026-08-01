@@ -1,5 +1,7 @@
 import asyncio
 import inspect
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -31,6 +33,20 @@ def _configure_paths(monkeypatch, tmp_path: Path) -> tuple[Path, Path]:
 def _write_fake_obs(obs_exe: Path) -> None:
     obs_exe.parent.mkdir(parents=True, exist_ok=True)
     obs_exe.write_bytes(b"fake obs")
+
+
+def _create_directory_link(link: Path, target: Path) -> None:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise OSError(completed.stderr or completed.stdout or "mklink /J failed")
+        return
+    os.symlink(target, link, target_is_directory=True)
 
 
 def test_setup_module_has_no_network_or_archive_install_path():
@@ -77,6 +93,26 @@ def test_user_provided_obs_is_bootstrapped_and_reported_ready(monkeypatch, tmp_p
     assert (obs_dir / "config" / "obs-studio" / "global.ini").is_file()
     assert (obs_dir / "config" / "obs-studio" / "user.ini").is_file()
     assert progress[-1] == (100, f"OBS is ready: {obs_dir}")
+
+
+def test_existing_obs_root_reparse_is_rejected_without_external_write(monkeypatch, tmp_path):
+    obs_dir, _obs_exe = _configure_paths(monkeypatch, tmp_path)
+    external = tmp_path / "external-obs"
+    external_executable = external / "bin" / "64bit" / "obs64.exe"
+    _write_fake_obs(external_executable)
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    obs_dir.parent.mkdir(parents=True)
+    _create_directory_link(obs_dir, external)
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="reparse point"):
+        asyncio.run(setup_env.ensure_obs_portable())
+
+    assert setup_env.is_environment_ready() is False
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert external_executable.read_bytes() == b"fake obs"
+    assert not (external / obs_bootstrap.PORTABLE_OBS_MARKER_NAME).exists()
+    assert not (external / "config" / "obs-studio" / "global.ini").exists()
 
 
 def test_legacy_obs_is_copied_without_deleting_user_files(monkeypatch, tmp_path):
@@ -129,18 +165,14 @@ def test_partial_legacy_copy_is_retried_without_deleting_source(monkeypatch, tmp
     legacy_dir = setup_env.LEGACY_OBS_PORTABLE_DIR
     legacy_exe = legacy_dir / "bin" / "64bit" / "obs64.exe"
     _write_fake_obs(legacy_exe)
-    real_copy = setup_env.copy_obs_tree_contents
+    real_copy_file = obs_bootstrap._copy_inventory_file
 
-    def fail_after_executable(_source, destination):
-        destination.mkdir(parents=True, exist_ok=True)
-        obs_bootstrap.get_obs_copy_in_progress_marker(destination).write_text(
-            str(legacy_dir), encoding="utf-8"
-        )
-        _write_fake_obs(destination / "bin" / "64bit" / "obs64.exe")
+    def fail_after_executable(*args, **kwargs):
+        real_copy_file(*args, **kwargs)
         raise OSError("simulated interrupted copy")
 
-    monkeypatch.setattr(setup_env, "copy_obs_tree_contents", fail_after_executable)
-    with pytest.raises(OSError, match="interrupted"):
+    monkeypatch.setattr(obs_bootstrap, "_copy_inventory_file", fail_after_executable)
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="interrupted"):
         setup_env.migrate_legacy_obs_portable()
 
     assert obs_exe.is_file()
@@ -148,7 +180,7 @@ def test_partial_legacy_copy_is_retried_without_deleting_source(monkeypatch, tmp
     assert obs_bootstrap.is_obs_copy_in_progress(obs_dir) is True
     assert setup_env.is_environment_ready() is False
 
-    monkeypatch.setattr(setup_env, "copy_obs_tree_contents", real_copy)
+    monkeypatch.setattr(obs_bootstrap, "_copy_inventory_file", real_copy_file)
     assert setup_env.migrate_legacy_obs_portable() is True
 
     assert obs_bootstrap.is_obs_copy_in_progress(obs_dir) is False

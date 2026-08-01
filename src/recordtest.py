@@ -38,15 +38,19 @@ try:
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
-        copy_obs_tree_contents,
+        OBSMigrationInProgressError,
+        OBSMigrationRecoveryRequiredError,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
         is_obs_copy_in_progress,
+        lexical_absolute_path,
+        migrate_legacy_obs_installation,
         new_obs_ini_parser as shared_new_obs_ini_parser,
         read_obs_ini_parser as shared_read_obs_ini_parser,
+        validate_obs_installation_path,
     )
     from .obs_process import OBSProcessManager
     from .post_game_result import (
@@ -90,15 +94,19 @@ except ImportError:
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
-        copy_obs_tree_contents,
+        OBSMigrationInProgressError,
+        OBSMigrationRecoveryRequiredError,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
         is_obs_copy_in_progress,
+        lexical_absolute_path,
+        migrate_legacy_obs_installation,
         new_obs_ini_parser as shared_new_obs_ini_parser,
         read_obs_ini_parser as shared_read_obs_ini_parser,
+        validate_obs_installation_path,
     )
     from obs_process import OBSProcessManager
     from post_game_result import (
@@ -229,10 +237,10 @@ OBS_GLOBAL_AUDIO_DEVICE_PARAMETERS = (
     "AuxDevice4",
 )
 
-MANAGED_PORTABLE_OBS_DIR = (DATA_DIR / DEFAULT_OBS_DIR).resolve()
-LEGACY_MANAGED_OBS_DIR = (ROOT_DIR / LEGACY_OBS_DIR).resolve()
-LEGACY_ROOT_OBS_DIR = (ROOT_DIR / DEFAULT_OBS_DIR).resolve()
-LEGACY_DATA_BIN_OBS_DIR = (DATA_DIR / LEGACY_OBS_DIR).resolve()
+MANAGED_PORTABLE_OBS_DIR = lexical_absolute_path(DATA_DIR / DEFAULT_OBS_DIR)
+LEGACY_MANAGED_OBS_DIR = lexical_absolute_path(ROOT_DIR / LEGACY_OBS_DIR)
+LEGACY_ROOT_OBS_DIR = lexical_absolute_path(ROOT_DIR / DEFAULT_OBS_DIR)
+LEGACY_DATA_BIN_OBS_DIR = lexical_absolute_path(DATA_DIR / LEGACY_OBS_DIR)
 PORTABLE_OBS_MARKER_NAME = "obs_portable_mode.txt"
 LEGACY_PORTABLE_OBS_MARKER_NAME = "portable_mode.txt"
 MANAGED_AUDIO_INPUTS = config_schema.MANAGED_AUDIO_INPUTS
@@ -512,28 +520,27 @@ def obs_executable_path(base_dir: str | Path | None) -> Path | None:
 
 
 def is_valid_obs_dir(base_dir: str | Path | None) -> bool:
-    obs_exe = obs_executable_path(base_dir)
-    return bool(
-        obs_exe
-        and obs_exe.is_file()
-        and base_dir is not None
-        and not is_obs_copy_in_progress(base_dir)
-    )
+    if base_dir is None:
+        return False
+    try:
+        if not validate_obs_installation_path(base_dir):
+            return False
+        SharedOBSBootstrapper(base_dir, logger=LOGGER).validate_layout()
+        return not is_obs_copy_in_progress(base_dir)
+    except Exception:
+        return False
 
 
 def legacy_managed_obs_dirs() -> tuple[Path, ...]:
     seen = set()
     result = []
     for path in (LEGACY_ROOT_OBS_DIR, LEGACY_MANAGED_OBS_DIR, LEGACY_DATA_BIN_OBS_DIR):
-        try:
-            resolved = path.resolve()
-        except Exception:
-            resolved = path
-        key = str(resolved).casefold()
+        normalized = lexical_absolute_path(path)
+        key = str(normalized).casefold()
         if key == str(MANAGED_PORTABLE_OBS_DIR).casefold() or key in seen:
             continue
         seen.add(key)
-        result.append(resolved)
+        result.append(normalized)
     return tuple(result)
 
 
@@ -550,7 +557,7 @@ def is_managed_portable_obs_dir(base_dir: str | Path | None) -> bool:
     if not base_dir:
         return False
     try:
-        candidate = Path(base_dir).resolve()
+        candidate = lexical_absolute_path(base_dir)
         return candidate == MANAGED_PORTABLE_OBS_DIR
     except Exception:
         return False
@@ -560,14 +567,14 @@ def is_legacy_managed_obs_dir(base_dir: str | Path | None) -> bool:
     if not base_dir:
         return False
     try:
-        candidate = Path(base_dir).resolve()
+        candidate = lexical_absolute_path(base_dir)
         return any(candidate == legacy_dir for legacy_dir in legacy_managed_obs_dirs())
     except Exception:
         return False
 
 
 def bootstrap_obs_dir(base_dir: str | Path, port: int | None = None, password: str = "") -> dict[str, Any]:
-    base_path = Path(base_dir).resolve()
+    base_path = lexical_absolute_path(base_dir)
     bootstrapper = SharedOBSBootstrapper(
         base_path,
         process_manager=OBSProcessManager(base_path, logger=LOGGER),
@@ -579,17 +586,20 @@ def bootstrap_obs_dir(base_dir: str | Path, port: int | None = None, password: s
 
 
 def migrate_legacy_managed_obs_if_needed(port: int | None = None, password: str = "") -> Path | None:
-    if is_valid_obs_dir(MANAGED_PORTABLE_OBS_DIR):
-        return None
+    def prepare_source(legacy_dir: Path) -> None:
+        OBSProcessManager(legacy_dir, logger=LOGGER).kill_stale_managed_processes()
 
-    legacy_dir = next((path for path in legacy_managed_obs_dirs() if is_valid_obs_dir(path)), None)
+    def finalize_destination(destination: Path) -> None:
+        bootstrap_obs_dir(destination, port=port, password=password)
+
+    legacy_dir = migrate_legacy_obs_installation(
+        MANAGED_PORTABLE_OBS_DIR,
+        legacy_managed_obs_dirs(),
+        prepare_source=prepare_source,
+        finalize_destination=finalize_destination,
+    )
     if legacy_dir is None:
         return None
-
-    OBSProcessManager(legacy_dir, logger=LOGGER).kill_stale_managed_processes()
-    MANAGED_PORTABLE_OBS_DIR.mkdir(parents=True, exist_ok=True)
-    copy_obs_tree_contents(legacy_dir, MANAGED_PORTABLE_OBS_DIR)
-    bootstrap_obs_dir(MANAGED_PORTABLE_OBS_DIR, port=port, password=password)
     LOGGER.info(
         "旧OBS配置を obs-portable へコピー移行しました: %s -> %s",
         legacy_dir,
@@ -1265,6 +1275,7 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         report["warnings"].append("binフォルダに mpv DLL が見つかりません。プレーヤー利用時に配置が必要です。")
 
     obs_password = str(obs_cfg.get("password") or "")
+    migration_failed = False
     if auto_fix:
         try:
             migrated_from = migrate_legacy_managed_obs_if_needed(port=port, password=obs_password)
@@ -1272,17 +1283,19 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
                 report["changed"] = True
                 report["notes"].append(f"旧OBS配置を obs-portable へコピー移行しました: {migrated_from}")
         except Exception as e:
+            migration_failed = True
             report["warnings"].append(f"旧OBS配置の移行に失敗しました: {e}")
 
-        try:
-            repaired_legacy = repair_legacy_managed_obs_if_present(port=port, password=obs_password)
-            if repaired_legacy is not None:
-                report["changed"] = True
-                report["notes"].append(f"旧OBS配置の起動前設定も修復しました: {repaired_legacy}")
-        except Exception as e:
-            report["warnings"].append(f"旧OBS配置の設定修復に失敗しました: {e}")
+        if not migration_failed:
+            try:
+                repaired_legacy = repair_legacy_managed_obs_if_present(port=port, password=obs_password)
+                if repaired_legacy is not None:
+                    report["changed"] = True
+                    report["notes"].append(f"旧OBS配置の起動前設定も修復しました: {repaired_legacy}")
+            except Exception as e:
+                report["warnings"].append(f"旧OBS配置の設定修復に失敗しました: {e}")
 
-    current_obs_dir = resolve_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), DATA_DIR)
+    current_obs_dir = resolve_obs_path(obs_cfg.get("dir", DEFAULT_OBS_DIR), DATA_DIR)
     expected_obs_dir = MANAGED_PORTABLE_OBS_DIR
 
     if not current_obs_dir or not is_managed_portable_obs_dir(current_obs_dir):
@@ -1294,57 +1307,82 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
         else:
             report["errors"].append(f"OBSフォルダは obs-portable のポータブルOBSのみ対応です: {expected_obs_dir}")
 
+    bootstrap_layout_safe = False
     if current_obs_dir and is_managed_portable_obs_dir(current_obs_dir):
-        try:
-            bootstrapper = OBSBootstrapper(current_obs_dir)
-            bootstrap_report = bootstrapper.check()
-            if bootstrap_report.needs_repair:
-                if auto_fix:
-                    if bootstrapper.process_manager.has_managed_process():
+        bootstrap_blocked_reason = None
+        if migration_failed:
+            bootstrap_blocked_reason = "OBSコピー移行が失敗したため、コピー元とコピー先の設定修復を延期しました。"
+        elif os.path.lexists(current_obs_dir):
+            try:
+                if is_obs_copy_in_progress(current_obs_dir):
+                    bootstrap_blocked_reason = (
+                        "OBSコピー移行が進行中または再開待ちのため、コピー先の設定修復を延期しました。"
+                    )
+            except Exception as e:
+                bootstrap_blocked_reason = f"OBSコピー移行状態を安全に確認できないため、設定修復を延期しました: {e}"
+
+        if bootstrap_blocked_reason is not None:
+            report["warnings"].append(bootstrap_blocked_reason)
+        else:
+            try:
+                bootstrapper = OBSBootstrapper(current_obs_dir)
+                bootstrap_report = bootstrapper.check()
+                bootstrap_layout_safe = True
+                if not bootstrap_report.obs_exe_exists:
+                    report["warnings"].append("OBS本体が未配置のため、起動前設定の自動生成を延期しました。")
+                elif bootstrap_report.needs_repair:
+                    if auto_fix:
+                        if bootstrapper.process_manager.has_managed_process():
+                            report["warnings"].append(
+                                "ポータブルOBSが起動中のため、起動前設定の自動修復を延期しました。"
+                                "録画監視を停止してから環境修復を再実行してください。"
+                            )
+                        else:
+                            bootstrap_result = bootstrapper.apply(
+                                port=int(obs_cfg.get("port") or DEFAULT_OBS_PORT),
+                                password=str(obs_cfg.get("password") or ""),
+                            )
+                            report["changed"] = True
+                            report["notes"].append(
+                                f"ポータブルOBS設定を修復しました: {bootstrap_result.get('global_ini_path')}"
+                            )
+                    else:
+                        report["warnings"].append("OBS Bootstrapper の修復が必要です。")
+            except Exception as e:
+                bootstrap_layout_safe = False
+                report["warnings"].append(f"OBS Bootstrapper の検査/修復に失敗しました: {e}")
+
+            if (
+                auto_fix
+                and bootstrap_layout_safe
+                and recordings_dir is not None
+                and is_valid_obs_dir(current_obs_dir)
+            ):
+                try:
+                    process_manager = OBSProcessManager(current_obs_dir, logger=LOGGER)
+                    if process_manager.has_managed_process():
                         report["warnings"].append(
-                            "ポータブルOBSが起動中のため、起動前設定の自動修復を延期しました。"
+                            "ポータブルOBSが起動中のため、録画プロファイル修復を延期しました。"
                             "録画監視を停止してから環境修復を再実行してください。"
                         )
                     else:
-                        bootstrap_result = bootstrapper.apply(
-                            port=int(obs_cfg.get("port") or DEFAULT_OBS_PORT),
-                            password=str(obs_cfg.get("password") or ""),
+                        changed_profiles = ensure_obs_recording_profile_ini(
+                            current_obs_dir,
+                            record_dir=recordings_dir,
+                            scale_type=str(obs_cfg.get("scale_type") or DEFAULT_OBS_SCALE_TYPE),
+                            recording_quality=str(obs_cfg.get("recording_quality") or DEFAULT_OBS_RECORDING_QUALITY),
+                            recording_encoder=str(obs_cfg.get("recording_encoder") or DEFAULT_OBS_RECORDING_ENCODER),
                         )
-                        report["changed"] = True
-                        report["notes"].append(
-                            f"ポータブルOBS設定を修復しました: {bootstrap_result.get('global_ini_path')}"
-                        )
-                else:
-                    report["warnings"].append("OBS Bootstrapper の修復が必要です。")
-        except Exception as e:
-            report["warnings"].append(f"OBS Bootstrapper の検査/修復に失敗しました: {e}")
+                        if changed_profiles:
+                            report["changed"] = True
+                            report["notes"].append(
+                                "OBS録画プロファイルをSimple/H.264/mkv設定へ修復しました: "
+                                + ", ".join(str(path) for path in changed_profiles)
+                            )
+                except Exception as e:
+                    report["warnings"].append(f"OBS録画プロファイルの検査/修復に失敗しました: {e}")
 
-        if auto_fix and recordings_dir is not None and is_valid_obs_dir(current_obs_dir):
-            try:
-                process_manager = OBSProcessManager(current_obs_dir, logger=LOGGER)
-                if process_manager.has_managed_process():
-                    report["warnings"].append(
-                        "ポータブルOBSが起動中のため、録画プロファイル修復を延期しました。"
-                        "録画監視を停止してから環境修復を再実行してください。"
-                    )
-                else:
-                    changed_profiles = ensure_obs_recording_profile_ini(
-                        current_obs_dir,
-                        record_dir=recordings_dir,
-                        scale_type=str(obs_cfg.get("scale_type") or DEFAULT_OBS_SCALE_TYPE),
-                        recording_quality=str(obs_cfg.get("recording_quality") or DEFAULT_OBS_RECORDING_QUALITY),
-                        recording_encoder=str(obs_cfg.get("recording_encoder") or DEFAULT_OBS_RECORDING_ENCODER),
-                    )
-                    if changed_profiles:
-                        report["changed"] = True
-                        report["notes"].append(
-                            "OBS録画プロファイルをSimple/H.264/mkv設定へ修復しました: "
-                            + ", ".join(str(path) for path in changed_profiles)
-                        )
-            except Exception as e:
-                report["warnings"].append(f"OBS録画プロファイルの検査/修復に失敗しました: {e}")
-
-    has_valid_obs = bool(current_obs_dir and is_valid_obs_dir(current_obs_dir))
+    has_valid_obs = bool(current_obs_dir and bootstrap_layout_safe and is_valid_obs_dir(current_obs_dir))
     if not has_valid_obs:
         report["errors"].append(
             f"ポータブルOBSが見つかりません。\n配置先: {expected_obs_dir}\nobs64.exe が存在する状態で配置してください。"
@@ -2129,6 +2167,15 @@ def resolve_path(value: str | Path | None, base_dir: str | Path) -> Path | None:
     return path
 
 
+def resolve_obs_path(value: str | Path | None, base_dir: str | Path) -> Path | None:
+    if value is None:
+        return None
+    expanded = Path(os.path.expandvars(str(value)))
+    if not expanded.is_absolute():
+        expanded = Path(base_dir) / expanded
+    return lexical_absolute_path(expanded)
+
+
 def load_settings() -> dict[str, Any]:
     return CONFIG_REPOSITORY.load(create_if_missing=True)
 
@@ -2214,6 +2261,8 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         try:
             migrate_legacy_managed_obs_if_needed(port=config.obs.port, password=config.obs.password)
             repair_legacy_managed_obs_if_present(port=config.obs.port, password=config.obs.password)
+        except (OBSMigrationInProgressError, OBSMigrationRecoveryRequiredError) as e:
+            raise RecorderError(str(e)) from e
         except Exception as e:
             LOGGER.warning("旧OBS配置の移行/修復に失敗しました: %s", e, exc_info=True)
 
@@ -2343,19 +2392,7 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
 def ensure_portable_mode_marker(base_dir: str | Path) -> Path:
     if not base_dir:
         raise RecorderError("OBSディレクトリが未設定です。")
-    base_path = Path(base_dir)
-    base_path.mkdir(parents=True, exist_ok=True)
-
-    primary_marker = base_path / PORTABLE_OBS_MARKER_NAME
-    if not primary_marker.exists():
-        primary_marker.write_text("", encoding="utf-8")
-
-    # OBS本体のバージョン差異に備え、従来名のマーカーも同時に維持する。
-    legacy_marker = base_path / LEGACY_PORTABLE_OBS_MARKER_NAME
-    if not legacy_marker.exists():
-        legacy_marker.write_text("", encoding="utf-8")
-
-    return primary_marker
+    return SharedOBSBootstrapper(base_dir, logger=LOGGER).ensure_portable_mode_marker()
 
 
 def kill_stale_obs_processes() -> None:

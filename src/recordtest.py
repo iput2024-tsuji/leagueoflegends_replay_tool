@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import configparser
+import io
 import json
 import logging
 import os
@@ -16,7 +18,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from logging.handlers import TimedRotatingFileHandler
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import obsws_python as obs
@@ -38,8 +40,11 @@ try:
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
+        OBSConfigFileSnapshot,
         OBSMigrationInProgressError,
         OBSMigrationRecoveryRequiredError,
+        OBSPathSafetyError,
+        ensure_safe_obs_config_directory,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
@@ -47,10 +52,15 @@ try:
         get_portable_marker_path as shared_get_portable_marker_path,
         is_obs_copy_in_progress,
         lexical_absolute_path,
+        list_safe_obs_config_directory,
         migrate_legacy_obs_installation,
         new_obs_ini_parser as shared_new_obs_ini_parser,
-        read_obs_ini_parser as shared_read_obs_ini_parser,
+        obs_config_mutation_guard,
+        preflight_obs_config_directory,
+        preflight_obs_config_file,
+        revalidate_obs_config_file,
         validate_obs_installation_path,
+        write_preflighted_obs_config_file,
     )
     from .obs_process import OBSProcessManager
     from .post_game_result import (
@@ -94,8 +104,11 @@ except ImportError:
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
         OBSBootstrapper as SharedOBSBootstrapper,
+        OBSConfigFileSnapshot,
         OBSMigrationInProgressError,
         OBSMigrationRecoveryRequiredError,
+        OBSPathSafetyError,
+        ensure_safe_obs_config_directory,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
@@ -103,10 +116,15 @@ except ImportError:
         get_portable_marker_path as shared_get_portable_marker_path,
         is_obs_copy_in_progress,
         lexical_absolute_path,
+        list_safe_obs_config_directory,
         migrate_legacy_obs_installation,
         new_obs_ini_parser as shared_new_obs_ini_parser,
-        read_obs_ini_parser as shared_read_obs_ini_parser,
+        obs_config_mutation_guard,
+        preflight_obs_config_directory,
+        preflight_obs_config_file,
+        revalidate_obs_config_file,
         validate_obs_installation_path,
+        write_preflighted_obs_config_file,
     )
     from obs_process import OBSProcessManager
     from post_game_result import (
@@ -638,14 +656,104 @@ def get_obs_portable_marker_path(base_dir: str | Path) -> Path:
     return shared_get_portable_marker_path(base_dir)
 
 
-def _read_or_new_obs_ini(path: Path) -> tuple[Any, bool]:
-    if not path.exists():
-        return shared_new_obs_ini_parser(), True
+@dataclass(frozen=True)
+class _OBSRecordingProfileLayout:
+    base_dir: Path
+    profiles_root: Path
+    profile_directories: tuple[Path, ...]
+    profile_files: tuple[OBSConfigFileSnapshot, ...]
+    user_file: OBSConfigFileSnapshot
+
+
+@dataclass(frozen=True)
+class _OBSRecordingProfileFileUpdate:
+    snapshot: OBSConfigFileSnapshot
+    payload: bytes | None
+
+    @property
+    def changed(self) -> bool:
+        return self.payload is not None
+
+
+@dataclass(frozen=True)
+class _OBSRecordingProfileUpdatePlan:
+    layout: _OBSRecordingProfileLayout
+    updates: tuple[_OBSRecordingProfileFileUpdate, ...]
+
+
+_WINDOWS_RESERVED_PROFILE_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{index}" for index in range(1, 10)}
+    | {f"LPT{index}" for index in range(1, 10)}
+)
+
+
+def _validate_obs_profile_dir_name(value: object) -> str:
+    name = str(value or "")
+    windows_path = PureWindowsPath(name)
+    reserved_stem = name.split(".", 1)[0].upper()
+    if (
+        not name
+        or name in {".", ".."}
+        or name != name.rstrip(" .")
+        or any(character in name for character in ('/', '\\', ':', '\0', '<', '>', '"', '|', '?', '*'))
+        or any(ord(character) < 32 for character in name)
+        or windows_path.drive
+        or windows_path.is_absolute()
+        or reserved_stem in _WINDOWS_RESERVED_PROFILE_NAMES
+    ):
+        raise OBSPathSafetyError(f"OBS profile directory名が安全な単一componentではありません: {name!r}")
+    return name
+
+
+def _obs_ini_parser_from_snapshot(snapshot: OBSConfigFileSnapshot) -> tuple[Any, bool]:
+    parser = shared_new_obs_ini_parser()
+    if snapshot.payload is None:
+        return parser, True
     try:
-        parser, normalized_encoding = shared_read_obs_ini_parser(path)
-        return parser, bool(normalized_encoding)
-    except Exception:
+        text = snapshot.payload.decode("utf-8")
+        had_bom = text.startswith("\ufeff")
+        if had_bom:
+            text = text.lstrip("\ufeff")
+        parser.read_string(text)
+        return parser, had_bom
+    except (UnicodeError, configparser.Error):
         return shared_new_obs_ini_parser(), True
+
+
+def _render_obs_ini(parser: Any) -> bytes:
+    buffer = io.StringIO()
+    parser.write(buffer, space_around_delimiters=False)
+    return buffer.getvalue().encode("utf-8")
+
+
+def _raw_obs_profile_selection_values(snapshot: OBSConfigFileSnapshot) -> dict[str, str]:
+    if snapshot.payload is None:
+        return {}
+    try:
+        text = snapshot.payload.decode("utf-8").lstrip("\ufeff")
+    except UnicodeError:
+        return {}
+
+    section = ""
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+            continue
+        if section != "Basic" or not stripped or stripped.startswith(("#", ";")):
+            continue
+        delimiter_indexes = [index for delimiter in ("=", ":") if (index := raw_line.find(delimiter)) >= 0]
+        if not delimiter_indexes:
+            continue
+        delimiter_index = min(delimiter_indexes)
+        key = raw_line[:delimiter_index].strip().casefold()
+        if key in {"profiledir", "profile"}:
+            # Discard formatting whitespace after the delimiter, but retain
+            # trailing whitespace because Windows normalizes it in path names.
+            values[key] = raw_line[delimiter_index + 1 :].lstrip(" \t")
+    return values
 
 
 def _set_obs_ini_value(parser: Any, section: str, key: str, value: str) -> bool:
@@ -661,57 +769,107 @@ def _set_obs_ini_value(parser: Any, section: str, key: str, value: str) -> bool:
     return False
 
 
-def _obs_current_profile_dir_name(base_dir: str | Path) -> str | None:
-    user_ini = get_obs_user_ini_path(base_dir)
-    if not user_ini.exists():
-        return None
-    try:
-        parser, _normalized = shared_read_obs_ini_parser(user_ini)
-    except Exception:
-        return None
+def _obs_current_profile_dir_name(user_file: OBSConfigFileSnapshot) -> str | None:
+    parser, _normalized = _obs_ini_parser_from_snapshot(user_file)
     if not parser.has_section("Basic"):
         return None
+    raw_values = _raw_obs_profile_selection_values(user_file)
     for key in ("ProfileDir", "Profile"):
         value = parser.get("Basic", key, fallback="")
-        value_text = str(value or "").strip()
-        if value_text:
-            return Path(value_text).name
+        value_text = str(value or "")
+        if value_text.strip():
+            raw_value = raw_values.get(key.casefold())
+            if raw_value is not None:
+                _validate_obs_profile_dir_name(raw_value)
+            return _validate_obs_profile_dir_name(value_text)
     return None
 
 
-def _obs_profile_basic_ini_paths(base_dir: str | Path) -> tuple[Path, ...]:
-    profiles_root = get_obs_config_dir(base_dir) / "basic" / "profiles"
-    names: list[str] = [MANAGED_OBS_PROFILE_DIR_NAME]
-    current_name = _obs_current_profile_dir_name(base_dir)
-    if current_name and current_name != MANAGED_OBS_PROFILE_DIR_NAME:
-        names.append(current_name)
-    if profiles_root.exists():
-        for profile_dir in profiles_root.iterdir():
-            if profile_dir.is_dir() and (profile_dir / "basic.ini").exists():
-                names.append(profile_dir.name)
+def preflight_obs_recording_profile_ini(base_dir: str | Path) -> _OBSRecordingProfileLayout:
+    """Inspect every profile target lexically without creating or writing anything."""
 
-    result: list[Path] = []
-    seen: set[str] = set()
-    for name in names:
-        safe_name = Path(str(name)).name.strip()
-        if not safe_name or safe_name in seen:
+    base_path = lexical_absolute_path(base_dir)
+    profiles_root = get_obs_config_dir(base_path) / "basic" / "profiles"
+    user_file = preflight_obs_config_file(
+        get_obs_user_ini_path(base_path),
+        label="user.ini",
+    )
+    current_name = _obs_current_profile_dir_name(user_file)
+
+    names: list[str] = []
+    seen_names: set[str] = set()
+
+    def add_profile_name(value: object) -> None:
+        name = _validate_obs_profile_dir_name(value)
+        name_key = name.casefold()
+        if name_key not in seen_names:
+            seen_names.add(name_key)
+            names.append(name)
+
+    add_profile_name(MANAGED_OBS_PROFILE_DIR_NAME)
+    if current_name is not None:
+        add_profile_name(current_name)
+
+    discovered_files: dict[str, OBSConfigFileSnapshot] = {}
+    discovered_names: dict[str, str] = {}
+    discovered_directories: list[Path] = []
+    for entry in list_safe_obs_config_directory(profiles_root):
+        if entry.kind != "directory":
             continue
-        seen.add(safe_name)
-        result.append(profiles_root / safe_name / "basic.ini")
-    return tuple(result)
+        name = _validate_obs_profile_dir_name(entry.name)
+        name_key = name.casefold()
+        previous_name = discovered_names.get(name_key)
+        if previous_name is not None and previous_name != name:
+            raise OBSPathSafetyError(
+                "OBS profile directory名がcase-insensitiveに衝突しています: "
+                f"{previous_name!r}, {name!r}"
+            )
+        discovered_names[name_key] = name
+        profile_dir = profiles_root / name
+        if not preflight_obs_config_directory(profile_dir):
+            raise OBSPathSafetyError(f"OBS profile directoryが列挙後に消失しました: {profile_dir}")
+        discovered_directories.append(lexical_absolute_path(profile_dir))
+        snapshot = preflight_obs_config_file(profile_dir / "basic.ini", label="basic.ini")
+        if snapshot.exists:
+            discovered_files[name_key] = snapshot
+            add_profile_name(name)
+
+    profile_directories: list[Path] = []
+    profile_files: list[OBSConfigFileSnapshot] = []
+    for name in names:
+        profile_dir = lexical_absolute_path(profiles_root / name)
+        if profile_dir.parent != lexical_absolute_path(profiles_root):
+            raise OBSPathSafetyError(f"OBS profile pathがprofiles root外です: {profile_dir}")
+        preflight_obs_config_directory(profile_dir)
+        profile_directories.append(profile_dir)
+        profile_files.append(
+            discovered_files.get(name.casefold())
+            or preflight_obs_config_file(profile_dir / "basic.ini", label="basic.ini")
+        )
+
+    all_directories = {str(path).casefold(): path for path in discovered_directories}
+    for profile_dir in profile_directories:
+        all_directories.setdefault(str(profile_dir).casefold(), profile_dir)
+    return _OBSRecordingProfileLayout(
+        base_dir=base_path,
+        profiles_root=lexical_absolute_path(profiles_root),
+        profile_directories=tuple(all_directories.values()),
+        profile_files=tuple(profile_files),
+        user_file=user_file,
+    )
 
 
-def _ensure_obs_user_profile_selection(base_dir: str | Path, profile_dir_name: str) -> Path | None:
-    user_ini = get_obs_user_ini_path(base_dir)
-    parser, changed = _read_or_new_obs_ini(user_ini)
+def _prepare_obs_user_profile_selection(
+    user_file: OBSConfigFileSnapshot,
+    profile_dir_name: str,
+) -> _OBSRecordingProfileFileUpdate:
+    parser, changed = _obs_ini_parser_from_snapshot(user_file)
     changed = _set_obs_ini_value(parser, "Basic", "Profile", MANAGED_OBS_PROFILE_NAME) or changed
     changed = _set_obs_ini_value(parser, "Basic", "ProfileDir", profile_dir_name) or changed
-    if changed or not user_ini.exists():
-        user_ini.parent.mkdir(parents=True, exist_ok=True)
-        with open(user_ini, "w", encoding="utf-8") as f:
-            parser.write(f, space_around_delimiters=False)
-        return user_ini
-    return None
+    return _OBSRecordingProfileFileUpdate(
+        snapshot=user_file,
+        payload=_render_obs_ini(parser) if changed else None,
+    )
 
 
 def _select_requested_obs_recording_encoder(
@@ -732,8 +890,8 @@ def _select_requested_obs_recording_encoder(
     )
 
 
-def _apply_obs_recording_profile_ini(
-    ini_path: Path,
+def _prepare_obs_recording_profile_ini(
+    snapshot: OBSConfigFileSnapshot,
     *,
     record_dir: str | Path,
     scale_type: str = DEFAULT_OBS_SCALE_TYPE,
@@ -741,14 +899,15 @@ def _apply_obs_recording_profile_ini(
     recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
     obs_dir: str | Path | None = None,
     selected_encoder: OBSRecordingEncoderSelection | None = None,
-) -> bool:
-    parser, changed = _read_or_new_obs_ini(ini_path)
+) -> _OBSRecordingProfileFileUpdate:
+    parser, changed = _obs_ini_parser_from_snapshot(snapshot)
     if not parser.has_section("General"):
         parser.add_section("General")
         changed = True
     current_name = parser.get("General", "Name", fallback="")
-    is_managed_profile = ini_path.parent.name == MANAGED_OBS_PROFILE_DIR_NAME
-    expected_name = MANAGED_OBS_PROFILE_NAME if is_managed_profile else ini_path.parent.name
+    profile_dir_name = snapshot.path.parent.name
+    is_managed_profile = profile_dir_name.casefold() == MANAGED_OBS_PROFILE_DIR_NAME.casefold()
+    expected_name = MANAGED_OBS_PROFILE_NAME if is_managed_profile else profile_dir_name
     if current_name == "" or (is_managed_profile and current_name != expected_name):
         parser.set("General", "Name", expected_name)
         changed = True
@@ -762,11 +921,76 @@ def _apply_obs_recording_profile_ini(
     ):
         changed = _set_obs_ini_value(parser, section, key, value) or changed
 
-    if changed or not ini_path.exists():
-        ini_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(ini_path, "w", encoding="utf-8") as f:
-            parser.write(f, space_around_delimiters=False)
-    return changed
+    return _OBSRecordingProfileFileUpdate(
+        snapshot=snapshot,
+        payload=_render_obs_ini(parser) if changed else None,
+    )
+
+
+def _prepare_obs_recording_profile_update(
+    layout: _OBSRecordingProfileLayout,
+    *,
+    record_dir: str | Path,
+    scale_type: str,
+    recording_quality: str,
+    recording_encoder: str,
+    selected_encoder: OBSRecordingEncoderSelection | None,
+) -> _OBSRecordingProfileUpdatePlan:
+    updates = [
+        _prepare_obs_recording_profile_ini(
+            snapshot,
+            record_dir=record_dir,
+            scale_type=scale_type,
+            recording_quality=recording_quality,
+            recording_encoder=recording_encoder,
+            obs_dir=layout.base_dir,
+            selected_encoder=selected_encoder,
+        )
+        for snapshot in layout.profile_files
+    ]
+    updates.append(
+        _prepare_obs_user_profile_selection(
+            layout.user_file,
+            MANAGED_OBS_PROFILE_DIR_NAME,
+        )
+    )
+    return _OBSRecordingProfileUpdatePlan(layout=layout, updates=tuple(updates))
+
+
+def _revalidate_obs_recording_profile_layout(layout: _OBSRecordingProfileLayout) -> None:
+    # Re-enumeration catches a reparse/special entry introduced after the plan.
+    entries = list_safe_obs_config_directory(layout.profiles_root)
+    for entry in entries:
+        if entry.kind != "directory":
+            continue
+        name = _validate_obs_profile_dir_name(entry.name)
+        profile_dir = layout.profiles_root / name
+        if not preflight_obs_config_directory(profile_dir):
+            raise OBSPathSafetyError(f"OBS profile directoryが再検査中に消失しました: {profile_dir}")
+        preflight_obs_config_file(profile_dir / "basic.ini", label="basic.ini")
+    for profile_dir in layout.profile_directories:
+        preflight_obs_config_directory(profile_dir)
+
+
+def _apply_obs_recording_profile_update(plan: _OBSRecordingProfileUpdatePlan) -> tuple[Path, ...]:
+    with obs_config_mutation_guard(plan.layout.base_dir):
+        _revalidate_obs_recording_profile_layout(plan.layout)
+        for update in plan.updates:
+            revalidate_obs_config_file(update.snapshot)
+
+        changed_updates = tuple(update for update in plan.updates if update.changed)
+        for directory in {update.snapshot.path.parent for update in changed_updates}:
+            ensure_safe_obs_config_directory(directory)
+
+        _revalidate_obs_recording_profile_layout(plan.layout)
+        for update in plan.updates:
+            revalidate_obs_config_file(update.snapshot)
+        for update in changed_updates:
+            if update.payload is None:
+                continue
+            write_preflighted_obs_config_file(update.snapshot, update.payload)
+
+    return tuple(lexical_absolute_path(update.snapshot.path) for update in changed_updates)
 
 
 def ensure_obs_recording_profile_ini(
@@ -778,24 +1002,16 @@ def ensure_obs_recording_profile_ini(
     recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
     selected_encoder: OBSRecordingEncoderSelection | None = None,
 ) -> tuple[Path, ...]:
-    changed_paths: list[Path] = []
-    profile_paths = _obs_profile_basic_ini_paths(base_dir)
-    for ini_path in profile_paths:
-        if _apply_obs_recording_profile_ini(
-            ini_path,
-            record_dir=record_dir,
-            scale_type=scale_type,
-            recording_quality=recording_quality,
-            recording_encoder=recording_encoder,
-            obs_dir=base_dir,
-            selected_encoder=selected_encoder,
-        ):
-            changed_paths.append(ini_path.resolve())
-    if profile_paths:
-        selection_path = _ensure_obs_user_profile_selection(base_dir, profile_paths[0].parent.name)
-        if selection_path is not None:
-            changed_paths.append(selection_path.resolve())
-    return tuple(changed_paths)
+    layout = preflight_obs_recording_profile_ini(base_dir)
+    plan = _prepare_obs_recording_profile_update(
+        layout,
+        record_dir=record_dir,
+        scale_type=scale_type,
+        recording_quality=recording_quality,
+        recording_encoder=recording_encoder,
+        selected_encoder=selected_encoder,
+    )
+    return _apply_obs_recording_profile_update(plan)
 
 
 def _obs_encoder_log_label(selected_encoder: OBSRecordingEncoderSelection) -> str:
@@ -1327,6 +1543,9 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             try:
                 bootstrapper = OBSBootstrapper(current_obs_dir)
                 bootstrap_report = bootstrapper.check()
+                # Nested profile targets belong to the same setup transaction.
+                # Validate them before bootstrap.apply can change global/user.ini.
+                preflight_obs_recording_profile_ini(current_obs_dir)
                 bootstrap_layout_safe = True
                 if not bootstrap_report.obs_exe_exists:
                     report["warnings"].append("OBS本体が未配置のため、起動前設定の自動生成を延期しました。")
@@ -2281,9 +2500,18 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         hint = f"\n自動検出候補: {detected}" if detected else ""
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
+    process_manager = OBSProcessManager(obs_dir_abs, logger=LOGGER)
+    bootstrapper = OBSBootstrapper(obs_dir_abs)
+
+    # Every bootstrap/profile target must be safe before a running OBS is stopped.
+    try:
+        bootstrapper.preflight_apply(port=config.obs.port)
+        preflight_obs_recording_profile_ini(obs_dir_abs)
+    except Exception as e:
+        raise RecorderError(f"ポータブルOBS起動前設定の安全性検査に失敗しました: {e}") from e
+
     # OBSは起動時にglobal.iniを読み、終了時に再保存する。
     # 管理対象OBSが既に動いている場合は、設定反映前に必ず止める。
-    process_manager = OBSProcessManager(obs_dir_abs, logger=LOGGER)
     process_manager.kill_stale_managed_processes()
     unmanaged_processes = process_manager.unmanaged_processes()
     if unmanaged_processes:
@@ -2297,8 +2525,6 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
             + "\n".join(details)
             + "\n既存のOBSを終了してから再実行してください。"
         )
-
-    bootstrapper = OBSBootstrapper(obs_dir_abs)
 
     try:
         bootstrap_result = bootstrapper.apply(
@@ -2360,6 +2586,12 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                 LOGGER.info(
                     "OBS起動後にGPUエンコーダを検出したため、録画設定反映のためOBSを再起動します。"
                 )
+                try:
+                    preflight_obs_recording_profile_ini(obs_dir_abs)
+                except Exception as e:
+                    raise RecorderError(
+                        f"OBS録画プロファイルの再起動前安全性検査に失敗しました: {e}"
+                    ) from e
                 process_manager.terminate_process(process)
                 changed_profiles = ensure_obs_recording_profile_ini(
                     obs_dir_abs,

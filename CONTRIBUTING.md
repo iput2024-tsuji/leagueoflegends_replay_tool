@@ -65,9 +65,14 @@ git switch -c fix/game-start-detection
 コードを変更したPRでは、原則として次を実行します。
 
 ```powershell
+.\venv\Scripts\python.exe -m scripts.external_runtime_policy --repository-root .
 .\venv\Scripts\python.exe -m ruff check src tests
 .\venv\Scripts\python.exe -m pytest -p no:cacheprovider tests
 ```
+
+外部ランタイム検査はGitで追跡しているファイルだけを対象にし、利用者が用意する
+OBS Studioやstandalone FFmpegの実行ファイル・配布archiveがリポジトリへ混入した
+場合に失敗します。未追跡のローカル生成物は対象にしません。
 
 パッケージング、実行時依存関係、GUI、OBS、mpv、インストーラーに影響する場合は、
 Windowsビルドとセルフチェックも実行します。

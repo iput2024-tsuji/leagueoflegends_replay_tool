@@ -85,15 +85,13 @@ if (-not $SkipTests) {
 }
 
 if (-not $SkipBuild) {
-  $buildArgs = @()
+  $buildArgs = @{}
   if ($selectedPython) {
-    $buildArgs += @("-PythonExe", $selectedPython)
+    $buildArgs["PythonExe"] = $selectedPython
   }
   if ($resolvedBuildProvenance) {
-    $buildArgs += @(
-      "-BuildProvenance", $resolvedBuildProvenance,
-      "-BuildProvenanceSha256", $BuildProvenanceSha256
-    )
+    $buildArgs["BuildProvenance"] = $resolvedBuildProvenance
+    $buildArgs["BuildProvenanceSha256"] = $BuildProvenanceSha256
   }
   & (Join-Path $scriptDir "build.ps1") @buildArgs
   if ($LASTEXITCODE -ne 0) {

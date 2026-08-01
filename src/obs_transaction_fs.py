@@ -763,12 +763,63 @@ class _OBSDirectoryLease:
         identity: tuple[int, int, int],
         *,
         mutable: bool,
+        mount_boundary: tuple[int, int] | None = None,
     ) -> None:
         self.path = _absolute_path(path)
         self._native_handle = native_handle
         self.identity = identity
         self.mutable = mutable
+        self.mount_id = (
+            None
+            if os.name == "nt"
+            else _posix_mount_id_for_descriptor(native_handle, path=self.path)
+        )
+        self._mount_boundary = mount_boundary
         self._closed = False
+
+    @property
+    def mount_identity(self) -> tuple[int, int] | None:
+        if os.name == "nt":
+            return None
+        if self.mount_id is None:
+            raise _UnsafeOBSMigrationPathError(
+                f"managed rootのmount identityを取得できません: {self.path}"
+            )
+        return (self.identity[0], self.mount_id)
+
+    def _pin_mount_boundary(self) -> None:
+        if os.name != "nt":
+            self._mount_boundary = self.mount_identity
+
+    def _validate_mount_boundary(
+        self,
+        identity: tuple[int, int, int],
+        mount_id: int | None,
+        *,
+        path: Path,
+    ) -> None:
+        if os.name == "nt" or self._mount_boundary is None:
+            return
+        current = (identity[0], mount_id)
+        if current != self._mount_boundary:
+            raise _UnsafeOBSMigrationPathError(
+                "managed root配下のmount境界を横断できません: "
+                f"{path} ({self._mount_boundary} != {current})"
+            )
+
+    def _validate_descriptor_mount_boundary(
+        self,
+        descriptor: int,
+        *,
+        path: Path,
+    ) -> None:
+        if os.name == "nt" or self._mount_boundary is None:
+            return
+        self._validate_mount_boundary(
+            _file_identity(os.fstat(descriptor)),
+            _posix_mount_id_for_descriptor(descriptor, path=path),
+            path=path,
+        )
 
     @classmethod
     def open_absolute(
@@ -797,6 +848,7 @@ class _OBSDirectoryLease:
                     raise _UnsafeOBSMigrationPathError(
                         f"作成先が禁止されたphysical tree内です: {lease.path}"
                     )
+            lease._pin_mount_boundary()
             if mutable and not lease.mutable:
                 mutable_lease = lease.mutable_clone()
                 lease.close()
@@ -823,11 +875,16 @@ class _OBSDirectoryLease:
                 raise
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         descriptor = os.open(anchor, flags)
-        opened = os.fstat(descriptor)
-        if not stat.S_ISDIR(opened.st_mode):
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISDIR(opened.st_mode):
+                raise _UnsafeOBSMigrationPathError(
+                    f"通常ディレクトリではありません: {anchor}"
+                )
+            return cls(anchor, descriptor, _file_identity(opened), mutable=False)
+        except Exception:
             os.close(descriptor)
-            raise _UnsafeOBSMigrationPathError(f"通常ディレクトリではありません: {anchor}")
-        return cls(anchor, descriptor, _file_identity(opened), mutable=False)
+            raise
 
     def mutable_clone(self) -> _OBSDirectoryLease:
         self.validate_lexical_binding()
@@ -850,7 +907,34 @@ class _OBSDirectoryLease:
             else:
                 os.close(handle)
             raise _UnsafeOBSMigrationPathError(f"mutable lease取得中にancestorが入れ替わりました: {self.path}")
-        return _OBSDirectoryLease(self.path, handle, identity, mutable=True)
+        try:
+            clone = _OBSDirectoryLease(
+                self.path,
+                handle,
+                identity,
+                mutable=True,
+                mount_boundary=self._mount_boundary,
+            )
+        except Exception:
+            if os.name == "nt":
+                _windows_close_handle(handle)
+            else:
+                os.close(handle)
+            raise
+        try:
+            if clone.mount_id != self.mount_id:
+                raise _UnsafeOBSMigrationPathError(
+                    f"mutable lease取得中にmount identityが変化しました: {self.path}"
+                )
+            clone._validate_mount_boundary(
+                clone.identity,
+                clone.mount_id,
+                path=clone.path,
+            )
+            return clone
+        except Exception:
+            clone.close()
+            raise
 
     @property
     def native_handle(self) -> int:
@@ -884,13 +968,38 @@ class _OBSDirectoryLease:
             if attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
                 raise _UnsafeOBSMigrationPathError(f"reparse pointは利用できません: {self.path}")
         else:
-            current = os.stat(self.path, follow_symlinks=False)
-            if _is_reparse_point(current) or not stat.S_ISDIR(current.st_mode):
-                raise _UnsafeOBSMigrationPathError(f"通常ディレクトリではありません: {self.path}")
-            identity = _file_identity(current)
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            try:
+                current_descriptor = os.open(self.path, flags)
+            except OSError as exc:
+                raise _UnsafeOBSMigrationPathError(
+                    f"directory pathをhandleで再検査できません: {self.path} ({exc})"
+                ) from exc
+            try:
+                current = os.fstat(current_descriptor)
+                if _is_reparse_point(current) or not stat.S_ISDIR(current.st_mode):
+                    raise _UnsafeOBSMigrationPathError(
+                        f"通常ディレクトリではありません: {self.path}"
+                    )
+                identity = _file_identity(current)
+                current_mount_id = _posix_mount_id_for_descriptor(
+                    current_descriptor,
+                    path=self.path,
+                )
+            finally:
+                os.close(current_descriptor)
             opened = os.fstat(self.native_handle)
             if _file_identity(opened) != self.identity:
                 raise _UnsafeOBSMigrationPathError(f"directory handle identityが変化しました: {self.path}")
+            if current_mount_id != self.mount_id:
+                raise _UnsafeOBSMigrationPathError(
+                    f"directory mount identityが変化しました: {self.path}"
+                )
+            self._validate_mount_boundary(
+                identity,
+                current_mount_id,
+                path=self.path,
+            )
         if identity != self.identity:
             raise _UnsafeOBSMigrationPathError(f"ancestor directoryが入れ替わりました: {self.path}")
 
@@ -988,6 +1097,12 @@ class _OBSDirectoryLease:
                 handle,
                 identity,
                 mutable=mutable,
+                mount_boundary=self._mount_boundary,
+            )
+            child._validate_mount_boundary(
+                child.identity,
+                child.mount_id,
+                path=child_path,
             )
             child.validate_lexical_binding()
             self.validate_lexical_binding()
@@ -1116,6 +1231,10 @@ class _OBSDirectoryLease:
                 )
         try:
             opened_identity = _file_identity(os.fstat(descriptor))
+            self._validate_descriptor_mount_boundary(
+                descriptor,
+                path=self.path / name,
+            )
             lexical = _validate_existing_entry(self.path / name, expected_kind="file")
             if _file_identity(lexical) != opened_identity:
                 raise _UnsafeOBSMigrationPathError(f"relative open後にidentityが変化しました: {self.path / name}")
@@ -1204,7 +1323,9 @@ def _posix_mount_id_for_descriptor(descriptor: int, *, path: Path) -> int | None
         return None
     fdinfo_root = Path("/proc/self/fdinfo")
     if not fdinfo_root.is_dir():
-        return None
+        raise _UnsafeOBSMigrationPathError(
+            f"このPOSIX runtimeはopen handleのmount identityを提供しません: {path}"
+        )
     fdinfo = fdinfo_root / str(descriptor)
     try:
         with fdinfo.open("r", encoding="ascii") as stream:
@@ -1455,6 +1576,7 @@ def _supports_handle_relative_migration() -> bool:
         )
     return (
         _supports_posix_handle_relative_migration()
+        and Path("/proc/self/fdinfo").is_dir()
         and callable(getattr(os, "listxattr", None))
         and callable(getattr(os, "getxattr", None))
     )

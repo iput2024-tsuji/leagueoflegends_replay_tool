@@ -1477,6 +1477,7 @@ def _legacy_inventory_fingerprint(
             "sha256": entry.sha256,
         }
         for entry in entries
+        if entry.relative_parts
     ]
     encoded = json.dumps(
         payload,
@@ -2310,8 +2311,31 @@ def _build_obs_tree_inventory(
             )
 
     try:
+        root_metadata_before = _snapshot_open_entry_metadata(
+            lease.native_handle,
+            path=root,
+            kind="directory",
+            native_windows_handle=os.name == "nt",
+        )
         visit(lease)
         lease.validate_lexical_binding()
+        root_metadata_after = _snapshot_open_entry_metadata(
+            lease.native_handle,
+            path=root,
+            kind="directory",
+            native_windows_handle=os.name == "nt",
+        )
+        if root_metadata_after != root_metadata_before:
+            raise _UnsafeOBSMigrationPathError(
+                f"走査中にinventory root metadataが変化しました: {root}"
+            )
+        inventory.append(
+            OBSMigrationInventoryEntry(
+                (),
+                "directory",
+                metadata=root_metadata_after,
+            )
+        )
         return tuple(
             sorted(
                 inventory,
@@ -2399,7 +2423,7 @@ def _validate_finalize_changes(
         if before.get(parts) != after.get(parts)
     }
     forbidden = sorted(
-        "/".join(parts)
+        "/".join(parts) or "<root>"
         for parts in changed
         if parts not in OBS_MIGRATION_FINALIZE_FILE_KEYS
         and parts not in OBS_MIGRATION_FINALIZE_DIRECTORY_KEYS
@@ -2620,6 +2644,8 @@ def _copy_obs_inventory(
     for entry in source_entries:
         validate_transaction()
         if entry.kind == "directory":
+            if not entry.relative_parts:
+                continue
             with destination_root_lease.open_descendant_directory(
                 entry.relative_parts,
                 create=True,
@@ -2672,6 +2698,8 @@ def migrate_legacy_obs_installation(
     destination_probe: _OBSDirectoryLease | None = None
     source_probe: _OBSDirectoryLease | None = None
     source: Path | None = None
+    prelock_marker_identity: tuple[int, int, int] | None = None
+    prelock_journal: OBSMigrationJournal | None = None
     transaction_resources = ExitStack()
     try:
         try:
@@ -2680,49 +2708,86 @@ def migrate_legacy_obs_installation(
             except FileNotFoundError:
                 destination_probe = None
 
-            marker_exists = (
-                destination_probe is not None
-                and destination_probe.relative_file_identity_or_none(marker.name) is not None
-            )
-            destination_appeared_valid = (
-                destination_probe is not None
-                and not marker_exists
-                and _is_valid_obs_installation_lease(destination_probe)
-            )
-            source_tree_identities: frozenset[tuple[int, int, int]] = frozenset()
-            if not marker_exists and not destination_appeared_valid:
-                for candidate in allowed_sources:
+            if destination_probe is not None:
+                prelock_marker_identity = (
+                    destination_probe.relative_file_identity_or_none(marker.name)
+                )
+            marker_exists = prelock_marker_identity is not None
+            source_tree_identity_set: set[tuple[int, int, int]] = set()
+            if marker_exists:
+                if destination_probe is None:
+                    raise AssertionError("markerにはdestination leaseが必要です")
+                prelock_journal = _read_obs_migration_journal(
+                    marker,
+                    directory_lease=destination_probe,
+                    expected_identity=prelock_marker_identity,
+                )
+                source = _validated_journal_source(
+                    prelock_journal,
+                    allowed_sources,
+                    destination,
+                )
+                try:
+                    source_probe = _OBSDirectoryLease.open_absolute(source)
+                except FileNotFoundError as exc:
+                    raise _UnsafeOBSMigrationPathError(
+                        "markerの移行元に有効なポータブルOBSがありません: "
+                        f"{get_obs_executable_path(source)}"
+                    ) from exc
+                if not _is_valid_obs_installation_lease(source_probe):
+                    raise _UnsafeOBSMigrationPathError(
+                        "markerの移行元に有効なポータブルOBSがありません: "
+                        f"{get_obs_executable_path(source)}"
+                    )
+            for candidate in allowed_sources:
+                candidate_owned = True
+                if (
+                    source_probe is not None
+                    and source is not None
+                    and _filesystem_path_key(candidate)
+                    == _filesystem_path_key(source)
+                ):
+                    candidate_probe = source_probe
+                    candidate_owned = False
+                else:
                     try:
                         candidate_probe = _OBSDirectoryLease.open_absolute(candidate)
                     except FileNotFoundError:
                         continue
-                    try:
-                        if not _is_valid_obs_installation_lease(candidate_probe):
-                            candidate_probe.close()
-                            continue
-                        source_marker = get_obs_copy_in_progress_marker(candidate)
-                        if (
-                            candidate_probe.relative_file_identity_or_none(source_marker.name)
-                            is not None
-                        ):
-                            raise _UnsafeOBSMigrationPathError(
-                                f"移行元にコピー中markerがあります: {source_marker}"
-                            )
-                    except Exception:
+                try:
+                    if not _is_valid_obs_installation_lease(candidate_probe):
+                        continue
+                    source_marker = get_obs_copy_in_progress_marker(candidate)
+                    if (
+                        candidate_probe.relative_file_identity_or_none(source_marker.name)
+                        is not None
+                    ):
+                        raise _UnsafeOBSMigrationPathError(
+                            f"移行元にコピー中markerがあります: {source_marker}"
+                        )
+                    if _has_transaction_temporary_name_under_lease(candidate_probe):
+                        raise _UnsafeOBSMigrationPathError(
+                            f"移行元にtransaction一時fileがあります: {candidate}"
+                        )
+                    source_tree_identity_set.update(
+                        _validate_distinct_physical_directory_trees(
+                            candidate_probe,
+                            destination,
+                            destination_lease=destination_probe,
+                        )
+                    )
+                    if source_probe is None:
+                        source = candidate
+                        source_probe = candidate_probe
+                        candidate_owned = False
+                finally:
+                    if candidate_owned:
                         candidate_probe.close()
-                        raise
-                    source = candidate
-                    source_probe = candidate_probe
-                    break
+            if not marker_exists:
                 if source_probe is None and destination_probe is None:
                     return None
 
-            if source_probe is not None:
-                source_tree_identities = _validate_distinct_physical_directory_trees(
-                    source_probe,
-                    destination,
-                    destination_lease=destination_probe,
-                )
+            source_tree_identities = frozenset(source_tree_identity_set)
 
             lock = _OBSInterProcessLock(get_obs_copy_lock_path(destination))
             if not lock.acquire(
@@ -2762,22 +2827,39 @@ def migrate_legacy_obs_installation(
                 marker_identity = destination_root_lease.relative_file_identity_or_none(
                     marker.name
                 )
-            if marker_identity is not None:
-                stale_journal = _read_obs_migration_journal(
-                    marker,
-                    directory_lease=destination_root_lease,
-                )
-                source = _validated_journal_source(stale_journal, allowed_sources, destination)
-                if source_probe is not None:
-                    source_probe.close()
-                try:
-                    source_probe = _OBSDirectoryLease.open_absolute(source)
-                except FileNotFoundError as exc:
+            if prelock_marker_identity is not None:
+                if marker_identity != prelock_marker_identity:
                     raise _migration_recovery_error(
                         destination,
-                        "markerの移行元に有効なポータブルOBSがありません: "
-                        f"{get_obs_executable_path(source)}",
-                    ) from exc
+                        "migration lock取得中にmarker identityが変化しました。",
+                    )
+                locked_journal = _read_obs_migration_journal(
+                    marker,
+                    directory_lease=destination_root_lease,
+                    expected_identity=prelock_marker_identity,
+                )
+                if locked_journal != prelock_journal:
+                    raise _migration_recovery_error(
+                        destination,
+                        "migration lock取得中にjournal内容が変化しました。",
+                    )
+                locked_source = _validated_journal_source(
+                    locked_journal,
+                    allowed_sources,
+                    destination,
+                )
+                if source != locked_source or source_probe is None:
+                    raise _migration_recovery_error(
+                        destination,
+                        "migration lock取得中にjournal sourceが変化しました。",
+                    )
+                source_probe.validate_lexical_binding()
+                stale_journal = locked_journal
+            elif marker_identity is not None:
+                raise _migration_recovery_error(
+                    destination,
+                    "migration lock取得中に新しいmarkerが出現しました。再試行してください。",
+                )
             elif _is_valid_obs_installation_lease(destination_root_lease):
                 return None
             else:

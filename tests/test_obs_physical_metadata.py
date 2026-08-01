@@ -1,11 +1,19 @@
 import ctypes
 import json
 import os
+import stat
+import subprocess
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from src import obs_bootstrap, obs_transaction_fs
+
+_POSIX_MOUNT_ID_AVAILABLE = (
+    os.name != "nt" and Path("/proc/self/fdinfo").is_dir()
+)
 
 
 def _write_fake_obs(root: Path, payload: bytes = b"obs") -> Path:
@@ -39,6 +47,61 @@ def _windows_short_path(path: Path) -> Path:
     if os.path.normcase(str(short_path)) == os.path.normcase(str(path)):
         pytest.skip("このdirectoryには別表記の8.3 short nameがありません")
     return short_path
+
+
+def _windows_volume_guid_path(path: Path) -> Path:
+    if os.name != "nt":
+        pytest.skip("Windows volume GUID aliasの実APIテスト")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_volume_name = kernel32.GetVolumeNameForVolumeMountPointW
+    get_volume_name.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong]
+    get_volume_name.restype = ctypes.c_int
+    volume_name = ctypes.create_unicode_buffer(1024)
+    if not get_volume_name(path.anchor, volume_name, len(volume_name)):
+        pytest.skip(
+            "volume GUID pathを取得できません: "
+            f"WinError {ctypes.get_last_error()}"
+        )
+    relative = path.resolve().relative_to(Path(path.anchor).resolve())
+    return Path(volume_name.value).joinpath(relative)
+
+
+@contextmanager
+def _windows_subst_root(target: Path):
+    if os.name != "nt":
+        pytest.skip("Windows SUBST aliasの実APIテスト")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetLogicalDrives.argtypes = []
+    kernel32.GetLogicalDrives.restype = ctypes.c_ulong
+    used_mask = int(kernel32.GetLogicalDrives())
+    drive_letter = next(
+        (
+            letter
+            for letter in reversed("DEFGHIJKLMNOPQRSTUVWXYZ")
+            if not used_mask & (1 << (ord(letter) - ord("A")))
+        ),
+        None,
+    )
+    if drive_letter is None:
+        pytest.skip("SUBSTに利用できるdrive letterがありません")
+    drive = f"{drive_letter}:"
+    completed = subprocess.run(
+        ["subst", drive, str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(completed.stderr or completed.stdout or "subst failed")
+    try:
+        yield Path(f"{drive}\\")
+    finally:
+        subprocess.run(
+            ["subst", drive, "/D"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 aliasの実APIテスト")
@@ -76,6 +139,237 @@ def test_windows_short_name_destination_ancestor_is_rejected_before_artifacts(tm
     assert not obs_bootstrap.get_obs_copy_lock_path(destination).exists()
 
 
+def _assert_windows_alias_rejects_both_ancestor_directions(
+    tmp_path: Path,
+    alias_root: Path,
+) -> None:
+    source = tmp_path / "source-ancestor"
+    executable = _write_fake_obs(source, b"source-keep")
+    alias_source = alias_root / source.relative_to(tmp_path)
+    nested_destination = alias_source / "nested-destination"
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="physical directory|ancestor alias",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            nested_destination,
+            [source],
+        )
+
+    assert executable.read_bytes() == b"source-keep"
+    _assert_no_transaction_artifacts(nested_destination)
+
+    destination = tmp_path / "destination-ancestor"
+    destination.mkdir()
+    alias_destination = alias_root / destination.relative_to(tmp_path)
+    nested_source = alias_destination / "nested-source"
+    nested_executable = _write_fake_obs(nested_source, b"nested-keep")
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="physical directory|ancestor alias",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [nested_source],
+        )
+
+    assert nested_executable.read_bytes() == b"nested-keep"
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+    assert not obs_bootstrap.get_obs_copy_lock_path(destination).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows SUBST aliasの実APIテスト")
+def test_windows_subst_alias_rejects_both_ancestor_directions(tmp_path):
+    with _windows_subst_root(tmp_path) as alias_root:
+        _assert_windows_alias_rejects_both_ancestor_directions(
+            tmp_path,
+            alias_root,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume GUID aliasの実APIテスト")
+def test_windows_volume_guid_alias_rejects_both_ancestor_directions(tmp_path):
+    _assert_windows_alias_rejects_both_ancestor_directions(
+        tmp_path,
+        _windows_volume_guid_path(tmp_path),
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 aliasの実APIテスト")
+def test_stale_journal_alias_is_rejected_before_lock_creation(tmp_path):
+    source = tmp_path / "legacy-stale-journal-long-name"
+    executable = _write_fake_obs(source, b"keep")
+    destination = _windows_short_path(source) / "nested-destination"
+    destination.mkdir()
+    marker = obs_bootstrap.get_obs_copy_in_progress_marker(destination)
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": obs_bootstrap.OBS_COPY_JOURNAL_SCHEMA_VERSION,
+                "source": str(source.resolve()),
+                "source_fingerprint": "0" * 64,
+                "phase": obs_bootstrap.OBS_MIGRATION_PHASE_COPYING,
+                "owner_pid": os.getpid(),
+                "owner_token": "a" * 32,
+                "started_at": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    lock = obs_bootstrap.get_obs_copy_lock_path(destination)
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="physical directory|ancestor alias",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert executable.read_bytes() == b"keep"
+    assert marker.exists()
+    assert not lock.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 aliasの実APIテスト")
+def test_stale_journal_checks_every_valid_allowed_alias_before_lock(tmp_path):
+    source_a = tmp_path / "journal-source-a"
+    source_b = tmp_path / "legacy-candidate-b-long-name"
+    executable_a = _write_fake_obs(source_a, b"source-a")
+    executable_b = _write_fake_obs(source_b, b"source-b")
+    destination = source_b / "nested-destination"
+    destination.mkdir()
+    marker = obs_bootstrap.get_obs_copy_in_progress_marker(destination)
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": obs_bootstrap.OBS_COPY_JOURNAL_SCHEMA_VERSION,
+                "source": str(source_a.resolve()),
+                "source_fingerprint": "0" * 64,
+                "phase": obs_bootstrap.OBS_MIGRATION_PHASE_COPYING,
+                "owner_pid": os.getpid(),
+                "owner_token": "c" * 32,
+                "started_at": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    lock = obs_bootstrap.get_obs_copy_lock_path(destination)
+    source_b_alias = _windows_short_path(source_b)
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="physical directory|ancestor alias",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source_a, source_b_alias],
+        )
+
+    assert executable_a.read_bytes() == b"source-a"
+    assert executable_b.read_bytes() == b"source-b"
+    assert marker.exists()
+    assert not lock.exists()
+    assert not (destination / executable_a.relative_to(source_a)).exists()
+
+
+def test_stale_journal_rejects_temporary_in_other_valid_candidate_before_lock(
+    tmp_path,
+):
+    source_a = tmp_path / "journal-source-a"
+    source_b = tmp_path / "candidate-b"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source_a, b"source-a")
+    _write_fake_obs(source_b, b"source-b")
+    temporary_target = source_b / "config" / "obs-studio" / "global.ini"
+    temporary_target.parent.mkdir(parents=True)
+    temporary = obs_bootstrap._transaction_copy_temporary_path(
+        temporary_target,
+        "d" * 32,
+    )
+    temporary.write_bytes(b"preserve")
+    destination.mkdir()
+    marker = obs_bootstrap.get_obs_copy_in_progress_marker(destination)
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_version": obs_bootstrap.OBS_COPY_JOURNAL_SCHEMA_VERSION,
+                "source": str(source_a.resolve()),
+                "source_fingerprint": "0" * 64,
+                "phase": obs_bootstrap.OBS_MIGRATION_PHASE_COPYING,
+                "owner_pid": os.getpid(),
+                "owner_token": "e" * 32,
+                "started_at": 1.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="transaction一時file",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source_a, source_b],
+        )
+
+    assert temporary.read_bytes() == b"preserve"
+    assert marker.exists()
+    assert not obs_bootstrap.get_obs_copy_lock_path(destination).exists()
+
+
+def test_marker_appearing_during_lock_acquire_requires_retry_without_copy(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    executable = _write_fake_obs(source, b"keep")
+    destination.mkdir()
+    marker = obs_bootstrap.get_obs_copy_in_progress_marker(destination)
+    lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
+    real_acquire = obs_bootstrap._OBSInterProcessLock.acquire
+    injected = False
+
+    def acquire_with_marker(lock, *args, **kwargs):
+        nonlocal injected
+        if lock.path == lock_path and not injected:
+            marker.write_text(
+                json.dumps(
+                    {
+                        "schema_version": obs_bootstrap.OBS_COPY_JOURNAL_SCHEMA_VERSION,
+                        "source": str(source.resolve()),
+                        "source_fingerprint": "0" * 64,
+                        "phase": obs_bootstrap.OBS_MIGRATION_PHASE_COPYING,
+                        "owner_pid": os.getpid(),
+                        "owner_token": "b" * 32,
+                        "started_at": 1.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            injected = True
+        return real_acquire(lock, *args, **kwargs)
+
+    monkeypatch.setattr(
+        obs_bootstrap._OBSInterProcessLock,
+        "acquire",
+        acquire_with_marker,
+    )
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="新しいmarker.*再試行",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert injected is True
+    assert executable.read_bytes() == b"keep"
+    assert marker.exists()
+    assert not (destination / executable.relative_to(source)).exists()
+
+
 def test_directory_link_alias_is_rejected_before_external_write(tmp_path):
     source = tmp_path / "legacy"
     external = tmp_path / "external"
@@ -110,7 +404,10 @@ def test_directory_link_alias_is_rejected_before_external_write(tmp_path):
     assert not (external / "obs-portable").exists()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX device/inode chainのCIテスト")
+@pytest.mark.skipif(
+    not _POSIX_MOUNT_ID_AVAILABLE,
+    reason="Linux /proc mount identityのCIテスト",
+)
 def test_posix_physical_identity_rejects_both_ancestor_directions(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -148,6 +445,104 @@ def test_posix_physical_identity_rejects_both_ancestor_directions(tmp_path):
             )
 
 
+def _simulate_posix_mount_transition(monkeypatch, target: Path) -> None:
+    target_identity = obs_transaction_fs._file_identity(
+        target.stat(follow_symlinks=False)
+    )
+    real_mount_id = obs_transaction_fs._posix_mount_id_for_descriptor
+
+    def changed_mount_id(descriptor, *, path):
+        mount_id = real_mount_id(descriptor, path=path)
+        if obs_transaction_fs._file_identity(os.fstat(descriptor)) == target_identity:
+            return mount_id + 1
+        return mount_id
+
+    monkeypatch.setattr(
+        obs_transaction_fs,
+        "_posix_mount_id_for_descriptor",
+        changed_mount_id,
+    )
+
+
+@pytest.mark.skipif(
+    not _POSIX_MOUNT_ID_AVAILABLE,
+    reason="Linux /proc mount boundaryのCIテスト",
+)
+def test_posix_source_nested_mount_is_rejected_before_destination_creation(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    executable = _write_fake_obs(source, b"keep")
+    nested_mount = source / "nested-mount"
+    nested_mount.mkdir()
+    sentinel = nested_mount / "external-sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    _simulate_posix_mount_transition(monkeypatch, nested_mount)
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="mount境界",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert executable.read_bytes() == b"keep"
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    _assert_no_transaction_artifacts(destination)
+
+
+@pytest.mark.skipif(
+    not _POSIX_MOUNT_ID_AVAILABLE,
+    reason="Linux /proc mount boundaryのCIテスト",
+)
+def test_posix_destination_nested_mount_is_rejected_before_external_write(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source, b"keep")
+    (source / "nested-mount").mkdir()
+    nested_mount = destination / "nested-mount"
+    nested_mount.mkdir(parents=True)
+    sentinel = nested_mount / "external-sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    _simulate_posix_mount_transition(monkeypatch, nested_mount)
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="mount境界",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+    assert not obs_bootstrap.get_obs_copy_lock_path(destination).exists()
+
+
+@pytest.mark.skipif(
+    not _POSIX_MOUNT_ID_AVAILABLE,
+    reason="Linux /proc file mount boundaryのCIテスト",
+)
+def test_posix_managed_lease_rejects_nested_file_mount_identity(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "managed"
+    root.mkdir()
+    mounted_file = root / "mounted-file.bin"
+    mounted_file.write_bytes(b"keep")
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(root) as root_lease:
+        _simulate_posix_mount_transition(monkeypatch, mounted_file)
+        with pytest.raises(obs_transaction_fs.OBSPathSafetyError, match="mount境界"):
+            root_lease.open_file(
+                mounted_file.name,
+                write=False,
+                create_exclusive=False,
+            )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="NTFS ADSの実APIテスト")
 def test_windows_named_ads_is_rejected_by_handle_inventory(tmp_path):
     root = tmp_path / "managed"
@@ -165,6 +560,116 @@ def test_windows_named_ads_is_rejected_by_handle_inventory(tmp_path):
         obs_bootstrap._build_obs_tree_inventory(root)
 
     assert target.read_bytes() == b"default-stream"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="NTFS root ADSの実APIテスト")
+def test_finalizer_rejects_named_ads_added_to_managed_root(tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    stream_path = f"{destination}:issue83-root"
+
+    def add_root_stream(current_destination: Path) -> None:
+        with open(f"{current_destination}:issue83-root", "wb") as stream:
+            stream.write(b"hidden")
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="alternate data stream|安全に解除できません",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source],
+            finalize_destination=add_root_stream,
+        )
+
+    assert Path(stream_path).read_bytes() == b"hidden"
+    assert obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows root attributesの実APIテスト")
+def test_finalizer_rejects_managed_root_attribute_only_change(tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+
+    def make_root_read_only(current_destination: Path) -> None:
+        os.chmod(current_destination, stat.S_IREAD)
+
+    try:
+        with pytest.raises(
+            obs_bootstrap.OBSMigrationRecoveryRequiredError,
+            match="allowlist外.*<root>",
+        ):
+            obs_bootstrap.migrate_legacy_obs_installation(
+                destination,
+                [source],
+                finalize_destination=make_root_read_only,
+            )
+
+        assert destination.stat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY
+        assert obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+    finally:
+        if destination.exists():
+            os.chmod(destination, stat.S_IWRITE)
+
+
+def test_finalizer_rejects_managed_root_security_descriptor_change(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    finalizer_active = False
+    real_snapshot = obs_bootstrap._snapshot_open_entry_metadata
+
+    def snapshot_with_changed_root_security(
+        descriptor,
+        *,
+        path,
+        kind,
+        native_windows_handle=False,
+    ):
+        metadata = real_snapshot(
+            descriptor,
+            path=path,
+            kind=kind,
+            native_windows_handle=native_windows_handle,
+        )
+        if finalizer_active and Path(path) == destination and kind == "directory":
+            replacement = (
+                "f" * 64
+                if metadata.security_descriptor_sha256 != "f" * 64
+                else "e" * 64
+            )
+            return replace(
+                metadata,
+                security_descriptor_sha256=replacement,
+            )
+        return metadata
+
+    def change_security_descriptor(_current_destination: Path) -> None:
+        nonlocal finalizer_active
+        finalizer_active = True
+
+    monkeypatch.setattr(
+        obs_bootstrap,
+        "_snapshot_open_entry_metadata",
+        snapshot_with_changed_root_security,
+    )
+
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match="allowlist外.*<root>",
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source],
+            finalize_destination=change_security_descriptor,
+        )
+
+    assert obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
 
 
 def test_inventory_uses_exact_metadata_within_tree_but_content_across_trees(tmp_path):
@@ -194,7 +699,10 @@ def test_inventory_uses_exact_metadata_within_tree_but_content_across_trees(tmp_
     )
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX xattr/ACL inventoryのCIテスト")
+@pytest.mark.skipif(
+    not _POSIX_MOUNT_ID_AVAILABLE,
+    reason="Linux /proc xattr/ACL inventoryのCIテスト",
+)
 def test_posix_xattr_only_difference_is_exact_metadata_change(tmp_path):
     source = tmp_path / "source"
     destination = tmp_path / "destination"

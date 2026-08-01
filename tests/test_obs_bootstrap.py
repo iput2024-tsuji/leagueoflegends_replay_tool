@@ -1546,7 +1546,11 @@ def test_obs_inventory_skips_reserved_root_names_case_insensitively(tmp_path, re
 
     entries = obs_bootstrap._build_obs_tree_inventory(source)
 
-    assert all(entry.relative_parts[0].casefold() != reserved_name.casefold() for entry in entries)
+    assert all(
+        not entry.relative_parts
+        or entry.relative_parts[0].casefold() != reserved_name.casefold()
+        for entry in entries
+    )
 
 
 @pytest.mark.parametrize("reserved_name", sorted(obs_bootstrap.OBS_COPY_SKIP_NAMES))
@@ -1561,7 +1565,10 @@ def test_obs_inventory_keeps_differently_cased_reserved_names_on_posix(tmp_path,
 
     entries = obs_bootstrap._build_obs_tree_inventory(source)
 
-    assert any(entry.relative_parts[0] == mixed_case_name for entry in entries)
+    assert any(
+        entry.relative_parts and entry.relative_parts[0] == mixed_case_name
+        for entry in entries
+    )
 
 
 def test_obs_inventory_rejects_orphaned_journal_temporary(tmp_path):

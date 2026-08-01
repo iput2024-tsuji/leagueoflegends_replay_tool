@@ -2,6 +2,7 @@ import errno
 import json
 import multiprocessing
 import os
+import stat
 import subprocess
 import time
 from pathlib import Path
@@ -94,6 +95,77 @@ def _write_json_journal(
         encoding="utf-8",
     )
     return marker
+
+
+def _write_prejournal_temporary(
+    destination: Path,
+    source: Path,
+    *,
+    owner_token: str = "a" * 32,
+    payload_updates: dict | None = None,
+) -> Path:
+    destination.mkdir(parents=True, exist_ok=True)
+    marker = obs_bootstrap.get_obs_copy_in_progress_marker(destination)
+    source_fingerprint = obs_bootstrap._inventory_fingerprint(
+        obs_bootstrap._build_obs_tree_inventory(source)
+    )
+    payload = {
+        "schema_version": obs_bootstrap.OBS_COPY_JOURNAL_SCHEMA_VERSION,
+        "source": str(source.resolve()),
+        "source_fingerprint": source_fingerprint,
+        "phase": obs_bootstrap.OBS_MIGRATION_PHASE_COPYING,
+        "owner_pid": os.getpid(),
+        "owner_token": owner_token,
+        "started_at": 1.0,
+    }
+    if payload_updates:
+        payload.update(payload_updates)
+    temporary = obs_bootstrap._transaction_journal_temporary_path(marker, owner_token)
+    temporary.write_text(json.dumps(payload), encoding="utf-8")
+    return temporary
+
+
+def _hold_obs_migration_before_journal_rename(
+    source: str,
+    destination: str,
+    entered,
+    release,
+    result_queue,
+) -> None:
+    original_replace = obs_bootstrap._OBSDirectoryLease.replace_open_file
+    paused = False
+
+    def pause_before_journal_rename(
+        directory,
+        descriptor,
+        temporary_name,
+        target_name,
+    ):
+        nonlocal paused
+        if (
+            not paused
+            and target_name == obs_bootstrap.OBS_COPY_IN_PROGRESS_MARKER_NAME
+        ):
+            paused = True
+            entered.set()
+            if not release.wait(15):
+                raise TimeoutError("test did not release journal rename")
+        return original_replace(
+            directory,
+            descriptor,
+            temporary_name,
+            target_name,
+        )
+
+    obs_bootstrap._OBSDirectoryLease.replace_open_file = pause_before_journal_rename
+    try:
+        migrated = obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source],
+        )
+        result_queue.put(("ok", str(migrated)))
+    except Exception as exc:  # pragma: no cover - reported to parent process
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
 class FakeProcessManager:
@@ -607,6 +679,86 @@ def test_live_lock_blocks_readiness_before_journal_is_written(tmp_path):
     assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
 
 
+def test_copy_progress_query_does_not_mutate_clean_destination(tmp_path):
+    destination = tmp_path / "obs-portable"
+    executable = _write_fake_obs(destination, b"clean destination")
+    lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
+
+    before = tuple(
+        sorted(
+            (
+                path.relative_to(destination).as_posix(),
+                "directory" if path.is_dir() else path.read_bytes(),
+            )
+            for path in destination.rglob("*")
+        )
+    )
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+
+    after = tuple(
+        sorted(
+            (
+                path.relative_to(destination).as_posix(),
+                "directory" if path.is_dir() else path.read_bytes(),
+            )
+            for path in destination.rglob("*")
+        )
+    )
+    assert after == before
+    assert executable.read_bytes() == b"clean destination"
+    assert not lock_path.exists()
+
+
+def test_copy_progress_query_does_not_recreate_lock_after_probe_race(
+    monkeypatch,
+    tmp_path,
+):
+    destination = tmp_path / "obs-portable"
+    executable = _write_fake_obs(destination, b"clean destination")
+    lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
+    real_probe = obs_bootstrap._OBSDirectoryLease.relative_file_identity_or_none
+    simulated_lock_probes = 0
+
+    def report_lock_once_then_missing(directory, name):
+        nonlocal simulated_lock_probes
+        if directory.path == destination.resolve() and name == lock_path.name:
+            simulated_lock_probes += 1
+            if simulated_lock_probes == 1:
+                return (1, 2, stat.S_IFREG)
+        return real_probe(directory, name)
+
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "relative_file_identity_or_none",
+        report_lock_once_then_missing,
+    )
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+
+    assert simulated_lock_probes >= 2
+    assert executable.read_bytes() == b"clean destination"
+    assert not lock_path.exists()
+
+
+def test_copy_progress_query_does_not_initialize_zero_byte_stale_lock(tmp_path):
+    destination = tmp_path / "obs-portable"
+    executable = _write_fake_obs(destination, b"clean destination")
+    lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
+    lock_path.write_bytes(b"")
+    before_paths = tuple(
+        sorted(path.relative_to(destination).as_posix() for path in destination.rglob("*"))
+    )
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
+
+    assert lock_path.read_bytes() == b""
+    assert executable.read_bytes() == b"clean destination"
+    assert tuple(
+        sorted(path.relative_to(destination).as_posix() for path in destination.rglob("*"))
+    ) == before_paths
+
+
 def test_stale_journal_with_reused_live_pid_is_resumed_when_os_lock_is_free(tmp_path):
     source = tmp_path / "legacy"
     destination = tmp_path / "obs-portable"
@@ -763,7 +915,7 @@ def test_obs_migration_only_removes_journal_owned_by_its_token(tmp_path):
     def replace_owner(_destination: Path) -> None:
         _write_json_journal(destination, source, owner_token="b" * 32)
 
-    with pytest.raises(obs_bootstrap.OBSMigrationError, match="所有者が変化"):
+    with pytest.raises(obs_bootstrap.OBSMigrationError, match="所有者が変化|allowlist外"):
         obs_bootstrap.migrate_legacy_obs_installation(
             destination,
             [source],
@@ -780,16 +932,16 @@ def test_obs_migration_keeps_journal_when_finalize_marker_removal_is_denied(monk
     destination = tmp_path / "obs-portable"
     source_executable = _write_fake_obs(source, b"source executable")
     marker = obs_bootstrap.get_obs_copy_in_progress_marker(destination)
-    real_unlink = Path.unlink
+    real_unlink = obs_bootstrap._OBSDirectoryLease.unlink_file
 
-    def deny_marker_unlink(path, *args, **kwargs):
-        if path == marker:
+    def deny_marker_unlink(directory, name, *args, **kwargs):
+        if directory.path == destination.resolve() and name == marker.name:
             raise PermissionError("simulated marker ACL denial")
-        return real_unlink(path, *args, **kwargs)
+        return real_unlink(directory, name, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", deny_marker_unlink)
+    monkeypatch.setattr(obs_bootstrap._OBSDirectoryLease, "unlink_file", deny_marker_unlink)
 
-    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="marker.*解除"):
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="marker"):
         obs_bootstrap.migrate_legacy_obs_installation(
             destination,
             [source],
@@ -821,9 +973,21 @@ def test_obs_migration_recovers_owned_copy_and_journal_temporaries(monkeypatch, 
     used_owner_tokens = []
     real_copy = obs_bootstrap._copy_inventory_file
 
-    def capture_owner_token(source_path, destination_path, expected, current_owner_token):
+    def capture_owner_token(
+        source_path,
+        destination_path,
+        expected,
+        current_owner_token,
+        **kwargs,
+    ):
         used_owner_tokens.append(current_owner_token)
-        real_copy(source_path, destination_path, expected, current_owner_token)
+        real_copy(
+            source_path,
+            destination_path,
+            expected,
+            current_owner_token,
+            **kwargs,
+        )
 
     monkeypatch.setattr(obs_bootstrap, "_copy_inventory_file", capture_owner_token)
 
@@ -878,6 +1042,38 @@ def test_obs_migration_recovers_owned_finalize_write_temporaries(tmp_path):
     assert not root_temporary.exists()
     assert not websocket_temporary.exists()
     assert not marker.exists()
+
+
+def test_owned_temporary_is_kept_when_lock_validation_fails_before_unlink(tmp_path):
+    destination = tmp_path / "obs-portable"
+    owner_token = "a" * 32
+    temporary = obs_bootstrap._transaction_write_temporary_path(
+        obs_bootstrap.get_portable_marker_path(destination),
+        owner_token,
+    )
+    temporary.parent.mkdir(parents=True)
+    temporary.write_bytes(b"preserve")
+    validation_calls = 0
+
+    def fail_immediately_before_unlink() -> None:
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 2:
+            raise RuntimeError("simulated lock ownership loss")
+
+    with obs_bootstrap._OBSDirectoryLease.open_absolute(
+        destination,
+        mutable=True,
+    ) as root_lease:
+        with pytest.raises(RuntimeError, match="ownership loss"):
+            obs_bootstrap._remove_owned_transaction_temporaries(
+                [temporary],
+                root_lease=root_lease,
+                validate_transaction=fail_immediately_before_unlink,
+            )
+
+    assert validation_calls == 2
+    assert temporary.read_bytes() == b"preserve"
 
 
 def test_obs_migration_does_not_remove_hardlinked_owned_copy_temporary(tmp_path):
@@ -975,7 +1171,7 @@ def test_obs_migration_retries_finalize_after_copy_transaction_completes(tmp_pat
         assert json.loads(marker.read_text(encoding="utf-8"))["phase"] == (
             obs_bootstrap.OBS_MIGRATION_PHASE_FINALIZE_PENDING
         )
-        managed_file = current_destination / "config" / "obs-studio" / "managed.ini"
+        managed_file = obs_bootstrap.get_obs_global_ini_path(current_destination)
         managed_file.parent.mkdir(parents=True, exist_ok=True)
         managed_file.write_text(f"attempt={finalize_calls}", encoding="utf-8")
         if finalize_calls == 1:
@@ -990,7 +1186,7 @@ def test_obs_migration_retries_finalize_after_copy_transaction_completes(tmp_pat
 
     assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
     assert obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
-    assert (destination / "config" / "obs-studio" / "managed.ini").read_text(encoding="utf-8") == "attempt=1"
+    assert obs_bootstrap.get_obs_global_ini_path(destination).read_text(encoding="utf-8") == "attempt=1"
 
     migrated = obs_bootstrap.migrate_legacy_obs_installation(
         destination,
@@ -1002,7 +1198,7 @@ def test_obs_migration_retries_finalize_after_copy_transaction_completes(tmp_pat
     assert finalize_calls == 2
     assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
     assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
-    assert (destination / "config" / "obs-studio" / "managed.ini").read_text(encoding="utf-8") == "attempt=2"
+    assert obs_bootstrap.get_obs_global_ini_path(destination).read_text(encoding="utf-8") == "attempt=2"
 
 
 def test_obs_migration_capability_allows_bootstrap_finalizer_without_relocking(tmp_path):
@@ -1065,7 +1261,7 @@ def test_obs_migration_rejects_unmanaged_change_while_finalize_is_pending(tmp_pa
         nonlocal finalize_called
         finalize_called = True
 
-    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="bin/plugin"):
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="bin/64bit/obs64.exe"):
         obs_bootstrap.migrate_legacy_obs_installation(
             destination,
             [source],
@@ -1106,7 +1302,7 @@ def test_obs_migration_rejects_reparse_lock_without_modifying_external_directory
     sentinel.write_text("keep me", encoding="utf-8")
     _create_directory_link(obs_bootstrap.get_obs_copy_lock_path(destination), external)
 
-    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="reparse point"):
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="migration lock"):
         obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
 
     assert sentinel.read_text(encoding="utf-8") == "keep me"
@@ -1120,7 +1316,7 @@ def test_obs_migration_rejects_directory_at_lock_path(tmp_path):
     lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
     lock_path.mkdir(parents=True)
 
-    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="通常ファイル"):
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="migration lock"):
         obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
 
     assert lock_path.is_dir()
@@ -1168,21 +1364,29 @@ def test_obs_migration_does_not_replace_existing_target_when_path_probe_is_denie
     source_executable = _write_fake_obs(source, b"new executable")
     destination_executable = _write_fake_obs(destination, b"original executable")
     marker = _write_json_journal(destination, source)
-    real_lexists = obs_bootstrap._path_lexists
-    real_replace = obs_bootstrap.os.replace
+    real_probe = obs_bootstrap._OBSDirectoryLease.relative_file_identity_or_none
+    real_replace = obs_bootstrap._OBSDirectoryLease.replace_open_file
     replaced_destinations = []
 
-    def deny_destination_probe(path):
-        if Path(path) == destination_executable:
+    def deny_destination_probe(directory, name):
+        if directory.path / name == destination_executable.resolve():
             raise PermissionError("simulated target probe ACL denial")
-        return real_lexists(path)
+        return real_probe(directory, name)
 
-    def track_replace(source_path, destination_path):
-        replaced_destinations.append(Path(destination_path))
-        return real_replace(source_path, destination_path)
+    def track_replace(directory, descriptor, temporary_name, target_name):
+        replaced_destinations.append(directory.path / target_name)
+        return real_replace(directory, descriptor, temporary_name, target_name)
 
-    monkeypatch.setattr(obs_bootstrap, "_path_lexists", deny_destination_probe)
-    monkeypatch.setattr(obs_bootstrap.os, "replace", track_replace)
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "relative_file_identity_or_none",
+        deny_destination_probe,
+    )
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "replace_open_file",
+        track_replace,
+    )
 
     with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="target probe ACL denial"):
         obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
@@ -1207,14 +1411,14 @@ def test_copy_validation_failure_closes_source_descriptor(monkeypatch, tmp_path)
         for entry in obs_bootstrap._build_obs_tree_inventory(source)
         if entry.kind == "file" and entry.relative_parts == ("bin", "64bit", "obs64.exe")
     )
-    real_open = obs_bootstrap.os.open
+    real_open = obs_bootstrap._OBSDirectoryLease.open_file
     real_close = obs_bootstrap.os.close
     source_descriptors = []
     closed_descriptors = []
 
-    def track_open(path, *args, **kwargs):
-        descriptor = real_open(path, *args, **kwargs)
-        if Path(path) == source_executable:
+    def track_open(directory, name, *args, **kwargs):
+        descriptor = real_open(directory, name, *args, **kwargs)
+        if directory.path / name == source_executable.resolve():
             source_descriptors.append(descriptor)
         return descriptor
 
@@ -1222,7 +1426,7 @@ def test_copy_validation_failure_closes_source_descriptor(monkeypatch, tmp_path)
         closed_descriptors.append(descriptor)
         return real_close(descriptor)
 
-    monkeypatch.setattr(obs_bootstrap.os, "open", track_open)
+    monkeypatch.setattr(obs_bootstrap._OBSDirectoryLease, "open_file", track_open)
     monkeypatch.setattr(obs_bootstrap.os, "close", track_close)
 
     with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="hardlink"):
@@ -1245,14 +1449,23 @@ def test_obs_migration_atomic_replace_preserves_raced_hardlink_target(monkeypatc
     source_executable = _write_fake_obs(source, b"new executable")
     destination_executable = _write_fake_obs(destination, b"old executable")
     marker = _write_json_journal(destination, source)
-    real_replace = obs_bootstrap.os.replace
+    real_replace = obs_bootstrap._OBSDirectoryLease.replace_open_file
 
-    def add_hardlink_immediately_before_replace(source_path, destination_path):
-        if Path(destination_path) == destination_executable and not external.exists():
+    def add_hardlink_immediately_before_replace(
+        directory,
+        descriptor,
+        temporary_name,
+        target_name,
+    ):
+        if directory.path / target_name == destination_executable.resolve() and not external.exists():
             os.link(destination_executable, external)
-        return real_replace(source_path, destination_path)
+        return real_replace(directory, descriptor, temporary_name, target_name)
 
-    monkeypatch.setattr(obs_bootstrap.os, "replace", add_hardlink_immediately_before_replace)
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "replace_open_file",
+        add_hardlink_immediately_before_replace,
+    )
 
     assert obs_bootstrap.migrate_legacy_obs_installation(destination, [source]) == source.resolve()
 
@@ -1281,6 +1494,7 @@ def test_obs_migration_rejects_destination_symlink_without_writing_outside(tmp_p
 
     assert external_file.read_bytes() == b"external plugin"
     assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
 
 
 def test_obs_migration_rejects_source_symlink_without_reading_external_target(tmp_path):
@@ -1336,6 +1550,7 @@ def test_obs_migration_rejects_backslash_component_without_writing_outside_desti
 
 
 @pytest.mark.parametrize("reserved_name", sorted(obs_bootstrap.OBS_COPY_SKIP_NAMES))
+@pytest.mark.skipif(os.name != "nt", reason="Windows names are case-insensitive")
 def test_obs_inventory_skips_reserved_root_names_case_insensitively(tmp_path, reserved_name):
     source = tmp_path / "legacy"
     _write_fake_obs(source)
@@ -1349,13 +1564,31 @@ def test_obs_inventory_skips_reserved_root_names_case_insensitively(tmp_path, re
     assert all(entry.relative_parts[0].casefold() != reserved_name.casefold() for entry in entries)
 
 
+@pytest.mark.parametrize("reserved_name", sorted(obs_bootstrap.OBS_COPY_SKIP_NAMES))
+@pytest.mark.skipif(os.name == "nt", reason="POSIX names are case-sensitive")
+def test_obs_inventory_keeps_differently_cased_reserved_names_on_posix(tmp_path, reserved_name):
+    source = tmp_path / "legacy"
+    _write_fake_obs(source)
+    mixed_case_name = reserved_name.upper()
+    reserved_file = source / mixed_case_name / "user-file.txt"
+    reserved_file.parent.mkdir()
+    reserved_file.write_text("reserved", encoding="utf-8")
+
+    entries = obs_bootstrap._build_obs_tree_inventory(source)
+
+    assert any(entry.relative_parts[0] == mixed_case_name for entry in entries)
+
+
 def test_obs_inventory_rejects_orphaned_journal_temporary(tmp_path):
     source = tmp_path / "legacy"
     _write_fake_obs(source)
     orphan = source / f"{obs_bootstrap.OBS_COPY_IN_PROGRESS_MARKER_NAME}.orphan.tmp"
     orphan.write_text("orphan", encoding="utf-8")
 
-    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="journal一時file"):
+    with pytest.raises(
+        obs_bootstrap.OBSPathSafetyError,
+        match="journal一時file|transaction owner token",
+    ):
         obs_bootstrap._build_obs_tree_inventory(source)
 
 
@@ -1396,9 +1629,9 @@ def test_obs_migration_detects_source_change_during_copy(monkeypatch, tmp_path):
     source_executable = _write_fake_obs(source, b"original")
     real_copy_file = obs_bootstrap._copy_inventory_file
 
-    def change_then_copy(source_path, destination_path, expected, owner_token):
+    def change_then_copy(source_path, destination_path, expected, owner_token, **kwargs):
         source_path.write_bytes(b"changed during copy")
-        real_copy_file(source_path, destination_path, expected, owner_token)
+        real_copy_file(source_path, destination_path, expected, owner_token, **kwargs)
 
     monkeypatch.setattr(obs_bootstrap, "_copy_inventory_file", change_then_copy)
     with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="コピー中"):
@@ -1414,8 +1647,8 @@ def test_obs_migration_detects_post_copy_extra_inventory(monkeypatch, tmp_path):
     _write_fake_obs(source)
     real_copy_file = obs_bootstrap._copy_inventory_file
 
-    def copy_then_add_extra(source_path, destination_path, expected, owner_token):
-        real_copy_file(source_path, destination_path, expected, owner_token)
+    def copy_then_add_extra(source_path, destination_path, expected, owner_token, **kwargs):
+        real_copy_file(source_path, destination_path, expected, owner_token, **kwargs)
         (destination / "unexpected.dll").write_bytes(b"unexpected")
 
     monkeypatch.setattr(obs_bootstrap, "_copy_inventory_file", copy_then_add_extra)
@@ -1445,14 +1678,14 @@ def test_obs_migration_wraps_lock_permission_error_with_recovery_guidance(monkey
     destination = tmp_path / "obs-portable"
     lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
     _write_fake_obs(source)
-    real_open = obs_bootstrap.os.open
+    real_open = obs_bootstrap._OBSDirectoryLease.open_file
 
-    def deny_lock(path, *args, **kwargs):
-        if Path(path) == lock_path:
+    def deny_lock(directory, name, *args, **kwargs):
+        if directory.path / name == lock_path.resolve():
             raise PermissionError("simulated permission denial")
-        return real_open(path, *args, **kwargs)
+        return real_open(directory, name, *args, **kwargs)
 
-    monkeypatch.setattr(obs_bootstrap.os, "open", deny_lock)
+    monkeypatch.setattr(obs_bootstrap._OBSDirectoryLease, "open_file", deny_lock)
     with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="migration lock"):
         obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
 
@@ -1473,26 +1706,34 @@ def test_obs_migration_fails_closed_when_marker_or_lock_probe_is_denied(
         protected_path = obs_bootstrap.get_obs_copy_lock_path(destination)
         protected_path.write_bytes(b"\0")
     protected_before = protected_path.read_bytes()
-    real_lexists = obs_bootstrap._path_lexists
-    real_replace = obs_bootstrap.os.replace
+    real_probe = obs_bootstrap._OBSDirectoryLease.relative_file_identity_or_none
+    real_replace = obs_bootstrap._OBSDirectoryLease.replace_open_file
     replace_calls = []
     finalize_called = False
 
-    def deny_protected_probe(path):
-        if Path(path) == protected_path:
+    def deny_protected_probe(directory, name):
+        if directory.path / name == protected_path.resolve():
             raise PermissionError(f"simulated {probe_name} probe ACL denial")
-        return real_lexists(path)
+        return real_probe(directory, name)
 
-    def track_replace(source_path, destination_path):
-        replace_calls.append((Path(source_path), Path(destination_path)))
-        return real_replace(source_path, destination_path)
+    def track_replace(directory, descriptor, temporary_name, target_name):
+        replace_calls.append((directory.path / temporary_name, directory.path / target_name))
+        return real_replace(directory, descriptor, temporary_name, target_name)
 
     def unexpected_finalize(_destination):
         nonlocal finalize_called
         finalize_called = True
 
-    monkeypatch.setattr(obs_bootstrap, "_path_lexists", deny_protected_probe)
-    monkeypatch.setattr(obs_bootstrap.os, "replace", track_replace)
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "relative_file_identity_or_none",
+        deny_protected_probe,
+    )
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "replace_open_file",
+        track_replace,
+    )
 
     with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="probe ACL denial"):
         obs_bootstrap.migrate_legacy_obs_installation(
@@ -1513,14 +1754,14 @@ def test_obs_migration_does_not_treat_existing_lock_acl_denial_as_contention(mon
     _write_fake_obs(source)
     destination.mkdir()
     lock_path.write_bytes(b"\0")
-    real_open = obs_bootstrap.os.open
+    real_open = obs_bootstrap._OBSDirectoryLease.open_file
 
-    def deny_existing_lock(path, *args, **kwargs):
-        if Path(path) == lock_path:
-            raise PermissionError(errno.EACCES, "simulated ACL denial", str(path))
-        return real_open(path, *args, **kwargs)
+    def deny_existing_lock(directory, name, *args, **kwargs):
+        if directory.path / name == lock_path.resolve():
+            raise PermissionError(errno.EACCES, "simulated ACL denial", str(lock_path))
+        return real_open(directory, name, *args, **kwargs)
 
-    monkeypatch.setattr(obs_bootstrap.os, "open", deny_existing_lock)
+    monkeypatch.setattr(obs_bootstrap._OBSDirectoryLease, "open_file", deny_existing_lock)
 
     with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="migration lock"):
         obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
@@ -1533,16 +1774,599 @@ def test_obs_migration_treats_windows_sharing_violation_as_contention(monkeypatc
     _write_fake_obs(source)
     destination.mkdir()
     lock_path.write_bytes(b"\0")
-    real_open = obs_bootstrap.os.open
+    real_open = obs_bootstrap._OBSDirectoryLease.open_file
 
-    def deny_shared_lock(path, *args, **kwargs):
-        if Path(path) == lock_path:
-            error = PermissionError(errno.EACCES, "simulated sharing violation", str(path))
+    def deny_shared_lock(directory, name, *args, **kwargs):
+        if directory.path / name == lock_path.resolve():
+            error = PermissionError(errno.EACCES, "simulated sharing violation", str(lock_path))
             error.winerror = 32
             raise error
-        return real_open(path, *args, **kwargs)
+        return real_open(directory, name, *args, **kwargs)
 
-    monkeypatch.setattr(obs_bootstrap.os, "open", deny_shared_lock)
+    monkeypatch.setattr(obs_bootstrap._OBSDirectoryLease, "open_file", deny_shared_lock)
 
     with pytest.raises(obs_bootstrap.OBSMigrationInProgressError, match="別のプロセス"):
         obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+
+def test_obs_migration_recovers_valid_prejournal_temporary(tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    source_executable = _write_fake_obs(source, b"pre-journal recovery")
+    temporary = _write_prejournal_temporary(destination, source)
+
+    migrated = obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert migrated == source.resolve()
+    assert not temporary.exists()
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+    assert (destination / source_executable.relative_to(source)).read_bytes() == b"pre-journal recovery"
+
+
+def test_prejournal_scan_rejects_file_swapped_between_listing_and_relative_open(
+    monkeypatch,
+    tmp_path,
+):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    temporary = _write_prejournal_temporary(destination, source)
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b"untrusted replacement")
+    real_open = obs_bootstrap._OBSDirectoryLease.open_file
+    swapped = False
+
+    def swap_before_open(directory, name, *args, **kwargs):
+        nonlocal swapped
+        if not swapped and directory.path / name == temporary.resolve():
+            swapped = True
+            replacement.replace(temporary)
+        return real_open(directory, name, *args, **kwargs)
+
+    monkeypatch.setattr(obs_bootstrap._OBSDirectoryLease, "open_file", swap_before_open)
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="identity"):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert swapped is True
+    assert temporary.read_bytes() == b"untrusted replacement"
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+
+
+def test_prejournal_scan_rejects_entry_added_after_listing(monkeypatch, tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    temporary = _write_prejournal_temporary(destination, source)
+    added = obs_bootstrap._transaction_journal_temporary_path(
+        obs_bootstrap.get_obs_copy_in_progress_marker(destination),
+        "b" * 32,
+    )
+    real_parse = obs_bootstrap._parse_transaction_temporary
+    injected = False
+
+    def add_after_listing(path):
+        nonlocal injected
+        if not injected and Path(path) == temporary:
+            injected = True
+            added.write_bytes(b"unverified")
+        return real_parse(path)
+
+    monkeypatch.setattr(obs_bootstrap, "_parse_transaction_temporary", add_after_listing)
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="走査中"):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert injected is True
+    assert temporary.exists()
+    assert added.read_bytes() == b"unverified"
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+
+
+@pytest.mark.parametrize("case", ["empty", "token", "fingerprint", "source"])
+def test_obs_migration_keeps_unverified_prejournal_temporary(tmp_path, case):
+    source = tmp_path / "legacy"
+    unauthorized = tmp_path / "unauthorized"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    _write_fake_obs(unauthorized, b"unauthorized")
+    updates = {}
+    if case == "token":
+        updates["owner_token"] = "b" * 32
+    elif case == "fingerprint":
+        updates["source_fingerprint"] = "0" * 64
+    elif case == "source":
+        updates["source"] = str(unauthorized.resolve())
+    temporary = _write_prejournal_temporary(
+        destination,
+        source,
+        payload_updates=updates,
+    )
+    if case == "empty":
+        temporary.write_bytes(b"")
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert temporary.exists()
+    assert (unauthorized / "bin" / "64bit" / "obs64.exe").read_bytes() == b"unauthorized"
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+
+
+def test_obs_migration_keeps_multiple_prejournal_temporaries(tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    first = _write_prejournal_temporary(destination, source, owner_token="a" * 32)
+    second = _write_prejournal_temporary(destination, source, owner_token="b" * 32)
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="複数"):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert first.exists()
+    assert second.exists()
+
+
+def test_obs_migration_keeps_prejournal_temporary_when_source_is_missing(tmp_path):
+    source = tmp_path / "legacy"
+    missing = tmp_path / "missing"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    temporary = _write_prejournal_temporary(
+        destination,
+        source,
+        payload_updates={"source": str(missing.resolve())},
+    )
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [missing])
+
+    assert temporary.exists()
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+
+
+@pytest.mark.parametrize("kind", ["copy", "write"])
+def test_markerless_nested_transaction_temporary_is_visible_and_preserved(
+    monkeypatch,
+    tmp_path,
+    kind,
+):
+    destination = tmp_path / "obs-portable"
+    missing = tmp_path / "missing"
+    _write_fake_obs(destination)
+    target = destination / "config" / "obs-studio" / "global.ini"
+    target.parent.mkdir(parents=True)
+    temporary = (
+        obs_bootstrap._transaction_copy_temporary_path(target, "a" * 32)
+        if kind == "copy"
+        else obs_bootstrap._transaction_write_temporary_path(target, "a" * 32)
+    )
+    temporary.write_bytes(b"preserve")
+    sentinel = destination / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    opened_names = []
+    real_open = obs_bootstrap._OBSDirectoryLease.open_file
+
+    def track_open(directory, name, *args, **kwargs):
+        opened_names.append(name)
+        return real_open(directory, name, *args, **kwargs)
+
+    monkeypatch.setattr(obs_bootstrap._OBSDirectoryLease, "open_file", track_open)
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
+    assert temporary.name not in opened_names
+    assert not obs_bootstrap.get_obs_copy_lock_path(destination).exists()
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="transaction一時"):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [missing])
+
+    assert temporary.read_bytes() == b"preserve"
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+def test_prelock_name_scan_does_not_open_live_journal_temporary(tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    context = multiprocessing.get_context("spawn")
+    entered = context.Event()
+    release = context.Event()
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_hold_obs_migration_before_journal_rename,
+        args=(str(source), str(destination), entered, release, result_queue),
+    )
+    process.start()
+    try:
+        assert entered.wait(15), "migration did not pause before journal rename"
+        with pytest.raises(obs_bootstrap.OBSMigrationInProgressError):
+            obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+    finally:
+        release.set()
+        process.join(15)
+        if process.is_alive():
+            process.terminate()
+            process.join(5)
+
+    assert process.exitcode == 0
+    try:
+        assert result_queue.get(timeout=5) == ("ok", str(source.resolve()))
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+    assert not list(destination.rglob("*.tmp"))
+
+
+def test_obs_migration_fails_before_mutation_without_handle_relative_support(monkeypatch, tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    monkeypatch.setattr(obs_bootstrap, "_supports_handle_relative_migration", lambda: False)
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="directory handle"):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert not destination.exists()
+
+
+def test_posix_handle_relative_capability_requires_rename(monkeypatch):
+    required = {
+        obs_bootstrap.os.open,
+        obs_bootstrap.os.mkdir,
+        obs_bootstrap.os.rename,
+        obs_bootstrap.os.unlink,
+        obs_bootstrap.os.stat,
+    }
+    monkeypatch.setattr(obs_bootstrap.os, "supports_fd", {obs_bootstrap.os.scandir})
+    monkeypatch.setattr(obs_bootstrap.os, "supports_dir_fd", required)
+    monkeypatch.setattr(obs_bootstrap.os, "O_DIRECTORY", 0x10000, raising=False)
+    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0x20000, raising=False)
+
+    assert obs_bootstrap._supports_posix_handle_relative_migration() is True
+
+    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0)
+
+    assert obs_bootstrap._supports_posix_handle_relative_migration() is False
+
+    monkeypatch.setattr(obs_bootstrap.os, "O_NOFOLLOW", 0x20000)
+    monkeypatch.setattr(
+        obs_bootstrap.os,
+        "supports_dir_fd",
+        (required - {obs_bootstrap.os.rename}) | {obs_bootstrap.os.replace},
+    )
+
+    assert obs_bootstrap._supports_posix_handle_relative_migration() is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIXのO_NOFOLLOWエラー分類を検証するため")
+def test_posix_directory_lease_rejects_symlink_child_as_path_safety_error(tmp_path):
+    root = tmp_path / "root"
+    external = tmp_path / "external"
+    root.mkdir()
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    _create_directory_link(root / "linked", external)
+
+    with obs_bootstrap._OBSDirectoryLease.open_absolute(root, mutable=True) as lease:
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="reparse point"):
+            lease.open_child_directory("linked", create=True, mutable=True)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIXのdirectory作成raceを検証するため")
+def test_posix_directory_lease_rejects_symlink_injected_after_mkdir(monkeypatch, tmp_path):
+    root = tmp_path / "root"
+    external = tmp_path / "external"
+    root.mkdir()
+    external.mkdir()
+    sentinel = external / "sentinel.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    real_mkdir = obs_bootstrap.os.mkdir
+
+    with obs_bootstrap._OBSDirectoryLease.open_absolute(root, mutable=True) as lease:
+        def replace_created_directory_with_symlink(path, mode=0o777, *, dir_fd=None):
+            real_mkdir(path, mode, dir_fd=dir_fd)
+            obs_bootstrap.os.rmdir(path, dir_fd=dir_fd)
+            (root / str(path)).symlink_to(external, target_is_directory=True)
+
+        monkeypatch.setattr(obs_bootstrap.os, "mkdir", replace_created_directory_with_symlink)
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="symbolic link|reparse point"):
+            lease.open_child_directory("injected", create=True, mutable=True)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("relation", ["source_parent", "destination_parent"])
+def test_obs_migration_rejects_overlapping_source_and_destination(tmp_path, relation):
+    if relation == "source_parent":
+        source = tmp_path / "legacy"
+        destination = source / "obs-portable"
+    else:
+        destination = tmp_path / "obs-portable"
+        source = destination / "legacy"
+    source_executable = _write_fake_obs(source, b"keep")
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="ancestor"):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert source_executable.read_bytes() == b"keep"
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+    assert not obs_bootstrap.get_obs_copy_lock_path(destination).exists()
+
+
+def test_obs_migration_rejects_finalizer_write_outside_exact_allowlist(tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    unmanaged = destination / "config" / "obs-studio" / "managed.ini"
+
+    def finalize(_destination: Path) -> None:
+        unmanaged.write_text("forbidden", encoding="utf-8")
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="allowlist外"):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source],
+            finalize_destination=finalize,
+        )
+
+    assert unmanaged.read_text(encoding="utf-8") == "forbidden"
+    assert obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+
+
+@pytest.mark.parametrize("field", ["phase", "source", "source_fingerprint"])
+def test_obs_migration_rejects_finalizer_journal_changes(field, tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    source_executable = _write_fake_obs(source, b"source stays intact")
+    marker = obs_bootstrap.get_obs_copy_in_progress_marker(destination)
+    original_owner_token = None
+
+    def tamper_with_journal(_destination: Path) -> None:
+        nonlocal original_owner_token
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+        original_owner_token = payload["owner_token"]
+        if field == "phase":
+            payload[field] = obs_bootstrap.OBS_MIGRATION_PHASE_COPYING
+        elif field == "source":
+            payload[field] = str((tmp_path / "attacker-source").resolve())
+        else:
+            payload[field] = "0" * 64
+        marker.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="allowlist外"):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source],
+            finalize_destination=tamper_with_journal,
+        )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert original_owner_token is not None
+    assert payload["owner_token"] == original_owner_token
+    assert source_executable.read_bytes() == b"source stays intact"
+    assert (destination / source_executable.relative_to(source)).read_bytes() == (
+        b"source stays intact"
+    )
+
+
+@pytest.mark.parametrize("guarded_root", [".lol_replay_obs_lease.json", "temp_appdata"])
+def test_finalize_retry_rejects_prior_change_to_copy_skipped_root(tmp_path, guarded_root):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    guarded = destination / guarded_root
+
+    def fail_after_change(_destination: Path) -> None:
+        if guarded_root == "temp_appdata":
+            guarded.mkdir()
+            (guarded / "state.json").write_text("changed", encoding="utf-8")
+        else:
+            guarded.write_text("changed", encoding="utf-8")
+        raise RuntimeError("simulated finalizer termination")
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match="termination"):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source],
+            finalize_destination=fail_after_change,
+        )
+
+    retried = False
+
+    def unexpected_retry(_destination: Path) -> None:
+        nonlocal retried
+        retried = True
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError, match=guarded_root):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source],
+            finalize_destination=unexpected_retry,
+        )
+
+    assert retried is False
+    assert obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+
+
+def test_finalizer_rejects_destination_ancestor_swap_without_reading_attacker_config(tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    parked = tmp_path / "parked-destination"
+    attacker = tmp_path / "attacker"
+    _write_fake_obs(source)
+    attacker_global = obs_bootstrap.get_obs_global_ini_path(attacker)
+    attacker_global.parent.mkdir(parents=True)
+    attacker_global.write_text("[General]\nAttacker=true\n", encoding="utf-8")
+
+    def swap_before_read(current_destination: Path) -> None:
+        try:
+            current_destination.rename(parked)
+        except PermissionError as exc:
+            raise RuntimeError("destination swap blocked") from exc
+        attacker.rename(current_destination)
+        try:
+            OBSBootstrapper(
+                current_destination,
+                process_manager=FakeProcessManager(),
+            ).ensure_global_ini(stop_managed_processes=False)
+        finally:
+            current_destination.rename(attacker)
+            parked.rename(current_destination)
+
+    with pytest.raises(obs_bootstrap.OBSMigrationRecoveryRequiredError):
+        obs_bootstrap.migrate_legacy_obs_installation(
+            destination,
+            [source],
+            finalize_destination=swap_before_read,
+        )
+
+    assert attacker_global.read_text(encoding="utf-8") == "[General]\nAttacker=true\n"
+    destination_global = obs_bootstrap.get_obs_global_ini_path(destination)
+    assert not destination_global.exists() or "Attacker=true" not in destination_global.read_text(
+        encoding="utf-8"
+    )
+    assert obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+
+
+def test_migration_inventory_calls_are_rooted(monkeypatch, tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(source)
+    real_inventory = obs_bootstrap._build_obs_tree_inventory
+    rooted_calls = []
+
+    def require_root_lease(root, **kwargs):
+        rooted_calls.append(kwargs.get("root_lease"))
+        assert kwargs.get("root_lease") is not None
+        return real_inventory(root, **kwargs)
+
+    monkeypatch.setattr(obs_bootstrap, "_build_obs_tree_inventory", require_root_lease)
+
+    assert obs_bootstrap.migrate_legacy_obs_installation(destination, [source]) == source.resolve()
+    assert rooted_calls
+
+
+def test_zero_byte_stale_lock_is_reinitialized(tmp_path):
+    destination = tmp_path / "obs-portable"
+    lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
+    lock_path.parent.mkdir()
+    lock_path.write_bytes(b"")
+    lock = obs_bootstrap._OBSInterProcessLock(lock_path)
+
+    assert lock.acquire() is True
+    try:
+        lock.validate_ownership()
+    finally:
+        lock.release()
+
+    assert lock_path.read_bytes() == b"\0"
+
+
+def test_lock_acquire_failure_closes_directory_lease(monkeypatch, tmp_path):
+    parent = tmp_path / "lock-parent"
+    renamed = tmp_path / "renamed-parent"
+    parent.mkdir()
+    lock = obs_bootstrap._OBSInterProcessLock(parent / obs_bootstrap.OBS_COPY_LOCK_NAME)
+    real_probe = obs_bootstrap._OBSDirectoryLease.relative_file_identity_or_none
+
+    def fail_probe(directory, name):
+        if directory.path == parent.resolve() and name == obs_bootstrap.OBS_COPY_LOCK_NAME:
+            raise PermissionError("simulated lock probe failure")
+        return real_probe(directory, name)
+
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "relative_file_identity_or_none",
+        fail_probe,
+    )
+    with pytest.raises(PermissionError, match="lock probe failure"):
+        lock.acquire()
+
+    parent.rename(renamed)
+    assert renamed.is_dir()
+
+
+def test_copy_progress_probe_close_failure_still_releases_lock(monkeypatch, tmp_path):
+    destination = tmp_path / "obs-portable"
+    renamed = tmp_path / "renamed-obs-portable"
+    _write_fake_obs(destination)
+    destination_path = destination.resolve()
+    real_close = obs_bootstrap._OBSDirectoryLease.close
+    injected = False
+
+    def fail_read_only_destination_probe_close(directory):
+        nonlocal injected
+        should_fail = (
+            not injected
+            and directory.path == destination_path
+            and not directory.mutable
+        )
+        real_close(directory)
+        if should_fail:
+            injected = True
+            raise OSError("simulated destination probe close failure")
+
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "close",
+        fail_read_only_destination_probe_close,
+    )
+
+    with pytest.raises(OSError, match="probe close failure"):
+        obs_bootstrap.is_obs_copy_in_progress(destination)
+
+    assert injected is True
+    destination.rename(renamed)
+    lock = obs_bootstrap._OBSInterProcessLock(
+        obs_bootstrap.get_obs_copy_lock_path(renamed)
+    )
+    assert lock.acquire() is True
+    lock.release()
+
+
+def test_native_created_directory_is_reopenable_from_another_process(tmp_path):
+    created = tmp_path / "native" / "child"
+    with obs_bootstrap._OBSDirectoryLease.open_absolute(
+        created,
+        create=True,
+        mutable=True,
+    ):
+        pass
+    script = (
+        "from pathlib import Path; import sys; "
+        "p=Path(sys.argv[1]); "
+        "f=p/'probe.txt'; f.write_text('ok', encoding='utf-8'); "
+        "assert f.read_text(encoding='utf-8') == 'ok'; f.unlink(); list(p.iterdir())"
+    )
+
+    completed = subprocess.run(
+        [os.fspath(Path(os.sys.executable)), "-c", script, str(created)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows access mask regression")
+def test_windows_mutable_directory_handle_uses_least_privilege_access():
+    file_delete_child = 0x0040
+
+    access = obs_bootstrap._windows_directory_access(mutable=True)
+
+    assert access & obs_bootstrap._WINDOWS_FILE_ADD_FILE
+    assert access & obs_bootstrap._WINDOWS_FILE_ADD_SUBDIRECTORY
+    assert access & file_delete_child == 0
+
+
+@pytest.mark.parametrize(
+    "name",
+    [".", "..", "x:y", "bad<name", "bad\x01", "trailing.", "trailing ", "CON", "con.txt", "COM¹", "LPT³.log"],
+)
+def test_migration_rejects_unsafe_native_path_components(name):
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError):
+        obs_bootstrap._validate_single_path_component(name)

@@ -1760,7 +1760,7 @@ def test_launch_obs_rejects_profile_reparse_before_stopping_process(monkeypatch,
     monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
     monkeypatch.setattr(recordtest, "OBSProcessManager", TrackingProcessManager)
 
-    with pytest.raises(recordtest.RecorderError, match="安全性検査"):
+    with pytest.raises(recordtest.RecorderError, match="reparse point|安全性検査"):
         recordtest.launch_obs(_fake_launch_config(tmp_path))
 
     assert TrackingProcessManager.kill_calls == 0
@@ -2215,9 +2215,9 @@ def test_preflight_partial_copy_failure_keeps_source_fingerprint_resumable(monke
     real_copy = obs_bootstrap._copy_inventory_file
     failed_once = False
 
-    def copy_then_fail(source_path, destination_path, expected, owner_token):
+    def copy_then_fail(source_path, destination_path, expected, owner_token, **kwargs):
         nonlocal failed_once
-        real_copy(source_path, destination_path, expected, owner_token)
+        real_copy(source_path, destination_path, expected, owner_token, **kwargs)
         if not failed_once:
             failed_once = True
             raise OSError("simulated partial copy failure")

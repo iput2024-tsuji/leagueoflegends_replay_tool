@@ -21,6 +21,28 @@
 - [ ] コピー中マーカーが示す旧配置を移動・削除した場合、別の候補を混在コピーせず、`obs-portable`全体の退避を含む復旧案内を表示する
 - [ ] 起動失敗時に利用者が対応可能なメッセージとログが残る
 
+### OBSコピー移行のtransaction耐久性（破棄可能な専用環境）
+
+実際のOBS配置とは別のテスト用source／destinationを用意し、sourceと外部directoryに変更検知用sentinelを置きます。各試行ではOS、filesystem、file数、総bytes、最大階層、開始・終了時刻を記録し、強制終了にはタスクマネージャーまたは`Stop-Process -Force`を使用します。
+
+- [ ] 同じsourceから異なる2つのdestinationへ同時に移行すると、後から開始した処理はsource lockで拒否され、journal・copy一時file・確定fileを作成しない
+- [ ] destination／sourceに残ったstale lockは再利用でき、0-byte lockは安全に初期化される一方、別processが保持中のlockはstale扱いしない
+- [ ] source lock取得直後にsourceへコピー中markerを作成した競合を検知し、destinationのコピーを開始しない
+- [ ] journal一時fileの確定直前と確定直後にprocessを強制終了し、再起動時に所有権を検証できる一時fileだけを回収または再開する
+- [ ] data copy一時fileの確定直前と確定直後にprocessを強制終了し、再起動後の全file hashがsourceと一致する
+- [ ] `finalize_pending`更新の直前と直後にprocessを強制終了し、再起動時にコピーを混在させず最終化だけを安全に再試行する
+- [ ] コピー中marker削除の直前と直後にprocessを強制終了し、再起動後は完了済みdestinationを再コピーせず利用できる
+- [ ] 各強制終了点でsourceと外部sentinelが不変であり、成功後は所有中marker／一時fileがなく、失敗時は復旧に必要なmarker／一時fileが保持される
+- [ ] markerなしの正当なjournal一時file1件だけはsource fingerprint一致時に回収でき、空・破損・所有者不一致・source不一致・複数・nestedの一時fileは変更せず復旧案内を表示する
+- [ ] destination配下のdirectoryを走査中にjunctionへ差し替えても外部treeを読まず、外部sentinelを変更せず、準備完了扱いにしない
+- [ ] `global.ini`など許可された最終化fileをread後からreplace直前に同名別fileへ差し替えると、別fileを上書きせずmarkerを維持して復旧案内を表示する
+- [ ] 許可された最終化fileと同名の大文字小文字違い、未知のfile、`temp_appdata`、lease情報を最終化処理が変更した場合は検知する
+- [ ] 非管理者のWindowsユーザーで移行先directoryを作成し、終了後に別processから作成・読み書き・一覧・renameできる
+- [ ] Windowsで保持中のnested directoryは外部からrename／junction差し替えできず、relative replace／unlink後も別processから正常に再openできる
+- [ ] 3,000～5,000 fileのsynthetic treeを移行し、file数・総bytes・経過時間・process handle数の開始値／最大値／終了値・source read倍率をPRへ記録する。時間の固定合否値は設けず、handleがfile数に比例して残存しないことと、source全体の反復読み込み回数が設計値を超えないことを確認する
+
+POSIXでの同一権限processによるpath差し替え防止は協調lockが前提です。Windowsでdirectory metadata flushがruntime／filesystemから提供されない場合も、各fileの`fsync`、journalの順序、再起動時検証で復旧できることを記録します。
+
 ## 設定画面
 
 - [ ] 保存先、FPS、解像度、容量制限、通知設定を読み書きできる

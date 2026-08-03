@@ -47,6 +47,14 @@ try:
         OBSMigrationInProgressError,
         OBSMigrationRecoveryRequiredError,
         OBSPathSafetyError,
+        _create_obs_settings_stop_evidence,
+        _execute_obs_config_transaction_with_one_replan,
+        _OBSSettingsStopEvidence,
+        _query_managed_obs_processes_before_settings_stop,
+        _stop_managed_obs_processes_for_settings,
+        _strictly_stop_managed_obs_processes,
+        _validate_obs_stop_query_snapshot,
+        _verify_no_obs_processes_for_settings_retry,
         execute_obs_config_transaction,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
@@ -65,7 +73,11 @@ try:
         revalidate_obs_config_file,
         validate_obs_installation_path,
     )
-    from .obs_process import OBSProcessManager
+    from .obs_process import (
+        OBSProcessInfo,
+        OBSProcessManager,
+        _obs_process_paths_equal,
+    )
     from .post_game_result import (
         PostGameResult,
         normalize_game_result_value,
@@ -114,6 +126,14 @@ except ImportError:
         OBSMigrationInProgressError,
         OBSMigrationRecoveryRequiredError,
         OBSPathSafetyError,
+        _create_obs_settings_stop_evidence,
+        _execute_obs_config_transaction_with_one_replan,
+        _OBSSettingsStopEvidence,
+        _query_managed_obs_processes_before_settings_stop,
+        _stop_managed_obs_processes_for_settings,
+        _strictly_stop_managed_obs_processes,
+        _validate_obs_stop_query_snapshot,
+        _verify_no_obs_processes_for_settings_retry,
         execute_obs_config_transaction,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
@@ -132,7 +152,7 @@ except ImportError:
         revalidate_obs_config_file,
         validate_obs_installation_path,
     )
-    from obs_process import OBSProcessManager
+    from obs_process import OBSProcessInfo, OBSProcessManager, _obs_process_paths_equal
     from post_game_result import (
         PostGameResult,
         normalize_game_result_value,
@@ -641,9 +661,17 @@ def migrate_legacy_managed_obs_if_needed(port: int | None = None, password: str 
                 pass
 
     def prepare_source(legacy_dir: Path) -> None:
-        _stop_managed_obs_tree_for_settings(
-            OBSProcessManager(legacy_dir, logger=LOGGER)
-        )
+        process_manager = OBSProcessManager(legacy_dir, logger=LOGGER)
+        try:
+            _strictly_stop_managed_obs_processes(
+                legacy_dir,
+                process_manager,
+            )
+        except Exception as exc:
+            raise RecorderError(
+                "コピー移行元OBSをstrict identityで安全に停止できません: "
+                f"{exc}"
+            ) from exc
 
     def finalize_destination(destination: Path) -> None:
         bootstrap_obs_dir(destination, port=port, password=password)
@@ -1111,11 +1139,12 @@ def _prepare_obs_startup_settings_plan(
     }
     for update in profiles.updates:
         if update.payload is None:
-            if str(update.snapshot.path).casefold() == user_path_key:
-                writes_by_path[user_path_key] = OBSConfigPlannedWrite(
+            writes_by_path[str(update.snapshot.path).casefold()] = (
+                OBSConfigPlannedWrite(
                     update.snapshot,
                     update.snapshot.payload or b"",
                 )
+            )
             continue
         writes_by_path[str(update.snapshot.path).casefold()] = OBSConfigPlannedWrite(
             update.snapshot,
@@ -1149,7 +1178,7 @@ def _execute_obs_startup_settings_transaction(
     recording_quality: str,
     recording_encoder: str,
     selected_encoder: OBSRecordingEncoderSelection | None,
-    before_commit: Callable[[], None] | None,
+    before_commit: Callable[[], _OBSSettingsStopEvidence] | None,
     run_before_commit_on_noop: bool = False,
 ) -> tuple[dict[str, Any], tuple[Path, ...]]:
     """Plan, stop and commit all startup settings under one mutation guard."""
@@ -1158,31 +1187,56 @@ def _execute_obs_startup_settings_transaction(
         bootstrapper.base_dir,
         before_settings_recovery=before_commit,
     ):
-        plan = _prepare_obs_startup_settings_plan(
-            bootstrapper,
-            port=port,
-            password=password,
-            record_dir=record_dir,
-            scale_type=scale_type,
-            recording_quality=recording_quality,
-            recording_encoder=recording_encoder,
-            selected_encoder=selected_encoder,
-        )
+        def prepare() -> _OBSStartupSettingsPlan:
+            return _prepare_obs_startup_settings_plan(
+                bootstrapper,
+                port=port,
+                password=password,
+                record_dir=record_dir,
+                scale_type=scale_type,
+                recording_quality=recording_quality,
+                recording_encoder=recording_encoder,
+                selected_encoder=selected_encoder,
+            )
 
-        def validate() -> None:
+        def validate(candidate: _OBSStartupSettingsPlan) -> None:
             bootstrapper.validate_layout(include_websocket=True)
-            _revalidate_obs_recording_profile_layout(plan.profiles.layout)
+            _revalidate_obs_recording_profile_layout(candidate.profiles.layout)
+
+        if before_commit is None:
+            plan = prepare()
+            execute_obs_config_transaction(
+                plan.transaction,
+                validate_plan=lambda: validate(plan),
+            )
+        else:
+            plan = _execute_obs_config_transaction_with_one_replan(
+                prepare,
+                lambda candidate: candidate.transaction,
+                before_commit=before_commit,
+                retry_precommit_check=lambda: (
+                    _verify_no_obs_processes_for_settings_retry(
+                        bootstrapper.base_dir,
+                        bootstrapper.process_manager,
+                    )
+                ),
+                validate_plan_for=validate,
+                validation_files_for=lambda candidate: (
+                    *candidate.profiles.layout.validation_files,
+                    candidate.profiles.layout.user_file,
+                ),
+                validation_directories_for=lambda candidate: (
+                    candidate.profiles.layout.profiles_root,
+                    *candidate.profiles.layout.profile_directories,
+                    *candidate.profiles.layout.existing_profile_directories,
+                ),
+                run_before_commit_on_noop=run_before_commit_on_noop,
+            )
 
         changed_by_path = {
             str(write.snapshot.path).casefold(): write.changed
             for write in plan.transaction.writes
         }
-        execute_obs_config_transaction(
-            plan.transaction,
-            before_commit=before_commit,
-            validate_plan=validate,
-            run_before_commit_on_noop=run_before_commit_on_noop,
-        )
         bootstrap = plan.bootstrap
         websocket_result = (
             False,
@@ -1249,25 +1303,72 @@ def ensure_obs_recording_profile_ini(
 ) -> tuple[Path, ...]:
     process_manager = OBSProcessManager(base_dir, logger=LOGGER)
 
-    def stop_for_settings() -> None:
-        _stop_managed_obs_tree_for_settings(process_manager)
+    def stop_for_settings() -> _OBSSettingsStopEvidence:
+        return _stop_managed_obs_tree_for_settings(process_manager)
 
     with obs_config_mutation_guard(
         base_dir,
         before_settings_recovery=stop_for_settings,
     ):
-        layout = preflight_obs_recording_profile_ini(base_dir)
-        plan = _prepare_obs_recording_profile_update(
-            layout,
-            record_dir=record_dir,
-            scale_type=scale_type,
-            recording_quality=recording_quality,
-            recording_encoder=recording_encoder,
-            selected_encoder=selected_encoder,
-        )
-        return _apply_obs_recording_profile_update(
-            plan,
+        def prepare() -> _OBSRecordingProfileUpdatePlan:
+            layout = preflight_obs_recording_profile_ini(base_dir)
+            return _prepare_obs_recording_profile_update(
+                layout,
+                record_dir=record_dir,
+                scale_type=scale_type,
+                recording_quality=recording_quality,
+                recording_encoder=recording_encoder,
+                selected_encoder=selected_encoder,
+            )
+
+        def transaction_for(
+            candidate: _OBSRecordingProfileUpdatePlan,
+        ) -> OBSConfigTransactionPlan:
+            return OBSConfigTransactionPlan(
+                base_dir=candidate.layout.base_dir,
+                directories=(
+                    candidate.layout.profiles_root,
+                    *candidate.layout.profile_directories,
+                    *(update.snapshot.path.parent for update in candidate.updates),
+                ),
+                writes=tuple(
+                    OBSConfigPlannedWrite(
+                        update.snapshot,
+                        update.payload
+                        if update.payload is not None
+                        else (update.snapshot.payload or b""),
+                    )
+                    for update in candidate.updates
+                ),
+            )
+
+        plan = _execute_obs_config_transaction_with_one_replan(
+            prepare,
+            transaction_for,
             before_commit=stop_for_settings,
+            retry_precommit_check=lambda: (
+                _verify_no_obs_processes_for_settings_retry(
+                    lexical_absolute_path(base_dir),
+                    process_manager,
+                )
+            ),
+            validate_plan_for=lambda candidate: (
+                _revalidate_obs_recording_profile_layout(candidate.layout)
+            ),
+            validation_files_for=lambda candidate: (
+                *candidate.layout.validation_files,
+                candidate.layout.user_file,
+            ),
+            validation_directories_for=lambda candidate: (
+                candidate.layout.profiles_root,
+                *candidate.layout.profile_directories,
+                *candidate.layout.existing_profile_directories,
+            ),
+        )
+        return tuple(
+            lexical_absolute_path(update.snapshot.path)
+            for update in plan.updates
+            if update.payload is not None
         )
 
 
@@ -1295,15 +1396,99 @@ def _wait_for_obs_startup_encoder_selection(
         time.sleep(DEFAULT_OBS_ENCODER_LOG_POLL_SEC)
 
 
+def _ensure_started_obs_handle_stopped(
+    process_manager: OBSProcessManager,
+    process: subprocess.Popen[Any],
+) -> None:
+    """Stop only the process represented by the Popen handle, or fail."""
+
+    try:
+        if process.poll() is not None:
+            return
+    except Exception:
+        pass
+    manager_error: Exception | None = None
+    try:
+        process_manager.terminate_process(process)
+    except Exception as exc:
+        manager_error = exc
+    try:
+        stopped = process.poll() is not None
+    except Exception:
+        stopped = False
+    if not stopped:
+        try:
+            process.kill()
+            process.wait(timeout=2)
+        except Exception as exc:
+            if manager_error is None:
+                manager_error = exc
+        try:
+            stopped = process.poll() is not None
+        except Exception:
+            stopped = False
+    if not stopped:
+        raise RecorderError(
+            "起動済みOBSのprocess handleを安全に停止できませんでした。"
+        ) from manager_error
+
+
+def _capture_started_obs_process_identity(
+    process_manager: OBSProcessManager,
+    process: subprocess.Popen[Any],
+) -> OBSProcessInfo:
+    """Bind a newly started Popen handle to one complete strict identity."""
+
+    try:
+        snapshot = process_manager.query_obs_processes_strict()
+        processes = _validate_obs_stop_query_snapshot(snapshot, label="起動直後")
+        popen_identity = process_manager.query_popen_process_identity(process)
+        expected_executable = lexical_absolute_path(process_manager.obs_exe)
+        if len(processes) != 1:
+            raise OBSPathSafetyError(
+                "起動直後strict queryが新規OBSの1件だけではありません。"
+            )
+        identity = processes[0]
+        if (
+            identity.pid != int(process.pid)
+            or identity.executable_path is None
+            or not _obs_process_paths_equal(
+                identity.executable_path,
+                expected_executable,
+            )
+            or identity != popen_identity
+            or process.poll() is not None
+        ):
+            raise OBSPathSafetyError(
+                "起動直後strict queryの完全identityがPopen handleと一致しません。"
+            )
+        return identity
+    except Exception as exc:
+        try:
+            _ensure_started_obs_handle_stopped(process_manager, process)
+        except Exception as cleanup_exc:
+            raise RecorderError(
+                "起動直後のOBS strict identity取得に失敗し、"
+                "起動済みprocessの安全な後始末も完了できませんでした。"
+            ) from cleanup_exc
+        raise RecorderError(
+            f"起動直後のOBS strict identityを確立できません: {exc}"
+        ) from exc
+
+
 def _start_hidden_obs_and_verify_portable(
     process_manager: OBSProcessManager,
     *,
     obs_dir_abs: str,
     obs_exe: str,
-) -> tuple[subprocess.Popen[Any], float]:
+) -> tuple[subprocess.Popen[Any], float, OBSProcessInfo]:
     LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
     started_at = time.time()
     process = process_manager.start_obs(env=process_manager.isolated_env(), hidden=True)
+    process_identity = _capture_started_obs_process_identity(
+        process_manager,
+        process,
+    )
     hidden_windows = process_manager.hide_main_windows(process, timeout_sec=3.0)
     if hidden_windows:
         LOGGER.info("OBSウィンドウを非表示にしました: pid=%s windows=%s", process.pid, hidden_windows)
@@ -1321,7 +1506,7 @@ def _start_hidden_obs_and_verify_portable(
         )
     if portable_mode is None:
         LOGGER.warning("OBSログから Portable mode を確認できませんでした: %s", obs_dir_abs)
-    return process, started_at
+    return process, started_at, process_identity
 
 
 class OBSBootstrapper(SharedOBSBootstrapper):
@@ -2789,15 +2974,19 @@ def _require_no_unmanaged_obs_for_settings(process_manager: OBSProcessManager) -
     )
 
 
-def _stop_managed_obs_tree_for_settings(process_manager: OBSProcessManager) -> None:
-    _require_no_unmanaged_obs_for_settings(process_manager)
-    process_manager.kill_stale_managed_processes()
-    if process_manager.has_managed_process():
-        raise RecorderError(
-            "管理対象のポータブルOBSをすべて停止できませんでした。"
-            "OBSを手動終了してから再実行してください。"
+def _stop_managed_obs_tree_for_settings(
+    process_manager: OBSProcessManager,
+) -> _OBSSettingsStopEvidence:
+    try:
+        return _stop_managed_obs_processes_for_settings(
+            process_manager.obs_dir,
+            process_manager,
         )
-    _require_no_unmanaged_obs_for_settings(process_manager)
+    except Exception as exc:
+        raise RecorderError(
+            "管理対象のポータブルOBSをstrict queryで安全に停止できませんでした。"
+            f"OBSを手動終了してから再実行してください: {exc}"
+        ) from exc
 
 
 def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
@@ -2870,10 +3059,10 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         # between planning and process shutdown.
         _require_no_unmanaged_obs_for_settings(process_manager)
 
-        def stop_managed_obs_for_settings() -> None:
+        def stop_managed_obs_for_settings() -> _OBSSettingsStopEvidence:
             # OBS reads startup INI files at launch and may flush them on exit.
             # The transaction revalidates every snapshot after this callback.
-            _stop_managed_obs_tree_for_settings(process_manager)
+            return _stop_managed_obs_tree_for_settings(process_manager)
 
         bootstrap_result, changed_profiles = _execute_obs_startup_settings_transaction(
             bootstrapper,
@@ -2916,10 +3105,12 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     ensure_obs_websocket_port_free(config)
 
     try:
-        process, started_at = _start_hidden_obs_and_verify_portable(
-            process_manager,
-            obs_dir_abs=obs_dir_abs,
-            obs_exe=obs_exe,
+        process, started_at, started_process_identity = (
+            _start_hidden_obs_and_verify_portable(
+                process_manager,
+                obs_dir_abs=obs_dir_abs,
+                obs_exe=obs_exe,
+            )
         )
         requested_encoder = str(config.obs.recording_encoder or DEFAULT_OBS_RECORDING_ENCODER).strip().lower()
         if requested_encoder == "auto" and not startup_encoder.hardware:
@@ -2934,12 +3125,85 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                     "OBS起動後にGPUエンコーダを検出したため、録画設定反映のためOBSを再起動します。"
                 )
 
-                def stop_obs_for_gpu_settings() -> None:
-                    _require_no_unmanaged_obs_for_settings(process_manager)
+                def stop_obs_for_gpu_settings() -> _OBSSettingsStopEvidence:
                     try:
-                        process_manager.terminate_process(process)
-                    finally:
-                        _stop_managed_obs_tree_for_settings(process_manager)
+                        before, managed_before = (
+                            _query_managed_obs_processes_before_settings_stop(
+                                obs_dir_abs,
+                                process_manager,
+                            )
+                        )
+                        if process.poll() is not None:
+                            raise OBSPathSafetyError(
+                                "GPU設定再起動対象のPopen handleは既に終了しています。"
+                            )
+                        known_matches = tuple(
+                            item for item in managed_before
+                            if item == started_process_identity
+                        )
+                        if len(known_matches) != 1:
+                            raise OBSPathSafetyError(
+                                "GPU設定再起動対象が停止前strict queryと完全一致しません。"
+                            )
+                        known_process = known_matches[0]
+                        remaining_expected = tuple(
+                            item for item in managed_before
+                            if item != known_process
+                        )
+                        direct_error: Exception | None = None
+                        try:
+                            process_manager.terminate_process(process)
+                        except Exception as exc:
+                            direct_error = exc
+                        try:
+                            direct_explained = process.poll() is not None
+                        except Exception:
+                            direct_explained = False
+
+                        cleanup_expected = (
+                            remaining_expected
+                            if direct_explained
+                            else managed_before
+                        )
+                        cleanup_result = (
+                            process_manager.terminate_expected_obs_processes_strict(
+                                cleanup_expected
+                            )
+                        )
+                        if cleanup_result.signaled_processes != cleanup_expected:
+                            raise OBSPathSafetyError(
+                                "GPU設定再起動のstrict停止identity集合が一致しません。"
+                            )
+                        if (
+                            direct_explained
+                            and known_process.pid
+                            in {
+                                item.pid
+                                for item in cleanup_result.signaled_processes
+                            }
+                        ):
+                            raise OBSPathSafetyError(
+                                "終了済みknown PIDがstrict停止結果へ再出現しました。"
+                            )
+                        if direct_error is not None or not direct_explained:
+                            raise OBSPathSafetyError(
+                                "GPU設定再起動対象の元Popen handle終了を説明できません。"
+                            ) from direct_error
+                        return _create_obs_settings_stop_evidence(
+                            obs_dir_abs,
+                            before=before,
+                            after=cleanup_result.after,
+                            killed_pids=tuple(
+                                item.pid
+                                for item in cleanup_result.signaled_processes
+                            ),
+                            known_managed_process=known_process,
+                        )
+                    except Exception as exc:
+                        raise RecorderError(
+                            "GPU設定反映前の管理OBS停止証跡を確立できません: "
+                            f"{exc}"
+                        ) from exc
 
                 try:
                     _bootstrap_result, changed_profiles = (
@@ -2957,6 +3221,16 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                         )
                     )
                 except Exception as e:
+                    try:
+                        _ensure_started_obs_handle_stopped(
+                            process_manager,
+                            process,
+                        )
+                    except Exception as cleanup_exc:
+                        raise RecorderError(
+                            "OBS録画プロファイルの再起動transactionに失敗し、"
+                            "起動済みOBSの安全な後始末も完了できませんでした。"
+                        ) from cleanup_exc
                     raise RecorderError(
                         "OBS録画プロファイルの再起動transactionに失敗しました。"
                         f"OBSを停止したまま再試行してください: {e}"
@@ -2967,10 +3241,12 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                         ", ".join(str(path) for path in changed_profiles),
                     )
                 LOGGER.info("OBS起動時録画エンコーダ: %s", _obs_encoder_log_label(detected_encoder))
-                process, _started_at = _start_hidden_obs_and_verify_portable(
-                    process_manager,
-                    obs_dir_abs=obs_dir_abs,
-                    obs_exe=obs_exe,
+                process, _started_at, _started_process_identity = (
+                    _start_hidden_obs_and_verify_portable(
+                        process_manager,
+                        obs_dir_abs=obs_dir_abs,
+                        obs_exe=obs_exe,
+                    )
                 )
             else:
                 LOGGER.info("OBS起動後にGPUエンコーダが見つからないためx264で録画します。")

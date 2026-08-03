@@ -72,11 +72,17 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 - [ ] 通常起動、GPU検出後の再起動、「OBS設定を構成・再検査」、`scripts/setup_env.py`を同時に開始しても、同じ管理rootでは1処理だけがlockを取得し、後続処理が設定やコピーを開始しない
 - [ ] 設定がすでにdesiredと一致するno-opでも、明示的な起動・修復操作では管理対象OBSを停止し、全processの終了確認後にだけ続行する
 - [ ] `preparing` journal確定の直前／直後、各backup／desired一時fileの書き込み途中／直後で強制終了し、targetが不変のまま次回実行で所有中一時fileとjournalだけを清掃できる
-- [ ] 全一時file準備後のOBS停止でINIをflushさせ、計画時snapshotとの差を検知してflush後のbytesを保持し、他targetを一つも確定しない
+- [ ] 全一時file準備後のOBS停止で既存の`global.ini`、`user.ini`、WebSocket設定、profile `basic.ini`へ未知keyを含む実flushを発生させ、同じmutation guard／root lease内の一度だけのfresh planで未知keyを保持してdesiredを確定する。retryでOBSを再停止・追加killしない
+- [ ] 初回planがno-opの状態から停止flushで既知設定を変更し、fresh plan由来のchanged flag、変更profile path、画面／ログの更新結果が変更ありになる。fresh planもno-opの場合でもcommit直前のstrict zero-process queryを省略しない
+- [ ] retry準備中にfile hash／identity／security、rootまたはancestor directory identity／security、portable marker、profile直下のname／kind／identity、target／directory／validation setのいずれかを変え、flush後bytesを上書きせずfail-closeする
+- [ ] 欠落targetを含むplan、既存だが修正予定のportable markerを含むplan、停止中の対象file作成／削除、観測・計画入力範囲内の未知file／path／profile topology変更では自動再計画せず、停止後の外部変更を保持して他targetを確定しない
+- [ ] retry直前のstrict process query失敗、管理／非管理OBSの再出現、fresh prepare失敗、二度目のconflictをそれぞれ発生させ、二度目のstop／kill／retryなしでfail-closeし、WebSocket passwordが例外、cause chain、journal、ログへ残らない
 - [ ] `committing`更新の直前／直後、各target確定の直前／直後で強制終了し、次回実行で全targetが混在せずoriginalへrollbackされる
 - [ ] `committed`更新の直前はoriginalへrollbackされ、更新直後またはcleanup途中の強制終了では全desiredを保持して次回実行で一時fileとjournalだけを清掃する
 - [ ] `committed` journalのatomic replace後に親directory flushを失敗させ、同じprocessではbackup／markerを清掃せず、次回実行が実際に残った`committing`／`committed` phaseに従ってrollbackまたはcleanupする
 - [ ] 管理対象外OBSが停止前または停止直後に存在する場合、管理対象processを終了・設定を確定せず案内を表示する。管理対象OBSのkill APIが成功扱いでもprocessが残る場合は確定しない
+- [ ] 通常／`preparing`復旧後の設定commitはstop 1回、`committing`／`committed`復旧後のcommitは復旧stopとcommit stopの計2回、停止flushからのretryは追加stop／kill 0回になる
+- [ ] GPU検出後の再起動では起動直後にPID、絶対executable path、creation FILETIMEをPopen handleへ固定し、停止前strict snapshotとの完全一致とhandle生存を確認する。既知processは元handleの終了、残りの管理processは`OpenProcess`したhandleを最終zero確認後まで保持したidentity付きstrict signal結果で説明し、同じPIDが異なるcreation FILETIMEで再出現した場合はreplacementをsignalせず失敗する。terminate失敗時も安全に特定できる残りtreeを停止するがevidenceは発行せず、flush再計画が成功してもterminateとsignalを繰り返さない
 - [ ] 計画時に未変更だった既存profileの`basic.ini`を停止中に変更した場合と、計画時に欠落していた`basic.ini`を停止中に作成した場合を検知し、変更されたbytesを保持して他targetを確定しない
 - [ ] 別targetを更新するtransactionで、計画時に未変更だった`global.ini`、`user.ini`、WebSocket設定を停止中に変更した場合も検知し、他targetを確定しない
 - [ ] `user.ini`の独自section／keyを保持し、bootstrap設定と管理profile選択が同じoriginal snapshotへ合成される。bootstrap preflight後の外部変更は再読込で混在させず停止前に拒否する

@@ -15,6 +15,7 @@ from pathlib import Path
 from src.app_paths import get_app_root, get_user_data_root
 from src.obs_bootstrap import (
     OBSBootstrapper,
+    _strictly_stop_managed_obs_processes,
     has_pending_obs_copy_transaction,
     has_pending_obs_settings_transaction,
     lexical_absolute_path,
@@ -107,19 +108,16 @@ def bootstrap_obs_portable_config(obs_dir: Path = OBS_PORTABLE_DIR) -> None:
 
 
 def _stop_obs_tree_for_settings_recovery(process_manager: OBSProcessManager) -> None:
-    if process_manager.unmanaged_processes():
-        raise ManualSetupRequiredError(
-            "管理対象外のOBSを終了してから設定復旧を再試行してください。"
+    try:
+        _strictly_stop_managed_obs_processes(
+            process_manager.obs_dir,
+            process_manager,
         )
-    process_manager.kill_stale_managed_processes()
-    if process_manager.has_managed_process():
+    except Exception as exc:
         raise ManualSetupRequiredError(
-            "管理対象OBSを停止できません。手動終了してから再試行してください。"
-        )
-    if process_manager.unmanaged_processes():
-        raise ManualSetupRequiredError(
-            "設定復旧中に別のOBSが起動しました。終了してから再試行してください。"
-        )
+            "管理対象OBSをstrict identityで安全に停止できません。"
+            f"全OBSを手動終了してから再試行してください: {exc}"
+        ) from exc
 
 
 def migrate_legacy_obs_portable(progress_cb: ProgressCallback | None = None) -> bool:

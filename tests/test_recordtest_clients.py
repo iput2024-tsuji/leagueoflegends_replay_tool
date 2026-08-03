@@ -5,7 +5,7 @@ import multiprocessing
 import os
 import shutil
 import subprocess
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +15,26 @@ import pytest
 
 from src import obs_bootstrap, recordtest
 from src.lcu_client import LCUConnectionInfo
+
+
+def _managed_settings_stop_evidence(base_dir: Path):
+    process = obs_bootstrap.OBSProcessInfo(
+        pid=4312,
+        executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+        creation_time=10.0,
+    )
+    return obs_bootstrap._create_obs_settings_stop_evidence(
+        base_dir,
+        before=obs_bootstrap.OBSProcessQuerySnapshot(
+            processes=(process,),
+            queried_at=100.0,
+        ),
+        after=obs_bootstrap.OBSProcessQuerySnapshot(
+            processes=(),
+            queried_at=101.0,
+        ),
+        killed_pids=(process.pid,),
+    )
 
 
 def _create_directory_link(link: Path, target: Path) -> None:
@@ -758,11 +778,20 @@ def test_recording_profile_rejects_unmanaged_obs_before_kill_or_commit(
     class UnmanagedProcessManager:
         kill_calls = 0
 
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, obs_dir_arg, **_kwargs):
+            self.obs_dir = Path(obs_dir_arg).absolute()
 
-        def unmanaged_processes(self):
-            return [SimpleNamespace(pid=99, executable_path=tmp_path / "obs64.exe")]
+        def query_obs_processes_strict(self):
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(
+                    obs_bootstrap.OBSProcessInfo(
+                        pid=99,
+                        executable_path=(tmp_path / "regular-obs" / "obs64.exe").absolute(),
+                        creation_time=10.0,
+                    ),
+                ),
+                queried_at=100.0,
+            )
 
         def kill_stale_managed_processes(self, timeout_sec=3.0):
             type(self).kill_calls += 1
@@ -802,15 +831,32 @@ def test_recording_profile_rejects_managed_obs_that_survives_kill(
     class StubbornProcessManager:
         kill_calls = 0
 
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, obs_dir_arg, **_kwargs):
+            self.obs_dir = Path(obs_dir_arg).absolute()
+            self.query_calls = 0
+            self.process = obs_bootstrap.OBSProcessInfo(
+                pid=4312,
+                executable_path=self.obs_dir / "bin" / "64bit" / "obs64.exe",
+                creation_time=10.0,
+            )
 
-        def unmanaged_processes(self):
-            return []
+        def query_obs_processes_strict(self):
+            self.query_calls += 1
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(self.process,),
+                queried_at=100.0 + self.query_calls,
+            )
 
         def kill_stale_managed_processes(self, timeout_sec=3.0):
             type(self).kill_calls += 1
-            return []
+            return [self.process.pid]
+
+        def terminate_expected_obs_processes_strict(self, expected):
+            self.kill_stale_managed_processes()
+            return obs_bootstrap.OBSStrictTerminationResult(
+                expected,
+                self.query_obs_processes_strict(),
+            )
 
         def has_managed_process(self):
             return True
@@ -834,6 +880,88 @@ def test_recording_profile_rejects_managed_obs_that_survives_kill(
 
     assert StubbornProcessManager.kill_calls == 1
     assert not profile_ini.exists()
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
+
+
+def test_recording_profile_replans_real_obs_flush_and_preserves_unknown_key(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+
+    class FlushingProcessManager:
+        active = False
+        flush_enabled = False
+        kill_calls = 0
+        query_calls = 0
+
+        def __init__(self, obs_dir_arg, **_kwargs):
+            self.obs_dir = Path(obs_dir_arg).absolute()
+            self.process = obs_bootstrap.OBSProcessInfo(
+                pid=4312,
+                executable_path=self.obs_dir / "bin" / "64bit" / "obs64.exe",
+                creation_time=10.0,
+            )
+
+        def query_obs_processes_strict(self):
+            type(self).query_calls += 1
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(self.process,) if type(self).active else (),
+                queried_at=100.0 + type(self).query_calls,
+            )
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            type(self).kill_calls += 1
+            if type(self).flush_enabled:
+                profile_ini.write_bytes(
+                    b"[General]\nName=external-update\n"
+                    b"ExternalAfterStop=keep\n"
+                )
+            killed = [self.process.pid] if type(self).active else []
+            type(self).active = False
+            return killed
+
+        def terminate_expected_obs_processes_strict(self, expected):
+            killed = set(self.kill_stale_managed_processes())
+            return obs_bootstrap.OBSStrictTerminationResult(
+                tuple(item for item in expected if item.pid in killed),
+                self.query_obs_processes_strict(),
+            )
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", FlushingProcessManager)
+    record_dir = tmp_path / "recordings"
+    recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=record_dir)
+    FlushingProcessManager.active = True
+    FlushingProcessManager.flush_enabled = True
+
+    changed_paths = recordtest.ensure_obs_recording_profile_ini(
+        obs_dir,
+        record_dir=record_dir,
+    )
+
+    rendered = profile_ini.read_text(encoding="utf-8")
+    assert changed_paths == (profile_ini,)
+    assert "Name=LoLReplayTool" in rendered
+    assert "ExternalAfterStop=keep" in rendered
+    assert FlushingProcessManager.kill_calls == 2
+    assert FlushingProcessManager.query_calls == 5
+
+    FlushingProcessManager.flush_enabled = False
+    assert recordtest.ensure_obs_recording_profile_ini(
+        obs_dir,
+        record_dir=record_dir,
+    ) == ()
+    assert FlushingProcessManager.kill_calls == 3
+    assert FlushingProcessManager.query_calls == 7
     assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
 
 
@@ -932,9 +1060,25 @@ def test_startup_settings_reject_user_ini_change_between_bootstrap_and_profile_p
     assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
 
 
-def test_startup_settings_revalidate_unchanged_profile_after_stop(tmp_path):
+def test_startup_settings_replans_profile_flush_and_returns_fresh_paths(tmp_path):
     obs_dir = (tmp_path / "obs-portable").absolute()
-    bootstrapper = obs_bootstrap.OBSBootstrapper(obs_dir)
+
+    class RetryQueryManager:
+        def __init__(self):
+            self.query_calls = 0
+
+        def query_obs_processes_strict(self):
+            self.query_calls += 1
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(),
+                queried_at=102.0 + self.query_calls,
+            )
+
+    retry_manager = RetryQueryManager()
+    bootstrapper = obs_bootstrap.OBSBootstrapper(
+        obs_dir,
+        process_manager=retry_manager,
+    )
     transaction_kwargs = {
         "port": 4455,
         "password": "secret",
@@ -947,7 +1091,7 @@ def test_startup_settings_revalidate_unchanged_profile_after_stop(tmp_path):
     recordtest._execute_obs_startup_settings_transaction(
         bootstrapper,
         **transaction_kwargs,
-        before_commit=lambda: None,
+        before_commit=None,
     )
     profile_ini = (
         obs_dir
@@ -959,21 +1103,34 @@ def test_startup_settings_revalidate_unchanged_profile_after_stop(tmp_path):
         / "basic.ini"
     )
     global_ini = obs_bootstrap.get_obs_global_ini_path(obs_dir)
-    global_before = global_ini.read_bytes()
 
-    def simulate_obs_profile_flush() -> None:
-        profile_ini.write_bytes(b"[General]\nName=external-update\n")
-
-    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="内容が変化"):
-        recordtest._execute_obs_startup_settings_transaction(
-            bootstrapper,
-            **transaction_kwargs,
-            before_commit=simulate_obs_profile_flush,
-            run_before_commit_on_noop=True,
+    def simulate_obs_profile_flush():
+        global_ini.write_bytes(
+            b"[General]\nFirstRun=false\nExternalGlobalAfterStop=keep\n\n"
+            b"[BasicWindow]\nSysTrayEnabled=false\n"
+            b"SysTrayWhenStarted=false\nSysTrayMinimizeToTray=false\n"
         )
+        profile_ini.write_bytes(
+            b"[General]\nName=external-update\nExternalAfterStop=keep\n"
+        )
+        return _managed_settings_stop_evidence(obs_dir)
 
-    assert profile_ini.read_bytes() == b"[General]\nName=external-update\n"
-    assert global_ini.read_bytes() == global_before
+    result, changed_paths = recordtest._execute_obs_startup_settings_transaction(
+        bootstrapper,
+        **transaction_kwargs,
+        before_commit=simulate_obs_profile_flush,
+        run_before_commit_on_noop=True,
+    )
+
+    rendered = profile_ini.read_text(encoding="utf-8")
+    global_rendered = global_ini.read_text(encoding="utf-8")
+    assert result["global_ini_changed"] is True
+    assert changed_paths == (profile_ini,)
+    assert "Name=LoLReplayTool" in rendered
+    assert "ExternalAfterStop=keep" in rendered
+    assert "FirstRun=true" in global_rendered
+    assert "ExternalGlobalAfterStop=keep" in global_rendered
+    assert retry_manager.query_calls == 1
     assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
 
 
@@ -994,7 +1151,7 @@ def test_startup_settings_reject_new_basic_ini_in_existing_profile_after_stop(
     recordtest._execute_obs_startup_settings_transaction(
         bootstrapper,
         **transaction_kwargs,
-        before_commit=lambda: None,
+        before_commit=None,
     )
     late_profile = (
         obs_dir
@@ -1013,10 +1170,11 @@ def test_startup_settings_reject_new_basic_ini_in_existing_profile_after_stop(
     )
     managed_before = managed_profile.read_bytes()
 
-    def simulate_obs_creating_profile_file() -> None:
+    def simulate_obs_creating_profile_file():
         late_profile.write_bytes(b"[General]\nName=created-after-plan\n")
+        return _managed_settings_stop_evidence(obs_dir)
 
-    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="作成されました"):
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="存在状態"):
         recordtest._execute_obs_startup_settings_transaction(
             bootstrapper,
             **transaction_kwargs,
@@ -1953,11 +2111,32 @@ def _fake_launch_config(root, recording_encoder="auto"):
 
 
 def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_encoder_kinds=()):
+    class FakePopen:
+        def __init__(self, pid, identity):
+            self.pid = pid
+            self.identity = identity
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
     class FakeProcessManager:
         start_count = 0
         kill_count = 0
         encoder_log_calls = 0
         terminated_pids = []
+        strict_signal_pids = []
+        active_processes = {}
+        process_handles = {}
+        query_clock = 100.0
 
         def __init__(self, obs_dir_arg, logger=None):
             self.obs_dir = Path(obs_dir_arg)
@@ -1965,7 +2144,39 @@ def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_enco
 
         def kill_stale_managed_processes(self, timeout_sec=3.0):
             type(self).kill_count += 1
-            return []
+            killed = sorted(type(self).active_processes)
+            type(self).active_processes.clear()
+            return killed
+
+        def terminate_expected_obs_processes_strict(self, expected):
+            type(self).kill_count += 1
+            current = tuple(type(self).active_processes.values())
+            if {item.pid: item for item in current} != {
+                item.pid: item for item in expected
+            }:
+                raise obs_bootstrap.OBSProcessQueryError(
+                    "strict fake identity mismatch"
+                )
+            type(self).strict_signal_pids.extend(item.pid for item in expected)
+            for item in expected:
+                type(self).active_processes.pop(item.pid, None)
+                process = type(self).process_handles.get(item.pid)
+                if process is not None:
+                    process.returncode = 0
+            return obs_bootstrap.OBSStrictTerminationResult(
+                expected,
+                self.query_obs_processes_strict(),
+            )
+
+        def query_obs_processes_strict(self):
+            type(self).query_clock += 1.0
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=tuple(type(self).active_processes.values()),
+                queried_at=type(self).query_clock,
+            )
+
+        def query_popen_process_identity(self, process):
+            return process.identity
 
         def has_managed_process(self):
             return False
@@ -1978,7 +2189,19 @@ def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_enco
 
         def start_obs(self, *args, **kwargs):
             type(self).start_count += 1
-            return SimpleNamespace(pid=100 + type(self).start_count, poll=lambda: None)
+            pid = 100 + type(self).start_count
+            identity = obs_bootstrap.OBSProcessInfo(
+                pid=pid,
+                executable_path=self.obs_exe.absolute(),
+                creation_time=1000.0 + pid,
+                creation_time_filetime=(
+                    116_444_736_000_000_000 + (1000 + pid) * 10_000_000
+                ),
+            )
+            type(self).active_processes[pid] = identity
+            process = FakePopen(pid, identity)
+            type(self).process_handles[pid] = process
+            return process
 
         def hide_main_windows(self, *args, **kwargs):
             return 0
@@ -1994,6 +2217,9 @@ def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_enco
 
         def terminate_process(self, process, timeout_sec=3.0):
             type(self).terminated_pids.append(process.pid)
+            process.returncode = 0
+            if type(self).active_processes.get(process.pid) == process.identity:
+                type(self).active_processes.pop(process.pid, None)
 
     monkeypatch.setattr(recordtest, "OBSProcessManager", FakeProcessManager)
     monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: False)
@@ -2005,6 +2231,7 @@ def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_enco
     ("stale_phase", "expected_payload", "expected_kills"),
     [
         ("preparing", b"original", 1),
+        ("committing", b"original", 2),
         ("committed", b"desired", 2),
     ],
 )
@@ -2049,6 +2276,23 @@ def test_launch_obs_recovers_pending_settings_without_copy_classification(
         with pytest.raises(SystemExit, match="stale preparing"):
             obs_bootstrap.execute_obs_config_transaction(plan)
         monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", real_write)
+    elif stale_phase == "committing":
+        real_journal = obs_bootstrap._write_settings_journal
+
+        def crash_after_committing(base, owner, phase, writes):
+            result = real_journal(base, owner, phase, writes)
+            if phase == "committing":
+                raise SystemExit("stale committing")
+            return result
+
+        monkeypatch.setattr(
+            obs_bootstrap,
+            "_write_settings_journal",
+            crash_after_committing,
+        )
+        with pytest.raises(SystemExit, match="stale committing"):
+            obs_bootstrap.execute_obs_config_transaction(plan)
+        monkeypatch.setattr(obs_bootstrap, "_write_settings_journal", real_journal)
     else:
         real_journal = obs_bootstrap._write_settings_journal
 
@@ -2131,7 +2375,7 @@ def test_launch_obs_rejects_profile_reparse_before_stopping_process(monkeypatch,
     assert sentinel.read_bytes() == sentinel_before
 
 
-def test_launch_obs_gpu_repair_preflights_before_terminating_process(monkeypatch, tmp_path):
+def test_launch_obs_gpu_plan_failure_cleans_started_process(monkeypatch, tmp_path):
     obs_dir = (tmp_path / "obs-portable").resolve()
     obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
     obs_exe.parent.mkdir(parents=True)
@@ -2159,7 +2403,160 @@ def test_launch_obs_gpu_repair_preflights_before_terminating_process(monkeypatch
 
     assert preflight_calls == 2
     assert manager.start_count == 1
-    assert manager.terminated_pids == []
+    assert manager.terminated_pids == [101]
+    assert manager.active_processes == {}
+
+
+def test_launch_obs_gpu_prequery_failure_cleans_started_process(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    real_query = recordtest._query_managed_obs_processes_before_settings_stop
+
+    def fail_gpu_prequery(base_dir, process_manager):
+        if manager.start_count == 1:
+            raise obs_bootstrap.OBSProcessQueryError("GPU pre-query failed")
+        return real_query(base_dir, process_manager)
+
+    monkeypatch.setattr(
+        recordtest,
+        "_query_managed_obs_processes_before_settings_stop",
+        fail_gpu_prequery,
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="再起動transaction"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert manager.strict_signal_pids == []
+    assert manager.active_processes == {}
+
+
+def test_launch_obs_gpu_strict_cleanup_failure_leaves_started_handle_stopped(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    real_terminate = manager.terminate_expected_obs_processes_strict
+
+    def fail_gpu_strict_cleanup(self, expected):
+        if type(self).start_count == 1 and expected == ():
+            raise obs_bootstrap.OBSProcessQueryError("GPU strict cleanup failed")
+        return real_terminate(self, expected)
+
+    monkeypatch.setattr(
+        manager,
+        "terminate_expected_obs_processes_strict",
+        fail_gpu_strict_cleanup,
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="再起動transaction"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert manager.strict_signal_pids == []
+    assert manager.active_processes == {}
+
+
+def test_launch_obs_gpu_cleanup_failure_preserves_primary_and_cleanup_chain(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    real_query = recordtest._query_managed_obs_processes_before_settings_stop
+    real_start = manager.start_obs
+    started = []
+    popen_kill_attempts = []
+
+    def start_unstoppable_process(self, *args, **kwargs):
+        process = real_start(self, *args, **kwargs)
+
+        def fail_kill():
+            popen_kill_attempts.append(process.pid)
+            raise RuntimeError("Popen kill failed")
+
+        process.kill = fail_kill
+        process.wait = lambda timeout=None: (_ for _ in ()).throw(
+            RuntimeError("Popen wait failed")
+        )
+        started.append(process)
+        return process
+
+    def fail_gpu_prequery(base_dir, process_manager):
+        if manager.start_count == 1:
+            raise obs_bootstrap.OBSProcessQueryError("GPU pre-query primary failure")
+        return real_query(base_dir, process_manager)
+
+    def fail_manager_cleanup(self, process, timeout_sec=3.0):
+        type(self).terminated_pids.append(process.pid)
+        raise RuntimeError("manager cleanup failed")
+
+    monkeypatch.setattr(manager, "start_obs", start_unstoppable_process)
+    monkeypatch.setattr(manager, "terminate_process", fail_manager_cleanup)
+    monkeypatch.setattr(
+        recordtest,
+        "_query_managed_obs_processes_before_settings_stop",
+        fail_gpu_prequery,
+    )
+
+    with pytest.raises(
+        recordtest.RecorderError,
+        match="安全な後始末も完了できませんでした",
+    ) as raised:
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    chained = []
+    pending = [raised.value]
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in {id(item) for item in chained}:
+            continue
+        chained.append(current)
+        pending.extend(
+            [
+                getattr(current, "__cause__", None),
+                getattr(current, "__context__", None),
+            ]
+        )
+    rendered_chain = "\n".join(str(item) for item in chained)
+    assert "GPU pre-query primary failure" in rendered_chain
+    assert "起動済みOBSのprocess handleを安全に停止できませんでした" in rendered_chain
+    assert "manager cleanup failed" in rendered_chain
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert popen_kill_attempts == [101]
+    assert started[0].poll() is None
+    assert manager.active_processes == {101: started[0].identity}
 
 
 def test_launch_obs_gpu_terminate_error_still_kills_all_managed_processes(
@@ -2259,6 +2656,214 @@ def test_launch_obs_restarts_once_when_gpu_encoder_is_discovered_after_start(mon
     assert parser.get("AdvOut", "RecEncoder") == "obs_nvenc_h264_tex"
 
 
+def test_launch_obs_gpu_stop_evidence_explains_known_and_remaining_processes(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    real_latest = manager.latest_log_encoder_kinds
+    real_factory = recordtest._create_obs_settings_stop_evidence
+    known_evidence_calls = []
+
+    def latest_with_remaining_process(self, since=None):
+        result = real_latest(self, since=since)
+        if type(self).start_count == 1 and 201 not in type(self).active_processes:
+            type(self).active_processes[201] = obs_bootstrap.OBSProcessInfo(
+                pid=201,
+                executable_path=self.obs_exe.absolute(),
+                creation_time=1201.0,
+            )
+        return result
+
+    def capture_factory(*args, **kwargs):
+        evidence = real_factory(*args, **kwargs)
+        if kwargs.get("known_managed_process") is not None:
+            known_evidence_calls.append((args, kwargs, evidence))
+        return evidence
+
+    monkeypatch.setattr(manager, "latest_log_encoder_kinds", latest_with_remaining_process)
+    monkeypatch.setattr(recordtest, "_create_obs_settings_stop_evidence", capture_factory)
+
+    process = recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert process.pid == 102
+    assert len(known_evidence_calls) == 1
+    _args, kwargs, evidence = known_evidence_calls[0]
+    before = kwargs["before"]
+    known = kwargs["known_managed_process"]
+    assert {item.pid for item in before.processes} == {101, 201}
+    assert known == next(item for item in before.processes if item.pid == 101)
+    assert kwargs["killed_pids"] == (201,)
+    assert evidence.known_managed_process == known
+    assert evidence.managed_after == ()
+    assert manager.terminated_pids == [101]
+    assert manager.kill_count == 2
+
+
+def test_launch_obs_gpu_stop_rejects_reused_known_pid_without_signaling_it(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    real_terminate = manager.terminate_process
+    replacement = obs_bootstrap.OBSProcessInfo(
+        pid=101,
+        executable_path=obs_exe,
+        creation_time=9999.0,
+        creation_time_filetime=116_444_835_990_000_000,
+    )
+
+    def terminate_then_reuse_pid(self, process, timeout_sec=3.0):
+        real_terminate(self, process, timeout_sec=timeout_sec)
+        type(self).active_processes[process.pid] = replacement
+
+    monkeypatch.setattr(manager, "terminate_process", terminate_then_reuse_pid)
+
+    with pytest.raises(recordtest.RecorderError, match="再起動transaction"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert manager.strict_signal_pids == []
+    assert manager.active_processes == {101: replacement}
+
+
+def test_launch_obs_cleans_started_handle_when_strict_identity_is_incomplete(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(monkeypatch)
+    real_query = manager.query_obs_processes_strict
+
+    def query_without_creation_time(self):
+        snapshot = real_query(self)
+        if type(self).start_count == 1 and snapshot.processes:
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                tuple(replace(item, creation_time=None) for item in snapshot.processes),
+                snapshot.queried_at,
+            )
+        return snapshot
+
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        query_without_creation_time,
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="strict identity"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path, recording_encoder="x264"))
+
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert manager.active_processes == {}
+
+
+def test_launch_obs_rejects_started_popen_identity_replacement_without_signaling_it(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(monkeypatch)
+    real_query = manager.query_obs_processes_strict
+    replacement = obs_bootstrap.OBSProcessInfo(
+        pid=101,
+        executable_path=obs_exe,
+        creation_time=9999.0,
+        creation_time_filetime=116_444_835_990_000_000,
+    )
+
+    def query_replacement_after_start(self):
+        if type(self).start_count == 1 and type(self).active_processes:
+            type(self).active_processes[101] = replacement
+        return real_query(self)
+
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        query_replacement_after_start,
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="strict identity"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path, recording_encoder="x264"))
+
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert manager.strict_signal_pids == []
+    assert manager.active_processes == {101: replacement}
+
+
+def test_launch_obs_gpu_replan_does_not_terminate_or_kill_twice(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+    real_terminate = manager.terminate_process
+
+    def terminate_with_profile_flush(self, process, timeout_sec=3.0):
+        real_terminate(self, process, timeout_sec=timeout_sec)
+        profile_ini.write_bytes(
+            b"[General]\nName=external-update\nExternalAfterStop=keep\n"
+        )
+
+    monkeypatch.setattr(manager, "terminate_process", terminate_with_profile_flush)
+
+    process = recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    rendered = profile_ini.read_text(encoding="utf-8")
+    assert process.pid == 102
+    assert manager.start_count == 2
+    assert manager.terminated_pids == [101]
+    assert manager.kill_count == 2
+    assert "ExternalAfterStop=keep" in rendered
+    assert "RecEncoder=nvenc" in rendered
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
+
+
 def test_launch_obs_does_not_restart_for_hevc_only_encoder_detection(monkeypatch, tmp_path):
     obs_dir = (tmp_path / "obs-portable").resolve()
     obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
@@ -2337,6 +2942,18 @@ def test_launch_obs_refuses_external_websocket_port(monkeypatch):
 
         def kill_stale_managed_processes(self, timeout_sec=3.0):
             return []
+
+        def query_obs_processes_strict(self):
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(),
+                queried_at=100.0,
+            )
+
+        def terminate_expected_obs_processes_strict(self, expected):
+            return obs_bootstrap.OBSStrictTerminationResult(
+                expected,
+                self.query_obs_processes_strict(),
+            )
 
         def has_managed_process(self):
             return False
@@ -2719,15 +3336,35 @@ def test_recordtest_legacy_migration_rejects_source_that_survives_kill(
     class StubbornProcessManager:
         kill_calls = 0
 
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, obs_dir_arg, **_kwargs):
+            self.obs_dir = Path(obs_dir_arg).absolute()
+            self.query_calls = 0
+            self.process = obs_bootstrap.OBSProcessInfo(
+                pid=4312,
+                executable_path=self.obs_dir / "bin" / "64bit" / "obs64.exe",
+                creation_time=10.0,
+            )
 
-        def unmanaged_processes(self):
-            return []
+        def query_obs_processes_strict(self):
+            self.query_calls += 1
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(self.process,),
+                queried_at=100.0 + self.query_calls,
+            )
+
+        def is_managed_process(self, process):
+            return process.executable_path == self.process.executable_path
 
         def kill_stale_managed_processes(self, timeout_sec=3.0):
             type(self).kill_calls += 1
             return []
+
+        def terminate_expected_obs_processes_strict(self, expected):
+            type(self).kill_calls += 1
+            return obs_bootstrap.OBSStrictTerminationResult(
+                expected,
+                self.query_obs_processes_strict(),
+            )
 
         def has_managed_process(self):
             return True
@@ -2747,7 +3384,7 @@ def test_recordtest_legacy_migration_rejects_source_that_survives_kill(
         run_prepare_source,
     )
 
-    with pytest.raises(recordtest.RecorderError, match="停止できません"):
+    with pytest.raises(recordtest.RecorderError, match="strict identity"):
         recordtest.migrate_legacy_managed_obs_if_needed(
             port=4455,
             password="secret",

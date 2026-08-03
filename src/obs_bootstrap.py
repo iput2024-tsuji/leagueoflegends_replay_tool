@@ -5,7 +5,6 @@ import hashlib
 import io
 import json
 import logging
-import math
 import os
 import stat
 import time
@@ -19,9 +18,23 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .obs_process import OBSProcessInfo, OBSProcessManager, OBSProcessQuerySnapshot
+    from .obs_process import (
+        OBSProcessInfo,
+        OBSProcessManager,
+        OBSProcessQueryError,
+        OBSProcessQuerySnapshot,
+        OBSStrictTerminationResult,
+        validate_obs_process_query_snapshot,
+    )
 except ImportError:
-    from obs_process import OBSProcessInfo, OBSProcessManager, OBSProcessQuerySnapshot
+    from obs_process import (
+        OBSProcessInfo,
+        OBSProcessManager,
+        OBSProcessQueryError,
+        OBSProcessQuerySnapshot,
+        OBSStrictTerminationResult,
+        validate_obs_process_query_snapshot,
+    )
 
 try:
     from . import obs_transaction_fs as _transaction_fs
@@ -410,49 +423,18 @@ def _validate_obs_stop_query_snapshot(
     *,
     label: str,
 ) -> tuple[OBSProcessInfo, ...]:
-    if type(snapshot) is not OBSProcessQuerySnapshot:
-        raise OBSPathSafetyError(f"{label} OBS process query snapshotが不正です。")
-    queried_at = snapshot.queried_at
-    if (
-        isinstance(queried_at, bool)
-        or not isinstance(queried_at, (int, float))
-        or not math.isfinite(float(queried_at))
-        or float(queried_at) <= 0
-    ):
-        raise OBSPathSafetyError(f"{label} OBS process query時刻が不正です。")
-    if type(snapshot.processes) is not tuple:
-        raise OBSPathSafetyError(f"{label} OBS process query結果がtupleではありません。")
-
-    seen_pids: set[int] = set()
-    for process in snapshot.processes:
-        if type(process) is not OBSProcessInfo:
-            raise OBSPathSafetyError(f"{label} OBS process情報が不正です。")
-        if type(process.pid) is not int or process.pid <= 0:
-            raise OBSPathSafetyError(f"{label} OBS process PIDが不正です。")
-        if process.pid in seen_pids:
-            raise OBSPathSafetyError(f"{label} OBS process PIDが重複しています。")
-        seen_pids.add(process.pid)
-        creation_time = process.creation_time
-        if (
-            isinstance(creation_time, bool)
-            or not isinstance(creation_time, (int, float))
-            or not math.isfinite(float(creation_time))
-            or float(creation_time) <= 0
-        ):
-            raise OBSPathSafetyError(
-                f"{label} OBS process creation timeが不正です: pid={process.pid}"
-            )
-        if process.executable_path is None:
-            raise OBSPathSafetyError(
-                f"{label} OBS process executable pathがありません: pid={process.pid}"
-            )
+    try:
+        processes = validate_obs_process_query_snapshot(snapshot, label=label)
+    except OBSProcessQueryError as exc:
+        raise OBSPathSafetyError(str(exc)) from exc
+    for process in processes:
         executable = Path(process.executable_path)
-        if not executable.is_absolute() or _absolute_path(executable) != executable:
+        if _absolute_path(executable) != executable:
             raise OBSPathSafetyError(
                 f"{label} OBS process executable pathがlexical absoluteではありません: "
                 f"pid={process.pid}"
             )
-    return snapshot.processes
+    return processes
 
 
 def _create_obs_settings_stop_evidence(
@@ -654,6 +636,141 @@ def _validate_obs_settings_stop_evidence(
     if explained != set(managed_by_pid):
         raise OBSPathSafetyError("停止前の全管理OBS processを停止証跡で説明できません。")
     return evidence
+
+
+def _query_strict_managed_obs_processes(
+    base_dir: str | Path,
+    process_manager: OBSProcessManager,
+    *,
+    label: str,
+) -> tuple[OBSProcessQuerySnapshot, tuple[OBSProcessInfo, ...]]:
+    """Strictly identify only complete identities from one managed OBS tree."""
+
+    base_path = _absolute_path(base_dir)
+    snapshot = process_manager.query_obs_processes_strict()
+    processes = _validate_obs_stop_query_snapshot(snapshot, label=label)
+    expected_executable = base_path / "bin" / "64bit" / "obs64.exe"
+    expected_key = _filesystem_path_key(expected_executable)
+    managed = tuple(
+        process
+        for process in processes
+        if _filesystem_path_key(process.executable_path) == expected_key
+    )
+    if len(managed) != len(processes):
+        raise OBSPathSafetyError(
+            f"{label} queryに管理対象外またはpath不一致のOBS processがあります。"
+        )
+    return snapshot, managed
+
+
+def _query_managed_obs_processes_before_settings_stop(
+    base_dir: str | Path,
+    process_manager: OBSProcessManager,
+) -> tuple[OBSProcessQuerySnapshot, tuple[OBSProcessInfo, ...]]:
+    """Strictly identify only processes from the held managed OBS tree."""
+
+    base_path = _absolute_path(base_dir)
+    root_lease = _active_obs_mutation_root_lease()
+    if root_lease is None or root_lease.path != base_path:
+        raise OBSPathSafetyError(
+            "OBS process停止に対応する管理OBS root leaseがありません。"
+        )
+    root_lease.validate_lexical_binding()
+    result = _query_strict_managed_obs_processes(
+        base_path,
+        process_manager,
+        label="停止前",
+    )
+    root_lease.validate_lexical_binding()
+    return result
+
+
+def _strictly_stop_managed_obs_processes(
+    base_dir: str | Path,
+    process_manager: OBSProcessManager,
+) -> tuple[
+    OBSProcessQuerySnapshot,
+    tuple[OBSProcessInfo, ...],
+    OBSProcessQuerySnapshot,
+]:
+    """Stop only an exact strict-before identity set and prove strict zero."""
+
+    base_path = _absolute_path(base_dir)
+    before, managed_before = _query_strict_managed_obs_processes(
+        base_path,
+        process_manager,
+        label="停止前",
+    )
+    result = process_manager.terminate_expected_obs_processes_strict(
+        managed_before
+    )
+    if type(result) is not OBSStrictTerminationResult:
+        raise OBSPathSafetyError("strict OBS停止結果の型が不正です。")
+    if result.signaled_processes != managed_before:
+        raise OBSPathSafetyError(
+            "strict OBS停止結果のidentity集合が停止前queryと一致しません。"
+        )
+    after_processes = _validate_obs_stop_query_snapshot(
+        result.after,
+        label="停止後",
+    )
+    if float(result.after.queried_at) < float(before.queried_at):
+        raise OBSPathSafetyError("停止後OBS process query時刻が停止前より古いです。")
+    if after_processes:
+        raise OBSPathSafetyError(
+            "停止後queryでOBS processの残存または再出現を検出しました。"
+        )
+    return before, result.signaled_processes, result.after
+
+
+def _stop_managed_obs_processes_for_settings(
+    base_dir: str | Path,
+    process_manager: OBSProcessManager,
+) -> _OBSSettingsStopEvidence:
+    """Stop one managed OBS tree and return strict before/after evidence."""
+
+    base_path = _absolute_path(base_dir)
+    root_lease = _active_obs_mutation_root_lease()
+    if root_lease is None or root_lease.path != base_path:
+        raise OBSPathSafetyError(
+            "OBS process停止に対応する管理OBS root leaseがありません。"
+        )
+    root_lease.validate_lexical_binding()
+    before, signaled_processes, after = _strictly_stop_managed_obs_processes(
+        base_path,
+        process_manager,
+    )
+    root_lease.validate_lexical_binding()
+    evidence = _create_obs_settings_stop_evidence(
+        base_path,
+        before=before,
+        after=after,
+        killed_pids=tuple(process.pid for process in signaled_processes),
+    )
+    root_lease.validate_lexical_binding()
+    return evidence
+
+
+def _verify_no_obs_processes_for_settings_retry(
+    base_dir: str | Path,
+    process_manager: OBSProcessManager,
+) -> None:
+    """Read-only strict zero-process check immediately before a retry commit."""
+
+    base_path = _absolute_path(base_dir)
+    root_lease = _active_obs_mutation_root_lease()
+    if root_lease is None or root_lease.path != base_path:
+        raise OBSPathSafetyError(
+            "停止後再計画に対応する管理OBS root leaseがありません。"
+        )
+    root_lease.validate_lexical_binding()
+    snapshot = process_manager.query_obs_processes_strict()
+    processes = _validate_obs_stop_query_snapshot(snapshot, label="再計画commit前")
+    if processes:
+        raise OBSPathSafetyError(
+            "再計画commit前にOBS processの残存または再出現を検出しました。"
+        )
+    root_lease.validate_lexical_binding()
 
 
 @dataclass(frozen=True)
@@ -1920,7 +2037,7 @@ def _observe_obs_profiles_root_inventory(
     root_lease: _OBSDirectoryLease,
     base_dir: Path,
 ) -> tuple[_OBSProfileEntryRetryObservation, ...]:
-    """Capture a stable immediate profiles-root name/kind inventory."""
+    """Capture a stable immediate profiles-root name/kind/identity inventory."""
 
     relative_parts = ("config", "obs-studio", "basic", "profiles")
     profiles_root = base_dir.joinpath(*relative_parts)
@@ -2419,6 +2536,24 @@ def _validate_limited_post_stop_config_retry(
         changed = True
 
     if changed:
+        baseline_files_by_relative_key = {
+            "/".join(_filesystem_parts_key(item.path.parts)): item
+            for item in baseline.files
+        }
+        missing_targets = tuple(
+            key
+            for key in sorted(baseline.target_keys)
+            if (
+                key not in baseline_files_by_relative_key
+                or not baseline_files_by_relative_key[key].existed
+            )
+        )
+        if missing_targets:
+            raise OBSPathSafetyError(
+                "停止前に存在しないtransaction targetを含むため、"
+                "停止後flushを再計画できません: "
+                + ", ".join(missing_targets)
+            )
         if not evidence.managed_before:
             raise OBSPathSafetyError(
                 "停止前に管理OBS processが存在しないため設定変更をOBS flushと判定できません。"
@@ -3342,18 +3477,22 @@ def recover_obs_settings_transaction(
                 before_recovery()
             else:
                 try:
-                    managed_process_running = OBSProcessManager(
+                    process_snapshot = OBSProcessManager(
                         base_path
-                    ).has_managed_process()
+                    ).query_obs_processes_strict()
+                    running_processes = _validate_obs_stop_query_snapshot(
+                        process_snapshot,
+                        label="設定復旧前",
+                    )
                 except Exception as exc:
                     raise _settings_recovery_error(
                         base_path,
-                        f"復旧前に管理対象OBSの稼働状態を確認できません: {exc}",
+                        f"復旧前にOBS processが0件であることをstrict確認できません: {exc}",
                     ) from exc
-                if managed_process_running:
+                if running_processes:
                     raise _settings_recovery_error(
                         base_path,
-                        "管理対象OBSが稼働中です。録画監視を停止してOBSを終了してから再試行してください。",
+                        "OBS processが稼働中です。録画監視を停止して全OBSを終了してから再試行してください。",
                     )
         revalidate_obs_config_file(marker_snapshot)
         recovery_snapshots: tuple[OBSConfigFileSnapshot, ...]
@@ -3582,6 +3721,243 @@ def execute_obs_config_transaction(
             _ACTIVE_OBS_SETTINGS_TRANSACTION_OWNER.reset(owner_token)
 
         return tuple(write.snapshot.path for write in writes)
+
+
+def _execute_obs_config_transaction_with_one_replan(
+    prepare_plan: Callable[[], Any],
+    transaction_for_plan: Callable[[Any], OBSConfigTransactionPlan],
+    *,
+    before_commit: Callable[[], Any],
+    retry_precommit_check: Callable[[], None],
+    validate_plan_for: Callable[[Any], None] | None = None,
+    validation_files_for: (
+        Callable[[Any], tuple[OBSConfigFileSnapshot, ...]] | None
+    ) = None,
+    validation_directories_for: Callable[[Any], tuple[Path, ...]] | None = None,
+    run_before_commit_on_noop: bool = True,
+) -> Any:
+    """Execute one guarded settings update with one proven post-stop replan.
+
+    The caller must already hold the outer mutation guard.  The initial
+    baseline is captured by the low-level ``before_commit`` callback, after
+    directory and durable temporary preparation.  A retry performs no stop or
+    kill; it only repeats a strict, read-only zero-process query immediately
+    before commit.
+    """
+
+    scope = _ACTIVE_OBS_BOOTSTRAP_MUTATION.get()
+    root_lease = _active_obs_mutation_root_lease()
+    if scope is None or root_lease is None or scope.base_dir != root_lease.path:
+        raise OBSPathSafetyError(
+            "停止後再計画には呼出元が保持するOBS mutation guardが必要です。"
+        )
+    if _ACTIVE_OBS_MIGRATION_CAPABILITY.get() is not None:
+        raise OBSPathSafetyError("OBS移行finalizerでは停止後再計画を実行できません。")
+    base_dir = scope.base_dir
+    root_identity = root_lease.identity
+
+    def validate_same_root_lease() -> None:
+        current_scope = _ACTIVE_OBS_BOOTSTRAP_MUTATION.get()
+        current_root = _active_obs_mutation_root_lease()
+        if (
+            current_scope is not scope
+            or current_root is not root_lease
+            or current_scope.base_dir != base_dir
+            or current_root.path != base_dir
+            or current_root.identity != root_identity
+        ):
+            raise OBSPathSafetyError(
+                "停止後再計画中に管理OBS mutation scopeまたはroot leaseが変化しました。"
+            )
+        current_root.validate_lexical_binding()
+
+    def checked_transaction(candidate: Any) -> OBSConfigTransactionPlan:
+        transaction = transaction_for_plan(candidate)
+        if type(transaction) is not OBSConfigTransactionPlan:
+            raise OBSPathSafetyError("停止後再計画のtransaction planが不正です。")
+        if _absolute_path(transaction.base_dir) != base_dir:
+            raise OBSPathSafetyError(
+                "停止後再計画のtransaction baseが保持中のrootと一致しません。"
+            )
+        return transaction
+
+    def validation_range(
+        candidate: Any,
+    ) -> tuple[tuple[OBSConfigFileSnapshot, ...], tuple[Path, ...]]:
+        files = () if validation_files_for is None else validation_files_for(candidate)
+        directories = (
+            ()
+            if validation_directories_for is None
+            else validation_directories_for(candidate)
+        )
+        if type(files) is not tuple or any(
+            type(snapshot) is not OBSConfigFileSnapshot for snapshot in files
+        ):
+            raise OBSPathSafetyError(
+                "停止後再計画の追加file validation rangeが不正です。"
+            )
+        if type(directories) is not tuple or any(
+            not isinstance(directory, Path) for directory in directories
+        ):
+            raise OBSPathSafetyError(
+                "停止後再計画の追加directory validation rangeが不正です。"
+            )
+        return files, directories
+
+    def validate_candidate(candidate: Any) -> None:
+        validate_same_root_lease()
+        if validate_plan_for is not None:
+            validate_plan_for(candidate)
+        validate_same_root_lease()
+
+    validate_same_root_lease()
+    initial_plan = prepare_plan()
+    validate_same_root_lease()
+    initial_transaction = checked_transaction(initial_plan)
+    initial_validation_files, initial_validation_directories = validation_range(
+        initial_plan
+    )
+    initial_baseline: _OBSConfigRetryObservation | None = None
+    initial_evidence: Any = None
+    initial_before_commit_called = False
+
+    def initial_before_commit() -> Any:
+        nonlocal initial_baseline, initial_evidence, initial_before_commit_called
+        if initial_before_commit_called:
+            raise OBSPathSafetyError(
+                "初回transactionのOBS停止callbackが複数回呼び出されました。"
+            )
+        initial_before_commit_called = True
+        validate_same_root_lease()
+        initial_baseline = _capture_obs_config_retry_baseline(
+            initial_transaction,
+            validation_files=initial_validation_files,
+            validation_directories=initial_validation_directories,
+        )
+        initial_evidence = before_commit()
+        return initial_evidence
+
+    def validate_initial_post_stop(evidence: Any) -> None:
+        if evidence is not initial_evidence or initial_baseline is None:
+            raise OBSPathSafetyError(
+                "初回OBS停止callbackのbaselineまたはevidence参照が一致しません。"
+            )
+        validate_same_root_lease()
+        _validate_limited_post_stop_config_retry(
+            initial_transaction,
+            initial_baseline,
+            evidence,
+            validation_files=initial_validation_files,
+            validation_directories=initial_validation_directories,
+        )
+
+    try:
+        execute_obs_config_transaction(
+            initial_transaction,
+            before_commit=initial_before_commit,
+            validate_plan=lambda: validate_candidate(initial_plan),
+            run_before_commit_on_noop=run_before_commit_on_noop,
+            _validate_after_before_commit=validate_initial_post_stop,
+        )
+        return initial_plan
+    except _OBSPostStopConfigConflict as conflict:
+        validate_same_root_lease()
+        if (
+            initial_baseline is None
+            or conflict.baseline is not initial_baseline
+            or conflict.evidence is not initial_evidence
+        ):
+            raise OBSPathSafetyError(
+                "停止後再計画signalのbaselineまたはevidence参照が一致しません。"
+            ) from conflict
+        _validate_obs_settings_stop_evidence(
+            conflict.evidence,
+            expected_base_dir=base_dir,
+            expected_root_identity=root_identity,
+        )
+        if (
+            type(conflict.post_stop) is not _OBSConfigRetryObservation
+            or conflict.post_stop.base_dir != base_dir
+            or conflict.post_stop.root_identity != root_identity
+        ):
+            raise OBSPathSafetyError(
+                "停止後再計画signalのpost-stop observationが不正です。"
+            ) from conflict
+        conflict_evidence = conflict.evidence
+        conflict_post_stop = conflict.post_stop
+
+        fresh_plan = prepare_plan()
+        validate_same_root_lease()
+        fresh_transaction = checked_transaction(fresh_plan)
+        _fresh_base, _fresh_directories, _fresh_planned, fresh_writes = (
+            _validated_settings_transaction_plan(fresh_transaction)
+        )
+        unsafe_fresh_writes = tuple(
+            write.snapshot.path
+            for write in fresh_writes
+            if not _is_known_obs_settings_retry_path(
+                write.snapshot.path.relative_to(base_dir)
+            )
+        )
+        if unsafe_fresh_writes:
+            raise OBSPathSafetyError(
+                "停止後再計画で既知のOBS設定file以外を変更できません: "
+                + ", ".join(str(path) for path in unsafe_fresh_writes)
+            ) from conflict
+        fresh_validation_files, fresh_validation_directories = validation_range(
+            fresh_plan
+        )
+        retry_before_commit_called = False
+
+        def retry_before_commit() -> None:
+            nonlocal retry_before_commit_called
+            if retry_before_commit_called:
+                raise OBSPathSafetyError(
+                    "再計画transactionのcommit前callbackが複数回呼び出されました。"
+                )
+            retry_before_commit_called = True
+            validate_same_root_lease()
+            fresh_observation = _capture_obs_config_retry_baseline(
+                fresh_transaction,
+                validation_files=fresh_validation_files,
+                validation_directories=fresh_validation_directories,
+            )
+            if fresh_observation != conflict_post_stop:
+                mismatched_fields = tuple(
+                    name
+                    for name in (
+                        "base_dir",
+                        "root_identity",
+                        "files",
+                        "directories",
+                        "profile_entries",
+                        "target_keys",
+                        "directory_keys",
+                        "validation_keys",
+                    )
+                    if getattr(fresh_observation, name)
+                    != getattr(conflict_post_stop, name)
+                )
+                raise OBSPathSafetyError(
+                    "停止後observationと再計画時の完全なfilesystem observationが一致しません。"
+                    " fields="
+                    + ",".join(mismatched_fields)
+                )
+            _validate_obs_settings_stop_evidence(
+                conflict_evidence,
+                expected_base_dir=base_dir,
+                expected_root_identity=root_identity,
+            )
+            retry_precommit_check()
+            validate_same_root_lease()
+
+        execute_obs_config_transaction(
+            fresh_transaction,
+            before_commit=retry_before_commit,
+            validate_plan=lambda: validate_candidate(fresh_plan),
+            run_before_commit_on_noop=True,
+        )
+        return fresh_plan
 
 
 def _write_obs_migration_journal(
@@ -5822,25 +6198,32 @@ class OBSBootstrapper:
         self.process_manager = process_manager or OBSProcessManager(self.base_dir)
         self.logger = logger or LOGGER
 
-    def _stop_managed_processes_for_settings_recovery(self) -> None:
-        unmanaged = self.process_manager.unmanaged_processes()
-        if unmanaged:
+    def _stop_managed_processes_for_settings_recovery(
+        self,
+    ) -> _OBSSettingsStopEvidence:
+        try:
+            return _stop_managed_obs_processes_for_settings(
+                self.base_dir,
+                self.process_manager,
+            )
+        except OBSSettingsRecoveryRequiredError:
+            raise
+        except Exception as exc:
             raise _settings_recovery_error(
                 self.base_dir,
-                "管理対象外のOBSが稼働中のため、停止してから設定復旧を再試行してください。",
-            )
-        self.process_manager.kill_stale_managed_processes()
-        if self.process_manager.has_managed_process():
-            raise _settings_recovery_error(
+                f"管理対象OBSのstrict停止証跡を確立できません: {exc}",
+            ) from exc
+
+    def _verify_no_processes_for_settings_retry(self) -> None:
+        try:
+            _verify_no_obs_processes_for_settings_retry(
                 self.base_dir,
-                "管理対象OBSを停止できませんでした。OBSを手動終了してから再試行してください。",
+                self.process_manager,
             )
-        unmanaged_after = self.process_manager.unmanaged_processes()
-        if unmanaged_after:
-            raise _settings_recovery_error(
-                self.base_dir,
-                "管理対象OBSの停止中に別のOBSが起動しました。終了してから再試行してください。",
-            )
+        except Exception as exc:
+            raise OBSPathSafetyError(
+                f"再計画commit前にOBSの停止状態をstrict確認できません: {exc}"
+            ) from exc
 
     @property
     def obs_exe(self) -> Path:
@@ -6144,20 +6527,31 @@ class OBSBootstrapper:
         *,
         stop_managed_processes: bool = True,
     ) -> dict[str, Any]:
-        plan = self.prepare_apply(port=port, password=password)
+        if (
+            stop_managed_processes
+            and _ACTIVE_OBS_MIGRATION_CAPABILITY.get() is None
+        ):
+            plan = _execute_obs_config_transaction_with_one_replan(
+                lambda: self.prepare_apply(port=port, password=password),
+                lambda candidate: candidate.transaction,
+                before_commit=self._stop_managed_processes_for_settings_recovery,
+                retry_precommit_check=self._verify_no_processes_for_settings_retry,
+            )
+        else:
+            plan = self.prepare_apply(port=port, password=password)
+            execute_obs_config_transaction(
+                plan.transaction,
+                before_commit=(
+                    self._stop_managed_processes_for_settings_recovery
+                    if stop_managed_processes
+                    else None
+                ),
+                run_before_commit_on_noop=stop_managed_processes,
+            )
         changed_by_path = {
             _filesystem_path_key(write.snapshot.path): write.changed
             for write in plan.transaction.writes
         }
-        execute_obs_config_transaction(
-            plan.transaction,
-            before_commit=(
-                self._stop_managed_processes_for_settings_recovery
-                if stop_managed_processes
-                else None
-            ),
-            run_before_commit_on_noop=stop_managed_processes,
-        )
         websocket_result = (
             None
             if plan.websocket_path is None
@@ -6220,40 +6614,72 @@ class OBSBootstrapper:
         # OBS reads global.ini only at startup and may rewrite it on exit.
         # Stop every process from this managed portable tree before patching.
         path = get_obs_global_ini_path(self.base_dir)
-        write = self._prepare_obs_ini_write(path, label="global.ini")
-        execute_obs_config_transaction(
-            OBSConfigTransactionPlan(
+        def prepare() -> OBSConfigTransactionPlan:
+            write = self._prepare_obs_ini_write(path, label="global.ini")
+            return OBSConfigTransactionPlan(
                 base_dir=self.base_dir,
                 directories=(path.parent,),
                 writes=(write,),
-            ),
-            before_commit=(
-                self._stop_managed_processes_for_settings_recovery
-                if stop_managed_processes
-                else None
-            ),
-            run_before_commit_on_noop=stop_managed_processes,
-        )
+            )
+
+        if (
+            stop_managed_processes
+            and _ACTIVE_OBS_MIGRATION_CAPABILITY.get() is None
+        ):
+            transaction = _execute_obs_config_transaction_with_one_replan(
+                prepare,
+                lambda candidate: candidate,
+                before_commit=self._stop_managed_processes_for_settings_recovery,
+                retry_precommit_check=self._verify_no_processes_for_settings_retry,
+            )
+        else:
+            transaction = prepare()
+            execute_obs_config_transaction(
+                transaction,
+                before_commit=(
+                    self._stop_managed_processes_for_settings_recovery
+                    if stop_managed_processes
+                    else None
+                ),
+                run_before_commit_on_noop=stop_managed_processes,
+            )
+        write = transaction.writes[0]
         return write.changed, path
 
     @_guard_obs_bootstrap_mutation(stop_managed_before_recovery=True)
     def ensure_user_ini(self, *, stop_managed_processes: bool = True) -> tuple[bool, Path]:
         # OBS 32.x reads UI startup and tray flags from user.ini.
         path = get_obs_user_ini_path(self.base_dir)
-        write = self._prepare_obs_ini_write(path, label="user.ini")
-        execute_obs_config_transaction(
-            OBSConfigTransactionPlan(
+        def prepare() -> OBSConfigTransactionPlan:
+            write = self._prepare_obs_ini_write(path, label="user.ini")
+            return OBSConfigTransactionPlan(
                 base_dir=self.base_dir,
                 directories=(path.parent,),
                 writes=(write,),
-            ),
-            before_commit=(
-                self._stop_managed_processes_for_settings_recovery
-                if stop_managed_processes
-                else None
-            ),
-            run_before_commit_on_noop=stop_managed_processes,
-        )
+            )
+
+        if (
+            stop_managed_processes
+            and _ACTIVE_OBS_MIGRATION_CAPABILITY.get() is None
+        ):
+            transaction = _execute_obs_config_transaction_with_one_replan(
+                prepare,
+                lambda candidate: candidate,
+                before_commit=self._stop_managed_processes_for_settings_recovery,
+                retry_precommit_check=self._verify_no_processes_for_settings_retry,
+            )
+        else:
+            transaction = prepare()
+            execute_obs_config_transaction(
+                transaction,
+                before_commit=(
+                    self._stop_managed_processes_for_settings_recovery
+                    if stop_managed_processes
+                    else None
+                ),
+                run_before_commit_on_noop=stop_managed_processes,
+            )
+        write = transaction.writes[0]
         return write.changed, path
 
     def _ensure_obs_ini(self, ini_path: Path, label: str) -> tuple[bool, Path]:
@@ -6277,18 +6703,34 @@ class OBSBootstrapper:
         stop_managed_processes: bool = True,
     ) -> tuple[bool, Path]:
         config_path = get_obs_websocket_config_path(self.base_dir)
-        write = self._prepare_websocket_write(port, password)
-        execute_obs_config_transaction(
-            OBSConfigTransactionPlan(
+        def prepare() -> OBSConfigTransactionPlan:
+            write = self._prepare_websocket_write(port, password)
+            return OBSConfigTransactionPlan(
                 base_dir=self.base_dir,
                 directories=(config_path.parent,),
                 writes=(write,),
-            ),
-            before_commit=(
-                self._stop_managed_processes_for_settings_recovery
-                if stop_managed_processes
-                else None
-            ),
-            run_before_commit_on_noop=stop_managed_processes,
-        )
+            )
+
+        if (
+            stop_managed_processes
+            and _ACTIVE_OBS_MIGRATION_CAPABILITY.get() is None
+        ):
+            transaction = _execute_obs_config_transaction_with_one_replan(
+                prepare,
+                lambda candidate: candidate,
+                before_commit=self._stop_managed_processes_for_settings_recovery,
+                retry_precommit_check=self._verify_no_processes_for_settings_retry,
+            )
+        else:
+            transaction = prepare()
+            execute_obs_config_transaction(
+                transaction,
+                before_commit=(
+                    self._stop_managed_processes_for_settings_recovery
+                    if stop_managed_processes
+                    else None
+                ),
+                run_before_commit_on_noop=stop_managed_processes,
+            )
+        write = transaction.writes[0]
         return write.changed, config_path

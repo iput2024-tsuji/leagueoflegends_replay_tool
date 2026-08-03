@@ -2,9 +2,10 @@ import hashlib
 import json
 import multiprocessing
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,6 +100,685 @@ def _sealed_stop_evidence(
     )
 
 
+def _strict_stop_evidence(
+    base_dir: Path,
+    *,
+    managed: bool = True,
+) -> obs_bootstrap._OBSSettingsStopEvidence:
+    process = obs_bootstrap.OBSProcessInfo(
+        pid=4312,
+        executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+        creation_time=10.0,
+    )
+    return obs_bootstrap._create_obs_settings_stop_evidence(
+        base_dir,
+        before=obs_bootstrap.OBSProcessQuerySnapshot(
+            processes=(process,) if managed else (),
+            queried_at=100.0,
+        ),
+        after=obs_bootstrap.OBSProcessQuerySnapshot(
+            processes=(),
+            queried_at=101.0,
+        ),
+        killed_pids=(process.pid,) if managed else (),
+    )
+
+
+def _prepare_global_ini_transaction(
+    base_dir: Path,
+) -> obs_bootstrap.OBSConfigTransactionPlan:
+    bootstrapper = obs_bootstrap.OBSBootstrapper(base_dir)
+    path = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    write = bootstrapper._prepare_obs_ini_write(path, label="global.ini")
+    return obs_bootstrap.OBSConfigTransactionPlan(
+        base_dir=base_dir,
+        directories=(path.parent,),
+        writes=(write,),
+    )
+
+
+def test_one_replan_preserves_real_obs_flush_unknown_key_and_commits_fresh_plan(
+    tmp_path,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"[General]\nFirstRun=false\nOriginal=keep\n")
+    prepare_calls = 0
+    stop_calls = 0
+    retry_checks = 0
+
+    def prepare():
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return _prepare_global_ini_transaction(base_dir)
+
+    def stop_with_flush():
+        nonlocal stop_calls
+        stop_calls += 1
+        target.write_bytes(
+            b"[General]\nFirstRun=false\nExternalAfterStop=keep\n"
+        )
+        return _strict_stop_evidence(base_dir)
+
+    def verify_stopped():
+        nonlocal retry_checks
+        retry_checks += 1
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        returned = obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+            prepare,
+            lambda candidate: candidate,
+            before_commit=stop_with_flush,
+            retry_precommit_check=verify_stopped,
+        )
+
+    rendered = target.read_text(encoding="utf-8")
+    assert returned.writes[0].changed is True
+    assert prepare_calls == 2
+    assert stop_calls == 1
+    assert retry_checks == 1
+    assert "FirstRun=true" in rendered
+    assert "ExternalAfterStop=keep" in rendered
+    assert "Original=keep" not in rendered
+    _assert_transaction_clean(base_dir)
+
+
+def test_one_replan_returns_fresh_changed_plan_after_initial_noop_flush(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(
+        b"[General]\nFirstRun=true\n\n[BasicWindow]\n"
+        b"SysTrayEnabled=false\nSysTrayWhenStarted=false\n"
+        b"SysTrayMinimizeToTray=false\n"
+    )
+    prepare_calls = 0
+    retry_checks = 0
+
+    def prepare():
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return _prepare_global_ini_transaction(base_dir)
+
+    def stop_with_flush():
+        target.write_bytes(
+            b"[General]\nFirstRun=false\nExternalAfterStop=keep\n\n"
+            b"[BasicWindow]\nSysTrayEnabled=false\n"
+            b"SysTrayWhenStarted=false\nSysTrayMinimizeToTray=false\n"
+        )
+        return _strict_stop_evidence(base_dir)
+
+    def verify_stopped():
+        nonlocal retry_checks
+        retry_checks += 1
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        returned = obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+            prepare,
+            lambda candidate: candidate,
+            before_commit=stop_with_flush,
+            retry_precommit_check=verify_stopped,
+        )
+
+    assert prepare_calls == 2
+    assert returned.writes[0].changed is True
+    assert retry_checks == 1
+    assert "ExternalAfterStop=keep" in target.read_text(encoding="utf-8")
+    assert "FirstRun=true" in target.read_text(encoding="utf-8")
+    _assert_transaction_clean(base_dir)
+
+
+def test_one_replan_runs_retry_check_when_fresh_plan_is_noop(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    target.parent.mkdir(parents=True)
+    compliant = (
+        b"[General]\nFirstRun=true\n\n[BasicWindow]\n"
+        b"SysTrayEnabled=false\nSysTrayWhenStarted=false\n"
+        b"SysTrayMinimizeToTray=false\n"
+    )
+    target.write_bytes(compliant)
+    retry_checks = 0
+
+    def stop_with_identity_flush():
+        replacement = target.with_name("replacement.ini")
+        replacement.write_bytes(compliant)
+        os.replace(replacement, target)
+        return _strict_stop_evidence(base_dir)
+
+    def verify_stopped():
+        nonlocal retry_checks
+        retry_checks += 1
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        returned = obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+            lambda: _prepare_global_ini_transaction(base_dir),
+            lambda candidate: candidate,
+            before_commit=stop_with_identity_flush,
+            retry_precommit_check=verify_stopped,
+        )
+
+    assert returned.writes[0].changed is False
+    assert retry_checks == 1
+    assert target.read_bytes() == compliant
+    _assert_transaction_clean(base_dir)
+
+
+def test_one_replan_propagates_fresh_prepare_failure_without_retrying(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"[General]\nFirstRun=false\n")
+    prepare_calls = 0
+    stop_calls = 0
+    retry_checks = 0
+
+    def prepare():
+        nonlocal prepare_calls
+        prepare_calls += 1
+        if prepare_calls == 2:
+            raise PermissionError("fresh prepare denied")
+        return _prepare_global_ini_transaction(base_dir)
+
+    def stop_with_flush():
+        nonlocal stop_calls
+        stop_calls += 1
+        target.write_bytes(b"[General]\nFirstRun=false\nExternal=keep\n")
+        return _strict_stop_evidence(base_dir)
+
+    def verify_stopped():
+        nonlocal retry_checks
+        retry_checks += 1
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(PermissionError, match="fresh prepare denied"):
+            obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+                prepare,
+                lambda candidate: candidate,
+                before_commit=stop_with_flush,
+                retry_precommit_check=verify_stopped,
+            )
+
+    assert prepare_calls == 2
+    assert stop_calls == 1
+    assert retry_checks == 0
+    assert b"External=keep" in target.read_bytes()
+    _assert_transaction_clean(base_dir)
+
+
+def test_one_replan_fails_closed_when_retry_strict_query_fails(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"[General]\nFirstRun=false\n")
+    stop_calls = 0
+
+    def stop_with_flush():
+        nonlocal stop_calls
+        stop_calls += 1
+        target.write_bytes(b"[General]\nFirstRun=false\nExternal=keep\n")
+        return _strict_stop_evidence(base_dir)
+
+    def fail_retry_query():
+        raise OBSProcessQueryError("retry strict query failed")
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(OBSProcessQueryError, match="retry strict query failed"):
+            obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+                lambda: _prepare_global_ini_transaction(base_dir),
+                lambda candidate: candidate,
+                before_commit=stop_with_flush,
+                retry_precommit_check=fail_retry_query,
+            )
+
+    assert stop_calls == 1
+    assert b"External=keep" in target.read_bytes()
+    _assert_transaction_clean(base_dir)
+
+
+def test_one_replan_rejects_flush_when_any_transaction_target_was_missing(
+    tmp_path,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    global_ini = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    user_ini = obs_bootstrap.get_obs_user_ini_path(base_dir)
+    global_ini.parent.mkdir(parents=True)
+    global_ini.write_bytes(b"[General]\nFirstRun=false\n")
+
+    def prepare():
+        global_write = obs_bootstrap.OBSBootstrapper(
+            base_dir
+        )._prepare_obs_ini_write(global_ini, label="global.ini")
+        user_write = obs_bootstrap.OBSBootstrapper(
+            base_dir
+        )._prepare_obs_ini_write(user_ini, label="user.ini")
+        return obs_bootstrap.OBSConfigTransactionPlan(
+            base_dir=base_dir,
+            directories=(global_ini.parent,),
+            writes=(global_write, user_write),
+        )
+
+    def stop_with_flush():
+        global_ini.write_bytes(
+            b"[General]\nFirstRun=false\nExternalAfterStop=keep\n"
+        )
+        return _strict_stop_evidence(base_dir)
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(
+            obs_bootstrap.OBSPathSafetyError,
+            match="存在しないtransaction target",
+        ) as exc_info:
+            obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+                prepare,
+                lambda candidate: candidate,
+                before_commit=stop_with_flush,
+                retry_precommit_check=lambda: None,
+            )
+
+    assert type(exc_info.value) is obs_bootstrap.OBSPathSafetyError
+    assert b"ExternalAfterStop=keep" in global_ini.read_bytes()
+    assert not user_ini.exists()
+    _assert_transaction_clean(base_dir)
+
+
+def test_one_replan_rejects_fresh_change_to_existing_portable_marker(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    global_ini = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    marker = obs_bootstrap.get_portable_marker_path(base_dir)
+    global_ini.parent.mkdir(parents=True)
+    global_ini.write_bytes(b"[General]\nFirstRun=false\n")
+    marker.write_bytes(b"incorrect-marker")
+
+    def prepare():
+        global_write = obs_bootstrap.OBSBootstrapper(
+            base_dir
+        )._prepare_obs_ini_write(global_ini, label="global.ini")
+        marker_snapshot = obs_bootstrap.preflight_obs_config_file(
+            marker,
+            label=obs_bootstrap.PORTABLE_OBS_MARKER_NAME,
+        )
+        return obs_bootstrap.OBSConfigTransactionPlan(
+            base_dir=base_dir,
+            directories=(global_ini.parent,),
+            writes=(
+                global_write,
+                obs_bootstrap.OBSConfigPlannedWrite(marker_snapshot, b""),
+            ),
+        )
+
+    def stop_with_flush():
+        global_ini.write_bytes(
+            b"[General]\nFirstRun=false\nExternalAfterStop=keep\n"
+        )
+        return _strict_stop_evidence(base_dir)
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(
+            obs_bootstrap.OBSPathSafetyError,
+            match="既知のOBS設定file以外",
+        ) as exc_info:
+            obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+                prepare,
+                lambda candidate: candidate,
+                before_commit=stop_with_flush,
+                retry_precommit_check=lambda: None,
+            )
+
+    assert type(exc_info.value) is obs_bootstrap.OBSPathSafetyError
+    assert marker.read_bytes() == b"incorrect-marker"
+    assert b"ExternalAfterStop=keep" in global_ini.read_bytes()
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "root_identity",
+        "files",
+        "directories",
+        "profile_entries",
+        "target_keys",
+        "directory_keys",
+        "validation_keys",
+    ),
+)
+def test_one_replan_requires_exact_fresh_observation(
+    monkeypatch,
+    tmp_path,
+    field,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"[General]\nFirstRun=false\n")
+    real_capture = obs_bootstrap._capture_obs_config_retry_baseline
+    capture_calls = 0
+
+    def changed_observation(observation):
+        if field == "root_identity":
+            return replace(observation, root_identity=(999, 998, 997))
+        if field == "files":
+            items = list(observation.files)
+            index = next(i for i, item in enumerate(items) if item.existed)
+            items[index] = replace(items[index], sha256="f" * 64)
+            return replace(observation, files=tuple(items))
+        if field == "directories":
+            items = list(observation.directories)
+            index = next(i for i, item in enumerate(items) if item.existed)
+            items[index] = replace(items[index], identity=(996, 995, 994))
+            return replace(observation, directories=tuple(items))
+        if field == "profile_entries":
+            added = obs_bootstrap._OBSProfileEntryRetryObservation(
+                name="External",
+                kind="directory",
+                identity=(993, 992, 991),
+            )
+            return replace(
+                observation,
+                profile_entries=(*observation.profile_entries, added),
+            )
+        values = getattr(observation, field)
+        return replace(observation, **{field: frozenset((*values, "sentinel"))})
+
+    def capture(*args, **kwargs):
+        nonlocal capture_calls
+        capture_calls += 1
+        observation = real_capture(*args, **kwargs)
+        if capture_calls == 2:
+            return changed_observation(observation)
+        return observation
+
+    def stop_with_flush():
+        target.write_bytes(b"[General]\nFirstRun=false\nExternal=keep\n")
+        return _strict_stop_evidence(base_dir)
+
+    monkeypatch.setattr(
+        obs_bootstrap,
+        "_capture_obs_config_retry_baseline",
+        capture,
+    )
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(
+            obs_bootstrap.OBSPathSafetyError,
+            match="完全なfilesystem observation",
+        ) as exc_info:
+            obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+                lambda: _prepare_global_ini_transaction(base_dir),
+                lambda candidate: candidate,
+                before_commit=stop_with_flush,
+                retry_precommit_check=lambda: None,
+            )
+
+    assert type(exc_info.value) is obs_bootstrap.OBSPathSafetyError
+    assert capture_calls == 2
+    assert b"External=keep" in target.read_bytes()
+    _assert_transaction_clean(base_dir)
+
+
+def test_one_replan_never_retries_a_second_private_conflict(monkeypatch, tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"[General]\nFirstRun=false\n")
+    real_execute = obs_bootstrap.execute_obs_config_transaction
+    execute_calls = 0
+    saved_conflict = None
+
+    def execute(*args, **kwargs):
+        nonlocal execute_calls, saved_conflict
+        execute_calls += 1
+        if execute_calls == 2:
+            assert saved_conflict is not None
+            raise saved_conflict
+        try:
+            return real_execute(*args, **kwargs)
+        except obs_bootstrap._OBSPostStopConfigConflict as conflict:
+            saved_conflict = conflict
+            raise
+
+    def stop_with_flush():
+        target.write_bytes(b"[General]\nFirstRun=false\nExternal=keep\n")
+        return _strict_stop_evidence(base_dir)
+
+    monkeypatch.setattr(obs_bootstrap, "execute_obs_config_transaction", execute)
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(
+            obs_bootstrap._OBSPostStopConfigConflict,
+        ) as exc_info:
+            obs_bootstrap._execute_obs_config_transaction_with_one_replan(
+                lambda: _prepare_global_ini_transaction(base_dir),
+                lambda candidate: candidate,
+                before_commit=stop_with_flush,
+                retry_precommit_check=lambda: None,
+            )
+
+    assert exc_info.value is saved_conflict
+    assert execute_calls == 2
+    assert b"External=keep" in target.read_bytes()
+    _assert_transaction_clean(base_dir)
+
+
+class _StrictSettingsProcessManager:
+    def __init__(self, base_dir, snapshots, *, killed_pids=()):
+        self.obs_dir = base_dir
+        self.obs_exe = base_dir / "bin" / "64bit" / "obs64.exe"
+        self.snapshots = list(snapshots)
+        self.killed_pids = tuple(killed_pids)
+        self.query_calls = 0
+        self.kill_calls = 0
+
+    def query_obs_processes_strict(self):
+        self.query_calls += 1
+        result = self.snapshots.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def terminate_expected_obs_processes_strict(self, expected):
+        self.kill_calls += 1
+        after = self.query_obs_processes_strict()
+        signaled = tuple(
+            process for process in expected if process.pid in self.killed_pids
+        )
+        return obs_bootstrap.OBSStrictTerminationResult(signaled, after)
+
+
+def _strict_process_snapshot(*processes, queried_at):
+    return obs_bootstrap.OBSProcessQuerySnapshot(
+        processes=tuple(processes),
+        queried_at=queried_at,
+    )
+
+
+def test_shared_settings_stop_uses_strict_before_and_after_snapshots(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    base_dir.mkdir(parents=True)
+    managed = obs_bootstrap.OBSProcessInfo(
+        pid=4312,
+        executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+        creation_time=10.0,
+    )
+    manager = _StrictSettingsProcessManager(
+        base_dir,
+        (
+            _strict_process_snapshot(managed, queried_at=100.0),
+            _strict_process_snapshot(queried_at=101.0),
+        ),
+        killed_pids=(managed.pid,),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        evidence = obs_bootstrap._stop_managed_obs_processes_for_settings(
+            base_dir,
+            manager,
+        )
+
+    assert evidence.managed_before == (managed,)
+    assert evidence.killed_pids == (managed.pid,)
+    assert evidence.managed_after == ()
+    assert manager.query_calls == 2
+    assert manager.kill_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("before", "killed_pids", "after", "expected_error", "kill_calls"),
+    (
+        (
+            OBSProcessQueryError("before query failed"),
+            (),
+            None,
+            OBSProcessQueryError,
+            0,
+        ),
+        (
+            "unmanaged",
+            (),
+            None,
+            obs_bootstrap.OBSPathSafetyError,
+            0,
+        ),
+        (
+            "managed",
+            (),
+            "empty",
+            obs_bootstrap.OBSPathSafetyError,
+            1,
+        ),
+        (
+            "managed",
+            (4312,),
+            OBSProcessQueryError("after query failed"),
+            OBSProcessQueryError,
+            1,
+        ),
+        (
+            "managed",
+            (4312,),
+            "managed",
+            obs_bootstrap.OBSPathSafetyError,
+            1,
+        ),
+    ),
+)
+def test_shared_settings_stop_fails_closed_for_strict_query_or_outcome(
+    tmp_path,
+    before,
+    killed_pids,
+    after,
+    expected_error,
+    kill_calls,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    base_dir.mkdir(parents=True)
+    managed = obs_bootstrap.OBSProcessInfo(
+        pid=4312,
+        executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+        creation_time=10.0,
+    )
+    unmanaged = replace(
+        managed,
+        executable_path=(tmp_path / "regular-obs" / "obs64.exe").absolute(),
+    )
+
+    def snapshot(value, queried_at):
+        if isinstance(value, BaseException):
+            return value
+        if value == "managed":
+            return _strict_process_snapshot(managed, queried_at=queried_at)
+        if value == "unmanaged":
+            return _strict_process_snapshot(unmanaged, queried_at=queried_at)
+        if value == "empty":
+            return _strict_process_snapshot(queried_at=queried_at)
+        raise AssertionError(value)
+
+    snapshots = [snapshot(before, 100.0)]
+    if after is not None:
+        snapshots.append(snapshot(after, 101.0))
+    manager = _StrictSettingsProcessManager(
+        base_dir,
+        snapshots,
+        killed_pids=killed_pids,
+    )
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(expected_error):
+            obs_bootstrap._stop_managed_obs_processes_for_settings(
+                base_dir,
+                manager,
+            )
+
+    assert manager.kill_calls == kill_calls
+
+
+@pytest.mark.parametrize("scope", ["missing", "mismatched"])
+def test_shared_settings_stop_requires_exact_root_lease_before_signal(
+    tmp_path,
+    scope,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    other_dir = (tmp_path / "other-obs-portable").absolute()
+    base_dir.mkdir(parents=True)
+    other_dir.mkdir(parents=True)
+    manager = _StrictSettingsProcessManager(base_dir, ())
+
+    if scope == "missing":
+        context = nullcontext()
+    else:
+        context = obs_bootstrap.obs_config_mutation_guard(other_dir)
+    with context:
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="root lease"):
+            obs_bootstrap._stop_managed_obs_processes_for_settings(
+                base_dir,
+                manager,
+            )
+
+    assert manager.query_calls == 0
+    assert manager.kill_calls == 0
+
+
+def test_shared_settings_stop_rejects_same_pid_replacement_without_signaling(
+    monkeypatch,
+    tmp_path,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    base_dir.mkdir(parents=True)
+    manager = obs_bootstrap.OBSProcessManager(base_dir)
+    expected = obs_bootstrap.OBSProcessInfo(
+        pid=4312,
+        executable_path=manager.obs_exe,
+        creation_time=10.0,
+        creation_time_filetime=116444736100000000,
+    )
+    replacement = replace(expected, creation_time=99.0)
+    snapshots = iter(
+        (
+            _strict_process_snapshot(expected, queried_at=100.0),
+            _strict_process_snapshot(replacement, queried_at=101.0),
+        )
+    )
+    signals = []
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: next(snapshots),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda pid, force: signals.append((pid, force)) or True,
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(OBSProcessQueryError, match="replaced|disappeared"):
+            obs_bootstrap._stop_managed_obs_processes_for_settings(
+                base_dir,
+                manager,
+            )
+
+    assert signals == []
+
+
 def _leave_stale_settings_transaction(monkeypatch, base_dir: Path, phase: str) -> Path:
     plan, (target,) = _make_plan(
         base_dir,
@@ -166,6 +846,71 @@ def _leave_stale_settings_transaction(monkeypatch, base_dir: Path, phase: str) -
     else:
         raise AssertionError(f"unsupported stale phase: {phase}")
     return target
+
+
+@pytest.mark.parametrize("case", ["query-error", "malformed", "running"])
+def test_committed_recovery_without_callback_requires_strict_zero_process_proof(
+    monkeypatch,
+    tmp_path,
+    case,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = _leave_stale_settings_transaction(monkeypatch, base_dir, "committed")
+    process = obs_bootstrap.OBSProcessInfo(
+        4312,
+        (tmp_path / "regular-obs" / "obs64.exe").absolute(),
+        10.0,
+    )
+
+    class RecoveryProcessManager:
+        def __init__(self, _base_dir):
+            pass
+
+        def query_obs_processes_strict(self):
+            if case == "query-error":
+                raise OBSProcessQueryError("recovery strict query failed")
+            if case == "malformed":
+                return SimpleNamespace(processes=(), queried_at=100.0)
+            return obs_bootstrap.OBSProcessQuerySnapshot((process,), 100.0)
+
+    monkeypatch.setattr(obs_bootstrap, "OBSProcessManager", RecoveryProcessManager)
+
+    with pytest.raises(
+        obs_bootstrap.OBSSettingsRecoveryRequiredError,
+        match="strict|OBS processが稼働中",
+    ):
+        with obs_bootstrap.obs_config_mutation_guard(base_dir):
+            pass
+
+    assert target.read_bytes() == b"desired"
+    assert obs_bootstrap.get_obs_settings_transaction_marker(base_dir).exists()
+
+
+def test_committed_recovery_without_callback_accepts_strict_zero_process_proof(
+    monkeypatch,
+    tmp_path,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    target = _leave_stale_settings_transaction(monkeypatch, base_dir, "committed")
+    query_calls = 0
+
+    class RecoveryProcessManager:
+        def __init__(self, _base_dir):
+            pass
+
+        def query_obs_processes_strict(self):
+            nonlocal query_calls
+            query_calls += 1
+            return obs_bootstrap.OBSProcessQuerySnapshot((), 100.0)
+
+    monkeypatch.setattr(obs_bootstrap, "OBSProcessManager", RecoveryProcessManager)
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        pass
+
+    assert query_calls == 1
+    assert target.read_bytes() == b"desired"
+    _assert_transaction_clean(base_dir)
 
 
 @contextmanager

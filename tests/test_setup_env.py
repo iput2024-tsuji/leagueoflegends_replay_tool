@@ -3,6 +3,7 @@ import inspect
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -49,6 +50,30 @@ def _create_directory_link(link: Path, target: Path) -> None:
     os.symlink(target, link, target_is_directory=True)
 
 
+class _StrictSetupProcessManager:
+    def __init__(self, obs_dir: Path, before, *, after=None, signaled=True):
+        self.obs_dir = obs_dir.absolute()
+        self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
+        self.before = before
+        self.after = after
+        self.signaled = signaled
+        self.query_calls = 0
+        self.termination_calls = 0
+
+    def query_obs_processes_strict(self):
+        self.query_calls += 1
+        if isinstance(self.before, BaseException):
+            raise self.before
+        return self.before
+
+    def terminate_expected_obs_processes_strict(self, expected):
+        self.termination_calls += 1
+        return obs_bootstrap.OBSStrictTerminationResult(
+            expected if self.signaled else (),
+            self.after,
+        )
+
+
 def test_setup_module_has_no_network_or_archive_install_path():
     source = inspect.getsource(setup_env)
 
@@ -58,6 +83,73 @@ def test_setup_module_has_no_network_or_archive_install_path():
     assert "unpack_archive" not in source
     assert not hasattr(setup_env, "download_file")
     assert not hasattr(setup_env, "ensure_ffmpeg")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_termination_calls"),
+    (
+        ("query-error", 0),
+        ("malformed", 0),
+        ("unmanaged", 0),
+        ("survivor", 1),
+    ),
+)
+def test_setup_settings_stop_fails_closed_for_incomplete_or_unsafe_process_state(
+    tmp_path,
+    case,
+    expected_termination_calls,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    obs_dir.mkdir(parents=True)
+    managed = obs_bootstrap.OBSProcessInfo(
+        101,
+        obs_dir / "bin" / "64bit" / "obs64.exe",
+        10.0,
+    )
+    unmanaged = obs_bootstrap.OBSProcessInfo(
+        202,
+        (tmp_path / "regular-obs" / "obs64.exe").absolute(),
+        20.0,
+    )
+    empty = obs_bootstrap.OBSProcessQuerySnapshot((), 101.0)
+    before = obs_bootstrap.OBSProcessQuerySnapshot((managed,), 100.0)
+    after = empty
+    if case == "query-error":
+        before = obs_bootstrap.OBSProcessQueryError("strict query failed")
+    elif case == "malformed":
+        before = SimpleNamespace(processes=(), queried_at=100.0)
+    elif case == "unmanaged":
+        before = obs_bootstrap.OBSProcessQuerySnapshot((unmanaged,), 100.0)
+    elif case == "survivor":
+        after = obs_bootstrap.OBSProcessQuerySnapshot((managed,), 101.0)
+    manager = _StrictSetupProcessManager(obs_dir, before, after=after)
+
+    with pytest.raises(setup_env.ManualSetupRequiredError, match="strict identity"):
+        setup_env._stop_obs_tree_for_settings_recovery(manager)
+
+    assert manager.termination_calls == expected_termination_calls
+
+
+def test_setup_settings_stop_accepts_only_identity_bearing_strict_zero_result(
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    obs_dir.mkdir(parents=True)
+    managed = obs_bootstrap.OBSProcessInfo(
+        101,
+        obs_dir / "bin" / "64bit" / "obs64.exe",
+        10.0,
+    )
+    manager = _StrictSetupProcessManager(
+        obs_dir,
+        obs_bootstrap.OBSProcessQuerySnapshot((managed,), 100.0),
+        after=obs_bootstrap.OBSProcessQuerySnapshot((), 101.0),
+    )
+
+    setup_env._stop_obs_tree_for_settings_recovery(manager)
+
+    assert manager.query_calls == 1
+    assert manager.termination_calls == 1
 
 
 def test_manual_setup_message_identifies_upstream_and_exact_destination(monkeypatch, tmp_path):
@@ -313,18 +405,28 @@ def test_legacy_migration_rejects_source_process_that_survives_kill(
     class StubbornProcessManager:
         kill_calls = 0
 
-        def __init__(self, *_args, **_kwargs):
-            pass
+        def __init__(self, obs_dir, **_kwargs):
+            self.obs_dir = Path(obs_dir).absolute()
+            self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
 
-        def unmanaged_processes(self):
-            return []
+        def query_obs_processes_strict(self):
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                (
+                    obs_bootstrap.OBSProcessInfo(
+                        101,
+                        self.obs_exe,
+                        10.0,
+                    ),
+                ),
+                100.0,
+            )
 
-        def kill_stale_managed_processes(self, timeout_sec=3.0):
+        def terminate_expected_obs_processes_strict(self, expected):
             type(self).kill_calls += 1
-            return []
-
-        def has_managed_process(self):
-            return True
+            return obs_bootstrap.OBSStrictTerminationResult(
+                expected,
+                obs_bootstrap.OBSProcessQuerySnapshot(expected, 101.0),
+            )
 
     copy_started = False
 

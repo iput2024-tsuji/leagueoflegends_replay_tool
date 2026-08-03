@@ -12,6 +12,7 @@ import pytest
 
 from src import obs_bootstrap
 from src.obs_bootstrap import OBSBootstrapper
+from src.obs_process import OBSProcessQueryError
 
 
 @contextmanager
@@ -184,10 +185,26 @@ def _hold_obs_migration_before_journal_rename(
 class FakeProcessManager:
     def __init__(self) -> None:
         self.kill_calls = 0
+        self.query_calls = 0
+
+    def query_obs_processes_strict(self):
+        self.query_calls += 1
+        return obs_bootstrap.OBSProcessQuerySnapshot(
+            processes=(),
+            queried_at=100.0 + self.query_calls,
+        )
 
     def kill_stale_managed_processes(self, timeout_sec: float = 3.0) -> list[int]:
         self.kill_calls += 1
         return []
+
+    def terminate_expected_obs_processes_strict(self, expected):
+        killed_pids = tuple(self.kill_stale_managed_processes())
+        after = self.query_obs_processes_strict()
+        return obs_bootstrap.OBSStrictTerminationResult(
+            tuple(process for process in expected if process.pid in killed_pids),
+            after,
+        )
 
     def has_managed_process(self) -> bool:
         return False
@@ -206,6 +223,293 @@ def test_apply_stops_managed_obs_once(tmp_path):
     assert process_manager.kill_calls == 2
     assert Path(result["global_ini_path"]).exists()
     assert Path(result["user_ini_path"]).exists()
+
+
+def test_apply_replans_noop_flush_and_returns_fresh_changed_flags(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    OBSBootstrapper(base_dir, process_manager=FakeProcessManager()).apply(
+        port=4455,
+        password="secret-password",
+        stop_managed_processes=False,
+    )
+    global_ini = obs_bootstrap.get_obs_global_ini_path(base_dir)
+
+    class FlushingProcessManager(FakeProcessManager):
+        def __init__(self):
+            super().__init__()
+            self.active = True
+            self.process = obs_bootstrap.OBSProcessInfo(
+                pid=4312,
+                executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+                creation_time=10.0,
+            )
+
+        def query_obs_processes_strict(self):
+            self.query_calls += 1
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(self.process,) if self.active else (),
+                queried_at=100.0 + self.query_calls,
+            )
+
+        def kill_stale_managed_processes(self, timeout_sec: float = 3.0):
+            self.kill_calls += 1
+            global_ini.write_bytes(
+                b"[General]\nFirstRun=false\nExternalAfterStop=keep\n\n"
+                b"[BasicWindow]\nSysTrayEnabled=false\n"
+                b"SysTrayWhenStarted=false\nSysTrayMinimizeToTray=false\n"
+            )
+            self.active = False
+            return [self.process.pid]
+
+    process_manager = FlushingProcessManager()
+    result = OBSBootstrapper(
+        base_dir,
+        process_manager=process_manager,
+    ).apply(port=4455, password="secret-password")
+
+    rendered = global_ini.read_text(encoding="utf-8")
+    assert result["global_ini_changed"] is True
+    assert result["user_ini_changed"] is False
+    assert result["websocket"] == (
+        False,
+        obs_bootstrap.get_obs_websocket_config_path(base_dir),
+    )
+    assert result["global_ini_path"] == global_ini
+    assert "FirstRun=true" in rendered
+    assert "ExternalAfterStop=keep" in rendered
+    assert process_manager.kill_calls == 1
+    assert process_manager.query_calls == 3
+
+
+@pytest.mark.parametrize("settings_api", ("global", "user", "websocket"))
+def test_standalone_settings_api_replans_stop_flush_and_returns_fresh_result(
+    tmp_path,
+    settings_api,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    OBSBootstrapper(base_dir, process_manager=FakeProcessManager()).apply(
+        port=4455,
+        password="old-password",
+        stop_managed_processes=False,
+    )
+    targets = {
+        "global": obs_bootstrap.get_obs_global_ini_path(base_dir),
+        "user": obs_bootstrap.get_obs_user_ini_path(base_dir),
+        "websocket": obs_bootstrap.get_obs_websocket_config_path(base_dir),
+    }
+    target = targets[settings_api]
+
+    class FlushingProcessManager(FakeProcessManager):
+        def __init__(self):
+            super().__init__()
+            self.active = True
+            self.process = obs_bootstrap.OBSProcessInfo(
+                pid=4312,
+                executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+                creation_time=10.0,
+            )
+
+        def query_obs_processes_strict(self):
+            self.query_calls += 1
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(self.process,) if self.active else (),
+                queried_at=100.0 + self.query_calls,
+            )
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            self.kill_calls += 1
+            if settings_api == "websocket":
+                target.write_text(
+                    json.dumps(
+                        {
+                            "server_enabled": False,
+                            "server_port": 4454,
+                            "auth_required": False,
+                            "server_password": "old-password",
+                            "external_after_stop": "keep",
+                        },
+                        indent=4,
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                target.write_bytes(
+                    b"[General]\nFirstRun=false\nExternalAfterStop=keep\n\n"
+                    b"[BasicWindow]\nSysTrayEnabled=true\n"
+                    b"SysTrayWhenStarted=false\nSysTrayMinimizeToTray=false\n"
+                )
+            self.active = False
+            return [self.process.pid]
+
+    class CountingBootstrapper(OBSBootstrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.prepare_calls = 0
+
+        def _prepare_obs_ini_write(self, ini_path, *, label):
+            if settings_api in {"global", "user"}:
+                self.prepare_calls += 1
+            return super()._prepare_obs_ini_write(ini_path, label=label)
+
+        def _prepare_websocket_write(self, port, password):
+            if settings_api == "websocket":
+                self.prepare_calls += 1
+            return super()._prepare_websocket_write(port, password)
+
+    process_manager = FlushingProcessManager()
+    bootstrapper = CountingBootstrapper(
+        base_dir,
+        process_manager=process_manager,
+    )
+    if settings_api == "global":
+        result = bootstrapper.ensure_global_ini()
+    elif settings_api == "user":
+        result = bootstrapper.ensure_user_ini()
+    else:
+        result = bootstrapper.ensure_websocket_config(4455, "old-password")
+
+    assert result == (True, target)
+    assert bootstrapper.prepare_calls == 2
+    assert process_manager.kill_calls == 1
+    assert process_manager.query_calls == 3
+    if settings_api == "websocket":
+        rendered = json.loads(target.read_text(encoding="utf-8"))
+        assert rendered["server_enabled"] is True
+        assert rendered["server_port"] == 4455
+        assert rendered["auth_required"] is True
+        assert rendered["external_after_stop"] == "keep"
+    else:
+        rendered = target.read_text(encoding="utf-8")
+        assert "FirstRun=true" in rendered
+        assert "SysTrayEnabled=false" in rendered
+        assert "ExternalAfterStop=keep" in rendered
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(base_dir).exists()
+
+
+@pytest.mark.parametrize("retry_outcome", ("query-error", "managed", "unmanaged"))
+def test_apply_replan_fails_closed_on_retry_query_failure_or_reappearance(
+    tmp_path,
+    retry_outcome,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    OBSBootstrapper(base_dir, process_manager=FakeProcessManager()).apply(
+        port=4455,
+        password="old-password",
+        stop_managed_processes=False,
+    )
+    global_ini = obs_bootstrap.get_obs_global_ini_path(base_dir)
+
+    class RetryFailureProcessManager(FakeProcessManager):
+        def __init__(self):
+            super().__init__()
+            self.process = obs_bootstrap.OBSProcessInfo(
+                pid=4312,
+                executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+                creation_time=10.0,
+            )
+
+        def query_obs_processes_strict(self):
+            self.query_calls += 1
+            if self.query_calls == 1:
+                processes = (self.process,)
+            elif self.query_calls == 2:
+                processes = ()
+            elif retry_outcome == "query-error":
+                raise OBSProcessQueryError("retry query failed")
+            elif retry_outcome == "managed":
+                processes = (self.process,)
+            else:
+                processes = (
+                    obs_bootstrap.OBSProcessInfo(
+                        pid=9912,
+                        executable_path=(tmp_path / "regular-obs" / "obs64.exe").absolute(),
+                        creation_time=11.0,
+                    ),
+                )
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=processes,
+                queried_at=100.0 + self.query_calls,
+            )
+
+        def kill_stale_managed_processes(self, timeout_sec: float = 3.0):
+            self.kill_calls += 1
+            global_ini.write_bytes(
+                b"[General]\nFirstRun=false\nExternalAfterStop=keep\n\n"
+                b"[BasicWindow]\nSysTrayEnabled=false\n"
+                b"SysTrayWhenStarted=false\nSysTrayMinimizeToTray=false\n"
+            )
+            return [self.process.pid]
+
+    process_manager = RetryFailureProcessManager()
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="再計画commit前"):
+        OBSBootstrapper(base_dir, process_manager=process_manager).apply(
+            port=4455,
+            password="old-password",
+        )
+
+    assert process_manager.kill_calls == 1
+    assert process_manager.query_calls == 3
+    assert b"ExternalAfterStop=keep" in global_ini.read_bytes()
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(base_dir).exists()
+
+
+def test_apply_replan_failure_chain_never_retains_requested_password(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    OBSBootstrapper(base_dir, process_manager=FakeProcessManager()).apply(
+        port=4455,
+        password="old-password",
+        stop_managed_processes=False,
+    )
+    global_ini = obs_bootstrap.get_obs_global_ini_path(base_dir)
+    requested_password = "phase3-new-secret-must-not-leak"
+
+    class RetryQueryFailureManager(FakeProcessManager):
+        def __init__(self):
+            super().__init__()
+            self.process = obs_bootstrap.OBSProcessInfo(
+                pid=4312,
+                executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+                creation_time=10.0,
+            )
+
+        def query_obs_processes_strict(self):
+            self.query_calls += 1
+            if self.query_calls == 3:
+                raise OBSProcessQueryError("retry query failed")
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                processes=(self.process,) if self.query_calls == 1 else (),
+                queried_at=100.0 + self.query_calls,
+            )
+
+        def kill_stale_managed_processes(self, timeout_sec: float = 3.0):
+            self.kill_calls += 1
+            global_ini.write_bytes(
+                b"[General]\nFirstRun=false\nExternalAfterStop=keep\n\n"
+                b"[BasicWindow]\nSysTrayEnabled=false\n"
+                b"SysTrayWhenStarted=false\nSysTrayMinimizeToTray=false\n"
+            )
+            return [self.process.pid]
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError) as exc_info:
+        OBSBootstrapper(
+            base_dir,
+            process_manager=RetryQueryFailureManager(),
+        ).apply(port=4455, password=requested_password)
+
+    pending = [exc_info.value]
+    seen = set()
+    while pending:
+        error = pending.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        diagnostic = f"{error!s}\n{error!r}\n{vars(error)!r}"
+        assert requested_password not in diagnostic
+        if error.__cause__ is not None:
+            pending.append(error.__cause__)
+        if error.__context__ is not None:
+            pending.append(error.__context__)
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(base_dir).exists()
 
 
 def test_standalone_ini_repairs_still_stop_managed_obs(tmp_path):

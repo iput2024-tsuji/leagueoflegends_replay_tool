@@ -717,25 +717,19 @@ def test_recording_profile_propagates_acl_error_without_reset_or_write(monkeypat
     profile_ini.write_text("[Output]\nMode=Advanced\n", encoding="utf-8")
     before = profile_ini.read_bytes()
     real_preflight = recordtest.preflight_obs_config_file
-    writes = []
 
     def deny_profile_read(path, **kwargs):
         if Path(path) == profile_ini:
             raise PermissionError("simulated profile ACL denial")
         return real_preflight(path, **kwargs)
 
-    def track_write(*args, **kwargs):
-        writes.append((args, kwargs))
-        raise AssertionError("ACL failure must prevent every profile write")
-
     monkeypatch.setattr(recordtest, "preflight_obs_config_file", deny_profile_read)
-    monkeypatch.setattr(recordtest, "write_preflighted_obs_config_file", track_write)
 
     with pytest.raises(PermissionError, match="ACL denial"):
         recordtest.ensure_obs_recording_profile_ini(obs_dir, record_dir=tmp_path / "recordings")
 
-    assert writes == []
     assert profile_ini.read_bytes() == before
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
 
 
 def test_recording_profile_uses_shared_mutation_lock(tmp_path):
@@ -753,6 +747,286 @@ def test_recording_profile_uses_shared_mutation_lock(tmp_path):
         lock.release()
 
     assert profile_ini.read_bytes() == before
+
+
+def test_recording_profile_rejects_unmanaged_obs_before_kill_or_commit(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = tmp_path / "obs-portable"
+
+    class UnmanagedProcessManager:
+        kill_calls = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def unmanaged_processes(self):
+            return [SimpleNamespace(pid=99, executable_path=tmp_path / "obs64.exe")]
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            type(self).kill_calls += 1
+            raise AssertionError("unmanaged OBS must be rejected before managed kill")
+
+        def has_managed_process(self):
+            raise AssertionError("managed state must not be queried after unmanaged reject")
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", UnmanagedProcessManager)
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="管理対象外"):
+        recordtest.ensure_obs_recording_profile_ini(
+            obs_dir,
+            record_dir=tmp_path / "recordings",
+        )
+
+    assert UnmanagedProcessManager.kill_calls == 0
+    assert not profile_ini.exists()
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
+
+
+def test_recording_profile_rejects_managed_obs_that_survives_kill(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = tmp_path / "obs-portable"
+
+    class StubbornProcessManager:
+        kill_calls = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def unmanaged_processes(self):
+            return []
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            type(self).kill_calls += 1
+            return []
+
+        def has_managed_process(self):
+            return True
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", StubbornProcessManager)
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="停止できません"):
+        recordtest.ensure_obs_recording_profile_ini(
+            obs_dir,
+            record_dir=tmp_path / "recordings",
+        )
+
+    assert StubbornProcessManager.kill_calls == 1
+    assert not profile_ini.exists()
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
+
+
+def test_startup_settings_compose_user_ini_from_one_original_snapshot(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    user_ini = obs_bootstrap.get_obs_user_ini_path(obs_dir)
+    user_ini.parent.mkdir(parents=True)
+    user_ini.write_text(
+        "[General]\nCustomGeneral=keep\n\n[Basic]\nCustomBasic=keep\n",
+        encoding="utf-8",
+    )
+    real_preflight = obs_bootstrap.preflight_obs_config_file
+    user_reads = 0
+
+    def count_user_snapshot(path, **kwargs):
+        nonlocal user_reads
+        if Path(path).absolute() == user_ini.absolute():
+            user_reads += 1
+        return real_preflight(path, **kwargs)
+
+    monkeypatch.setattr(
+        obs_bootstrap,
+        "preflight_obs_config_file",
+        count_user_snapshot,
+    )
+    bootstrapper = obs_bootstrap.OBSBootstrapper(obs_dir)
+    plan = recordtest._prepare_obs_startup_settings_plan(
+        bootstrapper,
+        port=4455,
+        password="secret",
+        record_dir=tmp_path / "recordings",
+        scale_type=recordtest.DEFAULT_OBS_SCALE_TYPE,
+        recording_quality=recordtest.DEFAULT_OBS_RECORDING_QUALITY,
+        recording_encoder="x264",
+        selected_encoder=None,
+    )
+
+    user_write = next(
+        write
+        for write in plan.transaction.writes
+        if write.snapshot.path == user_ini.absolute()
+    )
+    rendered = user_write.payload.decode("utf-8")
+    assert user_reads == 1
+    assert "CustomGeneral=keep" in rendered
+    assert "CustomBasic=keep" in rendered
+    assert "FirstRun=true" in rendered
+    assert "Profile=LoLReplayTool" in rendered
+    assert "ProfileDir=LoLReplayTool" in rendered
+
+
+def test_startup_settings_reject_user_ini_change_between_bootstrap_and_profile_plan(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    user_ini = obs_bootstrap.get_obs_user_ini_path(obs_dir)
+    user_ini.parent.mkdir(parents=True)
+    user_ini.write_bytes(b"[General]\nCustom=original\n")
+    external = b"[General]\nCustom=external-update\n"
+    real_profile_preflight = recordtest.preflight_obs_recording_profile_ini
+    stop_calls = 0
+
+    def change_after_bootstrap_snapshot(base_dir, *, user_file=None):
+        user_ini.write_bytes(external)
+        return real_profile_preflight(base_dir, user_file=user_file)
+
+    def stop_managed() -> None:
+        nonlocal stop_calls
+        stop_calls += 1
+
+    monkeypatch.setattr(
+        recordtest,
+        "preflight_obs_recording_profile_ini",
+        change_after_bootstrap_snapshot,
+    )
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="内容が変化"):
+        recordtest._execute_obs_startup_settings_transaction(
+            obs_bootstrap.OBSBootstrapper(obs_dir),
+            port=4455,
+            password="secret",
+            record_dir=tmp_path / "recordings",
+            scale_type=recordtest.DEFAULT_OBS_SCALE_TYPE,
+            recording_quality=recordtest.DEFAULT_OBS_RECORDING_QUALITY,
+            recording_encoder="x264",
+            selected_encoder=None,
+            before_commit=stop_managed,
+        )
+
+    assert stop_calls == 0
+    assert user_ini.read_bytes() == external
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
+
+
+def test_startup_settings_revalidate_unchanged_profile_after_stop(tmp_path):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    bootstrapper = obs_bootstrap.OBSBootstrapper(obs_dir)
+    transaction_kwargs = {
+        "port": 4455,
+        "password": "secret",
+        "record_dir": tmp_path / "recordings",
+        "scale_type": recordtest.DEFAULT_OBS_SCALE_TYPE,
+        "recording_quality": recordtest.DEFAULT_OBS_RECORDING_QUALITY,
+        "recording_encoder": "x264",
+        "selected_encoder": None,
+    }
+    recordtest._execute_obs_startup_settings_transaction(
+        bootstrapper,
+        **transaction_kwargs,
+        before_commit=lambda: None,
+    )
+    profile_ini = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+    global_ini = obs_bootstrap.get_obs_global_ini_path(obs_dir)
+    global_before = global_ini.read_bytes()
+
+    def simulate_obs_profile_flush() -> None:
+        profile_ini.write_bytes(b"[General]\nName=external-update\n")
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="内容が変化"):
+        recordtest._execute_obs_startup_settings_transaction(
+            bootstrapper,
+            **transaction_kwargs,
+            before_commit=simulate_obs_profile_flush,
+            run_before_commit_on_noop=True,
+        )
+
+    assert profile_ini.read_bytes() == b"[General]\nName=external-update\n"
+    assert global_ini.read_bytes() == global_before
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
+
+
+def test_startup_settings_reject_new_basic_ini_in_existing_profile_after_stop(
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    bootstrapper = obs_bootstrap.OBSBootstrapper(obs_dir)
+    transaction_kwargs = {
+        "port": 4455,
+        "password": "secret",
+        "record_dir": tmp_path / "recordings",
+        "scale_type": recordtest.DEFAULT_OBS_SCALE_TYPE,
+        "recording_quality": recordtest.DEFAULT_OBS_RECORDING_QUALITY,
+        "recording_encoder": "x264",
+        "selected_encoder": None,
+    }
+    recordtest._execute_obs_startup_settings_transaction(
+        bootstrapper,
+        **transaction_kwargs,
+        before_commit=lambda: None,
+    )
+    late_profile = (
+        obs_dir
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / "existing-empty"
+        / "basic.ini"
+    )
+    late_profile.parent.mkdir()
+    managed_profile = (
+        late_profile.parent.parent
+        / recordtest.MANAGED_OBS_PROFILE_DIR_NAME
+        / "basic.ini"
+    )
+    managed_before = managed_profile.read_bytes()
+
+    def simulate_obs_creating_profile_file() -> None:
+        late_profile.write_bytes(b"[General]\nName=created-after-plan\n")
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="作成されました"):
+        recordtest._execute_obs_startup_settings_transaction(
+            bootstrapper,
+            **transaction_kwargs,
+            before_commit=simulate_obs_creating_profile_file,
+            run_before_commit_on_noop=True,
+        )
+
+    assert late_profile.read_bytes() == b"[General]\nName=created-after-plan\n"
+    assert managed_profile.read_bytes() == managed_before
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
 
 
 def test_record_status_details_include_obs_profile_and_output_diagnostics():
@@ -922,6 +1196,32 @@ def test_preflight_rejects_config_reparse_before_profile_or_external_write(monke
     assert sentinel.read_text(encoding="utf-8") == "keep"
     assert not (external / "obs-studio").exists()
     assert not (managed_dir / obs_bootstrap.PORTABLE_OBS_MARKER_NAME).exists()
+
+
+def test_read_only_preflight_reports_pending_settings_transaction(monkeypatch, tmp_path):
+    managed_dir = (tmp_path / "obs-portable").absolute()
+    obs_executable = managed_dir / "bin" / "64bit" / "obs64.exe"
+    obs_executable.parent.mkdir(parents=True)
+    obs_executable.write_bytes(b"fake obs")
+    obs_bootstrap.OBSBootstrapper(managed_dir).apply()
+    settings_marker = obs_bootstrap.get_obs_settings_transaction_marker(managed_dir)
+    settings_marker.write_bytes(b"inactive-stale-settings")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "missing-legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+
+    report = recordtest.run_preflight_checks(
+        _preflight_config(managed_dir, tmp_path),
+        auto_fix=False,
+        ensure_dirs=False,
+    )
+
+    assert any(
+        "OBS設定transaction" in warning and "再開待ち" in warning
+        for warning in report["warnings"]
+    )
+    assert settings_marker.read_bytes() == b"inactive-stale-settings"
 
 
 def test_preflight_rejects_nested_profile_reparse_before_bootstrap_write(monkeypatch, tmp_path):
@@ -1655,6 +1955,7 @@ def _fake_launch_config(root, recording_encoder="auto"):
 def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_encoder_kinds=()):
     class FakeProcessManager:
         start_count = 0
+        kill_count = 0
         encoder_log_calls = 0
         terminated_pids = []
 
@@ -1663,7 +1964,11 @@ def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_enco
             self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
 
         def kill_stale_managed_processes(self, timeout_sec=3.0):
+            type(self).kill_count += 1
             return []
+
+        def has_managed_process(self):
+            return False
 
         def unmanaged_processes(self):
             return []
@@ -1690,35 +1995,93 @@ def _install_fake_obs_launch(monkeypatch, *, before_encoder_kinds=(), after_enco
         def terminate_process(self, process, timeout_sec=3.0):
             type(self).terminated_pids.append(process.pid)
 
-    class FakeBootstrapper:
-        def __init__(self, base_dir):
-            self.base_dir = Path(base_dir)
-
-        def preflight_apply(self, port=None):
-            return None
-
-        def apply(self, *args, **kwargs):
-            return {
-                "global_ini_changed": False,
-                "global_ini_path": self.base_dir / "config" / "obs-studio" / "global.ini",
-                "user_ini_changed": False,
-                "user_ini_path": self.base_dir / "config" / "obs-studio" / "user.ini",
-                "websocket": (
-                    False,
-                    self.base_dir
-                    / "config"
-                    / "obs-studio"
-                    / "plugin_config"
-                    / "obs-websocket"
-                    / "config.json",
-                ),
-            }
-
     monkeypatch.setattr(recordtest, "OBSProcessManager", FakeProcessManager)
-    monkeypatch.setattr(recordtest, "OBSBootstrapper", FakeBootstrapper)
     monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: False)
     monkeypatch.setattr(recordtest.time, "sleep", lambda *args, **kwargs: None)
     return FakeProcessManager
+
+
+@pytest.mark.parametrize(
+    ("stale_phase", "expected_payload", "expected_kills"),
+    [
+        ("preparing", b"original", 1),
+        ("committed", b"desired", 2),
+    ],
+)
+def test_launch_obs_recovers_pending_settings_without_copy_classification(
+    monkeypatch,
+    tmp_path,
+    stale_phase,
+    expected_payload,
+    expected_kills,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    custom_ini = obs_dir / "config" / "obs-studio" / "custom.ini"
+    custom_ini.parent.mkdir(parents=True)
+    custom_ini.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(custom_ini, label="custom.ini")
+    plan = obs_bootstrap.OBSConfigTransactionPlan(
+        base_dir=obs_dir,
+        directories=(custom_ini.parent,),
+        writes=(obs_bootstrap.OBSConfigPlannedWrite(snapshot, b"desired"),),
+    )
+
+    if stale_phase == "preparing":
+        real_write = obs_bootstrap._write_settings_temporary
+        write_calls = 0
+
+        def crash_in_preparing(path, payload):
+            nonlocal write_calls
+            write_calls += 1
+            result = real_write(path, payload)
+            if write_calls == 1:
+                raise SystemExit("stale preparing")
+            return result
+
+        monkeypatch.setattr(
+            obs_bootstrap,
+            "_write_settings_temporary",
+            crash_in_preparing,
+        )
+        with pytest.raises(SystemExit, match="stale preparing"):
+            obs_bootstrap.execute_obs_config_transaction(plan)
+        monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", real_write)
+    else:
+        real_journal = obs_bootstrap._write_settings_journal
+
+        def crash_after_committed(base, owner, phase, writes):
+            result = real_journal(base, owner, phase, writes)
+            if phase == "committed":
+                raise SystemExit("stale committed")
+            return result
+
+        monkeypatch.setattr(
+            obs_bootstrap,
+            "_write_settings_journal",
+            crash_after_committed,
+        )
+        with pytest.raises(SystemExit, match="stale committed"):
+            obs_bootstrap.execute_obs_config_transaction(plan)
+        monkeypatch.setattr(obs_bootstrap, "_write_settings_journal", real_journal)
+
+    assert obs_bootstrap.has_pending_obs_settings_transaction(obs_dir) is True
+    assert obs_bootstrap.has_pending_obs_copy_transaction(obs_dir) is False
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "missing-legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+    manager = _install_fake_obs_launch(monkeypatch)
+
+    process = recordtest.launch_obs(_fake_launch_config(tmp_path, recording_encoder="x264"))
+
+    assert process.pid == 101
+    assert custom_ini.read_bytes() == expected_payload
+    assert manager.kill_count == expected_kills
+    assert obs_bootstrap.has_pending_obs_settings_transaction(obs_dir) is False
+    assert obs_bootstrap.has_pending_obs_copy_transaction(obs_dir) is False
 
 
 def test_launch_obs_rejects_profile_reparse_before_stopping_process(monkeypatch, tmp_path):
@@ -1782,21 +2145,55 @@ def test_launch_obs_gpu_repair_preflights_before_terminating_process(monkeypatch
     real_preflight = recordtest.preflight_obs_recording_profile_ini
     preflight_calls = 0
 
-    def fail_gpu_restart_preflight(base_dir):
+    def fail_gpu_restart_preflight(base_dir, *, user_file=None):
         nonlocal preflight_calls
         preflight_calls += 1
-        if preflight_calls == 3:
+        if preflight_calls == 2:
             raise obs_bootstrap.OBSPathSafetyError("GPU restart unsafe profile")
-        return real_preflight(base_dir)
+        return real_preflight(base_dir, user_file=user_file)
 
     monkeypatch.setattr(recordtest, "preflight_obs_recording_profile_ini", fail_gpu_restart_preflight)
 
-    with pytest.raises(recordtest.RecorderError, match="再起動前安全性検査"):
+    with pytest.raises(recordtest.RecorderError, match="再起動transaction"):
         recordtest.launch_obs(_fake_launch_config(tmp_path))
 
-    assert preflight_calls == 3
+    assert preflight_calls == 2
     assert manager.start_count == 1
     assert manager.terminated_pids == []
+
+
+def test_launch_obs_gpu_terminate_error_still_kills_all_managed_processes(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+
+    def fail_known_process_termination(self, process, timeout_sec=3.0):
+        type(self).terminated_pids.append(process.pid)
+        raise RuntimeError("known process terminate failed")
+
+    monkeypatch.setattr(
+        manager,
+        "terminate_process",
+        fail_known_process_termination,
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="再起動transaction"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert manager.kill_count == 2
+    assert not obs_bootstrap.get_obs_settings_transaction_marker(obs_dir).exists()
 
 
 def test_launch_obs_uses_startup_log_gpu_encoder_without_restart(monkeypatch, tmp_path):
@@ -1846,6 +2243,7 @@ def test_launch_obs_restarts_once_when_gpu_encoder_is_discovered_after_start(mon
 
     assert process.pid == 102
     assert manager.start_count == 2
+    assert manager.kill_count == 2
     assert manager.terminated_pids == [101]
     profile_ini = (
         obs_dir
@@ -1939,6 +2337,9 @@ def test_launch_obs_refuses_external_websocket_port(monkeypatch):
 
         def kill_stale_managed_processes(self, timeout_sec=3.0):
             return []
+
+        def has_managed_process(self):
+            return False
 
         def unmanaged_processes(self):
             return []
@@ -2194,6 +2595,64 @@ def test_preflight_preserves_stale_migration_recovery_message(monkeypatch, tmp_p
     assert forbidden_calls == []
 
 
+def test_managed_migration_entry_recovers_destination_settings_first(
+    monkeypatch,
+    tmp_path,
+):
+    managed_dir = (tmp_path / "obs-portable").absolute()
+    executable = managed_dir / "bin" / "64bit" / "obs64.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"fake obs")
+    target = managed_dir / "config" / "obs-studio" / "custom.ini"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(target, label="custom.ini")
+    plan = obs_bootstrap.OBSConfigTransactionPlan(
+        base_dir=managed_dir,
+        directories=(target.parent,),
+        writes=(obs_bootstrap.OBSConfigPlannedWrite(snapshot, b"desired"),),
+    )
+    real_write = obs_bootstrap._write_settings_temporary
+    write_calls = 0
+
+    def crash_after_backup(path, payload):
+        nonlocal write_calls
+        write_calls += 1
+        result = real_write(path, payload)
+        if write_calls == 1:
+            raise SystemExit("stale destination settings")
+        return result
+
+    monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", crash_after_backup)
+    with pytest.raises(SystemExit, match="stale destination"):
+        obs_bootstrap.execute_obs_config_transaction(plan)
+    monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", real_write)
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", tmp_path / "missing-legacy")
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+
+    class NoOBSProcesses:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def unmanaged_processes(self):
+            return []
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            return []
+
+        def has_managed_process(self):
+            return False
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", NoOBSProcesses)
+
+    assert recordtest.migrate_legacy_managed_obs_if_needed() is None
+
+    assert obs_bootstrap.has_pending_obs_settings_transaction(managed_dir) is False
+    assert target.read_bytes() == b"original"
+
+
 def test_preflight_partial_copy_failure_keeps_source_fingerprint_resumable(monkeypatch, tmp_path):
     managed_dir = (tmp_path / "obs-portable").absolute()
     legacy_dir = (tmp_path / "legacy-obs").absolute()
@@ -2241,6 +2700,61 @@ def test_preflight_partial_copy_failure_keeps_source_fingerprint_resumable(monke
     assert obs_bootstrap._build_obs_tree_inventory(legacy_dir) == source_inventory
     assert (managed_dir / "bin" / "64bit" / "obs64.exe").read_bytes() == b"fake legacy obs"
     assert not marker.exists()
+
+
+def test_recordtest_legacy_migration_rejects_source_that_survives_kill(
+    monkeypatch,
+    tmp_path,
+):
+    managed_dir = (tmp_path / "obs-portable").absolute()
+    legacy_dir = (tmp_path / "legacy-obs").absolute()
+    legacy_executable = legacy_dir / "bin" / "64bit" / "obs64.exe"
+    legacy_executable.parent.mkdir(parents=True)
+    legacy_executable.write_bytes(b"fake legacy obs")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", managed_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_MANAGED_OBS_DIR", legacy_dir)
+    monkeypatch.setattr(recordtest, "LEGACY_ROOT_OBS_DIR", tmp_path / "missing-root")
+    monkeypatch.setattr(recordtest, "LEGACY_DATA_BIN_OBS_DIR", tmp_path / "missing-data")
+
+    class StubbornProcessManager:
+        kill_calls = 0
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def unmanaged_processes(self):
+            return []
+
+        def kill_stale_managed_processes(self, timeout_sec=3.0):
+            type(self).kill_calls += 1
+            return []
+
+        def has_managed_process(self):
+            return True
+
+    copy_started = False
+
+    def run_prepare_source(destination, sources, *, prepare_source, **_kwargs):
+        nonlocal copy_started
+        prepare_source(legacy_dir)
+        copy_started = True
+        return legacy_dir
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", StubbornProcessManager)
+    monkeypatch.setattr(
+        recordtest,
+        "migrate_legacy_obs_installation",
+        run_prepare_source,
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="停止できません"):
+        recordtest.migrate_legacy_managed_obs_if_needed(
+            port=4455,
+            password="secret",
+        )
+
+    assert StubbornProcessManager.kill_calls == 1
+    assert copy_started is False
 
 
 def test_preflight_does_not_mutate_live_copy_and_normalizes_after_completion(monkeypatch, tmp_path):

@@ -336,6 +336,69 @@ def test_source_marker_injected_after_source_lock_is_rejected(tmp_path):
 
 
 @pytest.mark.parametrize(
+    "pending_state",
+    ["settings_marker", "settings_journal_temporary", "settings_data_temporary"],
+)
+def test_source_settings_state_injected_before_source_lock_is_rejected(
+    monkeypatch,
+    tmp_path,
+    pending_state,
+):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    source_executable = _write_fake_obs(source)
+    settings_marker = obs_bootstrap.get_obs_settings_transaction_marker(source)
+    settings_journal_temporary = obs_bootstrap._transaction_write_temporary_path(
+        settings_marker,
+        "a" * 32,
+    )
+    settings_data_temporary = obs_bootstrap._transaction_write_temporary_path(
+        source / "config" / "obs-studio" / "global.ini",
+        "a" * 32,
+    )
+    artifacts = {
+        "settings_marker": settings_marker,
+        "settings_journal_temporary": settings_journal_temporary,
+        "settings_data_temporary": settings_data_temporary,
+    }
+    artifact = artifacts[pending_state]
+    source_lock_path = obs_bootstrap.get_obs_copy_lock_path(source)
+    real_acquire = obs_bootstrap._OBSInterProcessLock.acquire
+    injected = False
+
+    def inject_pending_state_before_source_lock(lock, *args, **kwargs):
+        nonlocal injected
+        if not injected and lock.path == source_lock_path:
+            injected = True
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.write_text("stale settings transaction", encoding="utf-8")
+        return real_acquire(lock, *args, **kwargs)
+
+    monkeypatch.setattr(
+        obs_bootstrap._OBSInterProcessLock,
+        "acquire",
+        inject_pending_state_before_source_lock,
+    )
+
+    expected_error = (
+        "起動前設定transaction marker"
+        if pending_state == "settings_marker"
+        else "transaction一時file"
+    )
+    with pytest.raises(
+        obs_bootstrap.OBSMigrationRecoveryRequiredError,
+        match=expected_error,
+    ):
+        obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+    assert injected is True
+    assert artifact.read_text(encoding="utf-8") == "stale settings transaction"
+    assert source_executable.read_bytes() == b"obs"
+    assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
+    assert not (destination / "bin" / "64bit" / "obs64.exe").exists()
+
+
+@pytest.mark.parametrize(
     "boundary",
     ["journal_pre_rename", "copy_replace", "phase_update", "marker_unlink"],
 )

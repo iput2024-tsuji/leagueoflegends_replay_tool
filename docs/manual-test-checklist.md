@@ -65,6 +65,27 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 - [ ] `basic.ini`または`user.ini`を外部fileへのhardlinkにした場合、link元・link先・先行する安全なprofileのbytesを変更せず、OBSを停止しない
 - [ ] junction／hardlinkを除去した通常配置では、既存の未知設定を保ったままprofileを修復し、管理対象OBSを起動できる
 
+### OBS起動前設定transactionの耐久性（破棄可能な専用環境）
+
+実際に利用するOBS設定ではなく、破棄可能な専用`obs-portable`を複製して確認します。開始前に全targetのbytes、管理対象OBS PID、外部sentinelを記録し、WebSocket passwordはログ、journal、PRへ記録しません。強制終了後も`.lol_replay_obs_settings_transaction.json`や所有中の`*.copy.tmp`／`*.write.tmp`を個別に削除せず、次の起動または「OBS設定を構成・再検査」で復旧させます。
+
+- [ ] 通常起動、GPU検出後の再起動、「OBS設定を構成・再検査」、`scripts/setup_env.py`を同時に開始しても、同じ管理rootでは1処理だけがlockを取得し、後続処理が設定やコピーを開始しない
+- [ ] 設定がすでにdesiredと一致するno-opでも、明示的な起動・修復操作では管理対象OBSを停止し、全processの終了確認後にだけ続行する
+- [ ] `preparing` journal確定の直前／直後、各backup／desired一時fileの書き込み途中／直後で強制終了し、targetが不変のまま次回実行で所有中一時fileとjournalだけを清掃できる
+- [ ] 全一時file準備後のOBS停止でINIをflushさせ、計画時snapshotとの差を検知してflush後のbytesを保持し、他targetを一つも確定しない
+- [ ] `committing`更新の直前／直後、各target確定の直前／直後で強制終了し、次回実行で全targetが混在せずoriginalへrollbackされる
+- [ ] `committed`更新の直前はoriginalへrollbackされ、更新直後またはcleanup途中の強制終了では全desiredを保持して次回実行で一時fileとjournalだけを清掃する
+- [ ] `committed` journalのatomic replace後に親directory flushを失敗させ、同じprocessではbackup／markerを清掃せず、次回実行が実際に残った`committing`／`committed` phaseに従ってrollbackまたはcleanupする
+- [ ] 管理対象外OBSが停止前または停止直後に存在する場合、管理対象processを終了・設定を確定せず案内を表示する。管理対象OBSのkill APIが成功扱いでもprocessが残る場合は確定しない
+- [ ] 計画時に未変更だった既存profileの`basic.ini`を停止中に変更した場合と、計画時に欠落していた`basic.ini`を停止中に作成した場合を検知し、変更されたbytesを保持して他targetを確定しない
+- [ ] 別targetを更新するtransactionで、計画時に未変更だった`global.ini`、`user.ini`、WebSocket設定を停止中に変更した場合も検知し、他targetを確定しない
+- [ ] `user.ini`の独自section／keyを保持し、bootstrap設定と管理profile選択が同じoriginal snapshotへ合成される。bootstrap preflight後の外部変更は再読込で混在させず停止前に拒否する
+- [ ] 読み取り上限を1 byte超えるdesired payloadと、予約済みmarker／lock名をdirectoryに含むplanを、journal・一時file作成とOBS停止より前に拒否する
+- [ ] journalを確認し、relative path、size、SHA-256、所有情報以外の設定本文やWebSocket passwordが含まれない
+- [ ] stale settings journalが環境準備完了またはOBSコピー中状態と誤表示されず、次回起動・再検査・旧配置コピー前にsettings phaseどおり復旧される
+- [ ] POSIXの破棄可能な環境でlock取得後にmanaged rootをrenameし、同じlexical pathへ別rootを作成してtransaction fileを移しても、新rootと外部sentinelを変更せずRecoveryにする。new root側で別lockを取得できる状況でも旧rootのlock所有をcommit権限に使わない
+- [ ] 復旧不能の案内では、全OBS終了、`obs-portable`全体とログの退避、再検査の順を確認する。marker単体削除やOBS／FFmpegの自動取得・再配布を案内または実行しない
+
 ## LoLクライアント未起動時
 
 - [ ] アプリが異常終了せず、試合待機状態を継続する

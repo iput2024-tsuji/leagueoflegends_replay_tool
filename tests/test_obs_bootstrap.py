@@ -5,12 +5,25 @@ import os
 import stat
 import subprocess
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 from src import obs_bootstrap
 from src.obs_bootstrap import OBSBootstrapper
+
+
+@contextmanager
+def _planned_config_write(root: Path, target: Path):
+    with obs_bootstrap.obs_config_mutation_guard(root):
+        token = obs_bootstrap._ACTIVE_OBS_SETTINGS_TRANSACTION_TARGETS.set(
+            frozenset({obs_bootstrap._filesystem_path_key(target.absolute())})
+        )
+        try:
+            yield
+        finally:
+            obs_bootstrap._ACTIVE_OBS_SETTINGS_TRANSACTION_TARGETS.reset(token)
 
 
 def _hold_obs_migration(source: str, destination: str, entered, release, result_queue) -> None:
@@ -176,14 +189,21 @@ class FakeProcessManager:
         self.kill_calls += 1
         return []
 
+    def has_managed_process(self) -> bool:
+        return False
+
+    def unmanaged_processes(self) -> list[object]:
+        return []
+
 
 def test_apply_stops_managed_obs_once(tmp_path):
     process_manager = FakeProcessManager()
     bootstrapper = OBSBootstrapper(tmp_path / "obs-portable", process_manager=process_manager)
 
     result = bootstrapper.apply()
+    bootstrapper.apply()
 
-    assert process_manager.kill_calls == 1
+    assert process_manager.kill_calls == 2
     assert Path(result["global_ini_path"]).exists()
     assert Path(result["user_ini_path"]).exists()
 
@@ -199,7 +219,11 @@ def test_standalone_ini_repairs_still_stop_managed_obs(tmp_path):
 
 
 def test_websocket_config_requires_password_authentication(tmp_path):
-    bootstrapper = OBSBootstrapper(tmp_path / "obs-portable", process_manager=FakeProcessManager())
+    process_manager = FakeProcessManager()
+    bootstrapper = OBSBootstrapper(
+        tmp_path / "obs-portable",
+        process_manager=process_manager,
+    )
 
     changed, config_path = bootstrapper.ensure_websocket_config(4455, "secret-password")
 
@@ -208,6 +232,7 @@ def test_websocket_config_requires_password_authentication(tmp_path):
     assert '"server_enabled": true' in text
     assert '"auth_required": true' in text
     assert '"server_password": "secret-password"' in text
+    assert process_manager.kill_calls == 1
 
 
 def test_websocket_config_rejects_empty_password(tmp_path):
@@ -287,10 +312,26 @@ def test_preflighted_config_write_rejects_in_place_content_change(tmp_path):
     snapshot = obs_bootstrap.preflight_obs_config_file(target, label="user.ini")
     target.write_bytes(b"changed in place")
 
-    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="内容が変化"):
-        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+    with _planned_config_write(tmp_path, target):
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="内容が変化"):
+            obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
 
     assert target.read_bytes() == b"changed in place"
+
+
+def test_preflighted_config_write_requires_guard_and_planned_target(tmp_path):
+    target = tmp_path / "user.ini"
+    target.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(target, label="user.ini")
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="mutation_guard"):
+        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+
+    with obs_bootstrap.obs_config_mutation_guard(tmp_path):
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="計画されていない"):
+            obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+
+    assert target.read_bytes() == b"original"
 
 
 def test_preflighted_config_write_rejects_identity_swap(tmp_path):
@@ -301,8 +342,9 @@ def test_preflighted_config_write_rejects_identity_swap(tmp_path):
     os.replace(target, original)
     target.write_bytes(b"intruder")
 
-    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="identityが変化"):
-        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+    with _planned_config_write(tmp_path, target):
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="identityが変化"):
+            obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
 
     assert target.read_bytes() == b"intruder"
     assert original.read_bytes() == b"original"
@@ -312,17 +354,22 @@ def test_preflighted_config_replace_failure_preserves_old_bytes_and_cleans_temp(
     target = tmp_path / "basic.ini"
     target.write_bytes(b"original")
     snapshot = obs_bootstrap.preflight_obs_config_file(target, label="basic.ini")
-    real_replace = obs_bootstrap.os.replace
+    real_replace = obs_bootstrap._OBSDirectoryLease.replace_open_file
 
-    def fail_target_replace(source, destination):
-        if Path(destination) == target:
+    def fail_target_replace(directory, descriptor, temporary_name, target_name):
+        if directory.path / target_name == target:
             raise PermissionError("simulated replace denial")
-        return real_replace(source, destination)
+        return real_replace(directory, descriptor, temporary_name, target_name)
 
-    monkeypatch.setattr(obs_bootstrap.os, "replace", fail_target_replace)
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "replace_open_file",
+        fail_target_replace,
+    )
 
-    with pytest.raises(PermissionError, match="replace denial"):
-        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+    with _planned_config_write(tmp_path, target):
+        with pytest.raises(PermissionError, match="replace denial"):
+            obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
 
     assert target.read_bytes() == b"original"
     assert list(tmp_path.glob(".basic.ini.*.write.tmp")) == []
@@ -338,8 +385,9 @@ def test_preflighted_config_write_rejects_existing_temp_without_touching_externa
     os.link(external, temporary)
     monkeypatch.setattr(obs_bootstrap, "_safe_write_temporary_path", lambda _path: temporary)
 
-    with pytest.raises(FileExistsError):
-        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+    with _planned_config_write(tmp_path, target):
+        with pytest.raises(FileExistsError):
+            obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
 
     assert target.read_bytes() == b"original"
     assert external.read_bytes() == b"external"
@@ -350,21 +398,26 @@ def test_preflighted_config_temp_identity_failure_preserves_destination(monkeypa
     target = tmp_path / "user.ini"
     target.write_bytes(b"original")
     snapshot = obs_bootstrap.preflight_obs_config_file(target, label="user.ini")
-    real_validate = obs_bootstrap._validate_open_identity
+    real_identity = obs_bootstrap._OBSDirectoryLease._relative_file_identity
     temporary_validations = 0
 
-    def fail_second_temp_validation(path, descriptor, before):
+    def fail_second_temp_validation(directory, name):
         nonlocal temporary_validations
-        if Path(path).name.startswith(".user.ini."):
+        if name.startswith(".user.ini."):
             temporary_validations += 1
             if temporary_validations == 2:
                 raise obs_bootstrap.OBSPathSafetyError("simulated temp identity race")
-        return real_validate(path, descriptor, before)
+        return real_identity(directory, name)
 
-    monkeypatch.setattr(obs_bootstrap, "_validate_open_identity", fail_second_temp_validation)
+    monkeypatch.setattr(
+        obs_bootstrap._OBSDirectoryLease,
+        "_relative_file_identity",
+        fail_second_temp_validation,
+    )
 
-    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="temp identity race"):
-        obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
+    with _planned_config_write(tmp_path, target):
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="temp identity race"):
+            obs_bootstrap.write_preflighted_obs_config_file(snapshot, b"replacement")
 
     assert target.read_bytes() == b"original"
     assert list(tmp_path.glob(".user.ini.*.write.tmp")) == []

@@ -39,18 +39,22 @@ try:
     from .match_metadata import merge_live_game_metadata
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
+        OBSBootstrapApplyPlan,
         OBSBootstrapper as SharedOBSBootstrapper,
         OBSConfigFileSnapshot,
+        OBSConfigPlannedWrite,
+        OBSConfigTransactionPlan,
         OBSMigrationInProgressError,
         OBSMigrationRecoveryRequiredError,
         OBSPathSafetyError,
-        ensure_safe_obs_config_directory,
+        execute_obs_config_transaction,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
-        is_obs_copy_in_progress,
+        has_pending_obs_copy_transaction,
+        has_pending_obs_settings_transaction,
         lexical_absolute_path,
         list_safe_obs_config_directory,
         migrate_legacy_obs_installation,
@@ -60,7 +64,6 @@ try:
         preflight_obs_config_file,
         revalidate_obs_config_file,
         validate_obs_installation_path,
-        write_preflighted_obs_config_file,
     )
     from .obs_process import OBSProcessManager
     from .post_game_result import (
@@ -103,18 +106,22 @@ except ImportError:
     from match_metadata import merge_live_game_metadata
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
+        OBSBootstrapApplyPlan,
         OBSBootstrapper as SharedOBSBootstrapper,
         OBSConfigFileSnapshot,
+        OBSConfigPlannedWrite,
+        OBSConfigTransactionPlan,
         OBSMigrationInProgressError,
         OBSMigrationRecoveryRequiredError,
         OBSPathSafetyError,
-        ensure_safe_obs_config_directory,
+        execute_obs_config_transaction,
         get_obs_config_dir as shared_get_obs_config_dir,
         get_obs_global_ini_path as shared_get_obs_global_ini_path,
         get_obs_user_ini_path as shared_get_obs_user_ini_path,
         get_obs_websocket_config_path as shared_get_obs_websocket_config_path,
         get_portable_marker_path as shared_get_portable_marker_path,
-        is_obs_copy_in_progress,
+        has_pending_obs_copy_transaction,
+        has_pending_obs_settings_transaction,
         lexical_absolute_path,
         list_safe_obs_config_directory,
         migrate_legacy_obs_installation,
@@ -124,7 +131,6 @@ except ImportError:
         preflight_obs_config_file,
         revalidate_obs_config_file,
         validate_obs_installation_path,
-        write_preflighted_obs_config_file,
     )
     from obs_process import OBSProcessManager
     from post_game_result import (
@@ -544,7 +550,7 @@ def is_valid_obs_dir(base_dir: str | Path | None) -> bool:
         if not validate_obs_installation_path(base_dir):
             return False
         SharedOBSBootstrapper(base_dir, logger=LOGGER).validate_layout()
-        return not is_obs_copy_in_progress(base_dir)
+        return not has_pending_obs_copy_transaction(base_dir)
     except Exception:
         return False
 
@@ -604,8 +610,40 @@ def bootstrap_obs_dir(base_dir: str | Path, port: int | None = None, password: s
 
 
 def migrate_legacy_managed_obs_if_needed(port: int | None = None, password: str = "") -> Path | None:
+    if has_pending_obs_settings_transaction(MANAGED_PORTABLE_OBS_DIR):
+        destination_manager = OBSProcessManager(
+            MANAGED_PORTABLE_OBS_DIR,
+            logger=LOGGER,
+        )
+        with obs_config_mutation_guard(
+            MANAGED_PORTABLE_OBS_DIR,
+            before_settings_recovery=lambda: _stop_managed_obs_tree_for_settings(
+                destination_manager
+            ),
+        ):
+            pass
+
+    # A stale settings journal on a legacy source must be resolved before the
+    # copy-migration code validates that source. A guard-only pass preserves
+    # the source inventory that the migration journal fingerprints.
+    for legacy_dir in legacy_managed_obs_dirs():
+        if (
+            validate_obs_installation_path(legacy_dir)
+            and has_pending_obs_settings_transaction(legacy_dir)
+        ):
+            legacy_manager = OBSProcessManager(legacy_dir, logger=LOGGER)
+            with obs_config_mutation_guard(
+                legacy_dir,
+                before_settings_recovery=lambda manager=legacy_manager: (
+                    _stop_managed_obs_tree_for_settings(manager)
+                ),
+            ):
+                pass
+
     def prepare_source(legacy_dir: Path) -> None:
-        OBSProcessManager(legacy_dir, logger=LOGGER).kill_stale_managed_processes()
+        _stop_managed_obs_tree_for_settings(
+            OBSProcessManager(legacy_dir, logger=LOGGER)
+        )
 
     def finalize_destination(destination: Path) -> None:
         bootstrap_obs_dir(destination, port=port, password=password)
@@ -661,7 +699,9 @@ class _OBSRecordingProfileLayout:
     base_dir: Path
     profiles_root: Path
     profile_directories: tuple[Path, ...]
+    existing_profile_directories: tuple[Path, ...]
     profile_files: tuple[OBSConfigFileSnapshot, ...]
+    validation_files: tuple[OBSConfigFileSnapshot, ...]
     user_file: OBSConfigFileSnapshot
 
 
@@ -679,6 +719,14 @@ class _OBSRecordingProfileFileUpdate:
 class _OBSRecordingProfileUpdatePlan:
     layout: _OBSRecordingProfileLayout
     updates: tuple[_OBSRecordingProfileFileUpdate, ...]
+
+
+@dataclass(frozen=True)
+class _OBSStartupSettingsPlan:
+    bootstrap: OBSBootstrapApplyPlan
+    profiles: _OBSRecordingProfileUpdatePlan
+    transaction: OBSConfigTransactionPlan
+    profile_changed_paths: tuple[Path, ...]
 
 
 _WINDOWS_RESERVED_PROFILE_NAMES = frozenset(
@@ -785,15 +833,26 @@ def _obs_current_profile_dir_name(user_file: OBSConfigFileSnapshot) -> str | Non
     return None
 
 
-def preflight_obs_recording_profile_ini(base_dir: str | Path) -> _OBSRecordingProfileLayout:
+def preflight_obs_recording_profile_ini(
+    base_dir: str | Path,
+    *,
+    user_file: OBSConfigFileSnapshot | None = None,
+) -> _OBSRecordingProfileLayout:
     """Inspect every profile target lexically without creating or writing anything."""
 
     base_path = lexical_absolute_path(base_dir)
     profiles_root = get_obs_config_dir(base_path) / "basic" / "profiles"
-    user_file = preflight_obs_config_file(
-        get_obs_user_ini_path(base_path),
-        label="user.ini",
-    )
+    expected_user_path = lexical_absolute_path(get_obs_user_ini_path(base_path))
+    if user_file is None:
+        user_file = preflight_obs_config_file(
+            expected_user_path,
+            label="user.ini",
+        )
+    elif user_file.path != expected_user_path:
+        raise OBSPathSafetyError(
+            "bootstrapとprofileのuser.ini snapshotが一致しません: "
+            f"{user_file.path} != {expected_user_path}"
+        )
     current_name = _obs_current_profile_dir_name(user_file)
 
     names: list[str] = []
@@ -830,8 +889,8 @@ def preflight_obs_recording_profile_ini(base_dir: str | Path) -> _OBSRecordingPr
             raise OBSPathSafetyError(f"OBS profile directoryが列挙後に消失しました: {profile_dir}")
         discovered_directories.append(lexical_absolute_path(profile_dir))
         snapshot = preflight_obs_config_file(profile_dir / "basic.ini", label="basic.ini")
+        discovered_files[name_key] = snapshot
         if snapshot.exists:
-            discovered_files[name_key] = snapshot
             add_profile_name(name)
 
     profile_directories: list[Path] = []
@@ -850,11 +909,17 @@ def preflight_obs_recording_profile_ini(base_dir: str | Path) -> _OBSRecordingPr
     all_directories = {str(path).casefold(): path for path in discovered_directories}
     for profile_dir in profile_directories:
         all_directories.setdefault(str(profile_dir).casefold(), profile_dir)
+    validation_files_by_path = {
+        str(snapshot.path).casefold(): snapshot
+        for snapshot in (*discovered_files.values(), *profile_files)
+    }
     return _OBSRecordingProfileLayout(
         base_dir=base_path,
         profiles_root=lexical_absolute_path(profiles_root),
         profile_directories=tuple(all_directories.values()),
+        existing_profile_directories=tuple(discovered_directories),
         profile_files=tuple(profile_files),
+        validation_files=tuple(validation_files_by_path.values()),
         user_file=user_file,
     )
 
@@ -960,36 +1025,216 @@ def _prepare_obs_recording_profile_update(
 def _revalidate_obs_recording_profile_layout(layout: _OBSRecordingProfileLayout) -> None:
     # Re-enumeration catches a reparse/special entry introduced after the plan.
     entries = list_safe_obs_config_directory(layout.profiles_root)
+    planned_names = {path.name.casefold() for path in layout.profile_directories}
     for entry in entries:
         if entry.kind != "directory":
             continue
         name = _validate_obs_profile_dir_name(entry.name)
+        if name.casefold() not in planned_names:
+            raise OBSPathSafetyError(
+                f"OBS profile directoryがtransaction計画後に追加されました: {entry.name}"
+            )
         profile_dir = layout.profiles_root / name
         if not preflight_obs_config_directory(profile_dir):
             raise OBSPathSafetyError(f"OBS profile directoryが再検査中に消失しました: {profile_dir}")
         preflight_obs_config_file(profile_dir / "basic.ini", label="basic.ini")
-    for profile_dir in layout.profile_directories:
-        preflight_obs_config_directory(profile_dir)
+    for profile_dir in layout.existing_profile_directories:
+        if not preflight_obs_config_directory(profile_dir):
+            raise OBSPathSafetyError(
+                f"OBS profile directoryがtransaction計画後に消失しました: {profile_dir}"
+            )
+    for snapshot in (*layout.validation_files, layout.user_file):
+        revalidate_obs_config_file(snapshot)
 
 
-def _apply_obs_recording_profile_update(plan: _OBSRecordingProfileUpdatePlan) -> tuple[Path, ...]:
-    with obs_config_mutation_guard(plan.layout.base_dir):
-        _revalidate_obs_recording_profile_layout(plan.layout)
-        for update in plan.updates:
-            revalidate_obs_config_file(update.snapshot)
+def _prepare_obs_startup_settings_plan(
+    bootstrapper: SharedOBSBootstrapper,
+    *,
+    port: int,
+    password: str,
+    record_dir: str | Path,
+    scale_type: str,
+    recording_quality: str,
+    recording_encoder: str,
+    selected_encoder: OBSRecordingEncoderSelection | None,
+) -> _OBSStartupSettingsPlan:
+    """Compose bootstrap and profile updates from one set of original snapshots."""
 
-        changed_updates = tuple(update for update in plan.updates if update.changed)
-        for directory in {update.snapshot.path.parent for update in changed_updates}:
-            ensure_safe_obs_config_directory(directory)
+    bootstrap = bootstrapper.prepare_apply(port=port, password=password)
+    expected_user_path_key = str(get_obs_user_ini_path(bootstrapper.base_dir)).casefold()
+    bootstrap_user = next(
+        write
+        for write in bootstrap.transaction.writes
+        if str(write.snapshot.path).casefold() == expected_user_path_key
+    )
+    layout = preflight_obs_recording_profile_ini(
+        bootstrapper.base_dir,
+        user_file=bootstrap_user.snapshot,
+    )
+    user_path_key = str(layout.user_file.path).casefold()
+    # Profile selection must be rendered on top of the bootstrap payload, while
+    # the transaction still validates the single original user.ini snapshot.
+    composed_layout = replace(
+        layout,
+        user_file=replace(layout.user_file, payload=bootstrap_user.payload),
+    )
+    raw_profiles = _prepare_obs_recording_profile_update(
+        composed_layout,
+        record_dir=record_dir,
+        scale_type=scale_type,
+        recording_quality=recording_quality,
+        recording_encoder=recording_encoder,
+        selected_encoder=selected_encoder,
+    )
+    normalized_updates: list[_OBSRecordingProfileFileUpdate] = []
+    profile_changed_paths: list[Path] = []
+    for update in raw_profiles.updates:
+        if str(update.snapshot.path).casefold() == user_path_key:
+            desired = update.payload if update.payload is not None else bootstrap_user.payload
+            normalized = _OBSRecordingProfileFileUpdate(
+                snapshot=layout.user_file,
+                payload=desired if desired != layout.user_file.payload else None,
+            )
+        else:
+            normalized = update
+        normalized_updates.append(normalized)
+        if update.payload is not None:
+            profile_changed_paths.append(update.snapshot.path)
+    profiles = _OBSRecordingProfileUpdatePlan(
+        layout=layout,
+        updates=tuple(normalized_updates),
+    )
 
-        _revalidate_obs_recording_profile_layout(plan.layout)
-        for update in plan.updates:
-            revalidate_obs_config_file(update.snapshot)
-        for update in changed_updates:
-            if update.payload is None:
-                continue
-            write_preflighted_obs_config_file(update.snapshot, update.payload)
+    writes_by_path: dict[str, OBSConfigPlannedWrite] = {
+        str(write.snapshot.path).casefold(): write
+        for write in bootstrap.transaction.writes
+    }
+    for update in profiles.updates:
+        if update.payload is None:
+            if str(update.snapshot.path).casefold() == user_path_key:
+                writes_by_path[user_path_key] = OBSConfigPlannedWrite(
+                    update.snapshot,
+                    update.snapshot.payload or b"",
+                )
+            continue
+        writes_by_path[str(update.snapshot.path).casefold()] = OBSConfigPlannedWrite(
+            update.snapshot,
+            update.payload,
+        )
+    directories = (
+        *bootstrap.transaction.directories,
+        layout.profiles_root,
+        *layout.profile_directories,
+        *(write.snapshot.path.parent for write in writes_by_path.values()),
+    )
+    return _OBSStartupSettingsPlan(
+        bootstrap=bootstrap,
+        profiles=profiles,
+        transaction=OBSConfigTransactionPlan(
+            base_dir=bootstrapper.base_dir,
+            directories=tuple(directories),
+            writes=tuple(writes_by_path.values()),
+        ),
+        profile_changed_paths=tuple(profile_changed_paths),
+    )
 
+
+def _execute_obs_startup_settings_transaction(
+    bootstrapper: SharedOBSBootstrapper,
+    *,
+    port: int,
+    password: str,
+    record_dir: str | Path,
+    scale_type: str,
+    recording_quality: str,
+    recording_encoder: str,
+    selected_encoder: OBSRecordingEncoderSelection | None,
+    before_commit: Callable[[], None] | None,
+    run_before_commit_on_noop: bool = False,
+) -> tuple[dict[str, Any], tuple[Path, ...]]:
+    """Plan, stop and commit all startup settings under one mutation guard."""
+
+    with obs_config_mutation_guard(
+        bootstrapper.base_dir,
+        before_settings_recovery=before_commit,
+    ):
+        plan = _prepare_obs_startup_settings_plan(
+            bootstrapper,
+            port=port,
+            password=password,
+            record_dir=record_dir,
+            scale_type=scale_type,
+            recording_quality=recording_quality,
+            recording_encoder=recording_encoder,
+            selected_encoder=selected_encoder,
+        )
+
+        def validate() -> None:
+            bootstrapper.validate_layout(include_websocket=True)
+            _revalidate_obs_recording_profile_layout(plan.profiles.layout)
+
+        changed_by_path = {
+            str(write.snapshot.path).casefold(): write.changed
+            for write in plan.transaction.writes
+        }
+        execute_obs_config_transaction(
+            plan.transaction,
+            before_commit=before_commit,
+            validate_plan=validate,
+            run_before_commit_on_noop=run_before_commit_on_noop,
+        )
+        bootstrap = plan.bootstrap
+        websocket_result = (
+            False,
+            bootstrap.websocket_path,
+        )
+        if bootstrap.websocket_path is not None:
+            websocket_result = (
+                changed_by_path.get(str(bootstrap.websocket_path).casefold(), False),
+                bootstrap.websocket_path,
+            )
+        result = {
+            "marker": bootstrap.marker,
+            "config_dir": bootstrap.config_dir,
+            "global_ini_changed": changed_by_path.get(
+                str(bootstrap.global_ini_path).casefold(),
+                False,
+            ),
+            "global_ini_path": bootstrap.global_ini_path,
+            "user_ini_changed": changed_by_path.get(
+                str(bootstrap.user_ini_path).casefold(),
+                False,
+            ),
+            "user_ini_path": bootstrap.user_ini_path,
+            "websocket": websocket_result,
+        }
+        return result, tuple(lexical_absolute_path(path) for path in plan.profile_changed_paths)
+
+
+def _apply_obs_recording_profile_update(
+    plan: _OBSRecordingProfileUpdatePlan,
+    *,
+    before_commit: Callable[[], None] | None = None,
+) -> tuple[Path, ...]:
+    changed_updates = tuple(update for update in plan.updates if update.payload is not None)
+    transaction = OBSConfigTransactionPlan(
+        base_dir=plan.layout.base_dir,
+        directories=(
+            plan.layout.profiles_root,
+            *plan.layout.profile_directories,
+            *(update.snapshot.path.parent for update in changed_updates),
+        ),
+        writes=tuple(
+            OBSConfigPlannedWrite(update.snapshot, update.payload)
+            for update in changed_updates
+            if update.payload is not None
+        ),
+    )
+    execute_obs_config_transaction(
+        transaction,
+        validate_plan=lambda: _revalidate_obs_recording_profile_layout(plan.layout),
+        before_commit=before_commit,
+    )
     return tuple(lexical_absolute_path(update.snapshot.path) for update in changed_updates)
 
 
@@ -1002,16 +1247,28 @@ def ensure_obs_recording_profile_ini(
     recording_encoder: str = DEFAULT_OBS_RECORDING_ENCODER,
     selected_encoder: OBSRecordingEncoderSelection | None = None,
 ) -> tuple[Path, ...]:
-    layout = preflight_obs_recording_profile_ini(base_dir)
-    plan = _prepare_obs_recording_profile_update(
-        layout,
-        record_dir=record_dir,
-        scale_type=scale_type,
-        recording_quality=recording_quality,
-        recording_encoder=recording_encoder,
-        selected_encoder=selected_encoder,
-    )
-    return _apply_obs_recording_profile_update(plan)
+    process_manager = OBSProcessManager(base_dir, logger=LOGGER)
+
+    def stop_for_settings() -> None:
+        _stop_managed_obs_tree_for_settings(process_manager)
+
+    with obs_config_mutation_guard(
+        base_dir,
+        before_settings_recovery=stop_for_settings,
+    ):
+        layout = preflight_obs_recording_profile_ini(base_dir)
+        plan = _prepare_obs_recording_profile_update(
+            layout,
+            record_dir=record_dir,
+            scale_type=scale_type,
+            recording_quality=recording_quality,
+            recording_encoder=recording_encoder,
+            selected_encoder=selected_encoder,
+        )
+        return _apply_obs_recording_profile_update(
+            plan,
+            before_commit=stop_for_settings,
+        )
 
 
 def _obs_encoder_log_label(selected_encoder: OBSRecordingEncoderSelection) -> str:
@@ -1494,13 +1751,35 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
     migration_failed = False
     if auto_fix:
         try:
-            migrated_from = migrate_legacy_managed_obs_if_needed(port=port, password=obs_password)
-            if migrated_from is not None:
-                report["changed"] = True
-                report["notes"].append(f"旧OBS配置を obs-portable へコピー移行しました: {migrated_from}")
+            for recovery_dir in (
+                MANAGED_PORTABLE_OBS_DIR,
+                *legacy_managed_obs_dirs(),
+            ):
+                if not has_pending_obs_settings_transaction(recovery_dir):
+                    continue
+                recovery_manager = OBSProcessManager(recovery_dir, logger=LOGGER)
+                with obs_config_mutation_guard(
+                    recovery_dir,
+                    before_settings_recovery=lambda manager=recovery_manager: (
+                        _stop_managed_obs_tree_for_settings(manager)
+                    ),
+                ):
+                    pass
         except Exception as e:
             migration_failed = True
-            report["warnings"].append(f"旧OBS配置の移行に失敗しました: {e}")
+            report["warnings"].append(
+                f"OBS設定transactionの事前復旧に失敗しました: {e}"
+            )
+
+        if not migration_failed:
+            try:
+                migrated_from = migrate_legacy_managed_obs_if_needed(port=port, password=obs_password)
+                if migrated_from is not None:
+                    report["changed"] = True
+                    report["notes"].append(f"旧OBS配置を obs-portable へコピー移行しました: {migrated_from}")
+            except Exception as e:
+                migration_failed = True
+                report["warnings"].append(f"旧OBS配置の移行に失敗しました: {e}")
 
         if not migration_failed:
             try:
@@ -1530,12 +1809,20 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             bootstrap_blocked_reason = "OBSコピー移行が失敗したため、コピー元とコピー先の設定修復を延期しました。"
         elif os.path.lexists(current_obs_dir):
             try:
-                if is_obs_copy_in_progress(current_obs_dir):
+                if has_pending_obs_settings_transaction(current_obs_dir):
+                    bootstrap_blocked_reason = (
+                        "OBS設定transactionが進行中または再開待ちのため、"
+                        "コピー先の設定修復を延期しました。"
+                    )
+                elif has_pending_obs_copy_transaction(current_obs_dir):
                     bootstrap_blocked_reason = (
                         "OBSコピー移行が進行中または再開待ちのため、コピー先の設定修復を延期しました。"
                     )
             except Exception as e:
-                bootstrap_blocked_reason = f"OBSコピー移行状態を安全に確認できないため、設定修復を延期しました: {e}"
+                bootstrap_blocked_reason = (
+                    "OBS設定／コピーtransaction状態を安全に確認できないため、"
+                    f"設定修復を延期しました: {e}"
+                )
 
         if bootstrap_blocked_reason is not None:
             report["warnings"].append(bootstrap_blocked_reason)
@@ -1543,63 +1830,74 @@ def run_preflight_checks(cfg: dict[str, Any], auto_fix: bool = True, ensure_dirs
             try:
                 bootstrapper = OBSBootstrapper(current_obs_dir)
                 bootstrap_report = bootstrapper.check()
-                # Nested profile targets belong to the same setup transaction.
-                # Validate them before bootstrap.apply can change global/user.ini.
                 preflight_obs_recording_profile_ini(current_obs_dir)
                 bootstrap_layout_safe = True
                 if not bootstrap_report.obs_exe_exists:
                     report["warnings"].append("OBS本体が未配置のため、起動前設定の自動生成を延期しました。")
-                elif bootstrap_report.needs_repair:
-                    if auto_fix:
-                        if bootstrapper.process_manager.has_managed_process():
-                            report["warnings"].append(
-                                "ポータブルOBSが起動中のため、起動前設定の自動修復を延期しました。"
-                                "録画監視を停止してから環境修復を再実行してください。"
-                            )
-                        else:
-                            bootstrap_result = bootstrapper.apply(
+                elif auto_fix:
+                    if bootstrapper.process_manager.has_managed_process():
+                        report["warnings"].append(
+                            "ポータブルOBSが起動中のため、起動前設定transactionを延期しました。"
+                            "録画監視を停止してから環境修復を再実行してください。"
+                        )
+                    elif recordings_dir is not None:
+                        bootstrap_result, changed_profiles = (
+                            _execute_obs_startup_settings_transaction(
+                                bootstrapper,
                                 port=int(obs_cfg.get("port") or DEFAULT_OBS_PORT),
                                 password=str(obs_cfg.get("password") or ""),
+                                record_dir=recordings_dir,
+                                scale_type=str(
+                                    obs_cfg.get("scale_type") or DEFAULT_OBS_SCALE_TYPE
+                                ),
+                                recording_quality=str(
+                                    obs_cfg.get("recording_quality")
+                                    or DEFAULT_OBS_RECORDING_QUALITY
+                                ),
+                                recording_encoder=str(
+                                    obs_cfg.get("recording_encoder")
+                                    or DEFAULT_OBS_RECORDING_ENCODER
+                                ),
+                                selected_encoder=None,
+                                before_commit=(
+                                    lambda: _stop_managed_obs_tree_for_settings(
+                                        bootstrapper.process_manager
+                                    )
+                                ),
                             )
+                        )
+                        changed_bootstrap = any(
+                            bool(bootstrap_result.get(key))
+                            for key in (
+                                "global_ini_changed",
+                                "user_ini_changed",
+                            )
+                        ) or bool(bootstrap_result.get("websocket", (False,))[0])
+                        if changed_bootstrap:
                             report["changed"] = True
                             report["notes"].append(
                                 f"ポータブルOBS設定を修復しました: {bootstrap_result.get('global_ini_path')}"
                             )
-                    else:
-                        report["warnings"].append("OBS Bootstrapper の修復が必要です。")
-            except Exception as e:
-                bootstrap_layout_safe = False
-                report["warnings"].append(f"OBS Bootstrapper の検査/修復に失敗しました: {e}")
-
-            if (
-                auto_fix
-                and bootstrap_layout_safe
-                and recordings_dir is not None
-                and is_valid_obs_dir(current_obs_dir)
-            ):
-                try:
-                    process_manager = OBSProcessManager(current_obs_dir, logger=LOGGER)
-                    if process_manager.has_managed_process():
-                        report["warnings"].append(
-                            "ポータブルOBSが起動中のため、録画プロファイル修復を延期しました。"
-                            "録画監視を停止してから環境修復を再実行してください。"
-                        )
-                    else:
-                        changed_profiles = ensure_obs_recording_profile_ini(
-                            current_obs_dir,
-                            record_dir=recordings_dir,
-                            scale_type=str(obs_cfg.get("scale_type") or DEFAULT_OBS_SCALE_TYPE),
-                            recording_quality=str(obs_cfg.get("recording_quality") or DEFAULT_OBS_RECORDING_QUALITY),
-                            recording_encoder=str(obs_cfg.get("recording_encoder") or DEFAULT_OBS_RECORDING_ENCODER),
-                        )
                         if changed_profiles:
                             report["changed"] = True
                             report["notes"].append(
                                 "OBS録画プロファイルをSimple/H.264/mkv設定へ修復しました: "
                                 + ", ".join(str(path) for path in changed_profiles)
                             )
-                except Exception as e:
-                    report["warnings"].append(f"OBS録画プロファイルの検査/修復に失敗しました: {e}")
+                    elif bootstrap_report.needs_repair:
+                        bootstrap_result = bootstrapper.apply(
+                            port=int(obs_cfg.get("port") or DEFAULT_OBS_PORT),
+                            password=str(obs_cfg.get("password") or ""),
+                        )
+                        report["changed"] = True
+                        report["notes"].append(
+                            f"ポータブルOBS設定を修復しました: {bootstrap_result.get('global_ini_path')}"
+                        )
+                elif bootstrap_report.needs_repair:
+                    report["warnings"].append("OBS Bootstrapper の修復が必要です。")
+            except Exception as e:
+                bootstrap_layout_safe = False
+                report["warnings"].append(f"OBS Bootstrapper の検査/修復に失敗しました: {e}")
 
     has_valid_obs = bool(current_obs_dir and bootstrap_layout_safe and is_valid_obs_dir(current_obs_dir))
     if not has_valid_obs:
@@ -2471,13 +2769,75 @@ def enforce_storage_limit(config: AppConfig | None = None, keep_paths: list[str 
     _storage_policy.enforce_storage_limit(config or load_app_config(), keep_paths)
 
 
+def _require_no_unmanaged_obs_for_settings(process_manager: OBSProcessManager) -> None:
+    unmanaged_processes = process_manager.unmanaged_processes()
+    if not unmanaged_processes:
+        return
+    details = []
+    for process in unmanaged_processes[:5]:
+        path_text = (
+            str(process.executable_path)
+            if process.executable_path
+            else "path unknown"
+        )
+        details.append(f"pid={process.pid} {path_text}")
+    raise RecorderError(
+        "管理対象外のOBSが既に起動しています。\n"
+        "通常版OBSまたは旧配置のOBSが起動していると、このアプリの起動前設定は反映されません。\n"
+        + "\n".join(details)
+        + "\n既存のOBSを終了してから再実行してください。"
+    )
+
+
+def _stop_managed_obs_tree_for_settings(process_manager: OBSProcessManager) -> None:
+    _require_no_unmanaged_obs_for_settings(process_manager)
+    process_manager.kill_stale_managed_processes()
+    if process_manager.has_managed_process():
+        raise RecorderError(
+            "管理対象のポータブルOBSをすべて停止できませんでした。"
+            "OBSを手動終了してから再実行してください。"
+        )
+    _require_no_unmanaged_obs_for_settings(process_manager)
+
+
 def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
     """OBSをバックグラウンドで起動する"""
     if not config.obs.obs_dir:
         raise RecorderError("OBSのパスが未設定です。設定画面の OBSフォルダ (obs.dir) を指定してください。")
 
+    obs_dir_abs = os.path.abspath(str(config.obs.obs_dir))
+    obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
+    if (
+        has_pending_obs_copy_transaction(obs_dir_abs)
+        and is_managed_portable_obs_dir(config.obs.obs_dir)
+    ):
+        try:
+            migrate_legacy_managed_obs_if_needed(
+                port=config.obs.port,
+                password=config.obs.password,
+            )
+        except (OBSMigrationInProgressError, OBSMigrationRecoveryRequiredError) as e:
+            raise RecorderError(str(e)) from e
+        except Exception as e:
+            raise RecorderError(f"OBSコピー移行状態を復旧できません: {e}") from e
+    if has_pending_obs_copy_transaction(obs_dir_abs):
+        raise RecorderError(
+            "OBSのコピー移行が完了していません。旧配置を保持したまま再検査するか、"
+            "現在のobs-portableを別の場所へ退避して空にしてから、"
+            "公式ReleaseのWindows x64 ZIPを専用obs-portableへ再展開してください。"
+        )
+    process_manager = OBSProcessManager(obs_dir_abs, logger=LOGGER)
+
     if is_managed_portable_obs_dir(config.obs.obs_dir):
         try:
+            if has_pending_obs_settings_transaction(obs_dir_abs):
+                with obs_config_mutation_guard(
+                    obs_dir_abs,
+                    before_settings_recovery=lambda: (
+                        _stop_managed_obs_tree_for_settings(process_manager)
+                    ),
+                ):
+                    pass
             migrate_legacy_managed_obs_if_needed(port=config.obs.port, password=config.obs.password)
             repair_legacy_managed_obs_if_present(port=config.obs.port, password=config.obs.password)
         except (OBSMigrationInProgressError, OBSMigrationRecoveryRequiredError) as e:
@@ -2485,10 +2845,7 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         except Exception as e:
             LOGGER.warning("旧OBS配置の移行/修復に失敗しました: %s", e, exc_info=True)
 
-    obs_dir_abs = os.path.abspath(str(config.obs.obs_dir))
-    obs_exe = os.path.abspath(os.path.join(obs_dir_abs, "bin", "64bit", "obs64.exe"))
-
-    if is_obs_copy_in_progress(obs_dir_abs):
+    if has_pending_obs_copy_transaction(obs_dir_abs):
         raise RecorderError(
             "OBSのコピー移行が完了していません。旧配置を保持したまま再検査するか、"
             "現在のobs-portableを別の場所へ退避して空にしてから、"
@@ -2500,37 +2857,35 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         hint = f"\n自動検出候補: {detected}" if detected else ""
         raise RecorderError(f"OBSの実行ファイルが見つかりません。\nパス: {obs_exe}{hint}")
 
-    process_manager = OBSProcessManager(obs_dir_abs, logger=LOGGER)
     bootstrapper = OBSBootstrapper(obs_dir_abs)
-
-    # Every bootstrap/profile target must be safe before a running OBS is stopped.
     try:
-        bootstrapper.preflight_apply(port=config.obs.port)
-        preflight_obs_recording_profile_ini(obs_dir_abs)
-    except Exception as e:
-        raise RecorderError(f"ポータブルOBS起動前設定の安全性検査に失敗しました: {e}") from e
-
-    # OBSは起動時にglobal.iniを読み、終了時に再保存する。
-    # 管理対象OBSが既に動いている場合は、設定反映前に必ず止める。
-    process_manager.kill_stale_managed_processes()
-    unmanaged_processes = process_manager.unmanaged_processes()
-    if unmanaged_processes:
-        details = []
-        for process in unmanaged_processes[:5]:
-            path_text = str(process.executable_path) if process.executable_path else "path unknown"
-            details.append(f"pid={process.pid} {path_text}")
-        raise RecorderError(
-            "管理対象外のOBSが既に起動しています。\n"
-            "通常版OBSまたは旧配置のOBSが起動していると、このアプリの起動前設定は反映されません。\n"
-            + "\n".join(details)
-            + "\n既存のOBSを終了してから再実行してください。"
+        record_dir = validate_recording_directory(config.paths.recordings_dir)
+        startup_encoder = _select_requested_obs_recording_encoder(
+            config.obs.recording_encoder,
+            obs_dir=obs_dir_abs,
         )
 
-    try:
-        bootstrap_result = bootstrapper.apply(
+        # Reject a conflicting regular/legacy OBS before any managed process is
+        # stopped. The guarded callback repeats this check to close the race
+        # between planning and process shutdown.
+        _require_no_unmanaged_obs_for_settings(process_manager)
+
+        def stop_managed_obs_for_settings() -> None:
+            # OBS reads startup INI files at launch and may flush them on exit.
+            # The transaction revalidates every snapshot after this callback.
+            _stop_managed_obs_tree_for_settings(process_manager)
+
+        bootstrap_result, changed_profiles = _execute_obs_startup_settings_transaction(
+            bootstrapper,
             port=config.obs.port,
             password=config.obs.password,
-            stop_managed_processes=False,
+            record_dir=record_dir,
+            scale_type=config.obs.scale_type,
+            recording_quality=config.obs.recording_quality,
+            recording_encoder=config.obs.recording_encoder,
+            selected_encoder=startup_encoder,
+            before_commit=stop_managed_obs_for_settings,
+            run_before_commit_on_noop=True,
         )
         global_ini_path = bootstrap_result.get("global_ini_path")
         user_ini_path = bootstrap_result.get("user_ini_path")
@@ -2546,25 +2901,17 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
         if changed and ws_cfg_path:
             LOGGER.info("ℹ️ ポータブルOBSのWebSocket設定を更新しました: %s", ws_cfg_path)
         LOGGER.info("OBS bootstrap paths: global.ini=%s user.ini=%s", global_ini_path, user_ini_path)
-    except Exception as e:
-        raise RecorderError(f"ポータブルOBS起動前設定の更新に失敗しました: {e}") from e
-
-    try:
-        record_dir = validate_recording_directory(config.paths.recordings_dir)
-        startup_encoder = _select_requested_obs_recording_encoder(config.obs.recording_encoder, obs_dir=obs_dir_abs)
-        changed_profiles = ensure_obs_recording_profile_ini(
-            obs_dir_abs,
-            record_dir=record_dir,
-            scale_type=config.obs.scale_type,
-            recording_quality=config.obs.recording_quality,
-            recording_encoder=config.obs.recording_encoder,
-            selected_encoder=startup_encoder,
-        )
         if changed_profiles:
-            LOGGER.info("ℹ️ OBS録画プロファイルを修復しました: %s", ", ".join(str(path) for path in changed_profiles))
+            LOGGER.info(
+                "ℹ️ OBS録画プロファイルを修復しました: %s",
+                ", ".join(str(path) for path in changed_profiles),
+            )
         LOGGER.info("OBS起動時録画エンコーダ: %s", _obs_encoder_log_label(startup_encoder))
     except Exception as e:
-        raise RecorderError(f"OBS録画プロファイルの起動前修復に失敗しました: {e}") from e
+        raise RecorderError(
+            "ポータブルOBS起動前設定transactionに失敗しました。"
+            f"管理対象OBSを停止したまま再試行してください: {e}"
+        ) from e
 
     ensure_obs_websocket_port_free(config)
 
@@ -2586,21 +2933,34 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                 LOGGER.info(
                     "OBS起動後にGPUエンコーダを検出したため、録画設定反映のためOBSを再起動します。"
                 )
+
+                def stop_obs_for_gpu_settings() -> None:
+                    _require_no_unmanaged_obs_for_settings(process_manager)
+                    try:
+                        process_manager.terminate_process(process)
+                    finally:
+                        _stop_managed_obs_tree_for_settings(process_manager)
+
                 try:
-                    preflight_obs_recording_profile_ini(obs_dir_abs)
+                    _bootstrap_result, changed_profiles = (
+                        _execute_obs_startup_settings_transaction(
+                            bootstrapper,
+                            port=config.obs.port,
+                            password=config.obs.password,
+                            record_dir=record_dir,
+                            scale_type=config.obs.scale_type,
+                            recording_quality=config.obs.recording_quality,
+                            recording_encoder=config.obs.recording_encoder,
+                            selected_encoder=detected_encoder,
+                            before_commit=stop_obs_for_gpu_settings,
+                            run_before_commit_on_noop=True,
+                        )
+                    )
                 except Exception as e:
                     raise RecorderError(
-                        f"OBS録画プロファイルの再起動前安全性検査に失敗しました: {e}"
+                        "OBS録画プロファイルの再起動transactionに失敗しました。"
+                        f"OBSを停止したまま再試行してください: {e}"
                     ) from e
-                process_manager.terminate_process(process)
-                changed_profiles = ensure_obs_recording_profile_ini(
-                    obs_dir_abs,
-                    record_dir=record_dir,
-                    scale_type=config.obs.scale_type,
-                    recording_quality=config.obs.recording_quality,
-                    recording_encoder=config.obs.recording_encoder,
-                    selected_encoder=detected_encoder,
-                )
                 if changed_profiles:
                     LOGGER.info(
                         "ℹ️ OBS録画プロファイルをGPUエンコーダへ更新しました: %s",

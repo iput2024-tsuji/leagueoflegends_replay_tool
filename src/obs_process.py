@@ -486,14 +486,27 @@ class OBSProcessManager:
                         "Expected OBS processes survived handle-bound forced termination"
                     )
                 for process, handle in live:
-                    strict_current(
+                    _snapshot, current = strict_current(
                         label="pre-force-signal",
-                        required=(process,),
                     )
-                    handle_identity = self._query_process_identity_from_handle(
-                        handle,
-                        process.pid,
-                    )
+                    current_by_pid = {item.pid: item for item in current}
+                    if current_by_pid.get(process.pid) is None:
+                        if self._wait_process_identity_handle(handle, timeout_ms=0):
+                            continue
+                        raise OBSProcessQueryError(
+                            "Live OBS handle is missing before forced termination"
+                        )
+                    if self._wait_process_identity_handle(handle, timeout_ms=0):
+                        continue
+                    try:
+                        handle_identity = self._query_process_identity_from_handle(
+                            handle,
+                            process.pid,
+                        )
+                    except OSError:
+                        if self._wait_process_identity_handle(handle, timeout_ms=0):
+                            continue
+                        raise
                     if not _obs_process_identities_equal(process, handle_identity):
                         raise OBSProcessQueryError(
                             "Windows process handle identity changed before forced termination"
@@ -501,6 +514,8 @@ class OBSProcessManager:
                     if self._wait_process_identity_handle(handle, timeout_ms=0):
                         continue
                     if not self._terminate_process_identity_handle(handle):
+                        if self._wait_process_identity_handle(handle, timeout_ms=0):
+                            continue
                         raise OBSProcessQueryError(
                             f"Handle-bound forced termination failed for pid={process.pid}"
                         )
@@ -1035,7 +1050,14 @@ class OBSProcessManager:
         operation_error: BaseException | None = None
         try:
             handle = self._open_process_identity_handle(pid)
-            identity = self._query_process_identity_from_handle(handle, pid)
+            if self._wait_process_identity_handle(handle, timeout_ms=0):
+                return None
+            try:
+                identity = self._query_process_identity_from_handle(handle, pid)
+            except OSError:
+                if self._wait_process_identity_handle(handle, timeout_ms=0):
+                    return None
+                raise
             validate_obs_process_query_snapshot(
                 OBSProcessQuerySnapshot((identity,), time.time()),
                 label="PowerShell row handle binding",

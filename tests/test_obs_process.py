@@ -370,6 +370,8 @@ def test_strict_process_query_filters_cim_row_whose_handle_already_exited(
         116444737235000000,
     )
     closed = []
+    identity_queries = []
+    wait_calls = []
     monkeypatch.setattr("src.obs_process.os.name", "nt")
     monkeypatch.setattr(
         manager,
@@ -383,12 +385,12 @@ def test_strict_process_query_filters_cim_row_whose_handle_already_exited(
     monkeypatch.setattr(
         manager,
         "_query_process_identity_from_handle",
-        lambda handle, pid: identity,
+        lambda handle, pid: identity_queries.append((handle, pid)) or identity,
     )
     monkeypatch.setattr(
         manager,
         "_wait_process_identity_handle",
-        lambda handle, timeout_ms: True,
+        lambda handle, timeout_ms: wait_calls.append((handle, timeout_ms)) or True,
     )
     monkeypatch.setattr(
         manager,
@@ -399,6 +401,216 @@ def test_strict_process_query_filters_cim_row_whose_handle_already_exited(
     snapshot = manager.query_obs_processes_strict()
 
     assert snapshot.processes == ()
+    assert closed == ["handle-123"]
+    assert identity_queries == []
+    assert wait_calls == [("handle-123", 0)]
+
+
+def test_strict_process_query_filters_row_that_exits_during_identity_query(
+    monkeypatch,
+):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_exit_race").resolve())
+    closed = []
+    waits = iter((False, True))
+    wait_calls = []
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    monkeypatch.setattr(
+        manager,
+        "_run_hidden",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout='{"ProcessId":123,"ExecutablePath":"C:/obs/bin/64bit/obs64.exe"}',
+        ),
+    )
+    monkeypatch.setattr(manager, "_open_process_identity_handle", lambda pid: "handle-123")
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: (_ for _ in ()).throw(
+            OSError(5, "Access is denied after process exit")
+        ),
+    )
+    def wait_handle(handle, timeout_ms):
+        wait_calls.append((handle, timeout_ms))
+        return next(waits)
+
+    monkeypatch.setattr(manager, "_wait_process_identity_handle", wait_handle)
+    monkeypatch.setattr(
+        manager,
+        "_close_process_identity_handle",
+        lambda handle: closed.append(handle),
+    )
+
+    snapshot = manager.query_obs_processes_strict()
+
+    assert snapshot.processes == ()
+    assert closed == ["handle-123"]
+    assert wait_calls == [("handle-123", 0), ("handle-123", 0)]
+
+
+@pytest.mark.parametrize(
+    "query_error",
+    (
+        OSError(5, "Access is denied for live process"),
+        OSError(22, "General identity query failure for live process"),
+    ),
+    ids=("access-denied", "general-os-error"),
+)
+def test_strict_process_query_does_not_ignore_os_error_for_live_handle(
+    monkeypatch,
+    query_error,
+):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_live_denied").resolve())
+    closed = []
+    waits = iter((False, False))
+    wait_calls = []
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    monkeypatch.setattr(
+        manager,
+        "_run_hidden",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout='{"ProcessId":123,"ExecutablePath":"C:/obs/bin/64bit/obs64.exe"}',
+        ),
+    )
+    monkeypatch.setattr(manager, "_open_process_identity_handle", lambda pid: "handle-123")
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: (_ for _ in ()).throw(query_error),
+    )
+
+    def wait_handle(handle, timeout_ms):
+        wait_calls.append((handle, timeout_ms))
+        return next(waits)
+
+    monkeypatch.setattr(manager, "_wait_process_identity_handle", wait_handle)
+    monkeypatch.setattr(
+        manager,
+        "_close_process_identity_handle",
+        lambda handle: closed.append(handle),
+    )
+
+    with pytest.raises(OSError, match="live process") as raised:
+        manager.query_obs_processes_strict()
+
+    assert raised.value is query_error
+    assert closed == ["handle-123"]
+    assert wait_calls == [("handle-123", 0), ("handle-123", 0)]
+
+
+def test_row_exit_race_still_fails_closed_when_handle_close_fails(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_race_close").resolve())
+    executable = Path("C:/obs/bin/64bit/obs64.exe")
+    waits = iter((False, True))
+    wait_calls = []
+    closed = []
+    query_error = OSError(5, "identity query failed after exit")
+
+    monkeypatch.setattr(manager, "_open_process_identity_handle", lambda pid: "handle-123")
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: (_ for _ in ()).throw(query_error),
+    )
+
+    def wait_handle(handle, timeout_ms):
+        wait_calls.append((handle, timeout_ms))
+        return next(waits)
+
+    def fail_close(handle):
+        closed.append(handle)
+        raise OSError("CloseHandle failed")
+
+    monkeypatch.setattr(manager, "_wait_process_identity_handle", wait_handle)
+    monkeypatch.setattr(manager, "_close_process_identity_handle", fail_close)
+
+    with pytest.raises(
+        OBSProcessQueryError,
+        match="row identity handle could not be closed",
+    ):
+        manager._bind_strict_process_row_to_handle(123, executable)
+
+    assert wait_calls == [("handle-123", 0), ("handle-123", 0)]
+    assert closed == ["handle-123"]
+
+
+@pytest.mark.parametrize("validation_failure", ("pid-mismatch", "invalid-identity"))
+def test_row_non_os_validation_failure_is_not_suppressed_by_later_exit(
+    monkeypatch,
+    validation_failure,
+):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_validation").resolve())
+    executable = Path("C:/obs/bin/64bit/obs64.exe")
+    wait_calls = []
+    closed = []
+
+    def query_identity(handle, pid):
+        if validation_failure == "pid-mismatch":
+            raise OBSProcessQueryError("Windows process handle PID mismatch")
+        return OBSProcessInfo(
+            pid=pid,
+            executable_path=executable,
+            creation_time=None,
+            creation_time_filetime=116444737235000000,
+        )
+
+    monkeypatch.setattr(manager, "_open_process_identity_handle", lambda pid: "handle-123")
+    monkeypatch.setattr(manager, "_query_process_identity_from_handle", query_identity)
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        lambda handle, timeout_ms: wait_calls.append((handle, timeout_ms)) or False,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_close_process_identity_handle",
+        lambda handle: closed.append(handle),
+    )
+
+    with pytest.raises(OBSProcessQueryError):
+        manager._bind_strict_process_row_to_handle(123, executable)
+
+    assert wait_calls == [("handle-123", 0)]
+    assert closed == ["handle-123"]
+
+
+def test_row_identity_query_wait_failure_keeps_query_error_as_context(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_wait_failure").resolve())
+    executable = Path("C:/obs/bin/64bit/obs64.exe")
+    query_error = OSError(5, "identity query failed")
+    wait_error = OSError(6, "WaitForSingleObject failed")
+    waits = iter((False, wait_error))
+    wait_calls = []
+    closed = []
+
+    monkeypatch.setattr(manager, "_open_process_identity_handle", lambda pid: "handle-123")
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: (_ for _ in ()).throw(query_error),
+    )
+
+    def wait_handle(handle, timeout_ms):
+        wait_calls.append((handle, timeout_ms))
+        outcome = next(waits)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(manager, "_wait_process_identity_handle", wait_handle)
+    monkeypatch.setattr(
+        manager,
+        "_close_process_identity_handle",
+        lambda handle: closed.append(handle),
+    )
+
+    with pytest.raises(OSError, match="WaitForSingleObject failed") as raised:
+        manager._bind_strict_process_row_to_handle(123, executable)
+
+    assert raised.value is wait_error
+    assert raised.value.__context__ is query_error
+    assert wait_calls == [("handle-123", 0), ("handle-123", 0)]
     assert closed == ["handle-123"]
 
 
@@ -1043,6 +1255,269 @@ def test_windows_handle_force_uses_validated_handle_instead_of_pid(monkeypatch):
     assert graceful == [(101, False)]
     assert forced == ["handle-101"]
     assert closed == ["handle-101"]
+
+
+@pytest.mark.parametrize(
+    "force_race",
+    (
+        "pre-query-exit",
+        "query-exit",
+        "live-os-error",
+        "missing-signaled",
+        "missing-live",
+        "terminate-false-signaled",
+        "terminate-false-live",
+        "terminate-false-wait-failure",
+        "identity-mismatch",
+        "invalid-identity",
+        "query-wait-failure",
+    ),
+)
+def test_windows_handle_force_only_ignores_query_error_after_handle_exit(
+    monkeypatch,
+    force_race,
+):
+    manager = OBSProcessManager(Path("tests/_tmp/windows_handle_force_race").resolve())
+    expected = OBSProcessInfo(101, manager.obs_exe, 1000.123, 116444746001230000)
+    current = {expected.pid: expected}
+    exited = False
+    query_calls = 0
+    handle_query_calls = []
+    wait_calls = []
+    graceful = []
+    forced = []
+    closed = []
+    query_error = OSError(5, "force identity query failed for live handle")
+    wait_error = OSError(6, "force identity wait failed")
+    terminate_wait_error = OSError(6, "post-TerminateProcess wait failed")
+    replacement = OBSProcessInfo(
+        expected.pid,
+        expected.executable_path,
+        expected.creation_time,
+        expected.creation_time_filetime + 1,
+    )
+
+    def query():
+        nonlocal exited, query_calls
+        query_calls += 1
+        if query_calls == 3 and force_race in {"missing-signaled", "missing-live"}:
+            current.clear()
+            exited = force_race == "missing-signaled"
+        return OBSProcessQuerySnapshot(tuple(current.values()), 100.0 + query_calls)
+
+    def query_handle(handle, pid):
+        nonlocal exited
+        handle_query_calls.append((handle, pid))
+        if len(handle_query_calls) == 1:
+            return expected
+        if force_race == "query-exit":
+            exited = True
+            current.clear()
+            raise OSError(5, "force identity query failed after exit")
+        if force_race == "live-os-error":
+            raise query_error
+        if force_race == "query-wait-failure":
+            raise query_error
+        if force_race == "identity-mismatch":
+            return replacement
+        if force_race == "invalid-identity":
+            return OBSProcessInfo(
+                expected.pid,
+                expected.executable_path,
+                creation_time=None,
+                creation_time_filetime=expected.creation_time_filetime,
+            )
+        if force_race.startswith("terminate-false-"):
+            return expected
+        raise AssertionError("pre-query exit must not query the force identity")
+
+    def wait_handle(handle, timeout_ms):
+        nonlocal exited
+        wait_calls.append((handle, timeout_ms))
+        if force_race == "pre-query-exit" and len(wait_calls) == 3:
+            exited = True
+            current.clear()
+        if force_race == "query-wait-failure" and len(wait_calls) == 4:
+            raise wait_error
+        if force_race == "terminate-false-wait-failure" and len(wait_calls) == 5:
+            raise terminate_wait_error
+        return exited
+
+    def force_handle(handle):
+        nonlocal exited
+        forced.append(handle)
+        if force_race == "terminate-false-signaled":
+            exited = True
+            current.clear()
+            return False
+        if force_race in {"terminate-false-live", "terminate-false-wait-failure"}:
+            return False
+        return True
+
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+    monkeypatch.setattr(manager, "query_obs_processes_strict", query)
+    monkeypatch.setattr(manager, "_open_process_identity_handle", lambda pid: "handle-101")
+    monkeypatch.setattr(manager, "_query_process_identity_from_handle", query_handle)
+    monkeypatch.setattr(manager, "_wait_process_identity_handle", wait_handle)
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda pid, force: graceful.append((pid, force)) or True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_process_identity_handle",
+        force_handle,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_close_process_identity_handle",
+        lambda handle: closed.append(handle),
+    )
+
+    failure_expectations = {
+        "live-os-error": (OSError, "live handle"),
+        "missing-live": (OBSProcessQueryError, "Live OBS handle is missing"),
+        "terminate-false-live": (
+            OBSProcessQueryError,
+            "Handle-bound forced termination failed",
+        ),
+        "terminate-false-wait-failure": (
+            OSError,
+            "post-TerminateProcess wait failed",
+        ),
+        "identity-mismatch": (OBSProcessQueryError, "identity changed"),
+        "invalid-identity": (OBSProcessQueryError, "identity changed"),
+        "query-wait-failure": (OSError, "force identity wait failed"),
+    }
+    if force_race in failure_expectations:
+        expected_error, expected_message = failure_expectations[force_race]
+        with pytest.raises(expected_error, match=expected_message) as raised:
+            manager.terminate_expected_obs_processes_strict(
+                (expected,),
+                timeout_sec=0,
+            )
+        if force_race == "live-os-error":
+            assert raised.value is query_error
+        elif force_race == "query-wait-failure":
+            assert raised.value is wait_error
+            assert raised.value.__context__ is query_error
+        elif force_race == "terminate-false-wait-failure":
+            assert raised.value is terminate_wait_error
+    else:
+        result = manager.terminate_expected_obs_processes_strict(
+            (expected,),
+            timeout_sec=0,
+        )
+        assert result.after.processes == ()
+
+    assert graceful == [(101, False)]
+    assert forced == (
+        ["handle-101"]
+        if force_race
+        in {
+            "terminate-false-signaled",
+            "terminate-false-live",
+            "terminate-false-wait-failure",
+        }
+        else []
+    )
+    assert closed == ["handle-101"]
+    assert handle_query_calls == (
+        [("handle-101", 101)]
+        if force_race in {"pre-query-exit", "missing-signaled", "missing-live"}
+        else [("handle-101", 101), ("handle-101", 101)]
+    )
+    expected_wait_count = {
+        "pre-query-exit": 4,
+        "query-exit": 5,
+        "live-os-error": 4,
+        "missing-signaled": 4,
+        "missing-live": 3,
+        "terminate-false-signaled": 6,
+        "terminate-false-live": 5,
+        "terminate-false-wait-failure": 5,
+        "identity-mismatch": 3,
+        "invalid-identity": 3,
+        "query-wait-failure": 4,
+    }[force_race]
+    assert wait_calls == [("handle-101", 0)] * expected_wait_count
+
+
+def test_windows_handle_force_continues_other_target_after_one_exits(
+    monkeypatch,
+):
+    manager = OBSProcessManager(Path("tests/_tmp/windows_handle_force_multi_race").resolve())
+    first = OBSProcessInfo(101, manager.obs_exe, 1000.1, 116444746001000000)
+    second = OBSProcessInfo(202, manager.obs_exe, 1000.2, 116444746002000000)
+    current = {first.pid: first, second.pid: second}
+    exited = {"handle-101": False, "handle-202": False}
+    per_handle_waits = {"handle-101": 0, "handle-202": 0}
+    query_clock = 100.0
+    handle_queries = []
+    graceful = []
+    forced = []
+    closed = []
+
+    def query():
+        nonlocal query_clock
+        query_clock += 1.0
+        return OBSProcessQuerySnapshot(tuple(current.values()), query_clock)
+
+    def query_handle(handle, pid):
+        handle_queries.append((handle, pid))
+        return first if pid == first.pid else second
+
+    def wait_handle(handle, timeout_ms):
+        assert timeout_ms == 0
+        per_handle_waits[handle] += 1
+        if handle == "handle-101" and per_handle_waits[handle] == 3:
+            exited[handle] = True
+            current.pop(first.pid)
+        return exited[handle]
+
+    def force_handle(handle):
+        forced.append(handle)
+        exited[handle] = True
+        current.pop(second.pid)
+        return True
+
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+    monkeypatch.setattr(manager, "query_obs_processes_strict", query)
+    monkeypatch.setattr(
+        manager,
+        "_open_process_identity_handle",
+        lambda pid: f"handle-{pid}",
+    )
+    monkeypatch.setattr(manager, "_query_process_identity_from_handle", query_handle)
+    monkeypatch.setattr(manager, "_wait_process_identity_handle", wait_handle)
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda pid, force: graceful.append((pid, force)) or True,
+    )
+    monkeypatch.setattr(manager, "_terminate_process_identity_handle", force_handle)
+    monkeypatch.setattr(
+        manager,
+        "_close_process_identity_handle",
+        lambda handle: closed.append(handle),
+    )
+
+    result = manager.terminate_expected_obs_processes_strict(
+        (first, second),
+        timeout_sec=0,
+    )
+
+    assert result.after.processes == ()
+    assert graceful == [(101, False), (202, False)]
+    assert forced == ["handle-202"]
+    assert handle_queries == [
+        ("handle-101", 101),
+        ("handle-202", 202),
+        ("handle-202", 202),
+    ]
+    assert per_handle_waits == {"handle-101": 4, "handle-202": 5}
+    assert closed == ["handle-202", "handle-101"]
 
 
 def test_windows_handle_requeries_one_transitional_exited_identity_row(monkeypatch):

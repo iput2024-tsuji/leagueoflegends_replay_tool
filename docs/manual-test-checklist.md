@@ -114,6 +114,17 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 - [ ] アプリ終了やエラー時に録画プロセスとOBS接続を安全に終了する
 - [ ] 完了、部分保存、中断の状態がログと通知へ正しく反映される
 
+### OBS runtime所有processの終了（破棄可能な専用環境）
+
+通常利用のOBS設定とは別に、管理対象portable OBSと管理対象外OBSを同時に起動できる環境を用意します。試行前後に各processのPID、絶対executable path、raw creation FILETIMEとprocess leaseを記録します。
+
+- [ ] schema v2 leaseと一致する管理対象OBSをruntime終了で停止し、同時に動作する管理対象外OBSのPID、path、raw creation FILETIMEが不変であることと、管理対象の消滅確認後にだけleaseが削除されることを確認する
+- [ ] 管理対象OBSのgraceful停止がtimeoutした場合、同じ検証済みhandleへのforce停止で終了し、管理対象外OBSへsignalしない
+- [ ] 旧schema leaseがlive processを指す場合はsignalせず、手動終了と再試行の案内を表示してleaseを維持する。手動終了後の再試行ではstrictなPID不在を確認してleaseを削除する
+- [ ] 破損leaseでは自動停止・自動削除せず、全OBSの手動終了後にだけ、案内へ表示された絶対pathのleaseを退避または削除して再試行できる
+- [ ] query失敗、identity欠落、same-PID replacement、signal失敗、wait失敗、`TerminateProcess`失敗、`CloseHandle`失敗、最終残存をそれぞれ発生させ、対象外processへsignalせずleaseを維持して失敗を表示する
+- [ ] 新規OBS起動直後にPopen handleからraw creation FILETIMEを取得できない場合、その新規processだけを停止して起動失敗にし、既存OBSを変更しない
+
 ## JSON保存
 
 - [ ] `recordings/json` または設定した保存先にJSONが1件保存される

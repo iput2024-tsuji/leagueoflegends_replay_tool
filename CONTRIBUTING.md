@@ -84,6 +84,14 @@ Windowsビルドとセルフチェックも実行します。
 
 ドキュメントだけの変更では、アプリのビルドとテストを省略できます。
 
+### GitHub Actions参照の更新
+
+workflowで利用する第三者Actionは、移動可能なtagではなく完全なcommit SHAへ固定します。
+更新時は公式repositoryで対象tagが指すcommitを確認し、Release notesと変更内容を
+確認してから、同じActionの参照をすべて同じSHAへ更新してください。各参照には
+確認したversionをコメントとして残し、通常CIのjob名、依存関係、成果物公開方針を
+変更していないことを差分で確認したうえで、Pull Requestの全checkを実行します。
+
 ## Pull Request
 
 - PRのマージ先は `main` にします。

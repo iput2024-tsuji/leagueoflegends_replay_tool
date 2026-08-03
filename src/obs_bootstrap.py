@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import stat
 import time
@@ -18,9 +19,9 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from .obs_process import OBSProcessManager
+    from .obs_process import OBSProcessInfo, OBSProcessManager, OBSProcessQuerySnapshot
 except ImportError:
-    from obs_process import OBSProcessManager
+    from obs_process import OBSProcessInfo, OBSProcessManager, OBSProcessQuerySnapshot
 
 try:
     from . import obs_transaction_fs as _transaction_fs
@@ -265,6 +266,25 @@ class OBSSettingsRecoveryRequiredError(OBSSettingsTransactionError):
     """Raised when a stale settings transaction cannot be rolled back safely."""
 
 
+class _OBSPostStopConfigConflict(OBSPathSafetyError):
+    """Internal signal for one narrowly validated post-stop replan."""
+
+    def __init__(
+        self,
+        *,
+        evidence: _OBSSettingsStopEvidence,
+        baseline: _OBSConfigRetryObservation,
+        post_stop: _OBSConfigRetryObservation,
+    ) -> None:
+        super().__init__(
+            "管理OBS停止直後に既知の設定flushを検出しました。"
+            "同一の設定更新操作内で一度だけ再計画します。"
+        )
+        self.evidence = evidence
+        self.baseline = baseline
+        self.post_stop = post_stop
+
+
 class _OBSSettingsCommitDurabilityUncertainError(RuntimeError):
     """Keep recovery material when the committed journal may not be durable."""
 
@@ -363,6 +383,322 @@ class OBSConfigTransactionPlan:
     base_dir: Path
     directories: tuple[Path, ...]
     writes: tuple[OBSConfigPlannedWrite, ...]
+
+
+_OBS_STOP_EVIDENCE_SEAL = object()
+
+
+@dataclass(frozen=True, init=False)
+class _OBSSettingsStopEvidence:
+    """Non-sensitive proof retained across one post-stop replan attempt."""
+
+    _seal: object = field(repr=False, compare=False, init=False)
+    base_dir: Path
+    root_identity: tuple[int, int, int]
+    before_queried_at: float
+    after_queried_at: float
+    managed_before: tuple[OBSProcessInfo, ...]
+    unmanaged_before: tuple[OBSProcessInfo, ...]
+    killed_pids: tuple[int, ...]
+    managed_after: tuple[OBSProcessInfo, ...]
+    unmanaged_after: tuple[OBSProcessInfo, ...]
+    known_managed_process: OBSProcessInfo | None = None
+
+
+def _validate_obs_stop_query_snapshot(
+    snapshot: OBSProcessQuerySnapshot,
+    *,
+    label: str,
+) -> tuple[OBSProcessInfo, ...]:
+    if type(snapshot) is not OBSProcessQuerySnapshot:
+        raise OBSPathSafetyError(f"{label} OBS process query snapshotが不正です。")
+    queried_at = snapshot.queried_at
+    if (
+        isinstance(queried_at, bool)
+        or not isinstance(queried_at, (int, float))
+        or not math.isfinite(float(queried_at))
+        or float(queried_at) <= 0
+    ):
+        raise OBSPathSafetyError(f"{label} OBS process query時刻が不正です。")
+    if type(snapshot.processes) is not tuple:
+        raise OBSPathSafetyError(f"{label} OBS process query結果がtupleではありません。")
+
+    seen_pids: set[int] = set()
+    for process in snapshot.processes:
+        if type(process) is not OBSProcessInfo:
+            raise OBSPathSafetyError(f"{label} OBS process情報が不正です。")
+        if type(process.pid) is not int or process.pid <= 0:
+            raise OBSPathSafetyError(f"{label} OBS process PIDが不正です。")
+        if process.pid in seen_pids:
+            raise OBSPathSafetyError(f"{label} OBS process PIDが重複しています。")
+        seen_pids.add(process.pid)
+        creation_time = process.creation_time
+        if (
+            isinstance(creation_time, bool)
+            or not isinstance(creation_time, (int, float))
+            or not math.isfinite(float(creation_time))
+            or float(creation_time) <= 0
+        ):
+            raise OBSPathSafetyError(
+                f"{label} OBS process creation timeが不正です: pid={process.pid}"
+            )
+        if process.executable_path is None:
+            raise OBSPathSafetyError(
+                f"{label} OBS process executable pathがありません: pid={process.pid}"
+            )
+        executable = Path(process.executable_path)
+        if not executable.is_absolute() or _absolute_path(executable) != executable:
+            raise OBSPathSafetyError(
+                f"{label} OBS process executable pathがlexical absoluteではありません: "
+                f"pid={process.pid}"
+            )
+    return snapshot.processes
+
+
+def _create_obs_settings_stop_evidence(
+    base_dir: str | Path,
+    *,
+    before: OBSProcessQuerySnapshot,
+    after: OBSProcessQuerySnapshot,
+    killed_pids: tuple[int, ...],
+    known_managed_process: OBSProcessInfo | None = None,
+) -> _OBSSettingsStopEvidence:
+    """Create internally sealed evidence from two successful strict queries."""
+
+    base_path = _absolute_path(base_dir)
+    root_lease = _active_obs_mutation_root_lease()
+    if root_lease is None or root_lease.path != base_path:
+        raise OBSPathSafetyError(
+            "停止証跡に対応する管理OBS root leaseがありません。"
+        )
+    root_lease.validate_lexical_binding()
+    before_processes = _validate_obs_stop_query_snapshot(before, label="停止前")
+    after_processes = _validate_obs_stop_query_snapshot(after, label="停止後")
+    if float(after.queried_at) < float(before.queried_at):
+        raise OBSPathSafetyError("停止後OBS process query時刻が停止前より古いです。")
+
+    expected_executable = base_path / "bin" / "64bit" / "obs64.exe"
+    expected_key = _filesystem_path_key(expected_executable)
+    managed_before = tuple(
+        process
+        for process in before_processes
+        if _filesystem_path_key(process.executable_path) == expected_key
+    )
+    unmanaged_before = tuple(
+        process for process in before_processes if process not in managed_before
+    )
+    if unmanaged_before:
+        raise OBSPathSafetyError(
+            "停止前queryに管理対象外またはpath不一致のOBS processがあります。"
+        )
+    if after_processes:
+        raise OBSPathSafetyError(
+            "停止後queryでOBS processの残存または再出現を検出しました。"
+        )
+
+    if type(killed_pids) is not tuple:
+        raise OBSPathSafetyError("停止証跡のkilled PID一覧がtupleではありません。")
+    killed: list[int] = []
+    seen_killed: set[int] = set()
+    managed_by_pid = {process.pid: process for process in managed_before}
+    for pid in killed_pids:
+        if type(pid) is not int or pid <= 0:
+            raise OBSPathSafetyError("停止証跡のkilled PIDが不正です。")
+        if pid in seen_killed:
+            raise OBSPathSafetyError("停止証跡のkilled PIDが重複しています。")
+        if pid not in managed_by_pid:
+            raise OBSPathSafetyError("停止証跡に停止前query外のkilled PIDがあります。")
+        seen_killed.add(pid)
+        killed.append(pid)
+
+    known_pid: int | None = None
+    if known_managed_process is not None:
+        if type(known_managed_process) is not OBSProcessInfo:
+            raise OBSPathSafetyError("既知の管理OBS process情報が不正です。")
+        matching = managed_by_pid.get(known_managed_process.pid)
+        if matching != known_managed_process:
+            raise OBSPathSafetyError(
+                "既知の管理OBS processが停止前strict queryと完全一致しません。"
+            )
+        known_pid = known_managed_process.pid
+
+    explained = set(seen_killed)
+    if known_pid is not None:
+        explained.add(known_pid)
+    if explained != set(managed_by_pid):
+        raise OBSPathSafetyError(
+            "停止前の全管理OBS processをkilled PIDまたは既知processで説明できません。"
+        )
+
+    evidence = object.__new__(_OBSSettingsStopEvidence)
+    object.__setattr__(evidence, "_seal", _OBS_STOP_EVIDENCE_SEAL)
+    object.__setattr__(evidence, "base_dir", base_path)
+    object.__setattr__(evidence, "root_identity", root_lease.identity)
+    object.__setattr__(evidence, "before_queried_at", float(before.queried_at))
+    object.__setattr__(evidence, "after_queried_at", float(after.queried_at))
+    object.__setattr__(evidence, "managed_before", managed_before)
+    object.__setattr__(evidence, "unmanaged_before", ())
+    object.__setattr__(evidence, "killed_pids", tuple(killed))
+    object.__setattr__(evidence, "managed_after", ())
+    object.__setattr__(evidence, "unmanaged_after", ())
+    object.__setattr__(evidence, "known_managed_process", known_managed_process)
+    _validate_obs_settings_stop_evidence(
+        evidence,
+        expected_base_dir=base_path,
+        expected_root_identity=root_lease.identity,
+    )
+    root_lease.validate_lexical_binding()
+    return evidence
+
+
+def _validate_obs_settings_stop_evidence(
+    evidence: Any,
+    *,
+    expected_base_dir: Path,
+    expected_root_identity: tuple[int, int, int],
+) -> _OBSSettingsStopEvidence:
+    """Defensively revalidate every field, including seal-bearing fabrications."""
+
+    if (
+        type(evidence) is not _OBSSettingsStopEvidence
+        or getattr(evidence, "_seal", None) is not _OBS_STOP_EVIDENCE_SEAL
+    ):
+        raise OBSPathSafetyError("停止後再計画に利用できるsealed process evidenceがありません。")
+    required_fields = (
+        "base_dir",
+        "root_identity",
+        "before_queried_at",
+        "after_queried_at",
+        "managed_before",
+        "unmanaged_before",
+        "killed_pids",
+        "managed_after",
+        "unmanaged_after",
+        "known_managed_process",
+    )
+    if any(not hasattr(evidence, name) for name in required_fields):
+        raise OBSPathSafetyError("停止後再計画のprocess evidence fieldが不足しています。")
+    if (
+        evidence.base_dir != expected_base_dir
+        or evidence.root_identity != expected_root_identity
+    ):
+        raise OBSPathSafetyError("停止後再計画の管理OBS root証跡が一致しません。")
+    if any(
+        type(processes) is not tuple
+        for processes in (
+            evidence.managed_before,
+            evidence.unmanaged_before,
+            evidence.managed_after,
+            evidence.unmanaged_after,
+        )
+    ):
+        raise OBSPathSafetyError("停止後再計画のprocess partitionがtupleではありません。")
+
+    before_processes = (*evidence.managed_before, *evidence.unmanaged_before)
+    after_processes = (*evidence.managed_after, *evidence.unmanaged_after)
+    _validate_obs_stop_query_snapshot(
+        OBSProcessQuerySnapshot(
+            processes=before_processes,
+            queried_at=evidence.before_queried_at,
+        ),
+        label="停止前証跡",
+    )
+    _validate_obs_stop_query_snapshot(
+        OBSProcessQuerySnapshot(
+            processes=after_processes,
+            queried_at=evidence.after_queried_at,
+        ),
+        label="停止後証跡",
+    )
+    if float(evidence.after_queried_at) < float(evidence.before_queried_at):
+        raise OBSPathSafetyError("停止後証跡のquery時刻が停止前より古いです。")
+
+    expected_executable = expected_base_dir / "bin" / "64bit" / "obs64.exe"
+    expected_key = _filesystem_path_key(expected_executable)
+    if any(
+        _filesystem_path_key(process.executable_path) != expected_key
+        for process in evidence.managed_before
+    ):
+        raise OBSPathSafetyError("管理OBS process partitionにpath不一致があります。")
+    if evidence.unmanaged_before:
+        raise OBSPathSafetyError("停止前証跡に管理対象外OBS processがあります。")
+    if after_processes:
+        raise OBSPathSafetyError("停止後証跡にOBS processが残存または再出現しています。")
+
+    if type(evidence.killed_pids) is not tuple:
+        raise OBSPathSafetyError("停止後証跡のkilled PID一覧がtupleではありません。")
+    managed_by_pid = {process.pid: process for process in evidence.managed_before}
+    seen_killed: set[int] = set()
+    for pid in evidence.killed_pids:
+        if type(pid) is not int or pid <= 0:
+            raise OBSPathSafetyError("停止後証跡のkilled PIDが不正です。")
+        if pid in seen_killed:
+            raise OBSPathSafetyError("停止後証跡のkilled PIDが重複しています。")
+        if pid not in managed_by_pid:
+            raise OBSPathSafetyError("停止後証跡に停止前query外のkilled PIDがあります。")
+        seen_killed.add(pid)
+
+    known_pid: int | None = None
+    if evidence.known_managed_process is not None:
+        if type(evidence.known_managed_process) is not OBSProcessInfo:
+            raise OBSPathSafetyError("停止後証跡の既知管理OBS processが不正です。")
+        matching = managed_by_pid.get(evidence.known_managed_process.pid)
+        if matching != evidence.known_managed_process:
+            raise OBSPathSafetyError(
+                "停止後証跡の既知管理OBS processが停止前queryと完全一致しません。"
+            )
+        known_pid = evidence.known_managed_process.pid
+    explained = set(seen_killed)
+    if known_pid is not None:
+        explained.add(known_pid)
+    if explained != set(managed_by_pid):
+        raise OBSPathSafetyError("停止前の全管理OBS processを停止証跡で説明できません。")
+    return evidence
+
+
+@dataclass(frozen=True)
+class _OBSConfigFileRetryObservation:
+    """Content/security digests only; never retains raw settings bytes."""
+
+    path: Path
+    existed: bool
+    identity: tuple[int, int, int] | None
+    size: int
+    sha256: str
+    security: tuple[object, ...] | None
+
+
+@dataclass(frozen=True)
+class _OBSConfigDirectoryRetryObservation:
+    """Typed directory identity/security metadata captured through an open handle."""
+
+    path: Path
+    existed: bool
+    identity: tuple[int, int, int] | None
+    security: tuple[object, ...] | None
+
+
+@dataclass(frozen=True)
+class _OBSProfileEntryRetryObservation:
+    """Immediate profiles-root name/kind/identity inventory without content."""
+
+    name: str
+    kind: str
+    identity: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class _OBSConfigRetryObservation:
+    """Plan and filesystem shape captured under one held root lease."""
+
+    base_dir: Path
+    root_identity: tuple[int, int, int]
+    files: tuple[_OBSConfigFileRetryObservation, ...]
+    directories: tuple[_OBSConfigDirectoryRetryObservation, ...]
+    profile_entries: tuple[_OBSProfileEntryRetryObservation, ...]
+    target_keys: frozenset[str]
+    directory_keys: frozenset[str]
+    validation_keys: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -1485,6 +1821,615 @@ def _validated_settings_transaction_plan(
     )
 
 
+def _obs_config_retry_relative_key(base_dir: Path, path: Path) -> str:
+    """Return a stable relative key without retaining an absolute target path."""
+
+    absolute = _absolute_path(path)
+    try:
+        relative = absolute.relative_to(base_dir)
+    except ValueError as exc:
+        raise OBSPathSafetyError(
+            f"停止後再検査の対象が管理OBS root外です: {absolute}"
+        ) from exc
+    if not relative.parts:
+        raise OBSPathSafetyError("管理OBS root自体を停止後再検査の対象にできません。")
+    for part in relative.parts:
+        _validate_single_path_component(part)
+    return "/".join(_filesystem_parts_key(relative.parts))
+
+
+def _obs_config_retry_security_metadata(
+    metadata: _OBSFilesystemMetadata,
+) -> tuple[object, ...]:
+    """Keep only security-relevant metadata, excluding content timestamps."""
+
+    return (
+        metadata.permissions,
+        metadata.owner,
+        metadata.group,
+        metadata.attributes,
+        metadata.security_descriptor_sha256,
+        metadata.extended_attributes_sha256,
+    )
+
+
+def _observe_obs_config_retry_directory(
+    root_lease: _OBSDirectoryLease,
+    base_dir: Path,
+    path: Path,
+) -> _OBSConfigDirectoryRetryObservation:
+    """Observe one semantic directory through its held handle."""
+
+    absolute = _absolute_path(path)
+    if absolute == base_dir:
+        relative_path = Path(".")
+        lease = root_lease
+        lease_owned = False
+    else:
+        relative_key = _obs_config_retry_relative_key(base_dir, absolute)
+        relative_path = Path(*relative_key.split("/"))
+        try:
+            lease = root_lease.open_descendant_directory(
+                tuple(absolute.relative_to(base_dir).parts)
+            )
+        except FileNotFoundError:
+            return _OBSConfigDirectoryRetryObservation(
+                path=relative_path,
+                existed=False,
+                identity=None,
+                security=None,
+            )
+        lease_owned = True
+    try:
+        identity = lease.identity
+        metadata_before = _snapshot_open_entry_metadata(
+            lease.native_handle,
+            path=absolute,
+            kind="directory",
+            native_windows_handle=os.name == "nt",
+        )
+        lease.validate_lexical_binding()
+        metadata_after = _snapshot_open_entry_metadata(
+            lease.native_handle,
+            path=absolute,
+            kind="directory",
+            native_windows_handle=os.name == "nt",
+        )
+        if lease.identity != identity or metadata_after != metadata_before:
+            raise OBSPathSafetyError(
+                f"停止後再検査中にdirectory identityまたはsecurityが変化しました: {absolute}"
+            )
+    except OBSPathSafetyError:
+        raise
+    except OSError as exc:
+        raise OBSPathSafetyError(
+            f"停止後再検査でdirectory metadataを取得できません: {absolute} ({exc})"
+        ) from exc
+    finally:
+        if lease_owned:
+            lease.close()
+    return _OBSConfigDirectoryRetryObservation(
+        path=relative_path,
+        existed=True,
+        identity=identity,
+        security=_obs_config_retry_security_metadata(metadata_before),
+    )
+
+
+def _observe_obs_profiles_root_inventory(
+    root_lease: _OBSDirectoryLease,
+    base_dir: Path,
+) -> tuple[_OBSProfileEntryRetryObservation, ...]:
+    """Capture a stable immediate profiles-root name/kind inventory."""
+
+    relative_parts = ("config", "obs-studio", "basic", "profiles")
+    profiles_root = base_dir.joinpath(*relative_parts)
+    try:
+        directory = root_lease.open_descendant_directory(relative_parts)
+    except FileNotFoundError:
+        return ()
+    try:
+        def scan() -> tuple[tuple[str, str, tuple[int, int, int]], ...]:
+            directory.validate_lexical_binding()
+            scan_descriptor: int | None = None
+            scan_target: str | Path | int
+            if os.name == "nt":
+                scan_target = directory.path
+            else:
+                scan_descriptor = os.open(
+                    ".",
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory.native_handle,
+                )
+                scan_target = scan_descriptor
+            entries: list[tuple[str, str, tuple[int, int, int]]] = []
+            try:
+                with os.scandir(scan_target) as iterator:
+                    for entry in iterator:
+                        _validate_single_path_component(entry.name)
+                        child_path = profiles_root / entry.name
+                        child_stat = (
+                            os.stat(child_path, follow_symlinks=False)
+                            if os.name == "nt"
+                            else entry.stat(follow_symlinks=False)
+                        )
+                        if _is_reparse_point(child_stat):
+                            raise OBSPathSafetyError(
+                                f"profiles root直下にreparse pointがあります: {child_path}"
+                            )
+                        scanned_identity = _file_identity(child_stat)
+                        if stat.S_ISDIR(child_stat.st_mode):
+                            kind = "directory"
+                            with directory.open_child_directory(entry.name) as child:
+                                opened_identity = child.identity
+                        elif stat.S_ISREG(child_stat.st_mode):
+                            kind = "file"
+                            descriptor = directory.open_file(
+                                entry.name,
+                                write=False,
+                                create_exclusive=False,
+                                share_delete=False,
+                            )
+                            try:
+                                opened_identity = _file_identity(os.fstat(descriptor))
+                            finally:
+                                os.close(descriptor)
+                        else:
+                            raise OBSPathSafetyError(
+                                f"profiles root直下に特殊entryがあります: {child_path}"
+                            )
+                        identity_matches = (
+                            opened_identity == scanned_identity
+                            if os.name != "nt"
+                            else (
+                                opened_identity[1] == int(child_stat.st_ino)
+                                and opened_identity[2] == stat.S_IFMT(child_stat.st_mode)
+                            )
+                        )
+                        if not identity_matches:
+                            raise OBSPathSafetyError(
+                                f"profiles root列挙中にentry identityが変化しました: {child_path}"
+                            )
+                        entries.append((entry.name, kind, opened_identity))
+            except OBSPathSafetyError:
+                raise
+            except OSError as exc:
+                raise OBSPathSafetyError(
+                    f"profiles rootを安全に列挙できません: {profiles_root} ({exc})"
+                ) from exc
+            finally:
+                if scan_descriptor is not None:
+                    os.close(scan_descriptor)
+            directory.validate_lexical_binding()
+            return tuple(sorted(entries, key=lambda item: (item[0].casefold(), item[0])))
+
+        before = scan()
+        after = scan()
+        if after != before:
+            raise OBSPathSafetyError("profiles rootのentryが列挙中に変化しました。")
+        return tuple(
+            _OBSProfileEntryRetryObservation(
+                name=name,
+                kind=kind,
+                identity=identity,
+            )
+            for name, kind, identity in before
+        )
+    finally:
+        directory.close()
+
+
+def _observe_obs_config_retry_file(
+    root_lease: _OBSDirectoryLease,
+    base_dir: Path,
+    snapshot: OBSConfigFileSnapshot,
+) -> _OBSConfigFileRetryObservation:
+    """Observe one planned file through held handles without retaining its bytes."""
+
+    path = _absolute_path(snapshot.path)
+    relative_key = _obs_config_retry_relative_key(base_dir, path)
+    relative_path = Path(*relative_key.split("/"))
+    try:
+        parent, parent_owned = _directory_for_descendant_parent(
+            root_lease,
+            path,
+            mutable=False,
+        )
+    except FileNotFoundError:
+        return _OBSConfigFileRetryObservation(
+            path=relative_path,
+            existed=False,
+            identity=None,
+            size=0,
+            sha256=hashlib.sha256(b"").hexdigest(),
+            security=None,
+        )
+
+    try:
+        try:
+            identity_before = parent.relative_file_identity_or_none(path.name)
+        except OBSPathSafetyError:
+            raise
+        except OSError as exc:
+            raise OBSPathSafetyError(
+                f"停止後再検査で設定fileの存在を確認できません: {path} ({exc})"
+            ) from exc
+        if identity_before is None:
+            return _OBSConfigFileRetryObservation(
+                path=relative_path,
+                existed=False,
+                identity=None,
+                size=0,
+                sha256=hashlib.sha256(b"").hexdigest(),
+                security=None,
+            )
+
+        try:
+            descriptor = parent.open_file(
+                path.name,
+                write=False,
+                create_exclusive=False,
+                share_delete=False,
+            )
+        except OBSPathSafetyError:
+            raise
+        except OSError as exc:
+            raise OBSPathSafetyError(
+                f"停止後再検査で設定fileをopenできません: {path} ({exc})"
+            ) from exc
+        try:
+            before = os.fstat(descriptor)
+            identity = _file_identity(before)
+            if identity != identity_before:
+                raise OBSPathSafetyError(
+                    f"停止後再検査中に設定file identityが変化しました: {path}"
+                )
+            if int(before.st_size) > OBS_BOOTSTRAP_CONFIG_MAX_BYTES:
+                raise OBSPathSafetyError(
+                    "停止後再検査の設定fileが上限を超えています: "
+                    f"{path} ({int(before.st_size)} > {OBS_BOOTSTRAP_CONFIG_MAX_BYTES})"
+                )
+            metadata_before = _snapshot_open_entry_metadata(
+                descriptor,
+                path=path,
+                kind="file",
+            )
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, OBS_BOOTSTRAP_CONFIG_MAX_BYTES + 1 - total),
+                )
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > OBS_BOOTSTRAP_CONFIG_MAX_BYTES:
+                    raise OBSPathSafetyError(
+                        f"停止後再検査中に設定fileが上限を超えました: {path}"
+                    )
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            metadata_after = _snapshot_open_entry_metadata(
+                descriptor,
+                path=path,
+                kind="file",
+            )
+            if (
+                _file_identity(after) != identity
+                or int(after.st_size) != total
+                or metadata_after != metadata_before
+            ):
+                raise OBSPathSafetyError(
+                    f"停止後再検査中に設定fileまたはmetadataが変化しました: {path}"
+                )
+            if parent._relative_file_identity(path.name) != identity:
+                raise OBSPathSafetyError(
+                    f"停止後再検査中に設定fileのpath identityが変化しました: {path}"
+                )
+        except OBSPathSafetyError:
+            raise
+        except OSError as exc:
+            raise OBSPathSafetyError(
+                f"停止後再検査で設定fileを読めません: {path} ({exc})"
+            ) from exc
+        finally:
+            os.close(descriptor)
+    finally:
+        if parent_owned:
+            parent.close()
+
+    root_lease.validate_lexical_binding()
+    return _OBSConfigFileRetryObservation(
+        path=relative_path,
+        existed=True,
+        identity=identity,
+        size=total,
+        sha256=digest.hexdigest(),
+        security=_obs_config_retry_security_metadata(metadata_before),
+    )
+
+
+def _observe_obs_config_retry_range(
+    plan: OBSConfigTransactionPlan,
+    *,
+    validation_files: tuple[OBSConfigFileSnapshot, ...] = (),
+    validation_directories: tuple[Path, ...] = (),
+    require_snapshot_match: bool,
+) -> _OBSConfigRetryObservation:
+    """Capture the exact non-sensitive plan range used by the limited validator."""
+
+    base_dir, directories, planned_writes, _changed = (
+        _validated_settings_transaction_plan(plan)
+    )
+    root_lease = _active_obs_mutation_root_lease()
+    if root_lease is None or root_lease.path != base_dir:
+        raise OBSPathSafetyError(
+            "停止後再検査に対応する管理OBS root leaseがありません。"
+        )
+    root_lease.validate_lexical_binding()
+
+    snapshots_by_key: dict[str, OBSConfigFileSnapshot] = {}
+    expected_snapshots_by_key: dict[str, OBSConfigFileSnapshot] = {}
+    target_keys: set[str] = set()
+    for write in planned_writes:
+        key = _obs_config_retry_relative_key(base_dir, write.snapshot.path)
+        target_keys.add(key)
+        snapshots_by_key[key] = write.snapshot
+        expected_snapshots_by_key[key] = write.snapshot
+
+    validation_keys: set[str] = set()
+    for snapshot in validation_files:
+        path = _absolute_path(snapshot.path)
+        if path != snapshot.path:
+            raise OBSPathSafetyError(
+                f"停止後再検査snapshotがlexical absoluteではありません: {snapshot.path}"
+            )
+        key = _obs_config_retry_relative_key(base_dir, path)
+        validation_keys.add(key)
+        existing = snapshots_by_key.get(key)
+        if existing is not None and existing != snapshot:
+            raise OBSPathSafetyError(
+                f"停止後再検査で同一fileに異なるsnapshotがあります: {path}"
+            )
+        snapshots_by_key[key] = snapshot
+        expected_snapshots_by_key[key] = snapshot
+
+    for marker_name in (PORTABLE_OBS_MARKER_NAME, LEGACY_PORTABLE_OBS_MARKER_NAME):
+        marker_path = base_dir / marker_name
+        key = _obs_config_retry_relative_key(base_dir, marker_path)
+        snapshots_by_key.setdefault(
+            key,
+            OBSConfigFileSnapshot(
+                path=marker_path,
+                payload=None,
+                identity=None,
+                label=marker_name,
+            ),
+        )
+
+    directory_by_key: dict[str, Path] = {".": base_dir}
+    directory_keys: set[str] = set()
+    for directory in directories:
+        if directory == base_dir:
+            continue
+        key = _obs_config_retry_relative_key(base_dir, directory)
+        directory_keys.add(key)
+        directory_by_key[key] = directory
+    for directory in validation_directories:
+        original = Path(directory)
+        absolute = _absolute_path(directory)
+        if original != absolute:
+            raise OBSPathSafetyError(
+                f"停止後再検査validation directoryがlexical absoluteではありません: {directory}"
+            )
+        if absolute == base_dir:
+            validation_keys.add("directory:.")
+            continue
+        key = _obs_config_retry_relative_key(base_dir, absolute)
+        validation_keys.add(f"directory:{key}")
+        directory_by_key[key] = absolute
+    for snapshot in snapshots_by_key.values():
+        parent = snapshot.path.parent
+        if parent != base_dir:
+            key = _obs_config_retry_relative_key(base_dir, parent)
+            directory_by_key[key] = parent
+
+    profiles_root = base_dir / "config" / "obs-studio" / "basic" / "profiles"
+    directory_by_key[
+        _obs_config_retry_relative_key(base_dir, profiles_root)
+    ] = profiles_root
+
+    ancestor_by_key: dict[str, Path] = {".": base_dir}
+    for directory in directory_by_key.values():
+        if directory == base_dir:
+            continue
+        relative = directory.relative_to(base_dir)
+        for count in range(1, len(relative.parts) + 1):
+            ancestor = base_dir.joinpath(*relative.parts[:count])
+            ancestor_by_key[_obs_config_retry_relative_key(base_dir, ancestor)] = ancestor
+    directory_observations = tuple(
+        _observe_obs_config_retry_directory(
+            root_lease,
+            base_dir,
+            ancestor_by_key[key],
+        )
+        for key in sorted(ancestor_by_key)
+    )
+    profile_entries = _observe_obs_profiles_root_inventory(root_lease, base_dir)
+
+    observations = tuple(
+        _observe_obs_config_retry_file(root_lease, base_dir, snapshots_by_key[key])
+        for key in sorted(snapshots_by_key)
+    )
+    if require_snapshot_match:
+        for observation in observations:
+            key = "/".join(_filesystem_parts_key(observation.path.parts))
+            snapshot = expected_snapshots_by_key.get(key)
+            if snapshot is None:
+                continue
+            if snapshot.payload is None:
+                if observation.existed or snapshot.identity is not None:
+                    raise OBSPathSafetyError(
+                        f"停止前snapshotの欠落状態が一致しません: {snapshot.path}"
+                    )
+                continue
+            size, sha256 = _settings_payload_digest(snapshot.payload)
+            if (
+                not observation.existed
+                or observation.identity != snapshot.identity
+                or observation.size != size
+                or observation.sha256 != sha256
+            ):
+                raise OBSPathSafetyError(
+                    f"停止前snapshotを安全に再確認できません: {snapshot.path}"
+                )
+
+    root_lease.validate_lexical_binding()
+    return _OBSConfigRetryObservation(
+        base_dir=base_dir,
+        root_identity=root_lease.identity,
+        files=observations,
+        directories=directory_observations,
+        profile_entries=profile_entries,
+        target_keys=frozenset(target_keys),
+        directory_keys=frozenset(directory_keys),
+        validation_keys=frozenset(validation_keys),
+    )
+
+
+def _capture_obs_config_retry_baseline(
+    plan: OBSConfigTransactionPlan,
+    *,
+    validation_files: tuple[OBSConfigFileSnapshot, ...] = (),
+    validation_directories: tuple[Path, ...] = (),
+) -> _OBSConfigRetryObservation:
+    """Capture a sealed-content baseline before the managed process is stopped."""
+
+    return _observe_obs_config_retry_range(
+        plan,
+        validation_files=validation_files,
+        validation_directories=validation_directories,
+        require_snapshot_match=True,
+    )
+
+
+def _is_known_obs_settings_retry_path(relative_path: Path) -> bool:
+    parts = _filesystem_parts_key(relative_path.parts)
+    fixed = {
+        _filesystem_parts_key(("config", "obs-studio", "global.ini")),
+        _filesystem_parts_key(("config", "obs-studio", "user.ini")),
+        _filesystem_parts_key(
+            (
+                "config",
+                "obs-studio",
+                "plugin_config",
+                "obs-websocket",
+                "config.json",
+            )
+        ),
+    }
+    if parts in fixed:
+        return True
+    return (
+        len(parts) == 6
+        and parts[:4]
+        == _filesystem_parts_key(("config", "obs-studio", "basic", "profiles"))
+        and parts[-1] == _filesystem_name_key("basic.ini")
+    )
+
+
+def _validate_limited_post_stop_config_retry(
+    plan: OBSConfigTransactionPlan,
+    baseline: _OBSConfigRetryObservation,
+    evidence: Any,
+    *,
+    validation_files: tuple[OBSConfigFileSnapshot, ...] = (),
+    validation_directories: tuple[Path, ...] = (),
+) -> None:
+    """Raise the private retry signal only for a narrowly proven OBS flush."""
+
+    evidence = _validate_obs_settings_stop_evidence(
+        evidence,
+        expected_base_dir=baseline.base_dir,
+        expected_root_identity=baseline.root_identity,
+    )
+    post_stop = _observe_obs_config_retry_range(
+        plan,
+        validation_files=validation_files,
+        validation_directories=validation_directories,
+        require_snapshot_match=False,
+    )
+    if (
+        evidence.base_dir != baseline.base_dir
+        or evidence.root_identity != baseline.root_identity
+        or baseline.base_dir != post_stop.base_dir
+        or baseline.root_identity != post_stop.root_identity
+    ):
+        raise OBSPathSafetyError("停止後再検査の管理OBS root identityが一致しません。")
+    if (
+        baseline.target_keys != post_stop.target_keys
+        or baseline.directory_keys != post_stop.directory_keys
+        or baseline.validation_keys != post_stop.validation_keys
+    ):
+        raise OBSPathSafetyError("停止後再検査の計画範囲が変化しました。")
+    if baseline.directories != post_stop.directories:
+        raise OBSPathSafetyError(
+            "停止後再検査でsemantic directory identityまたはsecurityが変化しました。"
+        )
+    if baseline.profile_entries != post_stop.profile_entries:
+        raise OBSPathSafetyError(
+            "停止後再検査でprofiles root直下のname/kind inventoryが変化しました。"
+        )
+
+    baseline_files = {str(item.path): item for item in baseline.files}
+    post_stop_files = {str(item.path): item for item in post_stop.files}
+    if (
+        len(baseline_files) != len(baseline.files)
+        or len(post_stop_files) != len(post_stop.files)
+        or baseline_files.keys() != post_stop_files.keys()
+    ):
+        raise OBSPathSafetyError("停止後再検査のfile validation setが変化しました。")
+
+    changed = False
+    for key in sorted(baseline_files):
+        before = baseline_files[key]
+        after = post_stop_files[key]
+        if before.existed != after.existed:
+            raise OBSPathSafetyError(
+                f"停止後再検査で設定fileの存在状態が変化しました: {before.path}"
+            )
+        if not before.existed:
+            continue
+        if before.security != after.security:
+            raise OBSPathSafetyError(
+                f"停止後再検査で設定fileのsecurity metadataが変化しました: {before.path}"
+            )
+        file_changed = (
+            before.identity != after.identity
+            or before.size != after.size
+            or before.sha256 != after.sha256
+        )
+        if not file_changed:
+            continue
+        if not _is_known_obs_settings_retry_path(before.path):
+            raise OBSPathSafetyError(
+                f"停止後に既知の設定file以外が変化しました: {before.path}"
+            )
+        changed = True
+
+    if changed:
+        if not evidence.managed_before:
+            raise OBSPathSafetyError(
+                "停止前に管理OBS processが存在しないため設定変更をOBS flushと判定できません。"
+            )
+        raise _OBSPostStopConfigConflict(
+            evidence=evidence,
+            baseline=baseline,
+            post_stop=post_stop,
+        )
+
+
 def _settings_journal_payload(
     base_dir: Path,
     owner_token: str,
@@ -2298,10 +3243,13 @@ def _preflight_settings_recovery_targets(
 
     targets: list[OBSConfigFileSnapshot] = []
     for entry in journal.entries:
+        if journal.phase == "preparing":
+            # No target replacement is possible in this phase. Recovery only
+            # removes owned temporaries and the journal, so even an unsafe
+            # external target must neither be opened nor block that cleanup.
+            continue
         current = _read_settings_file_or_none(entry.target, label=entry.label)
         targets.append(current)
-        if journal.phase == "preparing":
-            continue
         current_is_original = bool(
             current.payload is not None
             and _settings_entry_matches(
@@ -2449,9 +3397,10 @@ def recover_obs_settings_transaction(
 def execute_obs_config_transaction(
     plan: OBSConfigTransactionPlan,
     *,
-    before_commit: Callable[[], None] | None = None,
+    before_commit: Callable[[], Any] | None = None,
     validate_plan: Callable[[], None] | None = None,
     run_before_commit_on_noop: bool = False,
+    _validate_after_before_commit: Callable[[Any], None] | None = None,
 ) -> tuple[Path, ...]:
     """Prepare and atomically commit one recoverable multi-file OBS update."""
 
@@ -2478,7 +3427,12 @@ def execute_obs_config_transaction(
 
         if not writes:
             if run_before_commit_on_noop and before_commit is not None:
-                before_commit()
+                evidence = before_commit()
+                if (
+                    _validate_after_before_commit is not None
+                    and _ACTIVE_OBS_MIGRATION_CAPABILITY.get() is None
+                ):
+                    _validate_after_before_commit(evidence)
             validate_transaction_state()
             return ()
 
@@ -2563,7 +3517,9 @@ def execute_obs_config_transaction(
                 validate_transaction_state()
 
                 if before_commit is not None:
-                    before_commit()
+                    evidence = before_commit()
+                    if _validate_after_before_commit is not None:
+                        _validate_after_before_commit(evidence)
                 # OBS shutdown may flush its own INI files. In the preparing
                 # phase no target has been replaced, so a mismatch can discard
                 # owned temporaries without touching the flushed target.

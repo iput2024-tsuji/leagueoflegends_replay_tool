@@ -3,11 +3,13 @@ import json
 import multiprocessing
 import os
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from src import obs_bootstrap
+from src.obs_process import OBSProcessQueryError
 
 
 def _hold_settings_guard(base_dir: str, entered, release, result_queue) -> None:
@@ -67,6 +69,34 @@ def _transaction_temporaries(base_dir: Path) -> tuple[Path, ...]:
 def _assert_transaction_clean(base_dir: Path) -> None:
     assert not obs_bootstrap.get_obs_settings_transaction_marker(base_dir).exists()
     assert _transaction_temporaries(base_dir) == ()
+
+
+def _sealed_stop_evidence(
+    baseline: obs_bootstrap._OBSConfigRetryObservation,
+    *,
+    managed: bool = True,
+) -> obs_bootstrap._OBSSettingsStopEvidence:
+    process = obs_bootstrap.OBSProcessInfo(
+        pid=4312,
+        executable_path=(
+            baseline.base_dir / "bin" / "64bit" / "obs64.exe"
+        ),
+        creation_time=10.0,
+    )
+    before = obs_bootstrap.OBSProcessQuerySnapshot(
+        processes=(process,) if managed else (),
+        queried_at=100.0,
+    )
+    after = obs_bootstrap.OBSProcessQuerySnapshot(
+        processes=(),
+        queried_at=101.0,
+    )
+    return obs_bootstrap._create_obs_settings_stop_evidence(
+        baseline.base_dir,
+        before=before,
+        after=after,
+        killed_pids=(process.pid,) if managed else (),
+    )
 
 
 def _leave_stale_settings_transaction(monkeypatch, base_dir: Path, phase: str) -> Path:
@@ -185,6 +215,1157 @@ def test_settings_transaction_prepares_durable_files_without_password_in_journal
     assert changed == (target,)
     assert callback_calls == 1
     assert target.read_bytes() == desired
+    _assert_transaction_clean(base_dir)
+
+
+def test_post_stop_validator_receives_exact_callback_result_before_raw_revalidation(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    evidence = object()
+    events = []
+
+    def before_commit():
+        events.append("stop")
+        return evidence
+
+    def validate_after_before_commit(actual):
+        events.append("post-stop")
+        assert actual is evidence
+        assert target.read_bytes() == b"original"
+
+    assert obs_bootstrap.execute_obs_config_transaction(
+        plan,
+        before_commit=before_commit,
+        _validate_after_before_commit=validate_after_before_commit,
+    ) == (target,)
+
+    assert events == ["stop", "post-stop"]
+    assert target.read_bytes() == b"desired"
+    _assert_transaction_clean(base_dir)
+
+
+def test_post_stop_validator_is_not_called_when_callback_fails(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    post_stop_calls = 0
+
+    def before_commit():
+        raise RuntimeError("stop failed")
+
+    def validate_after_before_commit(_evidence):
+        nonlocal post_stop_calls
+        post_stop_calls += 1
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        obs_bootstrap.execute_obs_config_transaction(
+            plan,
+            before_commit=before_commit,
+            _validate_after_before_commit=validate_after_before_commit,
+        )
+
+    assert post_stop_calls == 0
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+def test_strict_query_failure_never_reaches_evidence_factory_or_validator(
+    monkeypatch,
+    tmp_path,
+):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    factory_calls = 0
+    validator_calls = 0
+
+    def fail_query():
+        raise OBSProcessQueryError("strict query failed")
+
+    def record_factory(*args, **kwargs):
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("factory must not run")
+
+    def before_commit():
+        before = fail_query()
+        return record_factory(base_dir, before=before)
+
+    def validate_after_before_commit(_evidence):
+        nonlocal validator_calls
+        validator_calls += 1
+
+    monkeypatch.setattr(
+        obs_bootstrap,
+        "_create_obs_settings_stop_evidence",
+        record_factory,
+    )
+    with pytest.raises(OBSProcessQueryError, match="strict query failed"):
+        obs_bootstrap.execute_obs_config_transaction(
+            plan,
+            before_commit=before_commit,
+            _validate_after_before_commit=validate_after_before_commit,
+        )
+
+    assert factory_calls == 0
+    assert validator_calls == 0
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+def test_post_stop_validator_runs_after_successful_noop_callback(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"ready", b"ready"),),
+    )
+    evidence = object()
+    events = []
+
+    def before_commit():
+        events.append("stop")
+        return evidence
+
+    def validate_after_before_commit(actual):
+        events.append("post-stop")
+        assert actual is evidence
+
+    assert obs_bootstrap.execute_obs_config_transaction(
+        plan,
+        before_commit=before_commit,
+        run_before_commit_on_noop=True,
+        _validate_after_before_commit=validate_after_before_commit,
+    ) == ()
+
+    assert events == ["stop", "post-stop"]
+    assert target.read_bytes() == b"ready"
+    _assert_transaction_clean(base_dir)
+
+
+def test_post_stop_validator_is_not_called_for_pre_stop_failure(monkeypatch, tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    stop_calls = 0
+    post_stop_calls = 0
+
+    def fail_preparation(_path, _payload):
+        raise OSError("pre-stop preparation failure")
+
+    def before_commit():
+        nonlocal stop_calls
+        stop_calls += 1
+
+    def validate_after_before_commit(_evidence):
+        nonlocal post_stop_calls
+        post_stop_calls += 1
+
+    monkeypatch.setattr(
+        obs_bootstrap,
+        "_write_settings_temporary",
+        fail_preparation,
+    )
+    with pytest.raises(OSError, match="pre-stop preparation failure"):
+        obs_bootstrap.execute_obs_config_transaction(
+            plan,
+            before_commit=before_commit,
+            _validate_after_before_commit=validate_after_before_commit,
+        )
+
+    assert stop_calls == 0
+    assert post_stop_calls == 0
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+def test_post_stop_validator_is_not_called_for_migration_capability_noop(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"ready", b"ready"),),
+    )
+    stop_calls = 0
+    post_stop_calls = 0
+
+    def before_commit():
+        nonlocal stop_calls
+        stop_calls += 1
+
+    def validate_after_before_commit(_evidence):
+        nonlocal post_stop_calls
+        post_stop_calls += 1
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        capability_token = obs_bootstrap._ACTIVE_OBS_MIGRATION_CAPABILITY.set(
+            (base_dir, "a" * 32)
+        )
+        try:
+            assert obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=before_commit,
+                run_before_commit_on_noop=True,
+                _validate_after_before_commit=validate_after_before_commit,
+            ) == ()
+        finally:
+            obs_bootstrap._ACTIVE_OBS_MIGRATION_CAPABILITY.reset(capability_token)
+
+    assert stop_calls == 1
+    assert post_stop_calls == 0
+    assert target.read_bytes() == b"ready"
+    _assert_transaction_clean(base_dir)
+
+
+def test_post_stop_validator_is_not_called_for_migration_capability_change(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    stop_calls = 0
+    post_stop_calls = 0
+
+    def before_commit():
+        nonlocal stop_calls
+        stop_calls += 1
+
+    def validate_after_before_commit(_evidence):
+        nonlocal post_stop_calls
+        post_stop_calls += 1
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        capability_token = obs_bootstrap._ACTIVE_OBS_MIGRATION_CAPABILITY.set(
+            (base_dir, "a" * 32)
+        )
+        try:
+            with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="最終化scope外"):
+                obs_bootstrap.execute_obs_config_transaction(
+                    plan,
+                    before_commit=before_commit,
+                    _validate_after_before_commit=validate_after_before_commit,
+                )
+        finally:
+            obs_bootstrap._ACTIVE_OBS_MIGRATION_CAPABILITY.reset(capability_token)
+
+    assert stop_calls == 1
+    assert post_stop_calls == 0
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+def test_post_stop_validator_is_not_reentered_during_committing(
+    monkeypatch,
+    tmp_path,
+):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    real_write_journal = obs_bootstrap._write_settings_journal
+    post_stop_calls = 0
+
+    def fail_committing(base, owner, phase, writes):
+        if phase == "committing":
+            raise OSError("committing failure")
+        return real_write_journal(base, owner, phase, writes)
+
+    def validate_after_before_commit(_evidence):
+        nonlocal post_stop_calls
+        post_stop_calls += 1
+
+    monkeypatch.setattr(obs_bootstrap, "_write_settings_journal", fail_committing)
+    with pytest.raises(OSError, match="committing failure"):
+        obs_bootstrap.execute_obs_config_transaction(
+            plan,
+            before_commit=lambda: object(),
+            _validate_after_before_commit=validate_after_before_commit,
+        )
+
+    assert post_stop_calls == 1
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+def test_post_stop_validator_is_not_called_during_committed_recovery(
+    monkeypatch,
+    tmp_path,
+):
+    base_dir = tmp_path / "obs-portable"
+    target = _leave_stale_settings_transaction(monkeypatch, base_dir, "committed")
+    snapshot = obs_bootstrap.preflight_obs_config_file(target, label="global.ini")
+    plan = obs_bootstrap.OBSConfigTransactionPlan(
+        base_dir=base_dir.absolute(),
+        directories=(target.parent,),
+        writes=(obs_bootstrap.OBSConfigPlannedWrite(snapshot, b"desired"),),
+    )
+    recovery_stop_calls = 0
+    post_stop_calls = 0
+
+    def before_recovery():
+        nonlocal recovery_stop_calls
+        recovery_stop_calls += 1
+
+    def validate_after_before_commit(_evidence):
+        nonlocal post_stop_calls
+        post_stop_calls += 1
+
+    assert obs_bootstrap.execute_obs_config_transaction(
+        plan,
+        before_commit=before_recovery,
+        _validate_after_before_commit=validate_after_before_commit,
+    ) == ()
+
+    assert recovery_stop_calls == 1
+    assert post_stop_calls == 0
+    assert target.read_bytes() == b"desired"
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "unmanaged",
+        "reappeared",
+        "duplicate-killed",
+        "unknown-killed",
+        "unexplained",
+        "known-mismatch",
+        "missing-creation",
+        "zero-creation",
+        "negative-creation",
+        "relative-executable",
+        "query-order",
+    ],
+)
+def test_stop_evidence_factory_rejects_inconsistent_strict_snapshots(tmp_path, case):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    base_dir.mkdir(parents=True)
+    managed = obs_bootstrap.OBSProcessInfo(
+        pid=4312,
+        executable_path=base_dir / "bin" / "64bit" / "obs64.exe",
+        creation_time=10.0,
+    )
+    before_process = managed
+    after_processes = ()
+    killed_pids = (managed.pid,)
+    known_process = None
+    before_time = 100.0
+    after_time = 101.0
+    if case == "unmanaged":
+        before_process = replace(
+            managed,
+            executable_path=(tmp_path / "other" / "obs64.exe").absolute(),
+        )
+        killed_pids = ()
+    elif case == "reappeared":
+        after_processes = (managed,)
+    elif case == "duplicate-killed":
+        killed_pids = (managed.pid, managed.pid)
+    elif case == "unknown-killed":
+        killed_pids = (9999,)
+    elif case == "unexplained":
+        killed_pids = ()
+    elif case == "known-mismatch":
+        killed_pids = ()
+        known_process = replace(managed, creation_time=11.0)
+    elif case == "missing-creation":
+        before_process = replace(managed, creation_time=None)
+    elif case == "zero-creation":
+        before_process = replace(managed, creation_time=0.0)
+    elif case == "negative-creation":
+        before_process = replace(managed, creation_time=-1.0)
+    elif case == "relative-executable":
+        before_process = replace(managed, executable_path=Path("obs64.exe"))
+    elif case == "query-order":
+        after_time = 99.0
+
+    before = obs_bootstrap.OBSProcessQuerySnapshot(
+        processes=(before_process,),
+        queried_at=before_time,
+    )
+    after = obs_bootstrap.OBSProcessQuerySnapshot(
+        processes=after_processes,
+        queried_at=after_time,
+    )
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError):
+            obs_bootstrap._create_obs_settings_stop_evidence(
+                base_dir,
+                before=before,
+                after=after,
+                killed_pids=killed_pids,
+                known_managed_process=known_process,
+            )
+
+
+def test_limited_validator_allows_no_managed_process_when_files_are_unchanged(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline, managed=False)
+        assert obs_bootstrap.execute_obs_config_transaction(
+            plan,
+            before_commit=lambda: evidence,
+            _validate_after_before_commit=lambda actual: (
+                obs_bootstrap._validate_limited_post_stop_config_retry(
+                    plan,
+                    baseline,
+                    actual,
+                )
+            ),
+        ) == (target,)
+
+    assert target.read_bytes() == b"desired"
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_validator_keeps_no_managed_process_file_change_raw(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline, managed=False)
+
+        def change_without_managed_process():
+            target.write_bytes(b"external")
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=change_without_managed_process,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"external"
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_validator_rejects_fabricated_sealed_evidence_fields(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        fabricated = _sealed_stop_evidence(baseline)
+        object.__setattr__(fabricated, "killed_pids", (9999,))
+
+        def change_with_fabricated_evidence():
+            target.write_bytes(b"external")
+            return fabricated
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=change_with_fabricated_evidence,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"external"
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_post_stop_validator_types_content_flush_and_preserves_target(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    secret = b"obs-exit-secret-flush"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_flush():
+            target.write_bytes(secret)
+            return evidence
+
+        with pytest.raises(obs_bootstrap._OBSPostStopConfigConflict) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_flush,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    conflict = raised.value
+    assert conflict.evidence is evidence
+    assert conflict.baseline is baseline
+    assert conflict.post_stop.files[0].path == Path("config/obs-studio/global.ini")
+    assert conflict.post_stop.files[0].size == len(secret)
+    assert conflict.post_stop.files[0].sha256 == hashlib.sha256(secret).hexdigest()
+    assert secret.decode() not in repr(conflict)
+    assert target.read_bytes() == secret
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_post_stop_validator_types_identity_only_flush(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    original = b"same-content"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/user.ini", original, b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_replace_identity():
+            replacement = target.with_name("replacement.ini")
+            replacement.write_bytes(original)
+            replacement.replace(target)
+            return evidence
+
+        with pytest.raises(obs_bootstrap._OBSPostStopConfigConflict) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_replace_identity,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    before = raised.value.baseline.files[0]
+    after = raised.value.post_stop.files[0]
+    assert before.identity != after.identity
+    assert before.size == after.size
+    assert before.sha256 == after.sha256
+    assert target.read_bytes() == original
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "config/obs-studio/plugin_config/obs-websocket/config.json",
+        "config/obs-studio/basic/profiles/Replay/basic.ini",
+    ],
+)
+def test_limited_post_stop_validator_types_other_known_settings_flush(
+    tmp_path,
+    relative,
+):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        ((relative, b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_flush():
+            target.write_bytes(b"known-settings-flush")
+            return evidence
+
+        with pytest.raises(obs_bootstrap._OBSPostStopConfigConflict):
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_flush,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert target.read_bytes() == b"known-settings-flush"
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.parametrize("original", [None, b"existing"])
+def test_limited_post_stop_validator_keeps_existence_changes_raw(
+    tmp_path,
+    original,
+):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", original, b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_change_existence():
+            if original is None:
+                target.write_bytes(b"external-created")
+            else:
+                target.unlink()
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_change_existence,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    if original is None:
+        assert target.read_bytes() == b"external-created"
+    else:
+        assert not target.exists()
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_post_stop_validator_keeps_portable_marker_change_raw(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        ((obs_bootstrap.PORTABLE_OBS_MARKER_NAME, b"marker", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_change_marker():
+            target.write_bytes(b"external-marker")
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_change_marker,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"external-marker"
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_validator_always_observes_portable_markers(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    marker = base_dir / obs_bootstrap.PORTABLE_OBS_MARKER_NAME
+    marker.write_bytes(b"marker-original")
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_change_unplanned_marker():
+            marker.write_bytes(b"marker-external")
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_change_unplanned_marker,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert marker.read_bytes() == b"marker-external"
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.parametrize("action", ["add-dir", "remove-dir", "add-file", "remove-file"])
+def test_limited_validator_keeps_profile_root_inventory_changes_raw(tmp_path, action):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    profiles_root = base_dir / "config" / "obs-studio" / "basic" / "profiles"
+    profiles_root.mkdir(parents=True)
+    entry = profiles_root / ("Replay" if action.endswith("dir") else "unexpected.ini")
+    if action == "remove-dir":
+        entry.mkdir()
+    elif action == "remove-file":
+        entry.write_bytes(b"profile-entry")
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_change_inventory():
+            if action == "add-dir":
+                entry.mkdir()
+            elif action == "remove-dir":
+                entry.rmdir()
+            elif action == "add-file":
+                entry.write_bytes(b"profile-entry")
+            else:
+                entry.unlink()
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_change_inventory,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.parametrize("kind", ["directory", "file"])
+def test_limited_validator_keeps_same_name_profile_entry_replacement_raw(
+    tmp_path,
+    kind,
+):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    profiles_root = base_dir / "config" / "obs-studio" / "basic" / "profiles"
+    profiles_root.mkdir(parents=True)
+    entry = profiles_root / ("Replay" if kind == "directory" else "unexpected.ini")
+    if kind == "directory":
+        entry.mkdir()
+    else:
+        entry.write_bytes(b"same-content")
+    original_identity = obs_bootstrap._file_identity(
+        os.stat(entry, follow_symlinks=False)
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_replace_entry():
+            if kind == "directory":
+                entry.rename(base_dir / "replaced-profile-directory")
+                entry.mkdir()
+            else:
+                replacement = entry.with_name("replacement.ini")
+                replacement.write_bytes(b"same-content")
+                replacement.replace(entry)
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_replace_entry,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert obs_bootstrap._file_identity(
+        os.stat(entry, follow_symlinks=False)
+    ) != original_identity
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_validator_keeps_unknown_config_change_raw(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/custom.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_change_unknown():
+            target.write_bytes(b"unknown-external")
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_change_unknown,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"unknown-external"
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement_value"),
+    [
+        ("target_keys", frozenset({"different-target"})),
+        ("directory_keys", frozenset({"different-directory"})),
+        ("validation_keys", frozenset({"different-validation"})),
+        ("directories", ()),
+        (
+            "profile_entries",
+            (obs_bootstrap._OBSProfileEntryRetryObservation("x", "file", (-1, -1, -1)),),
+        ),
+        ("root_identity", (-1, -1, -1)),
+    ],
+)
+def test_limited_post_stop_validator_keeps_range_changes_raw(
+    monkeypatch,
+    tmp_path,
+    field,
+    replacement_value,
+):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+        real_observe = obs_bootstrap._observe_obs_config_retry_range
+
+        def alter_post_stop_range(*args, **kwargs):
+            observed = real_observe(*args, **kwargs)
+            if not kwargs["require_snapshot_match"]:
+                return replace(observed, **{field: replacement_value})
+            return observed
+
+        monkeypatch.setattr(
+            obs_bootstrap,
+            "_observe_obs_config_retry_range",
+            alter_post_stop_range,
+        )
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=lambda: evidence,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_post_stop_validator_keeps_security_change_raw(
+    monkeypatch,
+    tmp_path,
+):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+        real_observe = obs_bootstrap._observe_obs_config_retry_range
+
+        def alter_post_stop_security(*args, **kwargs):
+            observed = real_observe(*args, **kwargs)
+            if kwargs["require_snapshot_match"]:
+                return observed
+            first = replace(observed.files[0], security=("changed-security",))
+            return replace(observed, files=(first, *observed.files[1:]))
+
+        monkeypatch.setattr(
+            obs_bootstrap,
+            "_observe_obs_config_retry_range",
+            alter_post_stop_security,
+        )
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=lambda: evidence,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.parametrize("directory_path", [Path("."), Path("config/obs-studio")])
+def test_limited_validator_keeps_directory_security_change_raw(
+    monkeypatch,
+    tmp_path,
+    directory_path,
+):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+        real_observe = obs_bootstrap._observe_obs_config_retry_range
+
+        def alter_post_stop_directory_security(*args, **kwargs):
+            observed = real_observe(*args, **kwargs)
+            if kwargs["require_snapshot_match"]:
+                return observed
+            directories = tuple(
+                replace(item, security=("changed-directory-security",))
+                if item.path == directory_path
+                else item
+                for item in observed.directories
+            )
+            return replace(observed, directories=directories)
+
+        monkeypatch.setattr(
+            obs_bootstrap,
+            "_observe_obs_config_retry_range",
+            alter_post_stop_directory_security,
+        )
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=lambda: evidence,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"original"
+    _assert_transaction_clean(base_dir)
+
+
+def test_retry_baseline_rejects_relative_validation_directory(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, _targets = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="lexical absolute"):
+            obs_bootstrap._capture_obs_config_retry_baseline(
+                plan,
+                validation_directories=(Path("config/obs-studio"),),
+            )
+
+
+def test_limited_post_stop_validator_keeps_hardlink_change_raw(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    external_link = target.with_name("external-hardlink.ini")
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_add_hardlink():
+            os.link(target, external_link)
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_add_hardlink,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert not isinstance(raised.value, obs_bootstrap._OBSPostStopConfigConflict)
+    assert target.read_bytes() == b"original"
+    assert external_link.read_bytes() == b"original"
+    external_link.unlink()
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_post_stop_validator_keeps_reparse_change_raw(tmp_path):
+    external = tmp_path / "external.ini"
+    external.write_bytes(b"external-sentinel")
+    probe = tmp_path / "symlink-capability-probe"
+    try:
+        os.symlink(external, probe)
+    except OSError as exc:
+        pytest.skip(f"file symlink creation unavailable: {exc}")
+    else:
+        probe.unlink()
+
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        evidence = _sealed_stop_evidence(baseline)
+
+        def stop_and_replace_with_reparse():
+            target.unlink()
+            os.symlink(external, target)
+            return evidence
+
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=stop_and_replace_with_reparse,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert not isinstance(raised.value, obs_bootstrap._OBSPostStopConfigConflict)
+    assert target.is_symlink()
+    assert external.read_bytes() == b"external-sentinel"
+    _assert_transaction_clean(base_dir)
+
+
+def test_preparing_recovery_cleans_owned_state_without_opening_unsafe_target(
+    monkeypatch,
+    tmp_path,
+):
+    base_dir = tmp_path / "obs-portable"
+    target = _leave_stale_settings_transaction(monkeypatch, base_dir, "preparing")
+    external_link = target.with_name("external-hardlink.ini")
+    os.link(target, external_link)
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        pass
+
+    assert target.read_bytes() == b"original"
+    assert external_link.read_bytes() == b"original"
+    external_link.unlink()
+    _assert_transaction_clean(base_dir)
+
+
+def test_limited_post_stop_validator_rejects_unsealed_evidence_as_raw(tmp_path):
+    base_dir = tmp_path / "obs-portable"
+    plan, (target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+
+    with obs_bootstrap.obs_config_mutation_guard(base_dir):
+        baseline = obs_bootstrap._capture_obs_config_retry_baseline(plan)
+        unsealed = object()
+        with pytest.raises(obs_bootstrap.OBSPathSafetyError) as raised:
+            obs_bootstrap.execute_obs_config_transaction(
+                plan,
+                before_commit=lambda: unsealed,
+                _validate_after_before_commit=lambda actual: (
+                    obs_bootstrap._validate_limited_post_stop_config_retry(
+                        plan,
+                        baseline,
+                        actual,
+                    )
+                ),
+            )
+
+    assert type(raised.value) is obs_bootstrap.OBSPathSafetyError
+    assert target.read_bytes() == b"original"
     _assert_transaction_clean(base_dir)
 
 

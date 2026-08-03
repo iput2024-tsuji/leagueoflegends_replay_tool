@@ -3,7 +3,9 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from src.obs_process import OBSProcessInfo, OBSProcessManager
+import pytest
+
+from src.obs_process import OBSProcessInfo, OBSProcessManager, OBSProcessQueryError
 
 
 def test_process_manager_only_targets_managed_obs(monkeypatch):
@@ -233,6 +235,91 @@ def test_windows_process_queries_run_hidden(monkeypatch):
     assert kwargs["creationflags"] == 0x08000000
     assert kwargs["startupinfo"].dwFlags & 1
     assert kwargs["startupinfo"].wShowWindow == 0
+
+
+def test_strict_process_query_distinguishes_successful_empty_result(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_empty").resolve())
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    monkeypatch.setattr(
+        manager,
+        "_run_hidden",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=""),
+    )
+
+    snapshot = manager.query_obs_processes_strict()
+
+    assert snapshot.processes == ()
+    assert snapshot.queried_at > 0
+
+
+def test_strict_process_query_returns_complete_process_snapshot(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_process").resolve())
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    monkeypatch.setattr(
+        manager,
+        "_run_hidden",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"ProcessId":123,"ExecutablePath":"C:/obs/bin/64bit/obs64.exe",'
+                '"CreationDate":"123.5"}'
+            ),
+        ),
+    )
+
+    snapshot = manager.query_obs_processes_strict()
+
+    assert snapshot.processes == (
+        OBSProcessInfo(
+            pid=123,
+            executable_path=Path("C:/obs/bin/64bit/obs64.exe"),
+            creation_time=123.5,
+        ),
+    )
+
+
+def test_strict_process_query_raises_when_query_fails(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_failure").resolve())
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    monkeypatch.setattr(
+        manager,
+        "_run_hidden",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    with pytest.raises(OBSProcessQueryError, match="exit code 1"):
+        manager.query_obs_processes_strict()
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "not-json",
+        "null",
+        '"unexpected"',
+        '{"ExecutablePath":"C:/obs/bin/64bit/obs64.exe"}',
+        '{"ProcessId":"invalid","ExecutablePath":"C:/obs/bin/64bit/obs64.exe"}',
+        '{"ProcessId":true,"ExecutablePath":"C:/obs/bin/64bit/obs64.exe"}',
+        '{"ProcessId":123,"ExecutablePath":null,"CreationDate":"invalid"}',
+        (
+            '[{"ProcessId":123,"ExecutablePath":"C:/obs/bin/64bit/obs64.exe",'
+            '"CreationDate":"123.5"},'
+            '{"ProcessId":123,"ExecutablePath":"C:/obs/bin/64bit/obs64.exe",'
+            '"CreationDate":"123.5"}]'
+        ),
+    ],
+)
+def test_strict_process_query_raises_for_malformed_results(monkeypatch, stdout):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_malformed").resolve())
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    monkeypatch.setattr(
+        manager,
+        "_run_hidden",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=stdout),
+    )
+
+    with pytest.raises(OBSProcessQueryError):
+        manager.query_obs_processes_strict()
 
 
 def test_taskkill_runs_hidden_on_windows(monkeypatch):

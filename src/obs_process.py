@@ -23,6 +23,18 @@ class OBSProcessInfo:
 
 
 @dataclass(frozen=True)
+class OBSProcessQuerySnapshot:
+    """A process snapshot whose query is known to have completed successfully."""
+
+    processes: tuple[OBSProcessInfo, ...]
+    queried_at: float
+
+
+class OBSProcessQueryError(RuntimeError):
+    """Raised when OBS process absence cannot be established reliably."""
+
+
+@dataclass(frozen=True)
 class OBSProcessLease:
     pid: int
     executable_path: Path
@@ -44,6 +56,20 @@ class OBSProcessManager:
         if os.name != "nt":
             return []
         return self._list_obs_processes_windows()
+
+    def query_obs_processes_strict(self) -> OBSProcessQuerySnapshot:
+        """Return a successful process-query snapshot or raise.
+
+        ``list_obs_processes`` intentionally remains best-effort for legacy callers.
+        Safety-sensitive callers use this method so an empty result cannot conceal a
+        failed or malformed Windows process query.
+        """
+        if os.name != "nt":
+            return OBSProcessQuerySnapshot(processes=(), queried_at=time.time())
+        return OBSProcessQuerySnapshot(
+            processes=tuple(self._list_obs_processes_powershell_strict()),
+            queried_at=time.time(),
+        )
 
     def is_managed_process(self, process: OBSProcessInfo) -> bool:
         if process.executable_path is None:
@@ -511,6 +537,79 @@ class OBSProcessManager:
                     pid=pid_int,
                     executable_path=Path(exe_text) if exe_text else None,
                     creation_time=_parse_windows_process_creation_time(row.get("CreationDate")),
+                )
+            )
+        return result
+
+    def _list_obs_processes_powershell_strict(self) -> list[OBSProcessInfo]:
+        script = (
+            "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+            "Get-CimInstance Win32_Process -Filter \"Name='obs64.exe'\" "
+            "| Select-Object ProcessId,ExecutablePath,CreationDate | ConvertTo-Json -Compress"
+        )
+        try:
+            completed = self._run_hidden(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as exc:
+            raise OBSProcessQueryError("PowerShell OBS process query could not be started") from exc
+        if completed.returncode != 0:
+            raise OBSProcessQueryError(
+                f"PowerShell OBS process query failed with exit code {completed.returncode}"
+            )
+
+        output = completed.stdout.strip()
+        if not output:
+            return []
+        try:
+            data = json.loads(output)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise OBSProcessQueryError("PowerShell OBS process query returned invalid JSON") from exc
+        if data is None:
+            raise OBSProcessQueryError(
+                "PowerShell OBS process query returned an invalid null result"
+            )
+        if isinstance(data, dict):
+            rows = [data]
+        elif isinstance(data, list):
+            rows = data
+        else:
+            raise OBSProcessQueryError("PowerShell OBS process query returned an invalid result")
+
+        result = []
+        seen_pids: set[int] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                raise OBSProcessQueryError("PowerShell OBS process query returned a malformed row")
+            raw_pid = row.get("ProcessId")
+            if type(raw_pid) is not int or raw_pid <= 0:
+                raise OBSProcessQueryError(
+                    "PowerShell OBS process query returned a malformed process id"
+                )
+            pid = raw_pid
+            if pid in seen_pids:
+                raise OBSProcessQueryError(
+                    "PowerShell OBS process query returned duplicate process ids"
+                )
+            seen_pids.add(pid)
+
+            creation_value = row.get("CreationDate")
+            creation_time = _parse_windows_process_creation_time(creation_value)
+            if creation_value not in (None, "") and creation_time is None:
+                raise OBSProcessQueryError(
+                    "PowerShell OBS process query returned a malformed creation time"
+                )
+            exe_text = str(row.get("ExecutablePath") or "").strip()
+            result.append(
+                OBSProcessInfo(
+                    pid=pid,
+                    executable_path=Path(exe_text) if exe_text else None,
+                    creation_time=creation_time,
                 )
             )
         return result

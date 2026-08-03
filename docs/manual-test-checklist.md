@@ -6,6 +6,7 @@
 
 - [ ] 対象ブランチまたはコミットを記録した
 - [ ] Windowsバージョン、Pythonまたはビルド版、LoLクライアント状態を記録した
+- [ ] 開発・ビルド確認では`pwsh --version`のmajor versionが7以上であることを記録した（Windows PowerShell 5.1は対象外）
 - [ ] OBS、mpv DLL、FFmpegの入手元と利用者が配置した場所を記録した
 - [ ] 既存設定・録画を退避する必要がある場合はバックアップした
 
@@ -140,7 +141,7 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 
 ## ビルドとself-check
 
-- [ ] 利用者管理のOBS、standalone FFmpeg、mpv DLLを含まない通常成果物で`.\scripts\build.ps1`が成功する
+- [ ] 利用者管理のOBS、standalone FFmpeg、mpv DLLを含まない通常成果物で`pwsh -NoProfile -File .\scripts\build.ps1`が成功する
 - [ ] `.\dist\LoLReplayTool\LoLReplayTool.exe --self-check` が終了コード0になる
 - [ ] OBS、mpv、FFmpeg未配置の警告が想定どおりで、必須診断は成功する
 - [ ] ビルド成果物へOBSまたはstandalone FFmpegが混入した場合は検査が失敗する
@@ -148,7 +149,8 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 
 ## インストーラー確認が必要なケース
 
-次の変更では `.\scripts\build_installer.ps1` による生成と実際のインストール確認を行います。
+次の変更では `pwsh -NoProfile -File .\scripts\build_installer.ps1` による生成と
+実際のインストール確認を行います。
 
 - [ ] `installer/LoLReplayTool.iss`、`VERSION`、インストール先、ショートカットを変更した
 - [ ] PyInstallerの成果物構成、データファイル、exe名を変更した

@@ -149,9 +149,16 @@ tests/
 
 - Windows
 - Python 3.14 for the currently tested development and build environment
+- PowerShell 7 or later (`pwsh`, for development and builds only)
 - A portable OBS Studio installation
 - Standalone FFmpeg when using clip export
 - A supported 64-bit mpv DLL
+
+Run the Windows development and build `.ps1` scripts with PowerShell 7 or
+later. Windows PowerShell 5.1 (`powershell.exe`) is not supported. Install
+PowerShell 7 by following the [official Microsoft instructions](https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows),
+then confirm that `pwsh --version` reports major version 7 or later. The
+`powershell` code blocks in this README assume a `pwsh` session.
 
 OBS Studio, standalone FFmpeg used for clip export, mpv DLLs, and Riot Games
 image assets are not included in this repository or the packaged application.
@@ -228,7 +235,7 @@ the license texts collected from the exact installed Python packages:
 
 ```powershell
 pip install pyinstaller
-.\scripts\build.ps1
+pwsh -NoProfile -File .\scripts\build.ps1
 ```
 
 Output:
@@ -260,7 +267,7 @@ Install Inno Setup 6 and run:
 
 ```powershell
 winget install --id JRSoftware.InnoSetup -e
-.\scripts\build_installer.ps1
+pwsh -NoProfile -File .\scripts\build_installer.ps1
 ```
 
 The default installation directory is `%LOCALAPPDATA%\Programs\LoLReplayTool`, so administrator privileges are not required.

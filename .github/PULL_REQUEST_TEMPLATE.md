@@ -15,7 +15,7 @@
 
 - [ ] Ruff: `.\venv\Scripts\python.exe -m ruff check src tests`
 - [ ] pytest: `.\venv\Scripts\python.exe -m pytest -p no:cacheprovider tests`
-- [ ] Windowsビルド: `.\scripts\build.ps1`
+- [ ] Windowsビルド: `pwsh -NoProfile -File .\scripts\build.ps1`
 - [ ] self-check: `.\dist\LoLReplayTool\LoLReplayTool.exe --self-check`
 - [ ] 手動テスト
 - [ ] 対象外または未実施の項目について理由を記載した

@@ -67,13 +67,18 @@ Qt DLL、plugin、PyQt6モジュール、C/C++ランタイムを混在させる�
 
 The preferred form for modification is available in the source archive
 attached to the matching GitHub Release and in the matching Git tag. On
-Windows x86-64, use the Python 3.14.6 runtime locked for Release builds:
+Windows x86-64, use PowerShell 7 or later (`pwsh`) and the Python 3.14.6
+runtime locked for Release builds. Windows PowerShell 5.1 (`powershell.exe`)
+is not supported. Install PowerShell 7 by following the
+[official Microsoft instructions](https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows)
+and confirm that `pwsh --version` reports major version 7 or later:
 
 ```powershell
+pwsh --version
 py -3.14 -m venv venv
 .\venv\Scripts\python.exe --version
 .\venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\scripts\build.ps1
+pwsh -NoProfile -File .\scripts\build.ps1
 .\dist\LoLReplayTool\LoLReplayTool.exe --self-check
 ```
 
@@ -81,15 +86,18 @@ To use a locally built PyQt6 or Qt, install that build into the same virtual
 environment before running `scripts\build.ps1`. Confirm the selected packages
 and licenses in the generated inventory. The resulting `dist\LoLReplayTool`
 directory can be run directly; Inno Setup can package it by using
-`scripts\build_installer.ps1`.
+`pwsh -NoProfile -File .\scripts\build_installer.ps1`.
 
 対応するGitHub Releaseに添付されたソースアーカイブと同じGit tagが、
-改変に適したソースです。Releaseビルドで固定するPython 3.14.6 x86-64を
-使用し、上記のversion確認結果も確認してください。ローカルでビルドした
+改変に適したソースです。WindowsではPowerShell 7以上（`pwsh`）を使用し、
+Windows PowerShell 5.1（`powershell.exe`）は使用しません。上記のMicrosoft公式
+導入手順からPowerShell 7を導入し、`pwsh --version`のmajor versionが7以上で
+あることを確認してください。Releaseビルドで固定するPython 3.14.6 x86-64を
+使用し、Pythonのversion確認結果も確認してください。ローカルでビルドした
 PyQt6またはQtを使う場合は、`scripts\build.ps1`の前に同じ仮想環境へ導入し、
 生成されたinventoryで採用パッケージとライセンスを確認してください。
 生成された`dist\LoLReplayTool`は直接実行でき、
-`scripts\build_installer.ps1`を使ってInno Setup形式にできます。
+`pwsh -NoProfile -File .\scripts\build_installer.ps1`を使ってInno Setup形式にできます。
 
 Nothing in this project adds a restriction against reverse engineering needed
 to debug modifications to an LGPL-covered Qt library. Replacement builds remain

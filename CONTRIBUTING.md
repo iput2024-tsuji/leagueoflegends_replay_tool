@@ -3,6 +3,26 @@
 `main` は常にテスト済みで、Releaseを作成できる状態に保ちます。通常の変更を
 `main` へ直接pushせず、作業ブランチとPull Request（PR）を使用してください。
 
+## Windows開発環境
+
+Windowsでの開発、テスト、ビルドにはPowerShell 7以上の`pwsh.exe`が必要です。
+Windows標準のWindows PowerShell 5.1（`powershell.exe`）は対応対象ではありません。
+PowerShell 7がない場合は、[Microsoft公式のWindows向け導入手順](https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows)
+を参照して導入し、versionを確認してください。
+
+```powershell
+winget install --id Microsoft.PowerShell --source winget
+pwsh --version
+```
+
+`pwsh --version`のmajor versionが7以上であることを確認し、新しいterminalから
+`pwsh`を起動してください。この文書の`powershell` code blockはPowerShell 7の
+sessionを前提とします。`.ps1`を1回だけ実行する例では、使用するshellを明確にする
+ため`pwsh -NoProfile -File`を使用します。
+
+GitHub ActionsのWindows jobも`.github/workflows/ci.yml`と
+`.github/workflows/release.yml`で`pwsh`を明示しており、ローカル要件と同じです。
+
 ## 開発フロー
 
 通常の開発は、次の順序で進めます。
@@ -78,7 +98,7 @@ OBS Studioやstandalone FFmpegの実行ファイル・配布archiveがリポジ�
 Windowsビルドとセルフチェックも実行します。
 
 ```powershell
-.\scripts\build.ps1
+pwsh -NoProfile -File .\scripts\build.ps1
 .\dist\LoLReplayTool\LoLReplayTool.exe --self-check
 ```
 

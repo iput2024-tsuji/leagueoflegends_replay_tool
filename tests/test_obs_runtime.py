@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import pytest
 
 from src import recordtest
-from src.obs_runtime import OBSRuntimeManager
+from src.obs_process import OBSProcessLeaseError, OBSProcessQueryError
+from src.obs_runtime import OBSRuntimeManager, RecorderRuntime
 
 
 class FakeRecorder:
@@ -11,6 +14,7 @@ class FakeRecorder:
         self.disconnect_called = 0
         self.finalize_called = 0
         self.fail_finalize = False
+        self.fail_disconnect = False
 
     def open(self):
         self.open_called += 1
@@ -20,6 +24,8 @@ class FakeRecorder:
 
     def disconnect_obs(self):
         self.disconnect_called += 1
+        if self.fail_disconnect:
+            raise RuntimeError("disconnect failed")
 
     def finalize_session(self):
         self.finalize_called += 1
@@ -136,3 +142,193 @@ def test_runtime_still_closes_obs_when_finalize_fails(monkeypatch):
     assert recorder.finalize_called == 1
     assert recorder.shutdown_called == 1
     assert recorder.disconnect_called == 0
+
+
+def test_existing_owned_runtime_propagates_cleanup_failure_with_manual_guidance():
+    recorder = FakeRecorder()
+    calls = []
+
+    class FailingManager:
+        lease_path = Path("C:/managed/obs/.lol_replay_obs_lease.json")
+
+        def kill_stale_owned_processes(self):
+            calls.append("cleanup")
+            raise OBSProcessQueryError("strict cleanup failed")
+
+    runtime = RecorderRuntime(
+        recorder=recorder,
+        owns_process=True,
+        owns_existing_process=True,
+        process_manager=FailingManager(),
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="手動で終了") as captured:
+        runtime.close()
+
+    assert recorder.disconnect_called == 1
+    assert calls == ["cleanup"]
+    assert isinstance(captured.value.__cause__, OBSProcessQueryError)
+    assert str(FailingManager.lease_path) in str(captured.value)
+    assert "退避または削除" in str(captured.value)
+
+
+def test_existing_owned_runtime_runs_cleanup_even_when_disconnect_fails():
+    recorder = FakeRecorder()
+    recorder.fail_disconnect = True
+    calls = []
+
+    class Manager:
+        def kill_stale_owned_processes(self):
+            calls.append("cleanup")
+            return [100]
+
+    runtime = RecorderRuntime(
+        recorder=recorder,
+        owns_process=True,
+        owns_existing_process=True,
+        process_manager=Manager(),
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="安全に終了") as captured:
+        runtime.close()
+
+    assert recorder.disconnect_called == 1
+    assert calls == ["cleanup"]
+    assert isinstance(captured.value.__cause__, RuntimeError)
+
+
+def test_runtime_preserves_finalize_error_and_records_cleanup_failure():
+    recorder = FakeRecorder()
+    recorder.fail_finalize = True
+
+    class FailingManager:
+        def kill_stale_owned_processes(self):
+            raise OBSProcessQueryError("strict cleanup failed")
+
+    runtime = RecorderRuntime(
+        recorder=recorder,
+        owns_process=True,
+        owns_existing_process=True,
+        process_manager=FailingManager(),
+    )
+
+    with pytest.raises(RuntimeError, match="save failed") as captured:
+        runtime.close(finalize_session=True)
+
+    assert recorder.finalize_called == 1
+    assert recorder.disconnect_called == 1
+    notes = getattr(captured.value, "__notes__", [])
+    assert any("cleanup also failed" in note for note in notes)
+
+
+def test_runtime_wraps_legacy_owned_lease_error_with_manual_guidance(monkeypatch):
+    class ProcessManager:
+        def __init__(self, obs_dir):
+            self.obs_dir = obs_dir
+            self.lease_path = Path(obs_dir).resolve() / ".lol_replay_obs_lease.json"
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(
+        recordtest,
+        "wait_for_owned_obs_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OBSProcessLeaseError("legacy live lease")
+        ),
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="手動で終了") as captured:
+        OBSRuntimeManager().open_recorder(
+            recordtest.AppConfig.from_dict({}),
+            force_launch=True,
+        )
+
+    assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+    assert str(ProcessManager(recordtest.AppConfig.from_dict({}).obs.obs_dir).lease_path) in str(
+        captured.value
+    )
+    assert "退避または削除" in str(captured.value)
+
+
+def test_runtime_wraps_live_handle_os_error_with_manual_guidance(monkeypatch):
+    class ProcessManager:
+        def __init__(self, obs_dir):
+            self.lease_path = Path(obs_dir).resolve() / ".lol_replay_obs_lease.json"
+
+        def has_owned_process(self):
+            raise OSError(5, "OpenProcess access denied")
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(
+        recordtest,
+        "test_obs_connection",
+        lambda *args, **kwargs: (True, "connected"),
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="手動で終了") as captured:
+        OBSRuntimeManager().open_recorder(
+            recordtest.AppConfig.from_dict({}),
+            auto_launch=True,
+        )
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "所有情報ファイル:" in str(captured.value)
+
+
+def test_runtime_wraps_wait_for_owned_os_error_with_manual_guidance(monkeypatch):
+    class ProcessManager:
+        def __init__(self, obs_dir):
+            self.lease_path = Path(obs_dir).resolve() / ".lol_replay_obs_lease.json"
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(
+        recordtest,
+        "wait_for_owned_obs_connection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError(5, "handle identity denied")
+        ),
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="手動で終了") as captured:
+        OBSRuntimeManager().open_recorder(
+            recordtest.AppConfig.from_dict({}),
+            force_launch=True,
+        )
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "所有情報ファイル:" in str(captured.value)
+
+
+def test_runtime_cleanup_holds_obs_operation_lock(monkeypatch):
+    recorder = FakeRecorder()
+
+    class TrackingLock:
+        active = False
+
+        def __enter__(self):
+            assert not self.active
+            self.active = True
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            assert self.active
+            self.active = False
+
+    lock = TrackingLock()
+
+    class Manager:
+        def kill_stale_owned_processes(self):
+            assert lock.active
+            return [100]
+
+    monkeypatch.setattr(recordtest, "OBS_OPERATION_LOCK", lock)
+    runtime = RecorderRuntime(
+        recorder=recorder,
+        owns_process=True,
+        owns_existing_process=True,
+        process_manager=Manager(),
+    )
+
+    runtime.close()
+
+    assert recorder.disconnect_called == 1
+    assert lock.active is False

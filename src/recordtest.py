@@ -3263,14 +3263,6 @@ def ensure_portable_mode_marker(base_dir: str | Path) -> Path:
     return SharedOBSBootstrapper(base_dir, logger=LOGGER).ensure_portable_mode_marker()
 
 
-def kill_stale_obs_processes() -> None:
-    """
-    アプリ管理OBSだけを起動直前に終了する。
-    通常版OBSやユーザーが別用途で起動したOBSは対象外にする。
-    """
-    OBSProcessManager(MANAGED_PORTABLE_OBS_DIR, logger=LOGGER).kill_stale_managed_processes()
-
-
 def _first_mapping_value(mapping: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         value = mapping.get(key)

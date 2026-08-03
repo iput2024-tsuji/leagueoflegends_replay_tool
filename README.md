@@ -198,9 +198,16 @@ tests/
 
 - Windows
 - Python 3.14（CI と配布ビルドの検証対象）
+- PowerShell 7以上（`pwsh`、開発・ビルド時のみ）
 - ポータブル版 OBS Studio
 - クリップ出力を利用する場合は standalone FFmpeg
 - mpv DLL
+
+Windowsの開発・ビルド用`.ps1`はPowerShell 7以上で実行します。Windows PowerShell
+5.1（`powershell.exe`）は対応対象ではありません。
+[Microsoft公式の導入手順](https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows)
+からPowerShell 7を導入し、`pwsh --version`のmajor versionが7以上であることを
+確認してください。このREADMEの`powershell` code blockは`pwsh` sessionを前提とします。
 
 このリポジトリおよびビルド成果物には、OBS Studio本体、クリップ出力用の
 standalone FFmpeg、mpv DLL、Riot Gamesの画像アセットを同梱しません。
@@ -283,7 +290,7 @@ Qt交換手順、第三者ソフトウェアの原文ライセンスを配置し
 
 ```powershell
 pip install pyinstaller
-.\scripts\build.ps1
+pwsh -NoProfile -File .\scripts\build.ps1
 ```
 
 出力先:
@@ -322,7 +329,7 @@ Inno Setup 6をインストールしたWindows環境で、テスト、アプリ�
 
 ```powershell
 winget install --id JRSoftware.InnoSetup -e
-.\scripts\build_installer.ps1
+pwsh -NoProfile -File .\scripts\build_installer.ps1
 ```
 
 出力先:

@@ -15,9 +15,12 @@ from pathlib import Path
 from src.app_paths import get_app_root, get_user_data_root
 from src.obs_bootstrap import (
     OBSBootstrapper,
-    is_obs_copy_in_progress,
+    _strictly_stop_managed_obs_processes,
+    has_pending_obs_copy_transaction,
+    has_pending_obs_settings_transaction,
     lexical_absolute_path,
     migrate_legacy_obs_installation,
+    obs_config_mutation_guard,
     validate_obs_installation_path,
 )
 from src.obs_process import OBSProcessManager
@@ -63,7 +66,9 @@ def is_environment_ready() -> bool:
     try:
         if not validate_obs_installation_path(OBS_PORTABLE_DIR):
             return False
-        if is_obs_copy_in_progress(OBS_PORTABLE_DIR):
+        if has_pending_obs_settings_transaction(OBS_PORTABLE_DIR):
+            return False
+        if has_pending_obs_copy_transaction(OBS_PORTABLE_DIR):
             return False
         return OBSBootstrapper(OBS_PORTABLE_DIR).check().ready
     except Exception:
@@ -102,12 +107,49 @@ def bootstrap_obs_portable_config(obs_dir: Path = OBS_PORTABLE_DIR) -> None:
     OBSBootstrapper(obs_dir).apply()
 
 
+def _stop_obs_tree_for_settings_recovery(process_manager: OBSProcessManager) -> None:
+    try:
+        _strictly_stop_managed_obs_processes(
+            process_manager.obs_dir,
+            process_manager,
+        )
+    except Exception as exc:
+        raise ManualSetupRequiredError(
+            "管理対象OBSをstrict identityで安全に停止できません。"
+            f"全OBSを手動終了してから再試行してください: {exc}"
+        ) from exc
+
+
 def migrate_legacy_obs_portable(progress_cb: ProgressCallback | None = None) -> bool:
     """Copy an existing legacy portable OBS without deleting the source."""
 
+    if has_pending_obs_settings_transaction(OBS_PORTABLE_DIR):
+        destination_manager = OBSProcessManager(OBS_PORTABLE_DIR)
+        with obs_config_mutation_guard(
+            OBS_PORTABLE_DIR,
+            before_settings_recovery=lambda: _stop_obs_tree_for_settings_recovery(
+                destination_manager
+            ),
+        ):
+            pass
+
+    for legacy_dir in legacy_obs_portable_dirs():
+        if (
+            validate_obs_installation_path(legacy_dir)
+            and has_pending_obs_settings_transaction(legacy_dir)
+        ):
+            legacy_manager = OBSProcessManager(legacy_dir)
+            with obs_config_mutation_guard(
+                legacy_dir,
+                before_settings_recovery=lambda manager=legacy_manager: (
+                    _stop_obs_tree_for_settings_recovery(manager)
+                ),
+            ):
+                pass
+
     def prepare_source(legacy_dir: Path) -> None:
         report(progress_cb, 10, f"旧OBS配置をローカル移行しています: {legacy_dir}")
-        OBSProcessManager(legacy_dir).kill_stale_managed_processes()
+        _stop_obs_tree_for_settings_recovery(OBSProcessManager(legacy_dir))
 
     migrated_from = migrate_legacy_obs_installation(
         OBS_PORTABLE_DIR,
@@ -131,9 +173,12 @@ async def ensure_obs_portable(
         raise RuntimeError("セットアップをキャンセルしました。")
 
     obs_is_valid = validate_obs_installation_path(OBS_PORTABLE_DIR)
-    if not obs_is_valid or is_obs_copy_in_progress(OBS_PORTABLE_DIR):
+    if not obs_is_valid or has_pending_obs_copy_transaction(OBS_PORTABLE_DIR):
         await asyncio.to_thread(migrate_legacy_obs_portable, progress_cb)
-    if not validate_obs_installation_path(OBS_PORTABLE_DIR) or is_obs_copy_in_progress(OBS_PORTABLE_DIR):
+    if (
+        not validate_obs_installation_path(OBS_PORTABLE_DIR)
+        or has_pending_obs_copy_transaction(OBS_PORTABLE_DIR)
+    ):
         raise ManualSetupRequiredError(obs_manual_setup_message())
 
     if cancel_cb and cancel_cb():

@@ -3,6 +3,7 @@ import inspect
 import os
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -49,6 +50,30 @@ def _create_directory_link(link: Path, target: Path) -> None:
     os.symlink(target, link, target_is_directory=True)
 
 
+class _StrictSetupProcessManager:
+    def __init__(self, obs_dir: Path, before, *, after=None, signaled=True):
+        self.obs_dir = obs_dir.absolute()
+        self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
+        self.before = before
+        self.after = after
+        self.signaled = signaled
+        self.query_calls = 0
+        self.termination_calls = 0
+
+    def query_obs_processes_strict(self):
+        self.query_calls += 1
+        if isinstance(self.before, BaseException):
+            raise self.before
+        return self.before
+
+    def terminate_expected_obs_processes_strict(self, expected):
+        self.termination_calls += 1
+        return obs_bootstrap.OBSStrictTerminationResult(
+            expected if self.signaled else (),
+            self.after,
+        )
+
+
 def test_setup_module_has_no_network_or_archive_install_path():
     source = inspect.getsource(setup_env)
 
@@ -58,6 +83,73 @@ def test_setup_module_has_no_network_or_archive_install_path():
     assert "unpack_archive" not in source
     assert not hasattr(setup_env, "download_file")
     assert not hasattr(setup_env, "ensure_ffmpeg")
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_termination_calls"),
+    (
+        ("query-error", 0),
+        ("malformed", 0),
+        ("unmanaged", 0),
+        ("survivor", 1),
+    ),
+)
+def test_setup_settings_stop_fails_closed_for_incomplete_or_unsafe_process_state(
+    tmp_path,
+    case,
+    expected_termination_calls,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    obs_dir.mkdir(parents=True)
+    managed = obs_bootstrap.OBSProcessInfo(
+        101,
+        obs_dir / "bin" / "64bit" / "obs64.exe",
+        10.0,
+    )
+    unmanaged = obs_bootstrap.OBSProcessInfo(
+        202,
+        (tmp_path / "regular-obs" / "obs64.exe").absolute(),
+        20.0,
+    )
+    empty = obs_bootstrap.OBSProcessQuerySnapshot((), 101.0)
+    before = obs_bootstrap.OBSProcessQuerySnapshot((managed,), 100.0)
+    after = empty
+    if case == "query-error":
+        before = obs_bootstrap.OBSProcessQueryError("strict query failed")
+    elif case == "malformed":
+        before = SimpleNamespace(processes=(), queried_at=100.0)
+    elif case == "unmanaged":
+        before = obs_bootstrap.OBSProcessQuerySnapshot((unmanaged,), 100.0)
+    elif case == "survivor":
+        after = obs_bootstrap.OBSProcessQuerySnapshot((managed,), 101.0)
+    manager = _StrictSetupProcessManager(obs_dir, before, after=after)
+
+    with pytest.raises(setup_env.ManualSetupRequiredError, match="strict identity"):
+        setup_env._stop_obs_tree_for_settings_recovery(manager)
+
+    assert manager.termination_calls == expected_termination_calls
+
+
+def test_setup_settings_stop_accepts_only_identity_bearing_strict_zero_result(
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").absolute()
+    obs_dir.mkdir(parents=True)
+    managed = obs_bootstrap.OBSProcessInfo(
+        101,
+        obs_dir / "bin" / "64bit" / "obs64.exe",
+        10.0,
+    )
+    manager = _StrictSetupProcessManager(
+        obs_dir,
+        obs_bootstrap.OBSProcessQuerySnapshot((managed,), 100.0),
+        after=obs_bootstrap.OBSProcessQuerySnapshot((), 101.0),
+    )
+
+    setup_env._stop_obs_tree_for_settings_recovery(manager)
+
+    assert manager.query_calls == 1
+    assert manager.termination_calls == 1
 
 
 def test_manual_setup_message_identifies_upstream_and_exact_destination(monkeypatch, tmp_path):
@@ -93,6 +185,67 @@ def test_user_provided_obs_is_bootstrapped_and_reported_ready(monkeypatch, tmp_p
     assert (obs_dir / "config" / "obs-studio" / "global.ini").is_file()
     assert (obs_dir / "config" / "obs-studio" / "user.ini").is_file()
     assert progress[-1] == (100, f"OBS is ready: {obs_dir}")
+
+
+@pytest.mark.parametrize("stale_phase", ["preparing", "committed"])
+def test_environment_is_not_ready_with_pending_settings_transaction(
+    monkeypatch,
+    tmp_path,
+    stale_phase,
+):
+    obs_dir, obs_exe = _configure_paths(monkeypatch, tmp_path)
+    _write_fake_obs(obs_exe)
+    obs_bootstrap.OBSBootstrapper(obs_dir).apply()
+    assert setup_env.is_environment_ready() is True
+    custom_ini = obs_dir / "config" / "obs-studio" / "custom.ini"
+    custom_ini.write_bytes(b"original")
+    snapshot = obs_bootstrap.preflight_obs_config_file(custom_ini, label="custom.ini")
+    plan = obs_bootstrap.OBSConfigTransactionPlan(
+        base_dir=obs_dir.absolute(),
+        directories=(custom_ini.parent.absolute(),),
+        writes=(obs_bootstrap.OBSConfigPlannedWrite(snapshot, b"desired"),),
+    )
+
+    if stale_phase == "preparing":
+        real_write = obs_bootstrap._write_settings_temporary
+        write_calls = 0
+
+        def crash_after_backup(path, payload):
+            nonlocal write_calls
+            write_calls += 1
+            result = real_write(path, payload)
+            if write_calls == 1:
+                raise SystemExit("pending preparing settings")
+            return result
+
+        monkeypatch.setattr(
+            obs_bootstrap,
+            "_write_settings_temporary",
+            crash_after_backup,
+        )
+        with pytest.raises(SystemExit, match="pending preparing"):
+            obs_bootstrap.execute_obs_config_transaction(plan)
+        monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", real_write)
+    else:
+        real_journal = obs_bootstrap._write_settings_journal
+
+        def crash_after_committed(base, owner, phase, writes):
+            result = real_journal(base, owner, phase, writes)
+            if phase == "committed":
+                raise SystemExit("pending committed settings")
+            return result
+
+        monkeypatch.setattr(
+            obs_bootstrap,
+            "_write_settings_journal",
+            crash_after_committed,
+        )
+        with pytest.raises(SystemExit, match="pending committed"):
+            obs_bootstrap.execute_obs_config_transaction(plan)
+        monkeypatch.setattr(obs_bootstrap, "_write_settings_journal", real_journal)
+
+    assert obs_bootstrap.has_pending_obs_settings_transaction(obs_dir) is True
+    assert setup_env.is_environment_ready() is False
 
 
 def test_existing_obs_root_reparse_is_rejected_without_external_write(monkeypatch, tmp_path):
@@ -135,6 +288,166 @@ def test_legacy_obs_is_copied_without_deleting_user_files(monkeypatch, tmp_path)
     assert not (obs_dir / ".lol_replay_obs_lease.json").exists()
     assert not (obs_dir / "temp_appdata").exists()
     assert setup_env.is_environment_ready() is True
+
+
+def test_legacy_migration_skips_settings_recovery_guard_without_pending_state(
+    monkeypatch,
+    tmp_path,
+):
+    _obs_dir, _obs_exe = _configure_paths(monkeypatch, tmp_path)
+    legacy_exe = setup_env.LEGACY_OBS_PORTABLE_DIR / "bin" / "64bit" / "obs64.exe"
+    _write_fake_obs(legacy_exe)
+
+    def fail_unneeded_guard(*_args, **_kwargs):
+        raise AssertionError("legacy settings guard must be entered only when pending")
+
+    monkeypatch.setattr(setup_env, "obs_config_mutation_guard", fail_unneeded_guard)
+
+    assert setup_env.migrate_legacy_obs_portable() is True
+
+
+def test_legacy_migration_recovers_preparing_settings_before_copy(monkeypatch, tmp_path):
+    obs_dir, _obs_exe = _configure_paths(monkeypatch, tmp_path)
+    legacy_dir = setup_env.LEGACY_OBS_PORTABLE_DIR
+    legacy_exe = legacy_dir / "bin" / "64bit" / "obs64.exe"
+    _write_fake_obs(legacy_exe)
+    custom_ini = legacy_dir / "config" / "obs-studio" / "custom.ini"
+    custom_ini.parent.mkdir(parents=True, exist_ok=True)
+    custom_ini.write_bytes(b"original-settings")
+    snapshot = obs_bootstrap.preflight_obs_config_file(custom_ini, label="custom.ini")
+    plan = obs_bootstrap.OBSConfigTransactionPlan(
+        base_dir=legacy_dir.absolute(),
+        directories=(custom_ini.parent.absolute(),),
+        writes=(obs_bootstrap.OBSConfigPlannedWrite(snapshot, b"desired-settings"),),
+    )
+    real_write = obs_bootstrap._write_settings_temporary
+    write_calls = 0
+
+    def crash_after_backup(path, payload):
+        nonlocal write_calls
+        write_calls += 1
+        result = real_write(path, payload)
+        if write_calls == 1:
+            raise SystemExit("preparing legacy settings")
+        return result
+
+    monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", crash_after_backup)
+    with pytest.raises(SystemExit, match="preparing legacy"):
+        obs_bootstrap.execute_obs_config_transaction(plan)
+    monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", real_write)
+    assert obs_bootstrap.has_pending_obs_settings_transaction(legacy_dir) is True
+
+    assert setup_env.migrate_legacy_obs_portable() is True
+
+    assert obs_bootstrap.has_pending_obs_settings_transaction(legacy_dir) is False
+    assert custom_ini.read_bytes() == b"original-settings"
+    assert (obs_dir / custom_ini.relative_to(legacy_dir)).read_bytes() == b"original-settings"
+
+
+def test_legacy_migration_recovers_invalid_destination_settings_before_copy(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir, obs_exe = _configure_paths(monkeypatch, tmp_path)
+    legacy_dir = setup_env.LEGACY_OBS_PORTABLE_DIR
+    _write_fake_obs(legacy_dir / "bin" / "64bit" / "obs64.exe")
+    relative_custom = Path("config") / "obs-studio" / "custom.ini"
+    legacy_custom = legacy_dir / relative_custom
+    destination_custom = obs_dir / relative_custom
+    legacy_custom.parent.mkdir(parents=True, exist_ok=True)
+    destination_custom.parent.mkdir(parents=True, exist_ok=True)
+    legacy_custom.write_bytes(b"original-settings")
+    destination_custom.write_bytes(b"original-settings")
+
+    snapshot = obs_bootstrap.preflight_obs_config_file(
+        destination_custom,
+        label="custom.ini",
+    )
+    plan = obs_bootstrap.OBSConfigTransactionPlan(
+        base_dir=obs_dir.absolute(),
+        directories=(destination_custom.parent.absolute(),),
+        writes=(obs_bootstrap.OBSConfigPlannedWrite(snapshot, b"desired-settings"),),
+    )
+    real_write = obs_bootstrap._write_settings_temporary
+    write_calls = 0
+
+    def crash_after_backup(path, payload):
+        nonlocal write_calls
+        write_calls += 1
+        result = real_write(path, payload)
+        if write_calls == 1:
+            raise SystemExit("preparing destination settings")
+        return result
+
+    monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", crash_after_backup)
+    with pytest.raises(SystemExit, match="preparing destination"):
+        obs_bootstrap.execute_obs_config_transaction(plan)
+    monkeypatch.setattr(obs_bootstrap, "_write_settings_temporary", real_write)
+
+    assert setup_env.validate_obs_installation_path(obs_dir) is False
+    assert obs_bootstrap.has_pending_obs_settings_transaction(obs_dir) is True
+
+    assert setup_env.migrate_legacy_obs_portable() is True
+
+    assert obs_exe.is_file()
+    assert obs_bootstrap.has_pending_obs_settings_transaction(obs_dir) is False
+    assert destination_custom.read_bytes() == b"original-settings"
+
+
+def test_legacy_migration_rejects_source_process_that_survives_kill(
+    monkeypatch,
+    tmp_path,
+):
+    _obs_dir, _obs_exe = _configure_paths(monkeypatch, tmp_path)
+    legacy_dir = setup_env.LEGACY_OBS_PORTABLE_DIR
+    _write_fake_obs(legacy_dir / "bin" / "64bit" / "obs64.exe")
+
+    class StubbornProcessManager:
+        kill_calls = 0
+
+        def __init__(self, obs_dir, **_kwargs):
+            self.obs_dir = Path(obs_dir).absolute()
+            self.obs_exe = self.obs_dir / "bin" / "64bit" / "obs64.exe"
+
+        def query_obs_processes_strict(self):
+            return obs_bootstrap.OBSProcessQuerySnapshot(
+                (
+                    obs_bootstrap.OBSProcessInfo(
+                        101,
+                        self.obs_exe,
+                        10.0,
+                    ),
+                ),
+                100.0,
+            )
+
+        def terminate_expected_obs_processes_strict(self, expected):
+            type(self).kill_calls += 1
+            return obs_bootstrap.OBSStrictTerminationResult(
+                expected,
+                obs_bootstrap.OBSProcessQuerySnapshot(expected, 101.0),
+            )
+
+    copy_started = False
+
+    def run_prepare_source(destination, sources, *, prepare_source, **_kwargs):
+        nonlocal copy_started
+        prepare_source(legacy_dir)
+        copy_started = True
+        return legacy_dir
+
+    monkeypatch.setattr(setup_env, "OBSProcessManager", StubbornProcessManager)
+    monkeypatch.setattr(
+        setup_env,
+        "migrate_legacy_obs_installation",
+        run_prepare_source,
+    )
+
+    with pytest.raises(setup_env.ManualSetupRequiredError, match="停止できません"):
+        setup_env.migrate_legacy_obs_portable()
+
+    assert StubbornProcessManager.kill_calls == 1
+    assert copy_started is False
 
 
 def test_existing_destination_prevents_legacy_copy(monkeypatch, tmp_path):

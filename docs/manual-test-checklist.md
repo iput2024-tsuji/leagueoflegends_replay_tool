@@ -133,7 +133,11 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 - [ ] 後段の実OBS A/Bコピーとは別に用意した同一の破棄可能な専用OBS rootで、holder process Aが `.lol_replay_obs_lease.lock` を取得したことをeventで確認してからreader process Bを開始し、Bが待機すること、Aのrelease後だけBが進むこと、両processの終了コードとlock再利用を確認する。固定sleepで順序を推測しない
 - [ ] Windowsの子processを、専用lock取得後かつ厳密形式の `.lol_replay_obs_lease.tmp.<32 lowercase hex>` 永続化後に強制終了し、次のprocessが同じlockを取得して一時fileだけを回収し、既存leaseとOBS本体を変更しないことを確認する
 - [ ] Windowsでschema v2 leaseをtransaction中に固定し、別processからのin-place write、replace、deleteがshare violationで拒否されること、元transactionが同じraw bytes／physical identityを再検証できることを確認する。POSIXで同等試験を行う場合は、同じprocess間lockを守る協調writer間の保証として記録する
-- [ ] 既存leaseがある状態で別のruntime起動を競合させ、既存bytesを上書きせず、負けた起動が自分の新しい`Popen`だけをcleanupすることを確認する
+- [ ] schema v2、旧schema、破損leaseを個別に配置してruntime起動を試し、strict process query、Popen、signalがすべて0回で、leaseのraw bytesとphysical identityが不変であることを確認する
+- [ ] leaseがない状態で同じmanaged executableを起動してからruntime起動を試し、strict snapshotで検出してPopenとsignalを行わず手動確認を案内すること、同時に動作する管理対象外OBSのPID、path、raw creation FILETIMEが不変であることを確認する
+- [ ] 同じmanaged rootを使う独立した2子processをeventで同時開始し、片方をtransaction内のPopen呼び出しでevent待機させてから他方のlock contentionを観測し、その後だけpublishを許可する。固定sleepを使わず、Popen 1回、成功1件、schema v2 lease 1件、敗者のPopen 0回、signal 0回であることを確認する
+- [ ] 承認済み原本からsingle fresh TEMP copyを作り、holder子processが`start_obs()`で実OBSを起動して返されたPopenを強参照する。schema v2 lease確定後だけ別のspawn contenderを開始し、実Popen直前guardで誤起動を中断できる状態にしたうえで、contenderのstrict process query、Popen、signalがすべて0回、leaseのraw bytes／physical identityとholderのPID／path／raw creation FILETIMEが不変であることを確認する。最後にholderが保存済みの元Popen handleだけを1回終了し、終了確認後にleaseが消滅することを確認する
+- [ ] identity取得、publish前、publish後、Popenへのlease bindで個別に失敗させ、admissionからの同じtransactionを保持したまま元Popen handleだけをcleanupすることを確認する。cleanup中の後続starterがPopenへ進まず、publish前は主leaseと所有一時fileが残らず、publish後／commit不確実時は主leaseを推測削除しないことも確認する
 - [ ] 通常`Popen`終了とstale owned cleanupの両方で、graceful直前とforce直前にlease bytes／identityまたは対象handle identityを差し替えるfault injectionを行い、認可を失った段階以降のsignalを発行せずleaseを維持することを確認する。実OBSのPID再利用は発生させない
 - [ ] 古いlease handleへdelete-on-closeを設定し、そのhandleをcloseした直後に協調writerが同じpathへ新しいleaseを作成しても、外側transaction終了後まで新leaseが保持されることを確認する
 - [ ] OBSコピー／設定inventory中は、厳密形式のprocess lease一時fileを内容を開く前に除外し、専用lockはmetadata固定のため開く場合があっても最終比較対象から除外すること、主leaseの変更はfinalizerが検知すること、予約prefixの不正な名前は絶対root／lease／lock pathと全OBS・関連toolの終了／再試行案内を伴うRecoveryになることを確認する

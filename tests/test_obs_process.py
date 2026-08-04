@@ -236,6 +236,14 @@ def test_start_obs_stops_only_new_popen_when_v2_lease_cannot_be_established(
     manager.obs_exe.parent.mkdir(parents=True)
     manager.obs_exe.write_bytes(b"fake obs")
     events = []
+    query_calls = []
+    lock_released = False
+    real_release = obs_process_module._OBSInterProcessLock.release
+
+    def release_after_recording(lock):
+        nonlocal lock_released
+        real_release(lock)
+        lock_released = True
 
     class FakePopen:
         pid = 100
@@ -247,10 +255,12 @@ def test_start_obs_stops_only_new_popen_when_v2_lease_cannot_be_established(
             return None if self.alive else 0
 
         def terminate(self):
+            assert not lock_released
             events.append("terminate")
             self.alive = False
 
         def wait(self, timeout):
+            assert not lock_released
             events.append(("wait", timeout))
             return 0
 
@@ -260,16 +270,36 @@ def test_start_obs_stops_only_new_popen_when_v2_lease_cannot_be_established(
 
     process = FakePopen()
     monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: query_calls.append("query") or _snapshot(),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("cleanup must not signal by PID"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "terminate_process",
+        lambda *args, **kwargs: pytest.fail("cleanup must not reenter public termination"),
+    )
+    monkeypatch.setattr(
         obs_process_module.subprocess,
         "Popen",
         lambda *args, **kwargs: process,
     )
     monkeypatch.setattr(
         manager,
-        "write_process_lease",
+        "query_popen_process_identity",
         lambda candidate: (_ for _ in ()).throw(
             OBSProcessLeaseError("identity unavailable")
         ),
+    )
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_after_recording,
     )
 
     with pytest.raises(OBSProcessLeaseError, match="identity unavailable"):
@@ -277,6 +307,8 @@ def test_start_obs_stops_only_new_popen_when_v2_lease_cannot_be_established(
 
     assert process.poll() == 0
     assert events == ["terminate", ("wait", 3.0)]
+    assert query_calls == ["query"]
+    assert lock_released
 
 
 def test_start_obs_requires_manual_stop_when_lease_failure_process_survives(
@@ -286,6 +318,13 @@ def test_start_obs_requires_manual_stop_when_lease_failure_process_survives(
     manager = OBSProcessManager(tmp_path / "obs-portable")
     manager.obs_exe.parent.mkdir(parents=True)
     manager.obs_exe.write_bytes(b"fake obs")
+    lock_released = False
+    real_release = obs_process_module._OBSInterProcessLock.release
+
+    def release_after_recording(lock):
+        nonlocal lock_released
+        real_release(lock)
+        lock_released = True
 
     class StubbornPopen:
         pid = 321
@@ -294,9 +333,11 @@ def test_start_obs_requires_manual_stop_when_lease_failure_process_survives(
             return None
 
         def terminate(self):
+            assert not lock_released
             raise OSError("terminate failed")
 
         def wait(self, timeout):
+            assert not lock_released
             raise TimeoutError("wait failed")
 
         def kill(self):
@@ -304,6 +345,7 @@ def test_start_obs_requires_manual_stop_when_lease_failure_process_survives(
 
     process = StubbornPopen()
     lease_error = OBSProcessLeaseError("identity unavailable")
+    monkeypatch.setattr(manager, "query_obs_processes_strict", lambda: _snapshot())
     monkeypatch.setattr(
         obs_process_module.subprocess,
         "Popen",
@@ -311,8 +353,23 @@ def test_start_obs_requires_manual_stop_when_lease_failure_process_survives(
     )
     monkeypatch.setattr(
         manager,
-        "write_process_lease",
-        lambda candidate: (_ for _ in ()).throw(lease_error),
+        "_write_process_lease_locked",
+        lambda transaction, candidate: (_ for _ in ()).throw(lease_error),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("cleanup must not signal by PID"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "terminate_process",
+        lambda *args, **kwargs: pytest.fail("cleanup must not reenter public termination"),
+    )
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_after_recording,
     )
 
     with pytest.raises(
@@ -323,29 +380,434 @@ def test_start_obs_requires_manual_stop_when_lease_failure_process_survives(
 
     assert captured.value.__cause__ is lease_error
     assert process.poll() is None
+    assert lock_released
 
 
-def test_start_obs_does_not_overwrite_existing_lease_and_cleans_only_new_popen(
+@pytest.mark.parametrize("lease_kind", ["v2", "legacy", "malformed"])
+def test_start_obs_existing_lease_fails_before_popen_without_changing_lease(
+    monkeypatch,
+    tmp_path,
+    lease_kind,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    existing_identity = _identity(manager, pid=100, unix_seconds=10.0)
+    if lease_kind == "v2":
+        _write_v2_lease(manager, existing_identity)
+    elif lease_kind == "legacy":
+        manager.lease_path.write_text(
+            json.dumps(
+                {
+                    "pid": existing_identity.pid,
+                    "executable_path": str(existing_identity.executable_path),
+                    "created_at": 1.0,
+                    "process_creation_time": existing_identity.creation_time,
+                }
+            ),
+            encoding="utf-8",
+        )
+    else:
+        manager.lease_path.write_bytes(b"{malformed")
+    existing_raw = manager.lease_path.read_bytes()
+    existing_file_identity = obs_process_module._file_identity(
+        manager.lease_path.stat()
+    )
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("existing lease must prevent Popen"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: pytest.fail("existing lease must prevent process query"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("admission must not signal a PID"),
+    )
+
+    with pytest.raises(OBSProcessLeaseError):
+        manager.start_obs(hidden=False)
+
+    assert manager.lease_path.read_bytes() == existing_raw
+    assert (
+        obs_process_module._file_identity(manager.lease_path.stat())
+        == existing_file_identity
+    )
+
+
+def test_start_obs_live_managed_process_without_lease_fails_before_popen_or_signal(
     monkeypatch,
     tmp_path,
 ):
     manager = OBSProcessManager(tmp_path / "obs-portable")
     manager.obs_exe.parent.mkdir(parents=True)
     manager.obs_exe.write_bytes(b"fake obs")
-    existing_identity = _identity(manager, pid=100, unix_seconds=10.0)
-    new_identity = _identity(manager, pid=200, unix_seconds=20.0)
-    existing_process = SimpleNamespace(pid=existing_identity.pid)
+    managed = _identity(manager, pid=200, unix_seconds=20.0)
+    unmanaged = _identity(
+        manager,
+        pid=300,
+        unix_seconds=30.0,
+        executable_path=(tmp_path / "regular-obs" / "obs64.exe").resolve(),
+    )
+    snapshot = _snapshot(unmanaged, managed)
+    query_calls = []
+    signal_calls = []
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: query_calls.append("query") or snapshot,
+    )
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("managed process must prevent Popen"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: signal_calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(OBSProcessLeaseError, match=r"PID 200") as captured:
+        manager.start_obs(hidden=False)
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert "手動確認" in str(captured.value)
+    assert query_calls == ["query"]
+    assert signal_calls == []
+    assert snapshot.processes == (unmanaged, managed)
+    assert not manager.lease_path.exists()
+
+
+def test_start_obs_strict_query_failure_prevents_popen(monkeypatch, tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    query_error = OBSProcessQueryError("query failed")
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: (_ for _ in ()).throw(query_error),
+    )
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("query failure must prevent Popen"),
+    )
+
+    with pytest.raises(OBSProcessLeaseError, match="strict process") as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value.__cause__ is query_error
+    _assert_actionable_lease_recovery(captured.value, manager)
+
+
+def test_start_obs_malformed_strict_snapshot_prevents_popen(monkeypatch, tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    malformed = OBSProcessInfo(
+        pid=200,
+        executable_path=None,
+        creation_time=20.0,
+        creation_time_filetime=_raw_filetime(20.0),
+    )
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: _snapshot(malformed),
+    )
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("malformed query must prevent Popen"),
+    )
+
+    with pytest.raises(OBSProcessLeaseError, match="strict process") as captured:
+        manager.start_obs(hidden=False)
+
+    assert isinstance(captured.value.__cause__, OBSProcessQueryError)
+    _assert_actionable_lease_recovery(captured.value, manager)
+
+
+@pytest.mark.parametrize("lock_failure", ["busy", "permission"])
+def test_start_obs_lock_failure_prevents_popen(
+    monkeypatch,
+    tmp_path,
+    lock_failure,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    acquire_calls = []
+
+    class RejectingLock:
+        def __init__(self, path):
+            assert path == manager.lease_lock_path
+
+        def acquire(self, *, create_parent):
+            acquire_calls.append(create_parent)
+            if lock_failure == "permission":
+                raise PermissionError("lock denied")
+            return False
+
+        def release(self):
+            pytest.fail("unacquired lock must not be released")
+
+    monkeypatch.setattr(obs_process_module, "_OBSInterProcessLock", RejectingLock)
+    monkeypatch.setattr(obs_process_module, "_OBS_PROCESS_LEASE_LOCK_TIMEOUT_SEC", 0.0)
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("lock failure must prevent Popen"),
+    )
+
+    with pytest.raises(OBSProcessLeaseError) as captured:
+        manager.start_obs(hidden=False)
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert acquire_calls == [True]
+
+
+def test_start_obs_rechecks_lease_absence_after_strict_query(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    replacement = _identity(manager, pid=400, unix_seconds=40.0)
+
+    def query_and_create_noncooperative_lease():
+        _write_v2_lease(manager, replacement)
+        return _snapshot()
+
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        query_and_create_noncooperative_lease,
+    )
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("appeared lease must prevent Popen"),
+    )
+
+    with pytest.raises(OBSProcessLeaseError, match="出現"):
+        manager.start_obs(hidden=False)
+
+    lease = manager.read_process_lease()
+    assert lease is not None
+    assert lease.pid == replacement.pid
+
+
+def test_start_obs_allows_only_unmanaged_rows_and_binds_lease_before_unlock(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    identity = _identity(manager, pid=500, unix_seconds=50.0)
+    unmanaged = _identity(
+        manager,
+        pid=600,
+        unix_seconds=60.0,
+        executable_path=(tmp_path / "regular-obs" / "obs64.exe").resolve(),
+    )
+    events = []
+
+    class FakePopen:
+        pid = identity.pid
+
+        def poll(self):
+            return None
+
+    process = FakePopen()
+    real_release = obs_process_module._OBSInterProcessLock.release
+
+    def release_after_asserting_bind(lock):
+        assert process._lol_replay_obs_process_lease.pid == identity.pid
+        assert manager.lease_path.exists()
+        events.append("release")
+        real_release(lock)
+
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: events.append("query") or _snapshot(unmanaged),
+    )
     monkeypatch.setattr(
         manager,
         "query_popen_process_identity",
-        lambda process: existing_identity,
+        lambda candidate: identity if candidate is process else pytest.fail("wrong Popen"),
     )
-    manager.write_process_lease(existing_process)
-    existing_raw = manager.lease_path.read_bytes()
-    events = []
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: events.append("popen") or process,
+    )
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_after_asserting_bind,
+    )
+    monkeypatch.setattr(
+        manager,
+        "write_process_lease",
+        lambda *args, **kwargs: pytest.fail("start must not reenter public lease writer"),
+    )
 
-    class NewPopen:
-        pid = new_identity.pid
+    assert manager.start_obs(hidden=False) is process
+
+    assert events == ["query", "popen", "release"]
+    assert process._lol_replay_obs_process_lease.pid == identity.pid
+
+
+def test_start_obs_popen_failure_releases_transaction_without_cleanup(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    popen_error = OSError("Popen failed")
+    monkeypatch.setattr(manager, "query_obs_processes_strict", lambda: _snapshot())
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(popen_error),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_unleased_popen_process",
+        lambda process: pytest.fail("failed Popen has no handle to clean up"),
+    )
+
+    with pytest.raises(OSError, match="Popen failed") as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value is popen_error
+    assert manager.read_process_lease() is None
+
+
+@pytest.mark.parametrize("failure_stage", ["pre-commit", "setattr"])
+def test_start_obs_lease_establishment_fault_cleans_original_handle(
+    monkeypatch,
+    tmp_path,
+    failure_stage,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    identity = _identity(manager, pid=700, unix_seconds=70.0)
+    events = []
+    query_calls = []
+    lock_released = False
+    real_release = obs_process_module._OBSInterProcessLock.release
+
+    def release_after_recording(lock):
+        nonlocal lock_released
+        real_release(lock)
+        lock_released = True
+
+    class FakePopen:
+        pid = identity.pid
+
+        def __init__(self):
+            object.__setattr__(self, "alive", True)
+
+        def __setattr__(self, name, value):
+            if (
+                failure_stage == "setattr"
+                and name == "_lol_replay_obs_process_lease"
+            ):
+                raise OSError("simulated lease bind failure")
+            object.__setattr__(self, name, value)
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            assert not lock_released
+            events.append("terminate")
+            self.alive = False
+
+        def wait(self, timeout):
+            assert not lock_released
+            events.append(("wait", timeout))
+            return 0
+
+        def kill(self):
+            pytest.fail("graceful cleanup should be sufficient")
+
+    process = FakePopen()
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: query_calls.append("query") or _snapshot(),
+    )
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("cleanup must not signal by PID"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "terminate_process",
+        lambda *args, **kwargs: pytest.fail("cleanup must not reenter public termination"),
+    )
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_after_recording,
+    )
+    if failure_stage == "pre-commit":
+        monkeypatch.setattr(
+            obs_process_module._OBSDirectoryLease,
+            "publish_open_file_no_replace",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                OSError("simulated pre-commit publish failure")
+            ),
+        )
+
+    with pytest.raises(OBSProcessLeaseError):
+        manager.start_obs(hidden=False)
+
+    assert events == ["terminate", ("wait", 3.0)]
+    assert query_calls == ["query"]
+    assert lock_released
+    temporary_paths = tuple(
+        manager.obs_dir.glob(f"{obs_process_module.OBS_PROCESS_LEASE_TEMP_PREFIX}*")
+    )
+    assert temporary_paths == ()
+    assert manager.lease_path.exists() is (failure_stage == "setattr")
+
+
+def test_start_obs_post_commit_failure_blocks_next_starter_until_cleanup_finishes(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    next_manager = OBSProcessManager(manager.obs_dir)
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    identity = _identity(manager, pid=800, unix_seconds=80.0)
+    cleanup_entered = threading.Event()
+    allow_cleanup = threading.Event()
+    start_results = []
+    start_errors = []
+    popen_calls = []
+    query_calls = []
+
+    class FakePopen:
+        pid = identity.pid
 
         def __init__(self):
             self.alive = True
@@ -354,37 +816,88 @@ def test_start_obs_does_not_overwrite_existing_lease_and_cleans_only_new_popen(
             return None if self.alive else 0
 
         def terminate(self):
-            events.append("terminate-new")
+            cleanup_entered.set()
+            assert allow_cleanup.wait(timeout=15)
             self.alive = False
 
         def wait(self, timeout):
-            events.append(("wait-new", timeout))
             return 0
 
         def kill(self):
-            events.append("kill-new")
-            self.alive = False
+            pytest.fail("graceful cleanup should be sufficient")
 
-    new_process = NewPopen()
-    monkeypatch.setattr(
-        obs_process_module.subprocess,
-        "Popen",
-        lambda *args, **kwargs: new_process,
-    )
+    process = FakePopen()
+    real_publish = obs_process_module._OBSDirectoryLease.publish_open_file_no_replace
+
+    def publish_then_fail(directory, *args, **kwargs):
+        real_publish(directory, *args, **kwargs)
+        raise OSError("simulated post-commit publish report")
+
+    def popen(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        return process
+
     monkeypatch.setattr(
         manager,
-        "query_popen_process_identity",
-        lambda process: new_identity,
+        "query_obs_processes_strict",
+        lambda: query_calls.append("first") or _snapshot(),
     )
+    monkeypatch.setattr(
+        next_manager,
+        "query_obs_processes_strict",
+        lambda: query_calls.append("second") or _snapshot(),
+    )
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", popen)
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("cleanup must not signal by PID"),
+    )
+    monkeypatch.setattr(
+        next_manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("admission must not signal by PID"),
+    )
+    monkeypatch.setattr(
+        obs_process_module._OBSDirectoryLease,
+        "publish_open_file_no_replace",
+        publish_then_fail,
+    )
+    thread_lock = _InstrumentedLeaseThreadLock()
+    monkeypatch.setattr(obs_process_module, "_OBS_PROCESS_LEASE_LOCK", thread_lock)
 
-    with pytest.raises(OBSProcessLeaseError, match="上書きしません"):
-        manager.start_obs(hidden=False)
+    def start(candidate):
+        try:
+            start_results.append(candidate.start_obs(hidden=False))
+        except BaseException as exc:
+            start_errors.append(exc)
 
-    assert events == ["terminate-new", ("wait-new", 3.0)]
-    assert manager.lease_path.read_bytes() == existing_raw
-    current = manager.read_process_lease()
-    assert current is not None
-    assert current.pid == existing_identity.pid
+    first_thread = threading.Thread(target=start, args=(manager,))
+    second_thread = threading.Thread(target=start, args=(next_manager,))
+    thread_lock.watch(second_thread)
+    first_thread.start()
+    assert cleanup_entered.wait(timeout=15)
+    second_thread.start()
+    assert thread_lock.attempted.wait(timeout=15)
+    assert not thread_lock.acquired.is_set()
+    assert len(popen_calls) == 1
+    allow_cleanup.set()
+    first_thread.join(timeout=15)
+    second_thread.join(timeout=15)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert start_results == []
+    assert len(start_errors) == 2
+    assert all(isinstance(error, OBSProcessLeaseError) for error in start_errors)
+    assert len(popen_calls) == 1
+    assert query_calls == ["first"]
+    assert process.poll() == 0
+    assert manager.lease_path.exists()
+    assert tuple(
+        manager.obs_dir.glob(f"{obs_process_module.OBS_PROCESS_LEASE_TEMP_PREFIX}*")
+    ) == ()
 
 
 def test_terminate_popen_clears_only_its_exact_bound_lease(monkeypatch, tmp_path):

@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import subprocess
@@ -809,6 +810,353 @@ def test_start_obs_lease_establishment_fault_cleans_original_handle(
     )
     assert temporary_paths == ()
     assert manager.lease_path.exists() is (failure_stage == "setattr")
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
+)
+def test_start_obs_preserves_control_flow_from_identity_and_cleans_popen_once(
+    monkeypatch,
+    tmp_path,
+    error_type,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    primary_error = error_type("identity interrupted")
+    query_calls = []
+
+    class FakePopen:
+        pid = 701
+
+        def __init__(self):
+            self.alive = True
+            self.terminate_calls = 0
+            self.kill_calls = 0
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+            self.alive = False
+
+        def wait(self, timeout):
+            assert timeout == 3.0
+            return 0
+
+        def kill(self):
+            self.kill_calls += 1
+
+    process = FakePopen()
+
+    def query_once():
+        query_calls.append("query")
+        if len(query_calls) > 1:
+            pytest.fail("Popen cleanup must not run a strict process query")
+        return _snapshot()
+
+    monkeypatch.setattr(manager, "query_obs_processes_strict", query_once)
+    monkeypatch.setattr(
+        manager,
+        "query_popen_process_identity",
+        lambda candidate: (_ for _ in ()).throw(primary_error),
+    )
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        manager,
+        "list_obs_processes",
+        lambda: pytest.fail("Popen cleanup must not enumerate process IDs"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("Popen cleanup must not signal by PID"),
+    )
+
+    with pytest.raises(error_type) as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value is primary_error
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    assert process.poll() == 0
+    assert query_calls == ["query"]
+    assert not manager.lease_path.exists()
+
+
+def test_start_obs_preserves_bind_interruption_and_retains_published_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    identity = _identity(manager, pid=702, unix_seconds=72.0)
+    primary_error = SystemExit("lease bind interrupted")
+    published_state = {}
+    real_write_all = obs_process_module._transaction_fs._write_all
+    real_publish = (
+        obs_process_module._OBSDirectoryLease.publish_open_file_no_replace
+    )
+
+    class FakePopen:
+        pid = identity.pid
+
+        def __init__(self):
+            object.__setattr__(self, "alive", True)
+            object.__setattr__(self, "terminate_calls", 0)
+
+        def __setattr__(self, name, value):
+            if name == "_lol_replay_obs_process_lease":
+                raise primary_error
+            object.__setattr__(self, name, value)
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            object.__setattr__(self, "terminate_calls", self.terminate_calls + 1)
+            object.__setattr__(self, "alive", False)
+
+        def wait(self, timeout):
+            return 0
+
+        def kill(self):
+            pytest.fail("graceful cleanup should be sufficient")
+
+    process = FakePopen()
+    query_calls = []
+
+    def capture_lease_payload(descriptor, payload):
+        if b'"version"' in payload:
+            published_state["raw"] = bytes(payload)
+        return real_write_all(descriptor, payload)
+
+    def publish_and_capture_identity(
+        directory,
+        descriptor,
+        temporary_name,
+        target_name,
+    ):
+        result = real_publish(
+            directory,
+            descriptor,
+            temporary_name,
+            target_name,
+        )
+        published_state["identity"] = obs_process_module._file_identity(
+            os.fstat(descriptor)
+        )
+        return result
+
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: query_calls.append("query") or _snapshot(),
+    )
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        obs_process_module._transaction_fs,
+        "_write_all",
+        capture_lease_payload,
+    )
+    monkeypatch.setattr(
+        obs_process_module._OBSDirectoryLease,
+        "publish_open_file_no_replace",
+        publish_and_capture_identity,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("Popen cleanup must not signal by PID"),
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value is primary_error
+    assert process.terminate_calls == 1
+    assert process.poll() == 0
+    assert query_calls == ["query"]
+    assert manager.lease_path.exists()
+    assert manager.lease_path.read_bytes() == published_state["raw"]
+    assert (
+        obs_process_module._file_identity(manager.lease_path.stat())
+        == published_state["identity"]
+    )
+    assert tuple(manager.obs_dir.glob(f"{obs_process_module.OBS_PROCESS_LEASE_TEMP_PREFIX}*")) == ()
+
+
+def test_start_obs_transaction_exit_interruption_cleans_handle_and_keeps_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    identity = _identity(manager, pid=703, unix_seconds=73.0)
+    primary_error = KeyboardInterrupt("lock release interrupted")
+    real_release = obs_process_module._OBSInterProcessLock.release
+    query_calls = []
+    published_state = {}
+
+    class FakePopen:
+        pid = identity.pid
+
+        def __init__(self):
+            self.alive = True
+            self.terminate_calls = 0
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.terminate_calls += 1
+            self.alive = False
+
+        def wait(self, timeout):
+            return 0
+
+        def kill(self):
+            pytest.fail("graceful cleanup should be sufficient")
+
+    process = FakePopen()
+
+    def release_then_interrupt(lock):
+        published_state["raw"] = manager.lease_path.read_bytes()
+        published_state["identity"] = obs_process_module._file_identity(
+            manager.lease_path.stat()
+        )
+        real_release(lock)
+        raise primary_error
+
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: query_calls.append("query") or _snapshot(),
+    )
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_then_interrupt,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("Popen cleanup must not signal by PID"),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value is primary_error
+    assert process.terminate_calls == 1
+    assert process.poll() == 0
+    assert query_calls == ["query"]
+    assert manager.lease_path.exists()
+    assert manager.lease_path.read_bytes() == published_state["raw"]
+    assert (
+        obs_process_module._file_identity(manager.lease_path.stat())
+        == published_state["identity"]
+    )
+
+
+def test_start_obs_cleanup_control_flow_supersedes_normal_lease_failure(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    process = SimpleNamespace(pid=704)
+    lease_error = OSError("lease write failed")
+    cleanup_interruption = SystemExit("cleanup interrupted")
+
+    monkeypatch.setattr(manager, "query_obs_processes_strict", lambda: _snapshot())
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        manager,
+        "_write_process_lease_locked",
+        lambda transaction, candidate: (_ for _ in ()).throw(lease_error),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_unleased_popen_process",
+        lambda candidate: (_ for _ in ()).throw(cleanup_interruption),
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value is cleanup_interruption
+    assert any("lease write failed" in note for note in cleanup_interruption.__notes__)
+    notes = getattr(cleanup_interruption, "__notes__", [])
+    assert any("手動終了" in note and "再試行" in note for note in notes)
+    assert any(str(manager.lease_path) in note for note in notes)
+    assert any(str(manager.lease_lock_path) in note for note in notes)
+
+
+def test_start_obs_keeps_first_control_flow_when_cleanup_is_also_interrupted(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    process = SimpleNamespace(pid=705)
+    primary_error = KeyboardInterrupt("lease write interrupted")
+    cleanup_interruption = SystemExit("cleanup interrupted")
+    original_cause = RuntimeError("original interruption cause")
+    original_context = LookupError("original interruption context")
+    primary_error.__cause__ = original_cause
+    primary_error.__context__ = original_context
+    primary_error.__suppress_context__ = True
+    cleanup_calls = []
+
+    monkeypatch.setattr(manager, "query_obs_processes_strict", lambda: _snapshot())
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        manager,
+        "_write_process_lease_locked",
+        lambda transaction, candidate: (_ for _ in ()).throw(primary_error),
+    )
+
+    def interrupt_cleanup(candidate):
+        cleanup_calls.append(candidate)
+        raise cleanup_interruption
+
+    monkeypatch.setattr(
+        manager,
+        "_terminate_unleased_popen_process",
+        interrupt_cleanup,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value is primary_error
+    assert cleanup_calls == [process]
+    assert any("cleanup interrupted" in note for note in getattr(primary_error, "__notes__", []))
+    assert any(
+        "手動終了" in note and "再試行" in note
+        for note in getattr(primary_error, "__notes__", [])
+    )
+    assert any(
+        str(manager.lease_path) in note
+        for note in getattr(primary_error, "__notes__", [])
+    )
+    assert any(
+        str(manager.lease_lock_path) in note
+        for note in getattr(primary_error, "__notes__", [])
+    )
+    assert primary_error.__cause__ is original_cause
+    assert primary_error.__context__ is original_context
+    assert primary_error.__suppress_context__ is True
 
 
 def test_start_obs_post_commit_failure_blocks_next_starter_until_cleanup_finishes(
@@ -3646,6 +3994,214 @@ def test_committed_lease_write_does_not_report_late_lock_release_failure(
     payload = json.loads(manager.lease_path.read_text(encoding="utf-8"))
     assert payload["pid"] == identity.pid
     assert process._lol_replay_obs_process_lease.pid == identity.pid
+
+
+def test_transaction_cleanup_control_flow_keeps_earlier_cleanup_failure_as_note(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    _write_v2_lease(manager, identity)
+    primary_error = SystemExit("lock release interrupted")
+    close_error = OSError("snapshot close failed")
+    real_close = obs_process_module.os.close
+    real_release = obs_process_module._OBSInterProcessLock.release
+    snapshot_descriptor = None
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        if descriptor == snapshot_descriptor:
+            raise close_error
+
+    def release_then_interrupt(lock):
+        real_release(lock)
+        raise primary_error
+
+    with pytest.raises(SystemExit) as captured:
+        with manager._process_lease_transaction(mutating=True) as transaction:
+            assert transaction is not None
+            snapshot = manager._open_process_lease_snapshot_locked(transaction)
+            assert snapshot is not None
+            snapshot_descriptor = snapshot.descriptor
+            monkeypatch.setattr(obs_process_module.os, "close", close_then_fail)
+            monkeypatch.setattr(
+                obs_process_module._OBSInterProcessLock,
+                "release",
+                release_then_interrupt,
+            )
+
+    assert captured.value is primary_error
+    assert any("snapshot close failed" in note for note in primary_error.__notes__)
+    assert manager.lease_path.exists()
+
+
+def test_transaction_cleanup_control_flow_supersedes_normal_body_failure(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    body_error = OSError("transaction body failed")
+    cleanup_interruption = SystemExit("lock release interrupted")
+    cleanup_cause = RuntimeError("cleanup interruption cause")
+    cleanup_interruption.__cause__ = cleanup_cause
+    cleanup_interruption.__suppress_context__ = True
+    real_release = obs_process_module._OBSInterProcessLock.release
+
+    def release_then_interrupt(lock):
+        real_release(lock)
+        raise cleanup_interruption
+
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_then_interrupt,
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        with manager._process_lease_transaction(mutating=True):
+            raise body_error
+
+    assert captured.value is cleanup_interruption
+    assert any("transaction body failed" in note for note in getattr(cleanup_interruption, "__notes__", []))
+    assert cleanup_interruption.__cause__ is cleanup_cause
+    assert cleanup_interruption.__context__ is body_error
+    assert cleanup_interruption.__suppress_context__ is True
+
+
+def test_transaction_keeps_body_control_flow_when_cleanup_is_also_interrupted(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    primary_error = KeyboardInterrupt("transaction body interrupted")
+    cleanup_interruption = SystemExit("lock release interrupted")
+    original_cause = RuntimeError("body interruption cause")
+    original_context = LookupError("body interruption context")
+    primary_error.__cause__ = original_cause
+    primary_error.__context__ = original_context
+    primary_error.__suppress_context__ = True
+    real_release = obs_process_module._OBSInterProcessLock.release
+
+    def release_then_interrupt(lock):
+        real_release(lock)
+        raise cleanup_interruption
+
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_then_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        with manager._process_lease_transaction(mutating=True):
+            raise primary_error
+
+    assert captured.value is primary_error
+    assert any("lock release interrupted" in note for note in getattr(primary_error, "__notes__", []))
+    assert primary_error.__cause__ is original_cause
+    assert primary_error.__context__ is original_context
+    assert primary_error.__suppress_context__ is True
+
+
+def test_lease_write_keeps_primary_control_flow_when_temp_cleanup_is_interrupted(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager, pid=706, unix_seconds=76.0)
+    process = SimpleNamespace(pid=identity.pid)
+    primary_error = KeyboardInterrupt("lease payload write interrupted")
+    cleanup_interruption = SystemExit("temporary identity query interrupted")
+    write_interrupted = False
+    real_write_all = obs_process_module._transaction_fs._write_all
+    real_relative_identity = obs_process_module._OBSDirectoryLease.relative_file_identity_or_none
+
+    def interrupt_write(descriptor, payload):
+        nonlocal write_interrupted
+        if b'"version"' in payload:
+            write_interrupted = True
+            raise primary_error
+        return real_write_all(descriptor, payload)
+
+    def interrupt_cleanup_identity(directory, name):
+        if write_interrupted:
+            raise cleanup_interruption
+        return real_relative_identity(directory, name)
+
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(obs_process_module._transaction_fs, "_write_all", interrupt_write)
+    monkeypatch.setattr(
+        obs_process_module._OBSDirectoryLease,
+        "relative_file_identity_or_none",
+        interrupt_cleanup_identity,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        manager.write_process_lease(process)
+
+    assert captured.value is primary_error
+    assert any("temporary identity query interrupted" in note for note in getattr(primary_error, "__notes__", []))
+    assert not manager.lease_path.exists()
+
+
+def test_lease_write_keeps_primary_control_flow_when_descriptor_close_interrupts(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager, pid=707, unix_seconds=77.0)
+    primary_error = KeyboardInterrupt("lease binding interrupted")
+    close_interruption = SystemExit("lease descriptor close interrupted")
+    real_open_file = obs_process_module._OBSDirectoryLease.open_file
+    real_close = obs_process_module.os.close
+    temporary_descriptor = None
+    close_interrupted = False
+
+    class InterruptingPopen:
+        pid = identity.pid
+
+        def __setattr__(self, name, value):
+            if name == "_lol_replay_obs_process_lease":
+                raise primary_error
+            object.__setattr__(self, name, value)
+
+    process = InterruptingPopen()
+
+    def capture_temporary_descriptor(directory, name, **kwargs):
+        nonlocal temporary_descriptor
+        descriptor = real_open_file(directory, name, **kwargs)
+        if (
+            temporary_descriptor is None
+            and name.startswith(obs_process_module.OBS_PROCESS_LEASE_TEMP_PREFIX)
+            and kwargs.get("write")
+            and kwargs.get("create_exclusive")
+        ):
+            temporary_descriptor = descriptor
+        return descriptor
+
+    def close_then_interrupt(descriptor):
+        nonlocal close_interrupted
+        real_close(descriptor)
+        if descriptor == temporary_descriptor and not close_interrupted:
+            close_interrupted = True
+            raise close_interruption
+
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(
+        obs_process_module._OBSDirectoryLease,
+        "open_file",
+        capture_temporary_descriptor,
+    )
+    monkeypatch.setattr(obs_process_module.os, "close", close_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        manager.write_process_lease(process)
+
+    assert captured.value is primary_error
+    assert close_interrupted is True
+    assert any("lease descriptor close interrupted" in note for note in getattr(primary_error, "__notes__", []))
+    assert manager.lease_path.exists()
 
 
 def test_process_manager_reads_latest_portable_mode_log(tmp_path):

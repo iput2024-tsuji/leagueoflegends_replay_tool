@@ -23,7 +23,7 @@ def _close_runtime_preserving_primary(
     except BaseException as cleanup_error:
         if primary_error is None:
             raise
-        recordtest._record_cleanup_failure(
+        selected_error = recordtest._select_cleanup_control_flow_error(
             primary_error,
             cleanup_error,
             logger=recordtest.LOGGER,
@@ -32,6 +32,8 @@ def _close_runtime_preserving_primary(
                 "OBSを手動で終了してから再試行してください"
             ),
         )
+        if selected_error is cleanup_error:
+            raise
 
 
 class ConfigController:
@@ -129,6 +131,7 @@ class ConfigController:
 
         config = recordtest.AppConfig.from_dict(report["config"])
         runtime = None
+        primary_error: BaseException | None = None
         with recordtest.OBS_OPERATION_LOCK:
             try:
                 runtime = self.runtime_manager.open_recorder(
@@ -142,9 +145,12 @@ class ConfigController:
                 return report, True, "接続成功: 管理対象OBS WebSocket"
             except Exception as e:
                 return report, False, str(e)
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
-                if runtime:
-                    runtime.close()
+                if runtime is not None:
+                    _close_runtime_preserving_primary(runtime, primary_error)
 
     def total_storage_size(self, config_data: dict[str, Any] | None = None) -> int:
         config = recordtest.AppConfig.from_dict(config_data or self.load_config())
@@ -207,7 +213,7 @@ class AudioSettingsController:
                 primary_error = exc
                 raise
             finally:
-                if runtime:
+                if runtime is not None:
                     _close_runtime_preserving_primary(runtime, primary_error)
 
     def apply_audio_settings(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
@@ -224,7 +230,7 @@ class AudioSettingsController:
                 primary_error = exc
                 raise
             finally:
-                if runtime:
+                if runtime is not None:
                     _close_runtime_preserving_primary(runtime, primary_error)
 
     def apply_runtime_output_settings(self, data: dict[str, Any]) -> bool:
@@ -245,7 +251,7 @@ class AudioSettingsController:
                 primary_error = exc
                 raise
             finally:
-                if runtime:
+                if runtime is not None:
                     _close_runtime_preserving_primary(runtime, primary_error)
 
 

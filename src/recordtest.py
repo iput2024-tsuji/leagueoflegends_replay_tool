@@ -379,6 +379,45 @@ def _record_cleanup_failure(
     logger.error("%s", detail)
 
 
+def _select_cleanup_control_flow_error(
+    primary_error: BaseException,
+    cleanup_error: BaseException,
+    *,
+    logger: logging.Logger,
+    context: str,
+) -> BaseException:
+    """Select the first control-flow error without changing exception chaining."""
+
+    if not isinstance(primary_error, Exception):
+        _record_cleanup_failure(
+            primary_error,
+            cleanup_error,
+            logger=logger,
+            context=context,
+        )
+        return primary_error
+    if not isinstance(cleanup_error, Exception):
+        earlier_notes = tuple(getattr(primary_error, "__notes__", ()))
+        _record_cleanup_failure(
+            cleanup_error,
+            primary_error,
+            logger=logger,
+            context=f"{context}。cleanup中断前の先行失敗",
+        )
+        add_note = getattr(cleanup_error, "add_note", None)
+        if callable(add_note):
+            for note in earlier_notes:
+                add_note(f"Earlier failure note before cleanup interruption: {note}")
+        return cleanup_error
+    _record_cleanup_failure(
+        primary_error,
+        cleanup_error,
+        logger=logger,
+        context=context,
+    )
+    return primary_error
+
+
 def is_lol_game_process_running() -> bool | None:
     """Return whether the LoL game process is currently alive on Windows."""
 
@@ -1464,23 +1503,12 @@ def _capture_started_obs_process_identity(
                 "起動直後strict queryの完全identityがPopen handleと一致しません。"
             )
         return identity
-    except Exception as exc:
-        primary_error = RecorderError(
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            raise
+        raise RecorderError(
             f"起動直後のOBS strict identityを確立できません: {exc}"
-        )
-        try:
-            _ensure_started_obs_handle_stopped(process_manager, process)
-        except Exception as cleanup_exc:
-            _record_cleanup_failure(
-                primary_error,
-                cleanup_exc,
-                logger=LOGGER,
-                context=(
-                    "起動済みOBSの安全な後始末にも失敗しました。"
-                    "OBSを手動で終了してから再試行してください"
-                ),
-            )
-        raise primary_error from exc
+        ) from exc
 
 
 def _start_hidden_obs_and_verify_portable(
@@ -1491,12 +1519,16 @@ def _start_hidden_obs_and_verify_portable(
 ) -> tuple[subprocess.Popen[Any], float, OBSProcessInfo]:
     LOGGER.info("🚀 OBSを起動しています (バックグラウンド/非表示)...")
     started_at = time.time()
-    process = process_manager.start_obs(env=process_manager.isolated_env(), hidden=True)
-    process_identity = _capture_started_obs_process_identity(
-        process_manager,
-        process,
-    )
+    process: subprocess.Popen[Any] | None = None
     try:
+        process = process_manager.start_obs(
+            env=process_manager.isolated_env(),
+            hidden=True,
+        )
+        process_identity = _capture_started_obs_process_identity(
+            process_manager,
+            process,
+        )
         hidden_windows = process_manager.hide_main_windows(process, timeout_sec=3.0)
         if hidden_windows:
             LOGGER.info(
@@ -1522,16 +1554,18 @@ def _start_hidden_obs_and_verify_portable(
                 "OBSログから Portable mode を確認できませんでした: %s",
                 obs_dir_abs,
             )
-    except Exception as exc:
+    except BaseException as exc:
+        if process is None:
+            raise
         primary_error = (
             exc
-            if isinstance(exc, RecorderError)
+            if isinstance(exc, RecorderError) or not isinstance(exc, Exception)
             else RecorderError(f"起動済みOBSの起動検証に失敗しました: {exc}")
         )
         try:
             process_manager.terminate_process(process)
-        except Exception as cleanup_exc:
-            _record_cleanup_failure(
+        except BaseException as cleanup_exc:
+            selected_error = _select_cleanup_control_flow_error(
                 primary_error,
                 cleanup_exc,
                 logger=LOGGER,
@@ -1540,6 +1574,8 @@ def _start_hidden_obs_and_verify_portable(
                     "OBSを手動で終了してから再試行してください"
                 ),
             )
+            if selected_error is cleanup_exc:
+                raise
         if primary_error is exc:
             raise
         raise primary_error from exc
@@ -2160,6 +2196,7 @@ def test_obs_connection(
     last_error = None
     for candidate in host_candidates:
         client = None
+        primary_error: BaseException | None = None
         try:
             client = obs.ReqClient(
                 host=candidate,
@@ -2170,17 +2207,36 @@ def test_obs_connection(
             version = client.get_version()
             suffix = f" (host={candidate})" if candidate != host_text else ""
             return True, f"接続成功: OBS {version.obs_version}{suffix}"
-        except Exception as e:
+        except BaseException as e:
+            primary_error = e
+            if not isinstance(e, Exception):
+                raise
             last_error = e
             message = f"{type(e).__name__}: {e}".lower()
             if any(token in message for token in ("auth", "authentication", "password", "identify")):
                 return False, "OBSには到達しましたが認証に失敗しました。WebSocketパスワードを確認してください。"
         finally:
-            if client:
+            if client is not None:
                 try:
                     client.disconnect()
-                except Exception:
-                    pass
+                except BaseException as cleanup_error:
+                    if primary_error is None:
+                        if not isinstance(cleanup_error, Exception):
+                            raise
+                        LOGGER.error(
+                            "OBS接続確認後のWebSocket切断に失敗しました: %s: %s",
+                            type(cleanup_error).__name__,
+                            cleanup_error,
+                        )
+                    else:
+                        selected_error = _select_cleanup_control_flow_error(
+                            primary_error,
+                            cleanup_error,
+                            logger=LOGGER,
+                            context="OBS接続確認後のWebSocket切断にも失敗しました",
+                        )
+                        if selected_error is cleanup_error:
+                            raise
 
     if last_error:
         return (
@@ -2867,42 +2923,44 @@ def _setup_obs_sync_elements_locked(
             "window_capture_name": config.obs.window_capture_name,
             "window_capture_window": config.obs.window_capture_window,
             "window_capture_method": config.obs.window_capture_method,
-            "obs_launched": bool(launched_process),
+            "obs_launched": launched_process is not None,
         }
     except BaseException as exc:
         primary_error = exc
         raise
     finally:
         cleanup_error: BaseException | None = None
-        if launched_process:
-            if recorder and not getattr(
-                recorder,
-                "_open_cleanup_attempted",
-                False,
-            ):
+        recorder_cleanup_attempted = bool(
+            recorder is not None
+            and getattr(recorder, "_open_cleanup_attempted", False)
+        )
+        if not recorder_cleanup_attempted:
+            if launched_process is not None and recorder is not None:
                 try:
                     recorder.shutdown_obs()
                 except BaseException as exc:
                     cleanup_error = exc
-            elif recorder is None and process_manager is not None:
+            elif launched_process is not None and process_manager is not None:
                 try:
                     process_manager.terminate_process(launched_process)
                 except BaseException as exc:
                     cleanup_error = exc
-        elif recorder:
-            try:
-                recorder.disconnect_obs()
-            except BaseException as exc:
-                cleanup_error = exc
+            elif recorder is not None:
+                try:
+                    recorder.disconnect_obs()
+                except BaseException as exc:
+                    cleanup_error = exc
 
         if cleanup_error is not None:
             if primary_error is not None:
-                _record_cleanup_failure(
+                selected_error = _select_cleanup_control_flow_error(
                     primary_error,
                     cleanup_error,
                     logger=LOGGER,
                     context="OBS同期設定処理後のcleanupにも失敗しました",
                 )
+                if selected_error is cleanup_error:
+                    raise cleanup_error
             else:
                 raise cleanup_error
 
@@ -3162,6 +3220,9 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
 
     ensure_obs_websocket_port_free(config)
 
+    process: subprocess.Popen[Any] | None = None
+    process_cleanup_attempted = False
+    process_cleanup_completed = False
     try:
         process, started_at, started_process_identity = (
             _start_hidden_obs_and_verify_portable(
@@ -3182,11 +3243,8 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                 LOGGER.info(
                     "OBS起動後にGPUエンコーダを検出したため、録画設定反映のためOBSを再起動します。"
                 )
-                gpu_stop_attempted = False
-                gpu_stop_completed = False
-
                 def stop_obs_for_gpu_settings() -> _OBSSettingsStopEvidence:
-                    nonlocal gpu_stop_attempted, gpu_stop_completed
+                    nonlocal process_cleanup_attempted, process_cleanup_completed
                     try:
                         before, managed_before = (
                             _query_managed_obs_processes_before_settings_stop(
@@ -3212,7 +3270,7 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                             if item != known_process
                         )
                         direct_error: Exception | None = None
-                        gpu_stop_attempted = True
+                        process_cleanup_attempted = True
                         try:
                             process_manager.terminate_process(process)
                         except Exception as exc:
@@ -3257,7 +3315,7 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                             ),
                             known_managed_process=known_process,
                         )
-                        gpu_stop_completed = True
+                        process_cleanup_completed = True
                         return evidence
                     except Exception as exc:
                         raise RecorderError(
@@ -3285,14 +3343,16 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                         "OBS録画プロファイルの再起動transactionに失敗しました。"
                         f"OBSを停止したまま再試行してください: {e}"
                     )
-                    if not gpu_stop_attempted:
+                    if not process_cleanup_attempted:
+                        process_cleanup_attempted = True
                         try:
                             _ensure_started_obs_handle_stopped(
                                 process_manager,
                                 process,
                             )
-                        except Exception as cleanup_exc:
-                            _record_cleanup_failure(
+                            process_cleanup_completed = True
+                        except BaseException as cleanup_exc:
+                            selected_error = _select_cleanup_control_flow_error(
                                 primary_error,
                                 cleanup_exc,
                                 logger=LOGGER,
@@ -3301,17 +3361,17 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
                                     "OBSを手動で終了してから再試行してください"
                                 ),
                             )
-                    elif not gpu_stop_completed:
-                        _record_cleanup_failure(
-                            primary_error,
-                            e,
-                            logger=LOGGER,
-                            context=(
-                                "GPU再起動中のOBS停止を完了できませんでした。"
-                                "同じPopenへ再度signalせず、OBSを手動で確認してください"
-                            ),
-                        )
+                            if selected_error is cleanup_exc:
+                                raise
                     raise primary_error from e
+                if not process_cleanup_attempted or not process_cleanup_completed:
+                    raise RecorderError(
+                        "GPU設定transactionはOBS停止完了証跡なしで返りました。"
+                        "元Popenを引き継がず、OBSを手動で確認してから再試行してください。"
+                    )
+                process = None
+                process_cleanup_attempted = False
+                process_cleanup_completed = False
                 if changed_profiles:
                     LOGGER.info(
                         "ℹ️ OBS録画プロファイルをGPUエンコーダへ更新しました: %s",
@@ -3328,9 +3388,39 @@ def launch_obs(config: AppConfig) -> subprocess.Popen[Any]:
             else:
                 LOGGER.info("OBS起動後にGPUエンコーダが見つからないためx264で録画します。")
         return process
-    except RecorderError:
-        raise
-    except Exception as e:
+    except BaseException as e:
+        if process is not None and not process_cleanup_attempted:
+            process_cleanup_attempted = True
+            try:
+                _ensure_started_obs_handle_stopped(process_manager, process)
+                process_cleanup_completed = True
+            except BaseException as cleanup_error:
+                selected_error = _select_cleanup_control_flow_error(
+                    e,
+                    cleanup_error,
+                    logger=LOGGER,
+                    context=(
+                        "OBS起動中断後の所有process cleanupにも失敗しました。"
+                        "OBSを手動で終了してから再試行してください"
+                    ),
+                )
+                if selected_error is cleanup_error:
+                    raise
+        elif (
+            process is not None
+            and process_cleanup_attempted
+            and not process_cleanup_completed
+        ):
+            detail = (
+                "GPU再起動中のOBS停止は既に試行済みです。"
+                "同じPopenへ再度signalせず、OBSを手動で確認してから再試行してください"
+            )
+            add_note = getattr(e, "add_note", None)
+            if callable(add_note):
+                add_note(detail)
+            LOGGER.error("%s", detail)
+        if not isinstance(e, Exception) or isinstance(e, RecorderError):
+            raise
         raise RecorderError(f"OBS起動エラー: {e}") from e
 
 
@@ -3428,13 +3518,13 @@ class ObsWebSocketClient(OBSClient):
 
     def disconnect(self) -> None:
         try:
-            if self.client:
+            if self.client is not None:
                 try:
                     self.client.disconnect()
                 finally:
                     self.client = None
         finally:
-            if self._status_handler:
+            if self._status_handler is not None:
                 try:
                     self.logger.removeHandler(self._status_handler)
                 except Exception:
@@ -3918,7 +4008,7 @@ class ObsWebSocketClient(OBSClient):
 
     def shutdown(self) -> None:
         termination_error: BaseException | None = None
-        if self.obs_process:
+        if self.obs_process is not None:
             self.log("🧹 OBSを終了しています...")
             try:
                 OBSProcessManager(
@@ -3937,7 +4027,7 @@ class ObsWebSocketClient(OBSClient):
 
         if termination_error is not None:
             if disconnect_error is not None:
-                _record_cleanup_failure(
+                termination_error = _select_cleanup_control_flow_error(
                     termination_error,
                     disconnect_error,
                     logger=self.logger,
@@ -3974,10 +4064,14 @@ class LoLAutoRecorder(RecordingSessionManager):
         if self._status_handler:
             self.logger.addHandler(self._status_handler)
         self.logger.propagate = True
-        self.obs_client = obs_client or ObsWebSocketClient(
-            config=self.config,
-            obs_process=obs_process,
-            status_cb=status_cb,
+        self.obs_client = (
+            obs_client
+            if obs_client is not None
+            else ObsWebSocketClient(
+                config=self.config,
+                obs_process=obs_process,
+                status_cb=status_cb,
+            )
         )
         self.riot_api_client = riot_api_client or LiveClientRiotAPIClient()
         self.obs_process = getattr(self.obs_client, "obs_process", obs_process)
@@ -3999,17 +4093,19 @@ class LoLAutoRecorder(RecordingSessionManager):
             if self.auto_setup:
                 self.ensure_sync_setup()
             self.opened = True
-        except Exception as primary_error:
+        except BaseException as primary_error:
             self._open_cleanup_attempted = True
             try:
                 self.shutdown_obs()
-            except Exception as cleanup_error:
-                _record_cleanup_failure(
+            except BaseException as cleanup_error:
+                selected_error = _select_cleanup_control_flow_error(
                     primary_error,
                     cleanup_error,
                     logger=self.logger,
                     context="Recorder起動失敗後のOBS cleanupにも失敗しました",
                 )
+                if selected_error is cleanup_error:
+                    raise
             raise
 
     def log(self, message: str) -> None:
@@ -5164,38 +5260,51 @@ def _cleanup_cli_recorder(
     app: LoLAutoRecorder,
     primary_error: BaseException | None,
 ) -> None:
-    cleanup_error: BaseException | None = None
+    selected_error = primary_error
     try:
         app.stop_recording()
     except BaseException as exc:
-        cleanup_error = exc
+        if selected_error is None:
+            selected_error = exc
+        else:
+            selected_error = _select_cleanup_control_flow_error(
+                selected_error,
+                exc,
+                logger=LOGGER,
+                context=(
+                    "CLI録画停止処理にも失敗しました。"
+                    "OBSを手動で終了してから再試行してください"
+                ),
+            )
 
     try:
         app.shutdown_obs()
     except BaseException as exc:
-        if cleanup_error is None:
-            cleanup_error = exc
+        if selected_error is None:
+            selected_error = exc
         else:
-            _record_cleanup_failure(
-                cleanup_error,
+            selected_error = _select_cleanup_control_flow_error(
+                selected_error,
                 exc,
                 logger=LOGGER,
-                context="CLI録画停止後のOBS shutdownにも失敗しました",
+                context=(
+                    "CLI録画停止後のOBS shutdownにも失敗しました。"
+                    "OBSを手動で終了してから再試行してください"
+                ),
             )
 
-    if cleanup_error is None:
+    if selected_error is None or selected_error is primary_error:
         return
-    if primary_error is None:
-        raise cleanup_error
-    _record_cleanup_failure(
-        primary_error,
-        cleanup_error,
-        logger=LOGGER,
-        context=(
-            "CLI録画処理失敗後のOBS cleanupにも失敗しました。"
+    if primary_error is not None:
+        detail = (
+            "CLI録画処理失敗後のOBS cleanupが中断されました。"
             "OBSを手動で終了してから再試行してください"
-        ),
-    )
+        )
+        add_note = getattr(selected_error, "add_note", None)
+        if callable(add_note):
+            add_note(detail)
+        LOGGER.error("%s", detail)
+    raise selected_error
 
 
 def _cleanup_cli_launched_process(
@@ -5208,7 +5317,7 @@ def _cleanup_cli_launched_process(
     except BaseException as cleanup_error:
         if primary_error is None:
             raise
-        _record_cleanup_failure(
+        selected_error = _select_cleanup_control_flow_error(
             primary_error,
             cleanup_error,
             logger=LOGGER,
@@ -5217,12 +5326,15 @@ def _cleanup_cli_launched_process(
                 "OBSを手動で終了してから再試行してください"
             ),
         )
+        if selected_error is cleanup_error:
+            raise
 
 
 async def run_cli_recorder() -> None:
     app = None
     config = None
     obs_process = None
+    startup_handoff_complete = False
     try:
         settings = load_settings()
         preflight = run_preflight_checks(settings, auto_fix=True, ensure_dirs=True)
@@ -5241,6 +5353,7 @@ async def run_cli_recorder() -> None:
 
         app = LoLAutoRecorder(config=config, obs_process=obs_process)
         app.open()
+        startup_handoff_complete = True
         try:
             app.apply_audio_profile(config)
             LOGGER.info("🔊 音声設定をOBSへ適用しました。")
@@ -5282,13 +5395,15 @@ async def run_cli_recorder() -> None:
                 break
             LOGGER.info("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
+        if not startup_handoff_complete:
+            raise
         LOGGER.info("中断を検知しました。終了処理を行います。")
     except RecorderError as e:
         LOGGER.error("❌ %s", e)
         sys.exit(1)
     finally:
         primary_error = sys.exc_info()[1]
-        if app:
+        if app is not None:
             if not getattr(app, "_open_cleanup_attempted", False):
                 _cleanup_cli_recorder(app, primary_error)
         elif config is not None and obs_process is not None:

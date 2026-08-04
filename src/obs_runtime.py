@@ -77,37 +77,70 @@ class RecorderRuntime:
 
         if primary_error is not None:
             if cleanup_error is not None:
-                add_note = getattr(primary_error, "add_note", None)
-                if callable(add_note):
-                    add_note(
-                        "OBS cleanup also failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
-                    )
-                LOGGER.error(
-                    "OBS cleanup failed while preserving an earlier runtime error: %s",
+                selected_error = recordtest._select_cleanup_control_flow_error(
+                    primary_error,
                     cleanup_error,
+                    logger=LOGGER,
+                    context="OBS cleanup also failed",
                 )
+                if selected_error is cleanup_error:
+                    raise cleanup_error
             raise primary_error
         if cleanup_error is not None:
             raise cleanup_error
 
     def _close_existing_owned_process(self) -> None:
         failures: list[BaseException] = []
+        selected_error: BaseException | None = None
+
+        def record_failure(error: BaseException, *, context: str) -> None:
+            nonlocal selected_error
+            failures.append(error)
+            if selected_error is None:
+                selected_error = error
+            else:
+                selected_error = recordtest._select_cleanup_control_flow_error(
+                    selected_error,
+                    error,
+                    logger=LOGGER,
+                    context=context,
+                )
+
         try:
             self.recorder.disconnect_obs()
         except BaseException as exc:
-            failures.append(exc)
+            record_failure(
+                exc,
+                context="管理対象OBS終了前のWebSocket切断にも失敗しました",
+            )
 
         if self.process_manager is None:
-            failures.append(RuntimeError("OBS process manager is unavailable"))
+            record_failure(
+                RuntimeError("OBS process manager is unavailable"),
+                context="管理対象OBSのlease検証cleanupを開始できませんでした",
+            )
         else:
             try:
                 self.process_manager.kill_stale_owned_processes()
             except BaseException as exc:
-                failures.append(exc)
+                record_failure(
+                    exc,
+                    context="管理対象OBSのlease検証cleanupにも失敗しました",
+                )
 
         if not failures:
             return
+        if selected_error is not None and not isinstance(selected_error, Exception):
+            detail = (
+                "管理対象OBSのcleanupが中断されました。OBSを手動で終了し、"
+                "アプリを再実行してください。\n"
+                f"{_manual_lease_recovery_guidance(self.process_manager)}"
+            )
+            add_note = getattr(selected_error, "add_note", None)
+            if callable(add_note):
+                add_note(detail)
+            LOGGER.error("%s", detail)
+            raise selected_error
         error = recordtest.RecorderError(
             "管理対象OBSを安全に終了できませんでした。OBSを手動で終了し、"
             "アプリを再実行してください。\n"
@@ -159,40 +192,46 @@ class OBSRuntimeManager:
         launched_process = None
         owns_existing_process = False
         process_manager = recordtest.OBSProcessManager(config.obs.obs_dir)
-        if force_launch:
-            if self._wait_for_owned_obs_connection(config, process_manager):
-                owns_existing_process = True
-            else:
-                launched_process = recordtest.launch_obs(config)
-        elif auto_launch:
-            ok, _detail = recordtest.test_obs_connection(
-                config.obs.host,
-                config.obs.port,
-                config.obs.password,
-                timeout=1.5,
-            )
-            if ok:
-                if not self._has_owned_process(process_manager):
-                    raise recordtest.RecorderError(
-                        "OBS WebSocketには接続できますが、このアプリが起動した管理対象OBSではありません。\n"
-                        f"接続先: {config.obs.host}:{config.obs.port}\n"
-                        "既存のOBSを終了してから再実行してください。"
-                    )
-            elif self._wait_for_owned_obs_connection(config, process_manager):
-                pass
-            else:
-                launched_process = recordtest.launch_obs(config)
-        elif recordtest.is_tcp_port_open(config.obs.host, config.obs.port, timeout=0.3):
-            if not self._has_owned_process(process_manager):
-                raise recordtest.RecorderError(
-                    "OBS WebSocketポートは使用中ですが、このアプリが起動した管理対象OBSではありません。\n"
-                    f"接続先: {config.obs.host}:{config.obs.port}\n"
-                    "既存のOBSを終了してから再実行してください。"
-                )
-
         obs_client = None
         recorder = None
         try:
+            if force_launch:
+                if self._wait_for_owned_obs_connection(config, process_manager):
+                    owns_existing_process = True
+                else:
+                    launched_process = recordtest.launch_obs(config)
+            elif auto_launch:
+                ok, _detail = recordtest.test_obs_connection(
+                    config.obs.host,
+                    config.obs.port,
+                    config.obs.password,
+                    timeout=1.5,
+                )
+                if ok:
+                    if not self._has_owned_process(process_manager):
+                        raise recordtest.RecorderError(
+                            "OBS WebSocketには接続できますが、このアプリが起動した"
+                            "管理対象OBSではありません。\n"
+                            f"接続先: {config.obs.host}:{config.obs.port}\n"
+                            "既存のOBSを終了してから再実行してください。"
+                        )
+                elif self._wait_for_owned_obs_connection(config, process_manager):
+                    pass
+                else:
+                    launched_process = recordtest.launch_obs(config)
+            elif recordtest.is_tcp_port_open(
+                config.obs.host,
+                config.obs.port,
+                timeout=0.3,
+            ):
+                if not self._has_owned_process(process_manager):
+                    raise recordtest.RecorderError(
+                        "OBS WebSocketポートは使用中ですが、このアプリが起動した"
+                        "管理対象OBSではありません。\n"
+                        f"接続先: {config.obs.host}:{config.obs.port}\n"
+                        "既存のOBSを終了してから再実行してください。"
+                    )
+
             obs_client = recordtest.ObsWebSocketClient(
                 config=config,
                 obs_process=launched_process,
@@ -208,23 +247,26 @@ class OBSRuntimeManager:
                 obs_client=obs_client,
             )
             recorder.open()
+            return RecorderRuntime(
+                recorder=recorder,
+                owns_process=launched_process is not None or owns_existing_process,
+                owns_existing_process=owns_existing_process,
+                process_manager=process_manager,
+            )
         except BaseException as primary_error:
+            selected_error = primary_error
+
             def record_cleanup_failure(
                 cleanup_error: BaseException,
                 *,
                 context: str,
-                primary: BaseException = primary_error,
             ) -> None:
-                add_note = getattr(primary, "add_note", None)
-                if callable(add_note):
-                    add_note(
-                        f"{context}: {type(cleanup_error).__name__}: "
-                        f"{cleanup_error}"
-                    )
-                LOGGER.error(
-                    "%s while preserving the original startup error: %s",
-                    context,
+                nonlocal selected_error
+                selected_error = recordtest._select_cleanup_control_flow_error(
+                    selected_error,
                     cleanup_error,
+                    logger=LOGGER,
+                    context=context,
                 )
 
             if recorder is not None:
@@ -237,7 +279,7 @@ class OBSRuntimeManager:
                             context="Recorder起動失敗後のOBS cleanupにも失敗しました",
                         )
             else:
-                if launched_process:
+                if launched_process is not None:
                     try:
                         process_manager.terminate_process(launched_process)
                     except BaseException as cleanup_error:
@@ -256,13 +298,23 @@ class OBSRuntimeManager:
                                 "失敗しました"
                             ),
                         )
+            if owns_existing_process:
+                try:
+                    process_manager.kill_stale_owned_processes()
+                except BaseException as cleanup_error:
+                    record_cleanup_failure(
+                        cleanup_error,
+                        context=(
+                            "引き継いだ管理対象OBSのlease検証cleanupにも失敗しました。"
+                            "PID fallbackや管理対象外OBSへのsignalは行っていません。"
+                            "OBSを手動で終了してから再試行してください。"
+                            f"{_manual_lease_recovery_guidance(process_manager)}"
+                        ),
+                    )
+            if selected_error is not primary_error:
+                # Preserve the injected control-flow object's existing chain.
+                raise selected_error  # noqa: B904
             raise
-        return RecorderRuntime(
-            recorder=recorder,
-            owns_process=bool(launched_process) or owns_existing_process,
-            owns_existing_process=owns_existing_process,
-            process_manager=process_manager,
-        )
 
     @staticmethod
     def _owned_process_error(

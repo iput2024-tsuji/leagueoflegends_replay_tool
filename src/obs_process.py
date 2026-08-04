@@ -281,6 +281,42 @@ class OBSProcessManager:
                 )
             self.logger.critical("%s: %s", label, close_error)
 
+    def _select_control_flow_cleanup_failure(
+        self,
+        primary_error: BaseException,
+        cleanup_error: BaseException,
+        *,
+        context: str,
+    ) -> BaseException | None:
+        """Record cleanup failure and select the first control-flow exception."""
+
+        if not isinstance(primary_error, Exception):
+            add_note = getattr(primary_error, "add_note", None)
+            if callable(add_note):
+                add_note(
+                    f"{context}: {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+            self.logger.critical(
+                "%s while preserving the original interruption: %s",
+                context,
+                cleanup_error,
+            )
+            return primary_error
+        if not isinstance(cleanup_error, Exception):
+            add_note = getattr(cleanup_error, "add_note", None)
+            if callable(add_note):
+                add_note(
+                    f"{context}. Earlier failure before cleanup was interrupted: "
+                    f"{type(primary_error).__name__}: {primary_error}"
+                )
+            self.logger.critical(
+                "%s was interrupted after an earlier failure: %s",
+                context,
+                cleanup_error,
+            )
+            return cleanup_error
+        return None
+
     def _nonmutating_process_lease_transaction_required(self) -> bool:
         """Probe a stable absent state without creating the managed root/lock."""
 
@@ -419,13 +455,21 @@ class OBSProcessManager:
             transaction: _OBSProcessLeaseTransaction | None = None
             primary_error: BaseException | None = None
             cleanup_error: BaseException | None = None
+            cleanup_control_flow_error: BaseException | None = None
             cleanup_failures: list[tuple[str, BaseException]] = []
             lock_acquired = False
 
             def record_cleanup_error(label: str, error: BaseException) -> None:
-                nonlocal cleanup_error
+                nonlocal cleanup_error, cleanup_control_flow_error
                 cleanup_failures.append((label, error))
-                target = primary_error or cleanup_error
+                target = (
+                    primary_error
+                    if primary_error is not None
+                    and not isinstance(primary_error, Exception)
+                    else cleanup_control_flow_error
+                    or primary_error
+                    or cleanup_error
+                )
                 if target is not None:
                     add_note = getattr(target, "add_note", None)
                     if callable(add_note):
@@ -435,6 +479,32 @@ class OBSProcessManager:
                     self.logger.critical("%s: %s", label, error)
                 else:
                     cleanup_error = error
+                if (
+                    (primary_error is None or isinstance(primary_error, Exception))
+                    and not isinstance(error, Exception)
+                    and cleanup_control_flow_error is None
+                ):
+                    cleanup_control_flow_error = error
+                    add_note = getattr(error, "add_note", None)
+                    if callable(add_note):
+                        if primary_error is not None:
+                            add_note(
+                                "Earlier transaction body failure: "
+                                f"{type(primary_error).__name__}: {primary_error}"
+                            )
+                        for previous_label, previous_error in cleanup_failures[:-1]:
+                            add_note(
+                                "Earlier transaction cleanup failure: "
+                                f"{previous_label}: "
+                                f"{type(previous_error).__name__}: {previous_error}"
+                            )
+                    for previous_label, previous_error in cleanup_failures[:-1]:
+                        self.logger.critical(
+                            "Earlier transaction cleanup failure before control-flow "
+                            "interruption (%s): %s",
+                            previous_label,
+                            previous_error,
+                        )
 
             try:
                 while True:
@@ -492,6 +562,10 @@ class OBSProcessManager:
                             "OBS lease IPC lock release failed",
                             release_error,
                         )
+                if cleanup_control_flow_error is not None and (
+                    primary_error is None or isinstance(primary_error, Exception)
+                ):
+                    raise cleanup_control_flow_error
                 if primary_error is None and cleanup_error is not None:
                     if transaction is not None and transaction.commit_occurred:
                         self.logger.critical(
@@ -1790,41 +1864,94 @@ class OBSProcessManager:
         if hidden:
             popen_kwargs.update(self._hidden_subprocess_kwargs())
 
-        with self._process_lease_transaction(mutating=True) as transaction:
-            if transaction is None:
-                raise AssertionError("mutating lease transaction did not acquire a lock")
-            self._validate_obs_start_admission_locked(transaction)
-            process = subprocess.Popen(cmd, **popen_kwargs)
-            try:
-                self._write_process_lease_locked(transaction, process)
-            except BaseException as lease_error:
+        process: subprocess.Popen[Any] | None = None
+        process_cleanup_attempted = False
+        try:
+            with self._process_lease_transaction(mutating=True) as transaction:
+                if transaction is None:
+                    raise AssertionError(
+                        "mutating lease transaction did not acquire a lock"
+                    )
+                self._validate_obs_start_admission_locked(transaction)
+                try:
+                    process = subprocess.Popen(cmd, **popen_kwargs)
+                    self._write_process_lease_locked(transaction, process)
+                except BaseException as lease_error:
+                    if process is None:
+                        raise
+                    process_cleanup_attempted = True
+                    try:
+                        self._terminate_unleased_popen_process(process)
+                    except BaseException as cleanup_error:
+                        control_flow_error = (
+                            self._select_control_flow_cleanup_failure(
+                                lease_error,
+                                cleanup_error,
+                                context=(
+                                    "Automatic cleanup of the newly started OBS "
+                                    f"failed for PID {process.pid}. "
+                                    "タスク マネージャーでOBSを確認し、残っている"
+                                    "場合は手動終了してから再試行してください。 "
+                                    f"lease={self.lease_path} "
+                                    f"lock={self.lease_lock_path}"
+                                ),
+                            )
+                        )
+                        if control_flow_error is cleanup_error:
+                            raise
+                        if control_flow_error is None:
+                            cleanup_failure = OBSProcessLeaseCleanupError(
+                                "OBSの所有情報を確立できず、起動したOBSの終了処理も"
+                                f"安全に完了できませんでした (PID {process.pid})。"
+                                "タスク マネージャーでOBSを確認し、残っている場合は"
+                                "手動終了してから再実行してください。"
+                            )
+                            add_note = getattr(cleanup_failure, "add_note", None)
+                            if callable(add_note):
+                                add_note(
+                                    "Lease establishment failed first: "
+                                    f"{type(lease_error).__name__}: {lease_error}"
+                                )
+                                add_note(
+                                    "Automatic process cleanup also failed: "
+                                    f"{type(cleanup_error).__name__}: "
+                                    f"{cleanup_error}"
+                                )
+                            self.logger.critical(
+                                "New OBS process cleanup failed after lease failure: "
+                                "pid=%s error=%s",
+                                process.pid,
+                                cleanup_error,
+                            )
+                            raise cleanup_failure from lease_error
+                    raise
+        except BaseException as start_error:
+            if (
+                process is not None
+                and not process_cleanup_attempted
+                and not isinstance(start_error, Exception)
+            ):
+                process_cleanup_attempted = True
                 try:
                     self._terminate_unleased_popen_process(process)
                 except BaseException as cleanup_error:
-                    cleanup_failure = OBSProcessLeaseCleanupError(
-                        "OBSの所有情報を確立できず、起動したOBSの終了処理も"
-                        f"安全に完了できませんでした (PID {process.pid})。"
-                        "タスク マネージャーでOBSを確認し、残っている場合は"
-                        "手動終了してから再実行してください。"
-                    )
-                    add_note = getattr(cleanup_failure, "add_note", None)
-                    if callable(add_note):
-                        add_note(
-                            "Lease establishment failed first: "
-                            f"{type(lease_error).__name__}: {lease_error}"
-                        )
-                        add_note(
-                            "Automatic process cleanup also failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}"
-                        )
-                    self.logger.critical(
-                        "New OBS process cleanup failed after lease failure: pid=%s error=%s",
-                        process.pid,
+                    control_flow_error = self._select_control_flow_cleanup_failure(
+                        start_error,
                         cleanup_error,
+                        context=(
+                            "Automatic cleanup after the OBS lease transaction "
+                            f"interruption failed for PID {process.pid}. "
+                            "タスク マネージャーでOBSを確認し、残っている場合は"
+                            "手動終了してから再試行してください。 "
+                            f"lease={self.lease_path} lock={self.lease_lock_path}"
+                        )
                     )
-                    raise cleanup_failure from lease_error
-                raise
-            return process
+                    if control_flow_error is cleanup_error:
+                        raise
+            raise
+        if process is None:
+            raise AssertionError("OBS Popen was not established")
+        return process
 
     def _validate_obs_start_admission_locked(
         self,
@@ -2682,17 +2809,31 @@ class OBSProcessManager:
                                 "OBS lease publish state is commit-uncertain; neither "
                                 "pathname was modified during recovery."
                             )
-                except Exception as cleanup_error:
-                    add_note = getattr(e, "add_note", None)
-                    if callable(add_note):
-                        add_note(
-                            "Temporary lease cleanup also failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}"
-                        )
-                    self.logger.critical(
-                        "Temporary lease cleanup also failed: %s",
+                except BaseException as cleanup_error:
+                    if isinstance(e, Exception) and not isinstance(
+                        cleanup_error, Exception
+                    ):
+                        operation_error = cleanup_error
+                    control_flow_error = self._select_control_flow_cleanup_failure(
+                        e,
                         cleanup_error,
+                        context="Temporary OBS lease cleanup failed",
                     )
+                    if control_flow_error is cleanup_error:
+                        raise
+                    if control_flow_error is None:
+                        add_note = getattr(e, "add_note", None)
+                        if callable(add_note):
+                            add_note(
+                                "Temporary lease cleanup also failed: "
+                                f"{type(cleanup_error).__name__}: {cleanup_error}"
+                            )
+                        self.logger.critical(
+                            "Temporary lease cleanup also failed: %s",
+                            cleanup_error,
+                        )
+            if not isinstance(e, Exception):
+                raise
             if isinstance(e, OBSProcessLeaseError):
                 if (
                     str(self.lease_path) in str(e)
@@ -2711,20 +2852,37 @@ class OBSProcessManager:
             if descriptor is not None:
                 try:
                     os.close(descriptor)
-                except OSError as close_error:
-                    if published:
+                except BaseException as close_error:
+                    if operation_error is not None:
+                        control_flow_error = (
+                            self._select_control_flow_cleanup_failure(
+                                operation_error,
+                                close_error,
+                                context="OBS lease descriptor close failed",
+                            )
+                        )
+                        if control_flow_error is close_error:
+                            raise
+                        if control_flow_error is None:
+                            add_note = getattr(operation_error, "add_note", None)
+                            if callable(add_note):
+                                add_note(
+                                    "Temporary lease descriptor close also failed: "
+                                    f"{type(close_error).__name__}: {close_error}"
+                                )
+                            self.logger.critical(
+                                "OBS lease descriptor close failed while preserving "
+                                "the primary operation failure: %s",
+                                close_error,
+                            )
+                    elif published and isinstance(close_error, Exception):
                         self.logger.critical(
                             "Committed OBS lease descriptor close failed: %s: %s",
                             self.lease_path,
                             close_error,
                         )
-                    elif operation_error is not None:
-                        add_note = getattr(operation_error, "add_note", None)
-                        if callable(add_note):
-                            add_note(
-                                "Temporary lease descriptor close also failed: "
-                                f"{type(close_error).__name__}: {close_error}"
-                            )
+                    else:
+                        raise
 
     def read_process_lease(self) -> OBSProcessLease | None:
         with self._process_lease_transaction() as transaction:

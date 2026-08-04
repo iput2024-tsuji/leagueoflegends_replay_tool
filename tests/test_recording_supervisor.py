@@ -211,6 +211,267 @@ def test_recording_supervisor_keeps_body_primary_when_shutdown_fails():
     assert any("手動で終了" in note for note in primary_error.__notes__)
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
+)
+def test_recording_supervisor_closes_runtime_when_recorder_handoff_is_interrupted(
+    error_type,
+):
+    primary_error = error_type("recorder handoff interrupted")
+    primary_cause = RuntimeError("handoff cause")
+    primary_context = ValueError("handoff context")
+    primary_error.__cause__ = primary_cause
+    primary_error.__context__ = primary_context
+    primary_error.__suppress_context__ = True
+
+    class FalseyHandoffRuntime:
+        def __init__(self):
+            self.close_calls = []
+
+        def __bool__(self):
+            return False
+
+        @property
+        def recorder(self):
+            raise primary_error
+
+        def close(self, finalize_session=False):
+            self.close_calls.append(finalize_session)
+
+    runtime = FalseyHandoffRuntime()
+
+    class Controller:
+        def create_runtime(self, config_data, status_cb=None):
+            return runtime
+
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=Controller(),
+    )
+
+    with pytest.raises(error_type) as captured:
+        run(run_supervisor(supervisor))
+
+    assert captured.value is primary_error
+    assert primary_error.__cause__ is primary_cause
+    assert primary_error.__context__ is primary_context
+    assert primary_error.__suppress_context__ is True
+    assert runtime.close_calls == [False]
+    assert supervisor.runtime is None
+    assert supervisor.recorder is None
+
+
+def test_recording_supervisor_cleanup_control_flow_supersedes_normal_handoff_failure():
+    primary_error = OSError("recorder handoff failed")
+    cleanup_error = SystemExit("runtime close interrupted")
+    cleanup_cause = RuntimeError("runtime close cause")
+    cleanup_context = ValueError("runtime close context")
+    cleanup_error.__cause__ = cleanup_cause
+    cleanup_error.__context__ = cleanup_context
+    cleanup_error.__suppress_context__ = True
+
+    class HandoffRuntime:
+        def __init__(self):
+            self.close_calls = []
+
+        @property
+        def recorder(self):
+            raise primary_error
+
+        def close(self, finalize_session=False):
+            self.close_calls.append(finalize_session)
+            raise cleanup_error
+
+    runtime = HandoffRuntime()
+
+    class Controller:
+        def create_runtime(self, config_data, status_cb=None):
+            return runtime
+
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=Controller(),
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        run(run_supervisor(supervisor))
+
+    assert captured.value is cleanup_error
+    assert cleanup_error.__cause__ is cleanup_cause
+    assert cleanup_error.__context__ is cleanup_context
+    assert cleanup_error.__suppress_context__ is True
+    assert runtime.close_calls == [False]
+    assert any(
+        "recorder handoff failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
+def test_recording_supervisor_keeps_first_control_flow_during_handoff_cleanup():
+    primary_error = KeyboardInterrupt("recorder handoff interrupted")
+    cleanup_error = SystemExit("runtime close interrupted")
+
+    class HandoffRuntime:
+        def __init__(self):
+            self.close_calls = []
+
+        @property
+        def recorder(self):
+            raise primary_error
+
+        def close(self, finalize_session=False):
+            self.close_calls.append(finalize_session)
+            raise cleanup_error
+
+    runtime = HandoffRuntime()
+
+    class Controller:
+        def create_runtime(self, config_data, status_cb=None):
+            return runtime
+
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=Controller(),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        run(run_supervisor(supervisor))
+
+    assert captured.value is primary_error
+    assert runtime.close_calls == [False]
+    assert any(
+        "runtime close interrupted" in note
+        for note in getattr(primary_error, "__notes__", [])
+    )
+
+
+def test_recording_supervisor_shutdown_closes_runtime_after_stop_request_interrupt():
+    primary_error = KeyboardInterrupt("stop request interrupted")
+    cleanup_error = SystemExit("runtime close interrupted")
+
+    class Recorder(FakeRecorder):
+        def request_stop(self):
+            self.calls.append("request_stop")
+            raise primary_error
+
+    recorder = Recorder()
+    runtime = FakeRuntime(recorder)
+
+    def fail_close(finalize_session=False):
+        runtime.close_calls.append(finalize_session)
+        recorder.calls.append("runtime_close")
+        raise cleanup_error
+
+    runtime.close = fail_close
+    supervisor = RecordingSupervisor()
+    supervisor.recorder = recorder
+    supervisor.runtime = runtime
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        supervisor.shutdown()
+
+    assert captured.value is primary_error
+    assert recorder.calls == ["request_stop", "stop_recording", "runtime_close"]
+    assert runtime.close_calls == [False]
+    assert any(
+        "runtime close interrupted" in note
+        for note in getattr(primary_error, "__notes__", [])
+    )
+    assert supervisor.runtime is None
+    assert supervisor.recorder is None
+
+    supervisor.shutdown()
+    assert runtime.close_calls == [False]
+
+
+def test_recording_supervisor_shutdown_promotes_runtime_close_control_flow():
+    primary_error = OSError("stop request failed")
+    cleanup_error = asyncio.CancelledError("runtime close cancelled")
+
+    class Recorder(FakeRecorder):
+        def request_stop(self):
+            self.calls.append("request_stop")
+            raise primary_error
+
+    recorder = Recorder()
+    runtime = FakeRuntime(recorder)
+
+    def fail_close(finalize_session=False):
+        runtime.close_calls.append(finalize_session)
+        recorder.calls.append("runtime_close")
+        raise cleanup_error
+
+    runtime.close = fail_close
+    supervisor = RecordingSupervisor()
+    supervisor.recorder = recorder
+    supervisor.runtime = runtime
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        supervisor.shutdown()
+
+    assert captured.value is cleanup_error
+    assert recorder.calls == ["request_stop", "stop_recording", "runtime_close"]
+    assert runtime.close_calls == [False]
+    assert any(
+        "stop request failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
+def test_recording_supervisor_shutdown_closes_runtime_after_finalize_interrupt():
+    primary_error = SystemExit("finalize interrupted")
+
+    class Recorder(FakeRecorder):
+        def __init__(self):
+            super().__init__()
+            self.session_has_data = True
+
+        def finalize_session(self, outcome=None, failure_reason=None):
+            self.calls.append("finalize_session")
+            raise primary_error
+
+    recorder = Recorder()
+    runtime = FakeRuntime(recorder)
+    supervisor = RecordingSupervisor()
+    supervisor.recorder = recorder
+    supervisor.runtime = runtime
+
+    with pytest.raises(SystemExit) as captured:
+        supervisor.shutdown()
+
+    assert captured.value is primary_error
+    assert recorder.calls == [
+        "request_stop",
+        "mark_session_aborted",
+        "finalize_session",
+        "runtime_close",
+    ]
+    assert runtime.close_calls == [False]
+
+
+def test_recording_supervisor_shutdown_closes_runtime_after_stop_interrupt():
+    primary_error = asyncio.CancelledError("recording stop cancelled")
+
+    class Recorder(FakeRecorder):
+        def stop_recording(self):
+            self.calls.append("stop_recording")
+            raise primary_error
+
+    recorder = Recorder()
+    runtime = FakeRuntime(recorder)
+    supervisor = RecordingSupervisor()
+    supervisor.recorder = recorder
+    supervisor.runtime = runtime
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        supervisor.shutdown()
+
+    assert captured.value is primary_error
+    assert recorder.calls == ["request_stop", "stop_recording", "runtime_close"]
+    assert runtime.close_calls == [False]
+
+
 def test_recording_supervisor_notifies_completion_after_game_process_clears():
     notifications = []
     recorder = FakeRecorder()

@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -311,12 +313,11 @@ def test_start_obs_stops_only_new_popen_when_v2_lease_cannot_be_established(
         "Popen",
         lambda *args, **kwargs: process,
     )
+    identity_error = OBSProcessLeaseError("identity unavailable")
     monkeypatch.setattr(
         manager,
         "query_popen_process_identity",
-        lambda candidate: (_ for _ in ()).throw(
-            OBSProcessLeaseError("identity unavailable")
-        ),
+        lambda candidate: (_ for _ in ()).throw(identity_error),
     )
     monkeypatch.setattr(
         obs_process_module._OBSInterProcessLock,
@@ -324,9 +325,10 @@ def test_start_obs_stops_only_new_popen_when_v2_lease_cannot_be_established(
         release_after_recording,
     )
 
-    with pytest.raises(OBSProcessLeaseError, match="identity unavailable"):
+    with pytest.raises(OBSProcessLeaseError, match="managed executable") as captured:
         manager.start_obs(env={"TEST": "1"}, hidden=False)
 
+    assert captured.value.__cause__ is identity_error
     assert process.poll() == 0
     assert events == ["terminate", ("wait", 3.0)]
     assert query_calls == ["query"]
@@ -375,8 +377,17 @@ def test_start_obs_requires_manual_stop_when_lease_failure_process_survives(
     )
     monkeypatch.setattr(
         manager,
+        "_validate_started_popen_against_admission_guard",
+        lambda candidate, guard: _identity(
+            manager,
+            pid=candidate.pid,
+            unix_seconds=32.1,
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
         "_write_process_lease_locked",
-        lambda transaction, candidate: (_ for _ in ()).throw(lease_error),
+        lambda transaction, candidate, **kwargs: (_ for _ in ()).throw(lease_error),
     )
     monkeypatch.setattr(
         manager,
@@ -469,11 +480,14 @@ def test_start_obs_live_managed_process_without_lease_fails_before_popen_or_sign
     manager.obs_exe.parent.mkdir(parents=True)
     manager.obs_exe.write_bytes(b"fake obs")
     managed = _identity(manager, pid=200, unix_seconds=20.0)
+    unmanaged_executable = tmp_path / "regular-obs" / "obs64.exe"
+    unmanaged_executable.parent.mkdir(parents=True)
+    unmanaged_executable.write_bytes(b"different fake obs")
     unmanaged = _identity(
         manager,
         pid=300,
         unix_seconds=30.0,
-        executable_path=(tmp_path / "regular-obs" / "obs64.exe").resolve(),
+        executable_path=unmanaged_executable.resolve(),
     )
     snapshot = _snapshot(unmanaged, managed)
     query_calls = []
@@ -503,6 +517,713 @@ def test_start_obs_live_managed_process_without_lease_fails_before_popen_or_sign
     assert signal_calls == []
     assert snapshot.processes == (unmanaged, managed)
     assert not manager.lease_path.exists()
+
+
+def test_start_obs_physical_hardlink_alias_fails_before_popen_or_signal(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    alias = tmp_path / "physical-alias" / "obs64.exe"
+    alias.parent.mkdir(parents=True)
+    try:
+        os.link(manager.obs_exe, alias)
+    except OSError as exc:
+        pytest.skip(f"このfilesystemではhardlink aliasを作成できません: {exc}")
+
+    aliased = _identity(
+        manager,
+        pid=210,
+        unix_seconds=21.0,
+        executable_path=alias.resolve(),
+    )
+    snapshot = _snapshot(aliased)
+    manager.lease_lock_path.write_bytes(b"\0")
+    lock_raw = manager.lease_lock_path.read_bytes()
+    lock_identity = obs_process_module._file_identity(
+        manager.lease_lock_path.stat()
+    )
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: snapshot,
+    )
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("physical alias must prevent Popen"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("admission must not signal a PID"),
+    )
+
+    assert manager.is_managed_process(aliased) is True
+    with pytest.raises(OBSProcessLeaseError, match=r"PID 210"):
+        manager.start_obs(hidden=False)
+
+    assert snapshot.processes == (aliased,)
+    assert not manager.lease_path.exists()
+    assert manager.lease_lock_path.read_bytes() == lock_raw
+    assert (
+        obs_process_module._file_identity(manager.lease_lock_path.stat())
+        == lock_identity
+    )
+
+
+def test_start_obs_physical_identity_denial_fails_closed_before_popen_or_signal(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    other_executable = tmp_path / "other-obs" / "obs64.exe"
+    other_executable.parent.mkdir(parents=True)
+    other_executable.write_bytes(b"different fake obs")
+    existing = _identity(
+        manager,
+        pid=220,
+        unix_seconds=22.0,
+        executable_path=other_executable.resolve(),
+    )
+    snapshot = _snapshot(existing)
+    manager.lease_lock_path.write_bytes(b"\0")
+    lock_raw = manager.lease_lock_path.read_bytes()
+    lock_identity = obs_process_module._file_identity(
+        manager.lease_lock_path.stat()
+    )
+    identity_error = PermissionError("simulated executable identity denial")
+    real_pin = obs_process_module._pin_obs_executable_identity
+
+    @contextmanager
+    def deny_other_executable(path):
+        if Path(path) == other_executable.resolve():
+            raise identity_error
+        with real_pin(path) as pin:
+            yield pin
+
+    monkeypatch.setattr(
+        obs_process_module,
+        "_pin_obs_executable_identity",
+        deny_other_executable,
+    )
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: snapshot,
+    )
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("identity denial must prevent Popen"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("admission must not signal a PID"),
+    )
+
+    with pytest.raises(OBSProcessLeaseError, match="物理identity") as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value.__cause__ is identity_error
+    assert snapshot.processes == (existing,)
+    assert not manager.lease_path.exists()
+    assert manager.lease_lock_path.read_bytes() == lock_raw
+    assert (
+        obs_process_module._file_identity(manager.lease_lock_path.stat())
+        == lock_identity
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume GUID起動pathの実APIテスト")
+def test_start_obs_uses_pinned_volume_guid_command_cwd_and_lease_proof(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    with obs_process_module._pin_obs_executable_identity(manager.obs_exe) as pin:
+        launch_path = pin.launch_path
+        expected_physical_identity = pin.physical_identity
+    assert str(launch_path).casefold().startswith("\\\\?\\volume{")
+    identity = _identity(
+        manager,
+        pid=230,
+        unix_seconds=23.0,
+        executable_path=launch_path,
+    )
+    popen_calls = []
+
+    class FakePopen:
+        pid = identity.pid
+
+        def poll(self):
+            return None
+
+    process = FakePopen()
+    monkeypatch.setattr(manager, "query_obs_processes_strict", lambda: _snapshot())
+    monkeypatch.setattr(
+        manager,
+        "query_popen_process_identity",
+        lambda candidate: (
+            identity if candidate is process else pytest.fail("wrong Popen")
+        ),
+    )
+
+    def popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return process
+
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", popen)
+
+    assert manager.start_obs(hidden=False) is process
+
+    assert len(popen_calls) == 1
+    command, kwargs = popen_calls[0]
+    assert command[0] == str(launch_path)
+    assert kwargs["cwd"] == str(launch_path.parent)
+    with obs_process_module._pin_obs_executable_identity(Path(command[0])) as pin:
+        assert pin.physical_identity == expected_physical_identity
+    lease = manager.read_process_lease()
+    assert lease is not None
+    assert lease.executable_path == manager.obs_exe
+    assert process._lol_replay_obs_process_lease == lease
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume GUID owned pathの実APIテスト")
+def test_owned_process_accepts_volume_guid_image_without_weakening_filetime(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    with obs_process_module._pin_obs_executable_identity(manager.obs_exe) as pin:
+        volume_guid_path = pin.launch_path
+    lease = obs_process_module.OBSProcessLease(
+        schema_version=OBS_PROCESS_LEASE_SCHEMA_VERSION,
+        pid=240,
+        executable_path=manager.obs_exe,
+        created_at=24.0,
+        process_creation_time=24.0,
+        process_creation_time_filetime=_raw_filetime(24.0),
+    )
+    owned = _identity(
+        manager,
+        pid=lease.pid,
+        unix_seconds=24.0,
+        filetime=lease.process_creation_time_filetime,
+        executable_path=volume_guid_path,
+    )
+
+    assert manager.is_owned_process(owned, lease) is True
+    assert manager.is_owned_process(
+        OBSProcessInfo(
+            pid=owned.pid,
+            executable_path=owned.executable_path,
+            creation_time=owned.creation_time,
+            creation_time_filetime=owned.creation_time_filetime + 1,
+        ),
+        lease,
+    ) is False
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: _snapshot(owned),
+    )
+    snapshot, current = manager._query_owned_target_strict(
+        OBSProcessInfo(
+            pid=lease.pid,
+            executable_path=lease.executable_path,
+            creation_time=lease.process_creation_time,
+            creation_time_filetime=lease.process_creation_time_filetime,
+        ),
+        label="volume GUID owned query",
+    )
+    assert snapshot.processes == (owned,)
+    assert current is owned
+
+
+def test_start_obs_guard_revalidation_failure_cleans_exact_new_popen_once(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    revalidation_calls = 0
+    events = []
+
+    @contextmanager
+    def changing_pin(path):
+        assert Path(path) == manager.obs_exe
+
+        def revalidate():
+            nonlocal revalidation_calls
+            revalidation_calls += 1
+            if revalidation_calls == 2:
+                raise OBSProcessQueryError("simulated namespace change")
+
+        yield obs_process_module._OBSExecutableIdentityPin(
+            physical_identity=(1, 2, stat.S_IFREG),
+            launch_path=manager.obs_exe,
+            revalidate=revalidate,
+        )
+
+    class FakePopen:
+        pid = 250
+
+        def __init__(self):
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            events.append("terminate")
+            self.alive = False
+
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            return 0
+
+        def kill(self):
+            pytest.fail("graceful cleanup should be sufficient")
+
+    process = FakePopen()
+    monkeypatch.setattr(manager, "query_obs_processes_strict", lambda: _snapshot())
+    monkeypatch.setattr(
+        obs_process_module,
+        "_pin_obs_executable_identity",
+        changing_pin,
+    )
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        manager,
+        "query_popen_process_identity",
+        lambda candidate: pytest.fail("changed guard must fail before identity binding"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_write_process_lease_locked",
+        lambda *args, **kwargs: pytest.fail("changed guard must fail before lease"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("cleanup must not signal a PID"),
+    )
+
+    with pytest.raises(OBSProcessLeaseError, match="post-Popen guard"):
+        manager.start_obs(hidden=False)
+
+    assert revalidation_calls == 2
+    assert events == ["terminate", ("wait", 3.0)]
+    assert process.poll() == 0
+    assert not manager.lease_path.exists()
+
+
+def test_start_obs_guard_interruption_cleans_once_and_reraises_same_object(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    interruption = KeyboardInterrupt("guard interrupted")
+    revalidation_calls = 0
+    events = []
+
+    @contextmanager
+    def interrupted_pin(path):
+        assert Path(path) == manager.obs_exe
+
+        def revalidate():
+            nonlocal revalidation_calls
+            revalidation_calls += 1
+            if revalidation_calls == 2:
+                raise interruption
+
+        yield obs_process_module._OBSExecutableIdentityPin(
+            physical_identity=(1, 2, stat.S_IFREG),
+            launch_path=manager.obs_exe,
+            revalidate=revalidate,
+        )
+
+    class FakePopen:
+        pid = 260
+
+        def __init__(self):
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            events.append("terminate")
+            self.alive = False
+
+        def wait(self, timeout):
+            events.append(("wait", timeout))
+            return 0
+
+        def kill(self):
+            pytest.fail("graceful cleanup should be sufficient")
+
+    process = FakePopen()
+    monkeypatch.setattr(manager, "query_obs_processes_strict", lambda: _snapshot())
+    monkeypatch.setattr(
+        obs_process_module,
+        "_pin_obs_executable_identity",
+        interrupted_pin,
+    )
+    monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("cleanup must not signal a PID"),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        manager.start_obs(hidden=False)
+
+    assert captured.value is interruption
+    assert revalidation_calls == 2
+    assert events == ["terminate", ("wait", 3.0)]
+    assert not manager.lease_path.exists()
+
+
+def _install_fake_windows_executable_pin_api(
+    monkeypatch,
+    path,
+    close_entry,
+    *,
+    identity_entry=None,
+):
+    components = obs_process_module._windows_obs_executable_components(path)
+    primary_count = len(components)
+    opened = []
+    diagnostics = []
+
+    def open_entry(component_path, *, directory):
+        handle = 1000 + len(opened)
+        opened.append(handle)
+        return handle
+
+    def identity(handle, *, path, directory):
+        if identity_entry is not None:
+            identity_entry(handle, len(opened) > primary_count)
+        component_index = next(
+            index
+            for index, (candidate, candidate_directory) in enumerate(components)
+            if candidate == Path(path) and candidate_directory == directory
+        )
+        return (
+            1,
+            (component_index + 1).to_bytes(16, "little"),
+            stat.S_IFDIR if directory else stat.S_IFREG,
+        )
+
+    def close_handle(handle):
+        close_entry(handle, tuple(opened[:primary_count]))
+
+    monkeypatch.setattr(
+        obs_process_module,
+        "_windows_obs_dos_device_snapshot",
+        lambda candidate: ("C:", (r"\Device\HarddiskVolume1",)),
+    )
+    monkeypatch.setattr(
+        obs_process_module,
+        "_windows_open_obs_executable_entry",
+        open_entry,
+    )
+    monkeypatch.setattr(
+        obs_process_module,
+        "_windows_obs_executable_handle_identity",
+        identity,
+    )
+    monkeypatch.setattr(
+        obs_process_module,
+        "_windows_obs_executable_final_path",
+        lambda handle: Path("//?/Volume{issue103}/managed/bin/64bit/obs64.exe"),
+    )
+    monkeypatch.setattr(
+        obs_process_module,
+        "_windows_close_obs_executable_handle",
+        close_handle,
+    )
+    monkeypatch.setattr(
+        obs_process_module.LOGGER,
+        "critical",
+        lambda message, *args: diagnostics.append(message % args),
+    )
+    return components, opened, diagnostics
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CloseHandle fault test")
+def test_windows_executable_pin_close_failures_are_diagnostic_and_not_retried(
+    monkeypatch,
+):
+    path = Path("C:/issue103/managed/bin/64bit/obs64.exe")
+    closed = []
+
+    def close_entry(handle, primary_handles):
+        closed.append(handle)
+        if handle in primary_handles:
+            raise OSError(f"simulated CloseHandle failure {handle}")
+
+    components, opened, diagnostics = _install_fake_windows_executable_pin_api(
+        monkeypatch,
+        path,
+        close_entry,
+    )
+
+    with obs_process_module._pin_obs_executable_identity(path) as pin:
+        assert pin.physical_identity[-1] == stat.S_IFREG
+
+    primary_handles = opened[: len(components)]
+    assert all(closed.count(handle) == 1 for handle in primary_handles)
+    assert len(diagnostics) == len(components)
+    assert all(
+        "Pinned OBS executable handle close failed" in diagnostic
+        for diagnostic in diagnostics
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CloseHandle fault test")
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("has_body_error", [False, True])
+def test_windows_executable_pin_propagates_close_control_flow_after_all_closes(
+    monkeypatch,
+    error_type,
+    has_body_error,
+):
+    path = Path("C:/issue103/managed/bin/64bit/obs64.exe")
+    close_interruption = error_type("pin close interrupted")
+    body_error = RuntimeError("pin body failed") if has_body_error else None
+    closed = []
+    interruption_raised = False
+
+    def close_entry(handle, primary_handles):
+        nonlocal interruption_raised
+        closed.append(handle)
+        if handle in primary_handles and not interruption_raised:
+            interruption_raised = True
+            raise close_interruption
+
+    components, opened, diagnostics = _install_fake_windows_executable_pin_api(
+        monkeypatch,
+        path,
+        close_entry,
+    )
+
+    with pytest.raises(error_type) as captured:
+        with obs_process_module._pin_obs_executable_identity(path):
+            if body_error is not None:
+                raise body_error
+
+    assert captured.value is close_interruption
+    primary_handles = opened[: len(components)]
+    assert all(closed.count(handle) == 1 for handle in primary_handles)
+    assert len(diagnostics) == 1
+    if body_error is not None:
+        assert any("Earlier executable pin failure" in note for note in close_interruption.__notes__)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CloseHandle fault test")
+@pytest.mark.parametrize(
+    ("primary_type", "close_type"),
+    [(KeyboardInterrupt, SystemExit), (SystemExit, KeyboardInterrupt)],
+)
+def test_windows_executable_pin_preserves_primary_control_flow_during_close(
+    monkeypatch,
+    primary_type,
+    close_type,
+):
+    path = Path("C:/issue103/managed/bin/64bit/obs64.exe")
+    primary_interruption = primary_type("pin body interrupted")
+    close_interruption = close_type("pin close interrupted")
+    closed = []
+    interruption_raised = False
+
+    def close_entry(handle, primary_handles):
+        nonlocal interruption_raised
+        closed.append(handle)
+        if handle in primary_handles and not interruption_raised:
+            interruption_raised = True
+            raise close_interruption
+
+    components, opened, diagnostics = _install_fake_windows_executable_pin_api(
+        monkeypatch,
+        path,
+        close_entry,
+    )
+
+    with pytest.raises(primary_type) as captured:
+        with obs_process_module._pin_obs_executable_identity(path):
+            raise primary_interruption
+
+    assert captured.value is primary_interruption
+    primary_handles = opened[: len(components)]
+    assert all(closed.count(handle) == 1 for handle in primary_handles)
+    assert any("Pinned OBS executable handle close failed" in note for note in primary_interruption.__notes__)
+    assert len(diagnostics) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CloseHandle fault test")
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_windows_verification_handle_propagates_close_control_flow(
+    monkeypatch,
+    error_type,
+):
+    path = Path("C:/issue103/managed/bin/64bit/obs64.exe")
+    close_interruption = error_type("verification close interrupted")
+    closed = []
+    interruption_raised = False
+
+    def close_entry(handle, primary_handles):
+        nonlocal interruption_raised
+        closed.append(handle)
+        if handle not in primary_handles and not interruption_raised:
+            interruption_raised = True
+            raise close_interruption
+
+    _components, opened, diagnostics = _install_fake_windows_executable_pin_api(
+        monkeypatch,
+        path,
+        close_entry,
+    )
+
+    with pytest.raises(error_type) as captured:
+        with obs_process_module._pin_obs_executable_identity(path):
+            pytest.fail("the initial verification close must interrupt before yield")
+
+    assert captured.value is close_interruption
+    assert all(closed.count(handle) == 1 for handle in opened)
+    assert len(diagnostics) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CloseHandle fault test")
+@pytest.mark.parametrize("error_type", [KeyboardInterrupt, SystemExit])
+def test_windows_verification_handle_preserves_identity_control_flow_on_close_fault(
+    monkeypatch,
+    error_type,
+):
+    path = Path("C:/issue103/managed/bin/64bit/obs64.exe")
+    identity_interruption = error_type("verification identity interrupted")
+    close_failure = OSError("verification close failed")
+    closed = []
+    identity_interrupted = False
+    close_failed = False
+
+    def identity_entry(_handle, is_verification):
+        nonlocal identity_interrupted
+        if is_verification and not identity_interrupted:
+            identity_interrupted = True
+            raise identity_interruption
+
+    def close_entry(handle, primary_handles):
+        nonlocal close_failed
+        closed.append(handle)
+        if handle not in primary_handles and not close_failed:
+            close_failed = True
+            raise close_failure
+
+    _components, opened, diagnostics = _install_fake_windows_executable_pin_api(
+        monkeypatch,
+        path,
+        close_entry,
+        identity_entry=identity_entry,
+    )
+
+    with pytest.raises(error_type) as captured:
+        with obs_process_module._pin_obs_executable_identity(path):
+            pytest.fail("the verification identity must interrupt before yield")
+
+    assert captured.value is identity_interruption
+    assert all(closed.count(handle) == 1 for handle in opened)
+    assert any(
+        "OBS executable verification handle close failed" in note
+        for note in identity_interruption.__notes__
+    )
+    assert len(diagnostics) == 1
+
+
+@pytest.mark.parametrize("close_error_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize(
+    "body_error_type",
+    [None, RuntimeError, KeyboardInterrupt, SystemExit],
+)
+def test_posix_executable_pin_propagates_close_control_flow(
+    monkeypatch,
+    tmp_path,
+    close_error_type,
+    body_error_type,
+):
+    path = tmp_path / "obs64.exe"
+    path.write_bytes(b"fake obs")
+    original_open = os.open
+    original_close = os.close
+    descriptors = []
+    close_calls = []
+    diagnostics = []
+    close_interruption = close_error_type("descriptor close interrupted")
+    body_error = (
+        body_error_type("pin body failed")
+        if body_error_type is not None
+        else None
+    )
+    expected_error = (
+        body_error
+        if body_error is not None and not isinstance(body_error, Exception)
+        else close_interruption
+    )
+
+    def open_descriptor(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+
+    def close_descriptor(descriptor):
+        close_calls.append(descriptor)
+        raise close_interruption
+
+    monkeypatch.setattr(obs_process_module, "_NATIVE_WINDOWS", False)
+    monkeypatch.setattr(obs_process_module.os, "open", open_descriptor)
+    monkeypatch.setattr(obs_process_module.os, "close", close_descriptor)
+    monkeypatch.setattr(
+        obs_process_module.LOGGER,
+        "critical",
+        lambda message, *args: diagnostics.append(message % args),
+    )
+
+    try:
+        with pytest.raises(type(expected_error)) as captured:
+            with obs_process_module._pin_obs_executable_identity(path):
+                if body_error is not None:
+                    raise body_error
+        assert captured.value is expected_error
+        assert close_calls == descriptors
+        assert len(diagnostics) == 1
+        if body_error is not None and isinstance(body_error, Exception):
+            assert any(
+                "Earlier executable pin failure" in note
+                for note in close_interruption.__notes__
+            )
+        if body_error is not None and not isinstance(body_error, Exception):
+            assert any(
+                "Pinned OBS executable descriptor close failed" in note
+                for note in body_error.__notes__
+            )
+    finally:
+        for descriptor in descriptors:
+            original_close(descriptor)
 
 
 def test_start_obs_strict_query_failure_prevents_popen(monkeypatch, tmp_path):
@@ -635,11 +1356,14 @@ def test_start_obs_allows_only_unmanaged_rows_and_binds_lease_before_unlock(
     manager.obs_exe.parent.mkdir(parents=True)
     manager.obs_exe.write_bytes(b"fake obs")
     identity = _identity(manager, pid=500, unix_seconds=50.0)
+    unmanaged_executable = tmp_path / "regular-obs" / "obs64.exe"
+    unmanaged_executable.parent.mkdir(parents=True)
+    unmanaged_executable.write_bytes(b"different fake obs")
     unmanaged = _identity(
         manager,
         pid=600,
         unix_seconds=60.0,
-        executable_path=(tmp_path / "regular-obs" / "obs64.exe").resolve(),
+        executable_path=unmanaged_executable.resolve(),
     )
     events = []
 
@@ -1081,8 +1805,17 @@ def test_start_obs_cleanup_control_flow_supersedes_normal_lease_failure(
     monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(
         manager,
+        "_validate_started_popen_against_admission_guard",
+        lambda candidate, guard: _identity(
+            manager,
+            pid=candidate.pid,
+            unix_seconds=70.4,
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
         "_write_process_lease_locked",
-        lambda transaction, candidate: (_ for _ in ()).throw(lease_error),
+        lambda transaction, candidate, **kwargs: (_ for _ in ()).throw(lease_error),
     )
     monkeypatch.setattr(
         manager,
@@ -1122,8 +1855,17 @@ def test_start_obs_keeps_first_control_flow_when_cleanup_is_also_interrupted(
     monkeypatch.setattr(obs_process_module.subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(
         manager,
+        "_validate_started_popen_against_admission_guard",
+        lambda candidate, guard: _identity(
+            manager,
+            pid=candidate.pid,
+            unix_seconds=70.5,
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
         "_write_process_lease_locked",
-        lambda transaction, candidate: (_ for _ in ()).throw(primary_error),
+        lambda transaction, candidate, **kwargs: (_ for _ in ()).throw(primary_error),
     )
 
     def interrupt_cleanup(candidate):
@@ -4609,6 +5351,75 @@ def test_strict_process_query_does_not_ignore_os_error_for_live_handle(
     assert raised.value is query_error
     assert closed == ["handle-123"]
     assert wait_calls == [("handle-123", 0), ("handle-123", 0)]
+
+
+@pytest.mark.parametrize("comparison_outcome", ["different", "unknown"])
+def test_strict_row_physical_alias_fallback_fails_closed_and_releases_handle(
+    monkeypatch,
+    comparison_outcome,
+):
+    manager = OBSProcessManager(
+        Path("tests/_tmp/strict_obs_query_physical_alias").resolve()
+    )
+    cim_path = Path("C:/cim/bin/64bit/obs64.exe")
+    handle_path = Path("C:/handle/bin/64bit/obs64.exe")
+    identity = OBSProcessInfo(
+        pid=123,
+        executable_path=handle_path,
+        creation_time=123.0,
+        creation_time_filetime=116_444_737_230_000_000,
+    )
+    comparison_error = PermissionError("physical identity unavailable")
+    comparison_calls = []
+    closed = []
+    wait_calls = []
+
+    def compare_physical(left, right):
+        comparison_calls.append((left, right))
+        if comparison_outcome == "unknown":
+            raise comparison_error
+        return False
+
+    monkeypatch.setattr(
+        manager,
+        "_open_process_identity_handle",
+        lambda pid: "handle-123",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: identity,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        lambda handle, timeout_ms: wait_calls.append((handle, timeout_ms)) or False,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_close_process_identity_handle",
+        lambda handle: closed.append(handle),
+    )
+    monkeypatch.setattr(
+        obs_process_module,
+        "_obs_executable_paths_same_physical_file",
+        compare_physical,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("strict row binding must not signal"),
+    )
+
+    expected_error = PermissionError if comparison_outcome == "unknown" else OBSProcessQueryError
+    with pytest.raises(expected_error) as captured:
+        manager._bind_strict_process_row_to_handle(identity.pid, cim_path)
+
+    if comparison_outcome == "unknown":
+        assert captured.value is comparison_error
+    assert comparison_calls == [(cim_path, handle_path)]
+    assert wait_calls == [("handle-123", 0)]
+    assert closed == ["handle-123"]
 
 
 def test_row_exit_race_still_fails_closed_when_handle_close_fails(monkeypatch):

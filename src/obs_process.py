@@ -12,7 +12,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
@@ -94,6 +94,470 @@ class OBSProcessTerminationError(OBSProcessQueryError):
     """Raised when a Popen-owned OBS cleanup cannot be proven complete."""
 
 
+_NATIVE_WINDOWS = os.name == "nt"
+_WINDOWS_FILE_READ_ATTRIBUTES = 0x0080
+_WINDOWS_FILE_SHARE_READ_WRITE = 0x0001 | 0x0002
+_WINDOWS_OPEN_EXISTING = 3
+_WINDOWS_FILE_ATTRIBUTE_DIRECTORY = 0x0010
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
+_WINDOWS_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_WINDOWS_FILE_ID_INFO_CLASS = 18
+_WINDOWS_VOLUME_NAME_GUID = 0x00000001
+
+
+@dataclass(frozen=True)
+class _OBSExecutableIdentityPin:
+    physical_identity: tuple[int, int | bytes, int]
+    launch_path: Path
+    revalidate: Callable[[], None]
+
+
+def _record_obs_executable_pin_close_failure(
+    *,
+    primary_error: BaseException | None,
+    selected_control_flow: BaseException | None,
+    close_error: BaseException,
+    label: str,
+) -> BaseException | None:
+    """Record one close failure and preserve the first control-flow exception."""
+
+    target: BaseException | None
+    if primary_error is not None and not isinstance(primary_error, Exception):
+        target = primary_error
+    elif selected_control_flow is not None:
+        target = selected_control_flow
+    elif not isinstance(close_error, Exception):
+        selected_control_flow = close_error
+        target = close_error
+        if primary_error is not None:
+            add_note = getattr(close_error, "add_note", None)
+            if callable(add_note):
+                add_note(
+                    "Earlier executable pin failure before close was interrupted: "
+                    f"{type(primary_error).__name__}: {primary_error}"
+                )
+    else:
+        target = primary_error
+
+    if target is not None and target is not close_error:
+        add_note = getattr(target, "add_note", None)
+        if callable(add_note):
+            add_note(f"{label}: {type(close_error).__name__}: {close_error}")
+    LOGGER.critical("%s: %s", label, close_error)
+    return selected_control_flow
+
+
+def _windows_close_obs_executable_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_obs_executable_handle_identity(
+    handle: int,
+    *,
+    path: Path,
+    directory: bool,
+) -> tuple[int, bytes, int]:
+    import ctypes
+    from ctypes import wintypes
+
+    class FileId128(ctypes.Structure):
+        _fields_ = [("Identifier", wintypes.BYTE * 16)]
+
+    class FileIdInfo(ctypes.Structure):
+        _fields_ = [
+            ("VolumeSerialNumber", ctypes.c_ulonglong),
+            ("FileId", FileId128),
+        ]
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    basic = ByHandleFileInformation()
+    if not kernel32.GetFileInformationByHandle(
+        wintypes.HANDLE(handle),
+        ctypes.byref(basic),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    attributes = int(basic.dwFileAttributes)
+    if attributes & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT:
+        raise OBSProcessQueryError(
+            f"OBS executable namespace contains an unsupported reparse point: {path}"
+        )
+    is_directory = bool(attributes & _WINDOWS_FILE_ATTRIBUTE_DIRECTORY)
+    if is_directory != directory:
+        expected = "directory" if directory else "regular file"
+        raise OBSProcessQueryError(
+            f"OBS executable namespace entry is not a {expected}: {path}"
+        )
+
+    kernel32.GetFileInformationByHandleEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    file_id_info = FileIdInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        wintypes.HANDLE(handle),
+        _WINDOWS_FILE_ID_INFO_CLASS,
+        ctypes.byref(file_id_info),
+        ctypes.sizeof(file_id_info),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    volume_serial = int(file_id_info.VolumeSerialNumber)
+    file_id = bytes(file_id_info.FileId.Identifier)
+    if volume_serial <= 0 or not any(file_id):
+        raise OBSProcessQueryError(
+            f"Windows did not provide a usable physical file ID: {path}"
+        )
+    kind = stat.S_IFDIR if directory else stat.S_IFREG
+    return (volume_serial, file_id, kind)
+
+
+def _windows_open_obs_executable_entry(path: Path, *, directory: bool) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    flags = _WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT
+    if directory:
+        flags |= _WINDOWS_FILE_FLAG_BACKUP_SEMANTICS
+    handle = kernel32.CreateFileW(
+        str(path),
+        _WINDOWS_FILE_READ_ATTRIBUTES,
+        _WINDOWS_FILE_SHARE_READ_WRITE,
+        None,
+        _WINDOWS_OPEN_EXISTING,
+        flags,
+        None,
+    )
+    handle_value = int(handle) if handle is not None else 0
+    invalid_handle = int(ctypes.c_void_p(-1).value)
+    if handle_value in {0, invalid_handle}:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle_value
+
+
+def _windows_obs_executable_final_path(handle: int) -> Path:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    required = int(
+        kernel32.GetFinalPathNameByHandleW(
+            wintypes.HANDLE(handle),
+            None,
+            0,
+            _WINDOWS_VOLUME_NAME_GUID,
+        )
+    )
+    if required <= 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_unicode_buffer(required + 1)
+    written = int(
+        kernel32.GetFinalPathNameByHandleW(
+            wintypes.HANDLE(handle),
+            buffer,
+            len(buffer),
+            _WINDOWS_VOLUME_NAME_GUID,
+        )
+    )
+    if written <= 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    if written >= len(buffer):
+        raise OBSProcessQueryError(
+            "Windows executable final path changed while allocating its buffer"
+        )
+    final_path = Path(buffer.value)
+    if not _is_absolute_obs_process_path(final_path):
+        raise OBSProcessQueryError(
+            f"Windows executable final path is not absolute: {final_path}"
+        )
+    return final_path
+
+
+def _windows_obs_dos_device_snapshot(
+    path: Path,
+) -> tuple[str, tuple[str, ...]] | None:
+    import ctypes
+    from ctypes import wintypes
+
+    drive = PureWindowsPath(str(path)).drive
+    if drive.startswith("\\\\?\\"):
+        drive = drive[4:]
+    if re.fullmatch(r"[A-Za-z]:", drive) is None:
+        return None
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.QueryDosDeviceW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    kernel32.QueryDosDeviceW.restype = wintypes.DWORD
+    capacity = 32768
+    buffer = ctypes.create_unicode_buffer(capacity)
+    length = int(kernel32.QueryDosDeviceW(drive, buffer, capacity))
+    if length <= 0:
+        raise ctypes.WinError(ctypes.get_last_error())
+    targets = tuple(
+        target
+        for target in "".join(buffer[:length]).split("\0")
+        if target
+    )
+    if not targets:
+        raise OBSProcessQueryError(
+            f"Windows DOS device mapping is empty for {drive}"
+        )
+    if any(
+        target.casefold().startswith(("\\??\\", "\\dosdevices\\"))
+        for target in targets
+    ):
+        raise OBSProcessQueryError(
+            f"SUBST/DOS-device OBS executable aliases are unsupported: {path}"
+        )
+    return (drive.upper(), targets)
+
+
+def _windows_obs_executable_components(
+    path: Path,
+) -> tuple[tuple[Path, bool], ...]:
+    if not _is_absolute_obs_process_path(path):
+        raise OBSProcessQueryError(
+            f"OBS executable path is not absolute: {path}"
+        )
+    parts = path.parts
+    if len(parts) < 2:
+        raise OBSProcessQueryError(
+            f"OBS executable path has no file component: {path}"
+        )
+    current = Path(parts[0])
+    components: list[tuple[Path, bool]] = [(current, True)]
+    for part in parts[1:-1]:
+        if ":" in part:
+            raise OBSProcessQueryError(
+                f"OBS executable path contains an unsupported stream component: {path}"
+            )
+        current /= part
+        components.append((current, True))
+    if ":" in parts[-1]:
+        raise OBSProcessQueryError(
+            f"OBS executable path contains an unsupported stream: {path}"
+        )
+    components.append((current / parts[-1], False))
+    return tuple(components)
+
+
+@contextmanager
+def _pin_obs_executable_identity(path: Path):
+    """Pin an executable namespace and physical file until the caller exits."""
+
+    primary_error: BaseException | None = None
+    if _NATIVE_WINDOWS:
+        handles: list[int] = []
+        records: list[tuple[Path, bool, tuple[int, bytes, int]]] = []
+        close_control_flow_error: BaseException | None = None
+        try:
+            dos_snapshot = _windows_obs_dos_device_snapshot(path)
+            for component_path, directory in _windows_obs_executable_components(path):
+                handle = _windows_open_obs_executable_entry(
+                    component_path,
+                    directory=directory,
+                )
+                handles.append(handle)
+                identity = _windows_obs_executable_handle_identity(
+                    handle,
+                    path=component_path,
+                    directory=directory,
+                )
+                records.append((component_path, directory, identity))
+            if _windows_obs_dos_device_snapshot(path) != dos_snapshot:
+                raise OBSProcessQueryError(
+                    f"Windows DOS device mapping changed while pinning: {path}"
+                )
+
+            def revalidate() -> None:
+                if _windows_obs_dos_device_snapshot(path) != dos_snapshot:
+                    raise OBSProcessQueryError(
+                        f"Windows DOS device mapping changed while pinned: {path}"
+                    )
+                for component_path, directory, expected_identity in records:
+                    verification_handle = _windows_open_obs_executable_entry(
+                        component_path,
+                        directory=directory,
+                    )
+                    verification_error: BaseException | None = None
+                    try:
+                        actual_identity = _windows_obs_executable_handle_identity(
+                            verification_handle,
+                            path=component_path,
+                            directory=directory,
+                        )
+                    except BaseException as exc:
+                        verification_error = exc
+                        raise
+                    finally:
+                        try:
+                            _windows_close_obs_executable_handle(verification_handle)
+                        except BaseException as close_error:
+                            close_control_flow_error = (
+                                _record_obs_executable_pin_close_failure(
+                                    primary_error=verification_error,
+                                    selected_control_flow=None,
+                                    close_error=close_error,
+                                    label=(
+                                        "OBS executable verification handle close "
+                                        "failed"
+                                    ),
+                                )
+                            )
+                            if close_control_flow_error is not None and (
+                                verification_error is None
+                                or isinstance(verification_error, Exception)
+                            ):
+                                raise close_control_flow_error  # noqa: B904
+                            if verification_error is None:
+                                raise
+                    if actual_identity != expected_identity:
+                        raise OBSProcessQueryError(
+                            "OBS executable namespace identity changed while pinned: "
+                            f"{component_path}"
+                        )
+                if _windows_obs_dos_device_snapshot(path) != dos_snapshot:
+                    raise OBSProcessQueryError(
+                        f"Windows DOS device mapping changed during revalidation: {path}"
+                    )
+
+            final_identity = records[-1][2]
+            final_path = _windows_obs_executable_final_path(handles[-1])
+            pin = _OBSExecutableIdentityPin(
+                physical_identity=final_identity,
+                launch_path=final_path,
+                revalidate=revalidate,
+            )
+            pin.revalidate()
+            yield pin
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            for handle in reversed(handles):
+                try:
+                    _windows_close_obs_executable_handle(handle)
+                except BaseException as close_error:
+                    close_control_flow_error = (
+                        _record_obs_executable_pin_close_failure(
+                            primary_error=primary_error,
+                            selected_control_flow=close_control_flow_error,
+                            close_error=close_error,
+                            label="Pinned OBS executable handle close failed",
+                        )
+                    )
+            if close_control_flow_error is not None and (
+                primary_error is None or isinstance(primary_error, Exception)
+            ):
+                raise close_control_flow_error
+        return
+
+    descriptor: int | None = None
+    close_control_flow_error: BaseException | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OBSProcessQueryError(
+                f"OBS executable path is not a regular file: {path}"
+            )
+        identity = _file_identity(opened)
+
+        def revalidate_posix() -> None:
+            current = path.stat(follow_symlinks=True)
+            if not stat.S_ISREG(current.st_mode) or _file_identity(current) != identity:
+                raise OBSProcessQueryError(
+                    f"OBS executable path identity changed while pinned: {path}"
+                )
+
+        pin = _OBSExecutableIdentityPin(
+            physical_identity=identity,
+            launch_path=path,
+            revalidate=revalidate_posix,
+        )
+        pin.revalidate()
+        yield pin
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except BaseException as close_error:
+                close_control_flow_error = _record_obs_executable_pin_close_failure(
+                    primary_error=primary_error,
+                    selected_control_flow=close_control_flow_error,
+                    close_error=close_error,
+                    label="Pinned OBS executable descriptor close failed",
+                )
+        if close_control_flow_error is not None and (
+            primary_error is None or isinstance(primary_error, Exception)
+        ):
+            raise close_control_flow_error
+
+
+def _obs_executable_paths_same_physical_file(left: Path, right: Path) -> bool:
+    """Compare two executable paths while both physical files stay pinned."""
+
+    with ExitStack() as stack:
+        left_pin = stack.enter_context(_pin_obs_executable_identity(left))
+        right_pin = stack.enter_context(_pin_obs_executable_identity(right))
+        left_pin.revalidate()
+        right_pin.revalidate()
+        return left_pin.physical_identity == right_pin.physical_identity
+
+
 def _is_absolute_obs_process_path(path: Path) -> bool:
     """Accept host-absolute paths and absolute Windows paths parsed on POSIX."""
 
@@ -117,20 +581,13 @@ def _obs_process_paths_equal(left: Path, right: Path) -> bool:
     return Path(left_text) == Path(right_text)
 
 
-def _obs_process_identities_equal(
+def _obs_process_lifetimes_equal(
     expected: OBSProcessInfo,
     actual: OBSProcessInfo,
 ) -> bool:
-    """Prefer exact raw FILETIME, with a legacy millisecond fallback."""
+    """Compare PID and creation time without weakening raw FILETIME identity."""
 
     if expected.pid != actual.pid:
-        return False
-    if expected.executable_path is None or actual.executable_path is None:
-        return False
-    if not _obs_process_paths_equal(
-        expected.executable_path,
-        actual.executable_path,
-    ):
         return False
     if expected.creation_time is None or actual.creation_time is None:
         return False
@@ -145,6 +602,20 @@ def _obs_process_identities_equal(
     return round(float(expected.creation_time) * 1000) == round(
         float(actual.creation_time) * 1000
     )
+
+
+def _obs_process_identities_equal(
+    expected: OBSProcessInfo,
+    actual: OBSProcessInfo,
+) -> bool:
+    """Compare the lexical image path and exact process lifetime identity."""
+
+    if expected.executable_path is None or actual.executable_path is None:
+        return False
+    return _obs_process_paths_equal(
+        expected.executable_path,
+        actual.executable_path,
+    ) and _obs_process_lifetimes_equal(expected, actual)
 
 
 def validate_obs_process_query_snapshot(
@@ -235,6 +706,21 @@ class _OBSProcessLeaseTransaction:
     def validate_ownership(self) -> None:
         self.lock.validate_ownership()
         self.root_lease.validate_lexical_binding()
+
+
+@dataclass(frozen=True)
+class _OBSStartAdmissionGuard:
+    managed_pin: _OBSExecutableIdentityPin
+    candidate_pins: tuple[_OBSExecutableIdentityPin, ...]
+
+    @property
+    def launch_path(self) -> Path:
+        return self.managed_pin.launch_path
+
+    def revalidate(self) -> None:
+        self.managed_pin.revalidate()
+        for pin in self.candidate_pins:
+            pin.revalidate()
 
 
 class OBSProcessManager:
@@ -1008,10 +1494,64 @@ class OBSProcessManager:
     def is_managed_process(self, process: OBSProcessInfo) -> bool:
         if process.executable_path is None:
             return False
+        if _obs_process_paths_equal(process.executable_path, self.obs_exe):
+            return True
         try:
-            return process.executable_path.resolve() == self.obs_exe
+            return _obs_executable_paths_same_physical_file(
+                process.executable_path,
+                self.obs_exe,
+            )
         except Exception:
-            return str(process.executable_path).casefold() == str(self.obs_exe).casefold()
+            try:
+                return process.executable_path.resolve() == self.obs_exe
+            except Exception:
+                return (
+                    str(process.executable_path).casefold()
+                    == str(self.obs_exe).casefold()
+                )
+
+    def _is_managed_process_strict(
+        self,
+        process: OBSProcessInfo,
+        *,
+        label: str,
+    ) -> bool:
+        """Classify one row without treating an unknown physical path as unmanaged."""
+
+        executable_path = process.executable_path
+        if executable_path is None:
+            raise OBSProcessQueryError(
+                f"{label} process path is missing"
+            )
+        if _obs_process_paths_equal(executable_path, self.obs_exe):
+            return True
+        try:
+            return _obs_executable_paths_same_physical_file(
+                executable_path,
+                self.obs_exe,
+            )
+        except Exception as exc:
+            raise OBSProcessQueryError(
+                f"{label} could not establish executable physical "
+                f"identity for PID {process.pid}: {executable_path}"
+            ) from exc
+
+    def _owned_process_identities_equal_strict(
+        self,
+        expected: OBSProcessInfo,
+        actual: OBSProcessInfo,
+        *,
+        label: str,
+    ) -> bool:
+        """Compare an owned lifetime while allowing only a physical managed alias."""
+
+        if (
+            expected.executable_path is None
+            or not _obs_process_paths_equal(expected.executable_path, self.obs_exe)
+            or not _obs_process_lifetimes_equal(expected, actual)
+        ):
+            return False
+        return self._is_managed_process_strict(actual, label=label)
 
     def managed_processes(self) -> list[OBSProcessInfo]:
         return [process for process in self.list_obs_processes() if self.is_managed_process(process)]
@@ -1488,10 +2028,15 @@ class OBSProcessManager:
         snapshot = self.query_obs_processes_strict()
         processes = validate_obs_process_query_snapshot(snapshot, label=label)
         current = next((item for item in processes if item.pid == expected.pid), None)
-        if current is not None and not _obs_process_identities_equal(expected, current):
-            raise _OBSOwnedProcessIdentityMismatchError(
-                "Owned OBS PID was replaced during strict termination"
-            )
+        if current is not None:
+            if not self._owned_process_identities_equal_strict(
+                expected,
+                current,
+                label=label,
+            ):
+                raise _OBSOwnedProcessIdentityMismatchError(
+                    "Owned OBS PID was replaced during strict termination"
+                )
         return snapshot, current
 
     def _terminate_owned_process_without_handle(
@@ -1620,7 +2165,11 @@ class OBSProcessManager:
                 OBSProcessQuerySnapshot((handle_identity,), time.time()),
                 label="owned handle identity",
             )
-            if not _obs_process_identities_equal(expected, handle_identity):
+            if not self._owned_process_identities_equal_strict(
+                expected,
+                handle_identity,
+                label="owned handle identity",
+            ):
                 raise OBSProcessQueryError(
                     "Owned OBS handle identity does not match its lease target"
                 )
@@ -1744,7 +2293,11 @@ class OBSProcessManager:
                     if self._wait_process_identity_handle(handle, timeout_ms=0):
                         continue
                     raise
-                if not _obs_process_identities_equal(expected, handle_identity):
+                if not self._owned_process_identities_equal_strict(
+                    expected,
+                    handle_identity,
+                    label="owned pre-force handle identity",
+                ):
                     raise OBSProcessQueryError(
                         "Owned OBS handle identity changed before forced termination"
                     )
@@ -1852,18 +2405,6 @@ class OBSProcessManager:
         if not self.obs_exe.exists():
             raise FileNotFoundError(f"obs64.exe was not found: {self.obs_exe}")
 
-        cmd = [
-            str(self.obs_exe),
-            "--portable",
-            "--multi",
-            "--disable-shutdown-check",
-            "--disable-updater",
-            *(extra_args or []),
-        ]
-        popen_kwargs: dict[str, Any] = {"cwd": str(self.working_dir), "env": env or os.environ.copy()}
-        if hidden:
-            popen_kwargs.update(self._hidden_subprocess_kwargs())
-
         process: subprocess.Popen[Any] | None = None
         process_cleanup_attempted = False
         try:
@@ -1872,10 +2413,41 @@ class OBSProcessManager:
                     raise AssertionError(
                         "mutating lease transaction did not acquire a lock"
                     )
-                self._validate_obs_start_admission_locked(transaction)
                 try:
-                    process = subprocess.Popen(cmd, **popen_kwargs)
-                    self._write_process_lease_locked(transaction, process)
+                    with self._obs_start_admission_guard_locked(
+                        transaction
+                    ) as admission_guard:
+                        cmd = [
+                            str(admission_guard.launch_path),
+                            "--portable",
+                            "--multi",
+                            "--disable-shutdown-check",
+                            "--disable-updater",
+                            *(extra_args or []),
+                        ]
+                        popen_kwargs: dict[str, Any] = {
+                            "cwd": str(admission_guard.launch_path.parent),
+                            "env": env or os.environ.copy(),
+                        }
+                        if hidden:
+                            popen_kwargs.update(self._hidden_subprocess_kwargs())
+                        process = subprocess.Popen(cmd, **popen_kwargs)
+                        self._revalidate_obs_start_guard_locked(
+                            transaction,
+                            admission_guard,
+                            label="OBS start post-Popen guard",
+                        )
+                        self._validate_started_popen_against_admission_guard(
+                            process,
+                            admission_guard,
+                        )
+                        self._write_process_lease_locked(
+                            transaction,
+                            process,
+                            expected_executable_identity=(
+                                admission_guard.managed_pin.physical_identity
+                            ),
+                        )
                 except BaseException as lease_error:
                     if process is None:
                         raise
@@ -1953,11 +2525,12 @@ class OBSProcessManager:
             raise AssertionError("OBS Popen was not established")
         return process
 
-    def _validate_obs_start_admission_locked(
+    @contextmanager
+    def _obs_start_admission_guard_locked(
         self,
         transaction: _OBSProcessLeaseTransaction,
-    ) -> None:
-        """Fail closed before creating a managed OBS Popen."""
+    ):
+        """Pin every admission path until the new Popen has a verified lease."""
 
         if self._open_process_lease_snapshot_locked(transaction) is not None:
             raise self._lease_recovery_error(
@@ -1977,30 +2550,123 @@ class OBSProcessManager:
                 cause=exc,
             ) from exc
 
-        managed = tuple(
-            process for process in processes if self.is_managed_process(process)
-        )
-        if managed:
-            pids = ", ".join(str(process.pid) for process in managed)
-            raise self._lease_recovery_error(
-                "OBS所有情報がない状態で管理対象OBSが既に実行中です。"
-                "新しいPopenを生成せず、既存processへsignalしません。"
-                f"タスク マネージャーで手動確認してください (PID {pids})。"
-            )
+        with ExitStack() as stack:
+            try:
+                managed_pin = stack.enter_context(
+                    _pin_obs_executable_identity(self.obs_exe)
+                )
+                candidate_pins: list[_OBSExecutableIdentityPin] = []
+                managed_processes: list[OBSProcessInfo] = []
+                for process in processes:
+                    executable_path = process.executable_path
+                    if executable_path is None:
+                        raise OBSProcessQueryError(
+                            "OBS start admission process path is missing"
+                        )
+                    if _obs_process_paths_equal(executable_path, self.obs_exe):
+                        managed_processes.append(process)
+                        continue
+                    candidate_pin = stack.enter_context(
+                        _pin_obs_executable_identity(executable_path)
+                    )
+                    candidate_pin.revalidate()
+                    if (
+                        candidate_pin.physical_identity
+                        == managed_pin.physical_identity
+                    ):
+                        managed_processes.append(process)
+                    else:
+                        candidate_pins.append(candidate_pin)
+                if managed_processes:
+                    pids = ", ".join(
+                        str(process.pid) for process in managed_processes
+                    )
+                    raise self._lease_recovery_error(
+                        "OBS所有情報がない状態で管理対象OBSが既に実行中です。"
+                        "新しいPopenを生成せず、既存processへsignalしません。"
+                        f"タスク マネージャーで手動確認してください (PID {pids})。"
+                    )
+                guard = _OBSStartAdmissionGuard(
+                    managed_pin=managed_pin,
+                    candidate_pins=tuple(candidate_pins),
+                )
+                self._revalidate_obs_start_guard_locked(
+                    transaction,
+                    guard,
+                    label="OBS start pre-Popen guard",
+                )
+            except OBSProcessLeaseError:
+                raise
+            except (OBSProcessQueryError, OSError, OBSPathSafetyError) as exc:
+                raise self._lease_recovery_error(
+                    "OBS起動前の実行file物理identityを安全に固定できないため"
+                    "新しいPopenを生成しません。",
+                    cause=exc,
+                ) from exc
+            yield guard
 
+    def _revalidate_obs_start_guard_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+        guard: _OBSStartAdmissionGuard,
+        *,
+        label: str,
+    ) -> None:
         try:
+            guard.revalidate()
             transaction.validate_ownership()
             if self._open_process_lease_snapshot_locked(transaction) is not None:
                 raise self._lease_recovery_error(
-                    "OBS起動前のstrict process確認中に所有情報が出現したため"
-                    "新しいPopenを生成しません。"
+                    f"{label}中にOBS所有情報が出現したため"
+                    "新しいPopenを成功扱いにしません。"
                 )
         except OBSProcessLeaseError:
             raise
-        except (OSError, OBSPathSafetyError) as exc:
+        except (OBSProcessQueryError, OSError, OBSPathSafetyError) as exc:
             raise self._lease_recovery_error(
-                "OBS起動直前の所有transactionを再検証できないため"
-                "新しいPopenを生成しません。",
+                f"{label}を安全に再検証できません。",
+                cause=exc,
+            ) from exc
+
+    def _validate_started_popen_against_admission_guard(
+        self,
+        process: subprocess.Popen[Any],
+        guard: _OBSStartAdmissionGuard,
+    ) -> OBSProcessInfo:
+        try:
+            process_info = self.query_popen_process_identity(process)
+            validate_obs_process_query_snapshot(
+                OBSProcessQuerySnapshot((process_info,), time.time()),
+                label="new OBS physical executable binding",
+            )
+            if process_info.pid != int(process.pid):
+                raise OBSProcessQueryError(
+                    "New OBS Popen identity has an unexpected PID"
+                )
+            executable_path = process_info.executable_path
+            if executable_path is None:
+                raise OBSProcessQueryError(
+                    "New OBS Popen identity is missing its executable path"
+                )
+            with _pin_obs_executable_identity(executable_path) as process_pin:
+                process_pin.revalidate()
+                if (
+                    process_pin.physical_identity
+                    != guard.managed_pin.physical_identity
+                ):
+                    raise OBSProcessQueryError(
+                        "New OBS Popen image does not match the pinned managed "
+                        "executable"
+                    )
+            guard.revalidate()
+            if process.poll() is not None:
+                raise OBSProcessQueryError(
+                    "New OBS Popen exited during physical executable validation"
+                )
+            return process_info
+        except (OBSProcessQueryError, OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "起動したOBSを固定済みmanaged executableへ安全に結び付けられません。",
                 cause=exc,
             ) from exc
 
@@ -2206,10 +2872,14 @@ class OBSProcessManager:
             creation_time=lease.process_creation_time,
             creation_time_filetime=lease.process_creation_time_filetime,
         )
-        return self.is_managed_process(process) and _obs_process_identities_equal(
-            expected,
-            process,
-        )
+        try:
+            return self._owned_process_identities_equal_strict(
+                expected,
+                process,
+                label="owned OBS identity",
+            )
+        except OBSProcessQueryError:
+            return False
 
     def terminate_process(
         self,
@@ -2612,7 +3282,19 @@ class OBSProcessManager:
                 OBSProcessQuerySnapshot((actual,), time.time()),
                 label="bound Popen handle identity",
             )
-            if not _obs_process_identities_equal(expected, actual):
+            try:
+                executable_matches = self._is_managed_process_strict(
+                    actual,
+                    label="bound Popen executable identity",
+                )
+            except OBSProcessQueryError as exc:
+                raise OBSProcessLeaseError(
+                    "Bound OBS executable physical identity cannot be verified"
+                ) from exc
+            if not executable_matches or not _obs_process_lifetimes_equal(
+                expected,
+                actual,
+            ):
                 raise OBSProcessLeaseError(
                     "Bound OBS process lease does not match the Popen handle identity"
                 )
@@ -2668,6 +3350,8 @@ class OBSProcessManager:
         self,
         transaction: _OBSProcessLeaseTransaction,
         process: subprocess.Popen[Any],
+        *,
+        expected_executable_identity: tuple[int, int | bytes, int] | None = None,
     ) -> None:
         if self._open_process_lease_snapshot_locked(transaction) is not None:
             raise self._lease_recovery_error(
@@ -2686,13 +3370,24 @@ class OBSProcessManager:
                 OBSProcessQuerySnapshot((process_info,), time.time()),
                 label="new OBS lease identity",
             )
+            executable_path = process_info.executable_path
+            executable_matches = False
+            if executable_path is not None:
+                if expected_executable_identity is None:
+                    executable_matches = _obs_process_paths_equal(
+                        executable_path,
+                        self.obs_exe,
+                    )
+                else:
+                    with _pin_obs_executable_identity(executable_path) as process_pin:
+                        process_pin.revalidate()
+                        executable_matches = (
+                            process_pin.physical_identity
+                            == expected_executable_identity
+                        )
             if (
                 process_info.pid != int(process.pid)
-                or process_info.executable_path is None
-                or not _obs_process_paths_equal(
-                    process_info.executable_path,
-                    self.obs_exe,
-                )
+                or not executable_matches
                 or process_info.creation_time_filetime is None
             ):
                 raise OBSProcessLeaseError(
@@ -3106,10 +3801,20 @@ class OBSProcessManager:
                 OBSProcessQuerySnapshot((identity,), time.time()),
                 label="PowerShell row handle binding",
             )
-            if identity.executable_path is None or not _obs_process_paths_equal(
+            if identity.executable_path is None:
+                raise OBSProcessQueryError(
+                    "PowerShell OBS row handle is missing its executable path"
+                )
+            path_matches = _obs_process_paths_equal(
                 executable_path,
                 identity.executable_path,
-            ):
+            )
+            if not path_matches:
+                path_matches = _obs_executable_paths_same_physical_file(
+                    executable_path,
+                    identity.executable_path,
+                )
+            if not path_matches:
                 raise OBSProcessQueryError(
                     "PowerShell OBS row path does not match its process handle"
                 )

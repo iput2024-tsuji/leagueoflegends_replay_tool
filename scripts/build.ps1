@@ -92,7 +92,7 @@ if ($forbiddenRuntimePaths.Count -gt 0) {
   -DistributionRoot $distRootDir
 
 $licensesDir = Join-Path $distRootDir "licenses"
-$licenseArgs = @("scripts\collect_licenses.py", "--destination", $licensesDir)
+$licenseArgs = @("-m", "scripts.collect_licenses", "--destination", $licensesDir)
 if ($resolvedBuildProvenance) {
   $licenseArgs += @(
     "--build-provenance", $resolvedBuildProvenance,

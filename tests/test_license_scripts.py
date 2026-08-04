@@ -314,6 +314,88 @@ def test_validate_package_manifest_rejects_traversal_and_authors_only(tmp_path):
     assert any("AUTHORS-only" in error for error in errors)
 
 
+def test_validate_package_manifest_accepts_locked_installer_license(
+    monkeypatch,
+    tmp_path,
+):
+    full_lock = _component_lock()
+    lock = {
+        "application": full_lock["application"],
+        "python": {
+            "component": "python",
+            "license": "PSF-2.0",
+            "release_version": "3.14.6",
+        },
+        "runtime_components": [],
+        "build_components": [],
+        "installer_components": full_lock["installer_components"],
+    }
+    distribution = tmp_path / "distribution"
+    licenses = distribution / "custom-license-destination"
+    licenses.mkdir(parents=True)
+    components_path = licenses / "components.json"
+    components_path.write_text(json.dumps(lock), encoding="utf-8")
+    installer_entry = license_collector.collect_installer_component_license(
+        lock["installer_components"][0],
+        licenses,
+        seen_targets={},
+    )
+    python_license = licenses / "python-packages" / "Python" / "LICENSE.txt"
+    python_license.parent.mkdir(parents=True)
+    python_license.write_text(
+        "Python Software Foundation License\nPermission to use, copy, modify, "
+        "and distribute this software is granted.\n",
+        encoding="utf-8",
+    )
+    python_relative = "python-packages/Python/LICENSE.txt"
+    native_runtime = {"fixture": True}
+    monkeypatch.setattr(
+        compliance,
+        "probe_python_native_runtime",
+        lambda _lock: native_runtime,
+    )
+    manifest_path = licenses / "python-packages.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "build_python_version": "3.14.6",
+                "release_python_version": "3.14.6",
+                "requirements_sha256": sha256_file(compliance.RUNTIME_REQUIREMENTS),
+                "component_lock_sha256": sha256_file(components_path),
+                "python_native_runtime": native_runtime,
+                "packages": [
+                    {
+                        "component": "python",
+                        "name": "Python",
+                        "version": "3.14.6",
+                        "expected_license": "PSF-2.0",
+                        "license_files": [python_relative],
+                        "license_file_sha256": {
+                            python_relative: sha256_file(python_license)
+                        },
+                        "substantive_license_files": [python_relative],
+                    },
+                    installer_entry,
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert validate_package_manifest(manifest_path, lock) == []
+    assert not (distribution / "licenses" / "inno-setup" / "LICENSE.txt").exists()
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["packages"][1]["license_files"] = ["inno-setup/OTHER.txt"]
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    errors = validate_package_manifest(manifest_path, lock)
+    assert any(
+        "License path differs from installer component lock" in error
+        for error in errors
+    )
+
+
 def test_parse_collect_toc_maps_contents_directory_and_rejects_traversal(tmp_path):
     toc = tmp_path / "COLLECT-00.toc"
     toc.write_text(

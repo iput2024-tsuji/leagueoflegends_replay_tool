@@ -279,7 +279,13 @@ def _write_distribution(root: Path) -> None:
     (licenses / "components.json").write_text("{}\n", encoding="utf-8")
     (licenses / "distribution-manifest.json").write_text("{}\n", encoding="utf-8")
     (licenses / "build-provenance.json").write_text(
-        json.dumps({"git_source": {"commit": "a" * 40}}) + "\n",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "git_source": {"commit": "a" * 40},
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -292,6 +298,17 @@ def _create_asset_set(
     runtime_downloads: list[dict[str, object]] | None = None,
     enforce_release_gates: bool = False,
 ) -> tuple[dict[str, object], Path]:
+    inno_identity = "b" * 64
+    monkeypatch.setattr(
+        release_assets,
+        "validate_inno_component_lock",
+        lambda _lock: {},
+    )
+    monkeypatch.setattr(
+        release_assets,
+        "validate_inno_build_provenance",
+        lambda _provenance, _lock: inno_identity,
+    )
     first = b"python source"
     second = b"demo source"
     lock_path = tmp_path / "components.json"
@@ -393,6 +410,12 @@ def test_create_release_assets_uses_fixed_names_and_hashes(monkeypatch, tmp_path
 
     names = [Path(path).name for path in payload["assets"]]
     assert payload["source_commit"] == "a" * 40
+    assert payload["installer_build"] == {
+        "component": "inno-setup",
+        "version": "6.7.3",
+        "inno_setup_provenance_sha256": "b" * 64,
+        "installer_sha256": _sha(b"installer"),
+    }
     assert names == [
         "LoLReplayTool-Setup-1.2.3.exe",
         "LoLReplayTool-source-1.2.3.zip",
@@ -2236,8 +2259,48 @@ def test_release_workflow_requires_manual_approval_and_remote_verification():
     assert workflow.count("--components .\\compliance\\components.json") >= 6
     assert "--build-provenance-sha256 $env:BUILD_PROVENANCE_SHA256" in workflow
     assert "EXPECTED_BUILD_PROVENANCE_SHA256:" in workflow
+    assert (
+        "release_assets_sha256: "
+        "${{ steps.release_assets.outputs.release_assets_sha256 }}"
+        in workflow
+    )
+    assert (
+        "EXPECTED_RELEASE_ASSETS_SHA256: "
+        "${{ needs.prepare.outputs.release_assets_sha256 }}"
+        in workflow
+    )
+    prepare_assets_step = workflow.index("name: Create and verify release assets")
+    prepare_create = workflow.index(
+        "& $env:RELEASE_PYTHON -m scripts.prepare_release_assets `\n"
+        "            create",
+        prepare_assets_step,
+    )
+    prepare_verify = workflow.index(
+        "& $env:RELEASE_PYTHON -m scripts.prepare_release_assets `\n"
+        "            verify",
+        prepare_create,
+    )
+    prepare_seal = workflow.index("$releaseAssetsSha256 = (", prepare_verify)
+    assert prepare_create < prepare_verify < prepare_seal
+    manifest_seal = workflow.index(
+        "$actualReleaseAssetsSha256 = (",
+        workflow.index("name: Re-verify Release assets after transfer"),
+    )
+    transferred_verify = workflow.index(
+        "& $env:PUBLISH_PYTHON -m scripts.prepare_release_assets `\n"
+        "            verify",
+        manifest_seal,
+    )
+    assert manifest_seal < workflow.index(
+        "$env:EXPECTED_RELEASE_ASSETS_SHA256",
+        manifest_seal,
+    ) < transferred_verify
     assert '$pipVersion -cne "26.1.2"' in workflow
-    assert "choco install innosetup --version=6.7.3" in workflow
+    assert "choco install innosetup" not in workflow
+    assert ".\\scripts\\prepare_inno_setup.ps1" in workflow
+    assert "-InnoSetupRoot $env:INNO_SETUP_ROOT" in workflow
+    assert "-InnoSetupProvenance $env:INNO_SETUP_PROVENANCE" in workflow
+    assert "gh release verify-asset" not in workflow
     assert "retention-days: 7" in workflow
     assert workflow.count("persist-credentials: false") == 2
     assert "gh release edit" not in workflow

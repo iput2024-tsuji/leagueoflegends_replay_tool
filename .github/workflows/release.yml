@@ -26,7 +26,8 @@ jobs:
     outputs:
       release_commit: ${{ steps.release_inputs.outputs.release_commit }}
       release_version: ${{ steps.release_inputs.outputs.release_version }}
-      build_provenance_sha256: ${{ steps.build_environment.outputs.build_provenance_sha256 }}
+      build_provenance_sha256: ${{ steps.inno_environment.outputs.build_provenance_sha256 }}
+      release_assets_sha256: ${{ steps.release_assets.outputs.release_assets_sha256 }}
     env:
       PYTHONIOENCODING: utf8
       RELEASE_TAG: ${{ inputs.tag }}
@@ -211,15 +212,41 @@ jobs:
             exit $LASTEXITCODE
           }
 
-          $buildProvenanceSha256 = (
-            Get-FileHash -LiteralPath $buildProvenance -Algorithm SHA256
-          ).Hash.ToLowerInvariant()
-
           "RELEASE_PYTHON=$releasePython" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Encoding utf8 `
             -Append
           "BUILD_PROVENANCE=$buildProvenance" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+      - name: Prepare verified Inno Setup
+        id: inno_environment
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $innoDownload = Join-Path $env:RUNNER_TEMP "LoLReplayTool-inno-download"
+          $innoRoot = Join-Path $env:RUNNER_TEMP "LoLReplayTool-inno-6.7.3"
+          $innoProvenance = Join-Path $env:RUNNER_TEMP "inno-setup-provenance.json"
+          .\scripts\prepare_inno_setup.ps1 `
+            -PythonExe $env:RELEASE_PYTHON `
+            -Components .\compliance\components.json `
+            -DownloadDirectory $innoDownload `
+            -InstallDirectory $innoRoot `
+            -OutputProvenance $innoProvenance `
+            -BuildProvenance $env:BUILD_PROVENANCE
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $buildProvenanceSha256 = (
+            Get-FileHash -LiteralPath $env:BUILD_PROVENANCE -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          "INNO_SETUP_ROOT=$innoRoot" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
+          "INNO_SETUP_PROVENANCE=$innoProvenance" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Encoding utf8 `
             -Append
@@ -232,10 +259,6 @@ jobs:
             -Encoding utf8 `
             -Append
 
-      - name: Install Inno Setup
-        shell: pwsh
-        run: choco install innosetup --version=6.7.3 --yes --no-progress
-
       - name: Run Ruff
         shell: pwsh
         run: '& $env:RELEASE_PYTHON -m ruff check .'
@@ -243,15 +266,18 @@ jobs:
       - name: Build installer
         shell: pwsh
         env:
-          SEALED_BUILD_PROVENANCE_SHA256: ${{ steps.build_environment.outputs.build_provenance_sha256 }}
+          SEALED_BUILD_PROVENANCE_SHA256: ${{ steps.inno_environment.outputs.build_provenance_sha256 }}
         run: |
           .\scripts\build_installer.ps1 `
             -Version $env:APP_VERSION `
             -PythonExe $env:RELEASE_PYTHON `
             -BuildProvenance $env:BUILD_PROVENANCE `
-            -BuildProvenanceSha256 $env:SEALED_BUILD_PROVENANCE_SHA256
+            -BuildProvenanceSha256 $env:SEALED_BUILD_PROVENANCE_SHA256 `
+            -InnoSetupRoot $env:INNO_SETUP_ROOT `
+            -InnoSetupProvenance $env:INNO_SETUP_PROVENANCE
 
       - name: Create and verify release assets
+        id: release_assets
         shell: pwsh
         run: |
           $installer = ".\dist\installer\LoLReplayTool-Setup-$env:APP_VERSION.exe"
@@ -298,6 +324,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+          $releaseAssetsSha256 = (
+            Get-FileHash `
+              -LiteralPath .\dist\installer\release-assets.json `
+              -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          "release_assets_sha256=$releaseAssetsSha256" | Out-File `
+            -FilePath $env:GITHUB_OUTPUT `
+            -Encoding utf8 `
+            -Append
 
       - name: Preserve verified Release assets for approved publication
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -328,6 +363,7 @@ jobs:
       EXPECTED_RELEASE_COMMIT: ${{ needs.prepare.outputs.release_commit }}
       EXPECTED_RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
       EXPECTED_BUILD_PROVENANCE_SHA256: ${{ needs.prepare.outputs.build_provenance_sha256 }}
+      EXPECTED_RELEASE_ASSETS_SHA256: ${{ needs.prepare.outputs.release_assets_sha256 }}
 
     steps:
       - name: Checkout exact tag commit
@@ -416,6 +452,17 @@ jobs:
       - name: Re-verify Release assets after transfer
         shell: pwsh
         run: |
+          $actualReleaseAssetsSha256 = (
+            Get-FileHash `
+              -LiteralPath .\dist\installer\release-assets.json `
+              -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if (
+            $actualReleaseAssetsSha256 -cne
+            $env:EXPECTED_RELEASE_ASSETS_SHA256
+          ) {
+            throw "Transferred Release asset manifest differs from the prepared seal."
+          }
           & $env:PUBLISH_PYTHON -m scripts.prepare_release_assets `
             verify `
             --asset-list .\dist\installer\release-assets.json `

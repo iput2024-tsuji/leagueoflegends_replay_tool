@@ -149,6 +149,7 @@ def _component_entries(lock: dict[str, Any]) -> list[dict[str, Any]]:
     entries = [lock["application"], lock["python"]]
     entries.extend(lock.get("runtime_components", []))
     entries.extend(lock.get("build_components", []))
+    entries.extend(lock.get("installer_components", []))
     return entries
 
 
@@ -192,8 +193,20 @@ def validate_package_manifest(
             lock = None
 
     expected: dict[str, dict[str, Any]] = {}
+    installer_components: set[str] = set()
     if lock is not None:
         expected = _components_by_distribution(lock)
+        for component in lock.get("installer_components", []):
+            canonical = canonicalize_distribution_name(
+                str(component.get("component", ""))
+            )
+            if not canonical or canonical in expected:
+                errors.append(
+                    "Duplicate or unnamed installer component in component lock."
+                )
+                continue
+            expected[canonical] = component
+            installer_components.add(canonical)
         expected["python"] = lock["python"]
 
     by_name: dict[str, dict[str, Any]] = {}
@@ -244,7 +257,28 @@ def validate_package_manifest(
             if relative_path is None:
                 errors.append(f"Unsafe license path for {package_name}: {value}")
                 continue
-            if not relative_path.startswith("python-packages/"):
+            expected_installer_paths = set()
+            if canonical in installer_components and expected_component is not None:
+                for material in expected_component.get("license_materials", []):
+                    if not isinstance(material, dict):
+                        continue
+                    locked_path = _safe_relative(material.get("path"))
+                    if locked_path and locked_path.startswith("licenses/"):
+                        expected_installer_paths.add(
+                            locked_path.removeprefix("licenses/")
+                        )
+            if canonical in installer_components and (
+                relative_path not in expected_installer_paths
+            ):
+                errors.append(
+                    f"License path differs from installer component lock for "
+                    f"{package_name}: {value}"
+                )
+                continue
+            if (
+                canonical not in installer_components
+                and not relative_path.startswith("python-packages/")
+            ):
                 errors.append(
                     f"License path is outside python-packages for {package_name}: "
                     f"{value}"

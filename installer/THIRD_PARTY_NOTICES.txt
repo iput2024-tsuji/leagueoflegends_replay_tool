@@ -10,6 +10,11 @@ scikit-learn、Microsoft Visual C++ runtime、Mesa software OpenGL
 などの第三者コンポーネントが含まれます。
 各コンポーネントには、それぞれのライセンス条件が適用されます。
 
+このインストーラーは Inno Setup 6.7.3 で作成され、Setup/Uninstall stubと
+LZMA展開コードを内蔵します。compiler、LZMA圧縮component、その他のbuild
+専用toolはインストール先へ再配布しません。固定したInno Setup License本文は
+licenses\inno-setup\LICENSE.txt、source情報はSOURCE_OFFER.mdにあります。
+
 インストール後は、次の同梱資料を確認できます。
 
   THIRD_PARTY_NOTICES.md
@@ -45,6 +50,12 @@ The application contains third-party components including Python, PyQt6, Qt,
 obsws-python, opencv-python, the OpenCV FFmpeg DLL, NumPy, pandas, SciPy,
 scikit-learn, Microsoft Visual C++ runtime files, and Mesa software OpenGL.
 Each component remains subject to its own license terms.
+
+This installer is built with Inno Setup 6.7.3 and embeds its Setup/Uninstall
+stubs and LZMA decompression code. The compiler, LZMA compression components,
+and other build-only tools are not redistributed into the installation. The
+pinned Inno Setup License is at licenses\inno-setup\LICENSE.txt, with source
+information in SOURCE_OFFER.md.
 
 After installation, see THIRD_PARTY_NOTICES.md, SOURCE_OFFER.md,
 QT_RELINKING.md, and the licenses directory. The generated

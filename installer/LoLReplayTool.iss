@@ -40,7 +40,8 @@ RestartApplications=no
 SetupMutex=LoLReplayToolInstallerMutex
 ChangesAssociations=no
 ChangesEnvironment=no
-Uninstallable=yes
+Uninstallable=not IsContentAuditMode
+CreateUninstallRegKey=not IsContentAuditMode
 
 [Languages]
 Name: "japanese"; MessagesFile: "compiler:Languages\Japanese.isl"
@@ -52,15 +53,15 @@ Name: "desktopicon"; Description: "デスクトップにショートカットを
 Source: "..\dist\LoLReplayTool\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Dirs]
-Name: "{localappdata}\LoLReplayTool\bin"
+Name: "{localappdata}\LoLReplayTool\bin"; Check: not IsContentAuditMode
 
 [Icons]
-Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Check: not IsContentAuditMode
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; WorkingDir: "{app}"; Tasks: desktopicon; Check: not IsContentAuditMode
 
 [Run]
-Filename: "{app}\{#AppExeName}"; Description: "{#AppName} を起動"; Flags: nowait postinstall skipifsilent
-Filename: "{localappdata}\LoLReplayTool\bin"; Description: "mpv DLL の配置フォルダーを開く"; Flags: shellexec postinstall skipifsilent unchecked
+Filename: "{app}\{#AppExeName}"; Description: "{#AppName} を起動"; Flags: nowait postinstall skipifsilent; Check: not IsContentAuditMode
+Filename: "{localappdata}\LoLReplayTool\bin"; Description: "mpv DLL の配置フォルダーを開く"; Flags: shellexec postinstall skipifsilent unchecked; Check: not IsContentAuditMode
 
 [Code]
 var
@@ -68,11 +69,19 @@ var
   DeleteManagedDataOnUninstall: Boolean;
   DeleteRecordingsOnUninstall: Boolean;
 
+function IsContentAuditMode: Boolean;
+begin
+  Result := ExpandConstant('{param:contentaudit|}') = '1';
+end;
+
 procedure InitializeWizard;
 var
   MpvDir: String;
   NewLine: String;
 begin
+  if IsContentAuditMode then
+    Exit;
+
   MpvDir := ExpandConstant('{localappdata}\LoLReplayTool\bin');
   NewLine := #13#10;
   MpvInfoPage := CreateOutputMsgPage(

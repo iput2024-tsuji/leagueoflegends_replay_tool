@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +18,7 @@ from src.obs_process import (
     OBSProcessManager,
     OBSProcessQueryError,
     OBSProcessQuerySnapshot,
+    OBSProcessTerminationError,
 )
 
 
@@ -209,12 +212,665 @@ def test_terminate_popen_clears_only_its_exact_bound_lease(monkeypatch, tmp_path
 
     process = FakePopen()
     monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: pytest.fail("Popen termination must not enumerate OBS processes"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("Popen termination must not signal a PID"),
+    )
     manager.write_process_lease(process)
 
     manager.terminate_process(process)
 
     assert process.poll() == 0
     assert manager.read_process_lease() is None
+
+
+def test_terminate_popen_natural_exit_clears_lease_without_signal(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    signals = []
+
+    class FakePopen:
+        pid = identity.pid
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def kill(self):
+            signals.append("kill")
+
+    process = FakePopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+
+    manager.terminate_process(process)
+
+    assert signals == []
+    assert manager.read_process_lease() is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows Popen handle regression")
+def test_terminate_real_exited_windows_popen_uses_filetime_without_path_requery(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe = Path(sys.executable).resolve()
+    process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.5)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        manager.write_process_lease(process)
+        process.wait(timeout=5)
+        assert process.poll() is not None
+        assert manager._wait_process_identity_handle(
+            process._handle,
+            timeout_ms=0,
+        ) is True
+        monkeypatch.setattr(
+            manager,
+            "_query_process_identity_from_handle",
+            lambda *args: pytest.fail(
+                "exited Windows Popen must not re-query executable path"
+            ),
+        )
+
+        manager.terminate_process(process)
+
+        assert manager.read_process_lease() is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_terminate_popen_graceful_timeout_uses_owned_force_handle(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    calls = []
+
+    class FakePopen:
+        pid = identity.pid
+
+        def __init__(self):
+            self.alive = True
+            self.wait_count = 0
+
+        def poll(self):
+            calls.append("poll")
+            return None if self.alive else 1
+
+        def terminate(self):
+            calls.append("terminate")
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            self.wait_count += 1
+            if self.wait_count == 1:
+                raise subprocess.TimeoutExpired("obs64.exe", timeout)
+            return 1
+
+        def kill(self):
+            calls.append("kill")
+            self.alive = False
+
+    process = FakePopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: pytest.fail("replacement listings are outside the Popen contract"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("replacement PID must not be signaled"),
+    )
+    manager.write_process_lease(process)
+
+    manager.terminate_process(process, timeout_sec=0.25)
+
+    assert calls.count("terminate") == 1
+    assert calls.count("kill") == 1
+    assert ("wait", 0.25) in calls
+    assert ("wait", 2) in calls
+    assert manager.read_process_lease() is None
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["terminate", "wait", "poll"],
+)
+def test_terminate_popen_api_failure_is_typed_even_when_force_proves_exit(
+    monkeypatch,
+    tmp_path,
+    failure_stage,
+):
+    manager = OBSProcessManager(tmp_path / f"obs-portable-{failure_stage}")
+    identity = _identity(manager)
+    calls = []
+
+    class FakePopen:
+        pid = identity.pid
+
+        def __init__(self):
+            self.alive = True
+            self.poll_count = 0
+
+        def poll(self):
+            calls.append("poll")
+            self.poll_count += 1
+            if failure_stage == "poll" and self.poll_count == 1:
+                raise OSError("poll failed")
+            return None if self.alive else 1
+
+        def terminate(self):
+            calls.append("terminate")
+            if failure_stage == "terminate":
+                raise OSError("terminate failed")
+
+        def wait(self, timeout):
+            calls.append(("wait", timeout))
+            if timeout != 2:
+                if failure_stage == "wait":
+                    raise OSError("wait failed")
+                raise subprocess.TimeoutExpired("obs64.exe", timeout)
+            return 1
+
+        def kill(self):
+            calls.append("kill")
+            self.alive = False
+
+    process = FakePopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process, timeout_sec=0)
+
+    notes = getattr(captured.value, "__notes__", ())
+    assert any(failure_stage in note.lower() for note in notes)
+    assert calls.count("kill") == 1
+    assert process.poll() == 1
+    assert manager.read_process_lease() is None
+
+
+def test_terminate_popen_kill_failure_and_final_live_keep_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+
+    class StubbornPopen:
+        pid = identity.pid
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("obs64.exe", timeout)
+
+        def kill(self):
+            raise OSError("kill failed")
+
+    process = StubbornPopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    lease_before = manager.lease_path.read_bytes()
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process, timeout_sec=0)
+
+    assert any("Popen.kill" in note for note in captured.value.__notes__)
+    assert "手動で終了" in str(captured.value)
+    assert "再試行" in str(captured.value)
+    assert process.poll() is None
+    assert manager.lease_path.read_bytes() == lease_before
+
+
+def test_terminate_popen_missing_bound_lease_is_not_success(tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+
+    class ExitedPopen:
+        pid = 100
+
+        def poll(self):
+            return 0
+
+    with pytest.raises(OBSProcessTerminationError, match="終了処理") as captured:
+        manager.terminate_process(ExitedPopen())
+
+    assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+
+
+def test_terminate_popen_malformed_bound_lease_keeps_disk_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    process = SimpleNamespace(pid=identity.pid, poll=lambda: 0)
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    lease_before = manager.lease_path.read_bytes()
+    process._lol_replay_obs_process_lease = {"pid": identity.pid}
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process)
+
+    assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+    assert manager.lease_path.read_bytes() == lease_before
+
+
+def test_terminate_popen_handle_identity_change_keeps_bound_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    replacement = _identity(
+        manager,
+        filetime=identity.creation_time_filetime + 10,
+    )
+    signals = []
+
+    class ExitedPopen:
+        pid = identity.pid
+        _handle = "popen-owned"
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def kill(self):
+            signals.append("kill")
+
+    process = ExitedPopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
+    manager.write_process_lease(process)
+    lease_before = manager.lease_path.read_bytes()
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "_query_process_creation_from_handle",
+        lambda handle, pid: (
+            replacement.creation_time,
+            replacement.creation_time_filetime,
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda *args: pytest.fail("exited Popen must not re-query executable path"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        lambda handle, timeout_ms: True,
+    )
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process)
+
+    assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+    assert signals == []
+    assert manager.lease_path.read_bytes() == lease_before
+
+
+def test_terminate_popen_live_handle_identity_mismatch_signals_nothing(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    replacement = _identity(
+        manager,
+        filetime=identity.creation_time_filetime + 10,
+    )
+    signals = []
+
+    class LivePopen:
+        pid = identity.pid
+        _handle = "replacement-handle"
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def kill(self):
+            signals.append("kill")
+
+        def wait(self, timeout):
+            signals.append(("wait", timeout))
+
+    process = LivePopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
+    manager.write_process_lease(process)
+    lease_before = manager.lease_path.read_bytes()
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        lambda handle, timeout_ms: False,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: replacement,
+    )
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: pytest.fail("leased Popen cleanup must not enumerate PIDs"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("replacement PID must not be signaled"),
+    )
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process)
+
+    assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+    assert signals == []
+    assert manager.lease_path.read_bytes() == lease_before
+
+
+def test_terminate_popen_exit_during_path_query_uses_bound_path_and_filetime(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    state = {"exited": False, "wait_calls": 0}
+    signals = []
+
+    class RacingPopen:
+        pid = identity.pid
+        _handle = "owned-handle"
+
+        def poll(self):
+            return 0 if state["exited"] else None
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def kill(self):
+            signals.append("kill")
+
+    process = RacingPopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
+    manager.write_process_lease(process)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+
+    def wait_handle(handle, timeout_ms):
+        state["wait_calls"] += 1
+        if state["wait_calls"] >= 2:
+            state["exited"] = True
+        return state["exited"]
+
+    monkeypatch.setattr(manager, "_wait_process_identity_handle", wait_handle)
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: (_ for _ in ()).throw(
+            OSError(31, "QueryFullProcessImageNameW failed after exit")
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_query_process_creation_from_handle",
+        lambda handle, pid: (
+            identity.creation_time,
+            identity.creation_time_filetime,
+        ),
+    )
+
+    manager.terminate_process(process)
+
+    assert state["wait_calls"] >= 3
+    assert signals == []
+    assert manager.read_process_lease() is None
+
+
+def test_terminate_popen_live_path_query_error_fails_closed_without_signal(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    signals = []
+
+    class LivePopen:
+        pid = identity.pid
+        _handle = "owned-handle"
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def kill(self):
+            signals.append("kill")
+
+    process = LivePopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
+    manager.write_process_lease(process)
+    lease_before = manager.lease_path.read_bytes()
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        lambda handle, timeout_ms: False,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: (_ for _ in ()).throw(
+            OSError(5, "live identity query denied")
+        ),
+    )
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process)
+
+    assert isinstance(captured.value.__cause__, OSError)
+    assert signals == []
+    assert manager.lease_path.read_bytes() == lease_before
+
+
+def test_terminate_popen_windows_handle_wait_failure_is_typed_after_cleanup(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+
+    class FakePopen:
+        pid = identity.pid
+        _handle = "owned-handle"
+
+        def __init__(self):
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.alive = False
+
+        def wait(self, timeout):
+            return 0
+
+        def kill(self):
+            pytest.fail("graceful cleanup should be sufficient")
+
+    process = FakePopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
+    manager.write_process_lease(process)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: identity,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        lambda handle, timeout_ms: (_ for _ in ()).throw(
+            OSError("WaitForSingleObject failed")
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: pytest.fail("Popen cleanup must not enumerate processes"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("Popen cleanup must not signal by PID"),
+    )
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process)
+
+    assert any("owned handle wait" in note for note in captured.value.__notes__)
+    assert process.poll() == 0
+    assert manager.read_process_lease() is None
+
+
+def test_terminate_popen_poll_handle_disagreement_is_typed_without_signal(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    signals = []
+
+    class FakePopen:
+        pid = identity.pid
+        _handle = "owned-handle"
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def kill(self):
+            signals.append("kill")
+
+    process = FakePopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
+    manager.write_process_lease(process)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        lambda handle, timeout_ms: True,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_query_process_creation_from_handle",
+        lambda handle, pid: (
+            identity.creation_time,
+            identity.creation_time_filetime,
+        ),
+    )
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: pytest.fail("Popen cleanup must not enumerate processes"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("Popen cleanup must not signal by PID"),
+    )
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process)
+
+    assert any("state agreement" in note for note in captured.value.__notes__)
+    assert signals == []
+    assert manager.read_process_lease() is None
+
+
+def test_terminate_popen_malformed_disk_lease_is_not_cleared(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    process = SimpleNamespace(pid=identity.pid, poll=lambda: 0)
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    manager.lease_path.write_bytes(b"{malformed")
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process)
+
+    assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+    assert manager.lease_path.read_bytes() == b"{malformed"
+
+
+def test_terminate_popen_lease_unlink_failure_is_typed(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    process = SimpleNamespace(pid=identity.pid, poll=lambda: 0)
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    lease_before = manager.lease_path.read_bytes()
+    monkeypatch.setattr(
+        manager,
+        "_clear_matching_process_lease",
+        lambda lease: (_ for _ in ()).throw(
+            OBSProcessLeaseError("lease unlink failed")
+        ),
+    )
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process)
+
+    assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+    assert manager.lease_path.read_bytes() == lease_before
 
 
 def test_terminate_popen_preserves_a_replaced_same_pid_lease(monkeypatch, tmp_path):
@@ -226,7 +882,21 @@ def test_terminate_popen_preserves_a_replaced_same_pid_lease(monkeypatch, tmp_pa
         writer_manager,
         filetime=old_identity.creation_time_filetime + 10,
     )
-    process = SimpleNamespace(pid=old_identity.pid, poll=lambda: 0)
+    signals = []
+
+    class ExitedPopen:
+        pid = old_identity.pid
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def kill(self):
+            signals.append("kill")
+
+    process = ExitedPopen()
     replacement_process = SimpleNamespace(pid=replacement.pid)
     monkeypatch.setattr(
         manager,
@@ -240,10 +910,26 @@ def test_terminate_popen_preserves_a_replaced_same_pid_lease(monkeypatch, tmp_pa
     )
     manager.write_process_lease(process)
     writer_manager.write_process_lease(replacement_process)
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: pytest.fail("replacement cleanup must not enumerate PIDs"),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda *args, **kwargs: pytest.fail("replacement PID must not be signaled"),
+    )
 
-    with pytest.raises(OBSProcessLeaseError, match="changed"):
+    lease_before = writer_manager.lease_path.read_bytes()
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
         manager.terminate_process(process)
 
+    assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+    assert "changed" in str(captured.value.__cause__)
+    assert signals == []
+    assert writer_manager.lease_path.read_bytes() == lease_before
     final_lease = manager.read_process_lease()
     assert final_lease is not None
     assert final_lease.process_creation_time_filetime == (

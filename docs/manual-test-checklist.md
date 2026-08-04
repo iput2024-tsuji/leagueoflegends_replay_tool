@@ -124,6 +124,16 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 - [ ] 破損leaseでは自動停止・自動削除せず、全OBSの手動終了後にだけ、案内へ表示された絶対pathのleaseを退避または削除して再試行できる
 - [ ] query失敗、identity欠落、same-PID replacement、signal失敗、wait失敗、`TerminateProcess`失敗、`CloseHandle`失敗、最終残存をそれぞれ発生させ、対象外processへsignalせずleaseを維持して失敗を表示する
 - [ ] 新規OBS起動直後にPopen handleからraw creation FILETIMEを取得できない場合、その新規processだけを停止して起動失敗にし、既存OBSを変更しない
+- [ ] 通常起動したschema v2 lease付きOBSを終了し、元Popen handleだけがgraceful終了する場合とgraceful timeout後に同じhandleをforce終了する場合の両方で、終了確認後にだけleaseが削除される
+- [ ] 通常Popen終了の`terminate`、`kill`、非timeout `wait`、`poll`失敗と最終残存を個別に発生させ、型付き失敗と手動終了案内が表示されること、元handleの終了を確認できない場合はleaseが維持されることを確認する
+- [ ] 通常Popenと同じPIDを別creation FILETIMEで表すreplacementを模擬し、元Popen以外へsignalせず、replacementのlease bytesを変更しない
+- [ ] 通常Popenのbound lease欠落・破損・handle identity不一致、disk上のlease破損・差し替え・削除失敗を個別に発生させ、成功扱いせず既存leaseを維持する
+- [ ] 通常Popen終了とWebSocket切断が同時に失敗する場合、終了失敗を主因として表示し、切断を一度試行した事実と切断失敗をnoteまたはlogで確認する
+- [ ] portable mode不一致、起動直後identity取得失敗、Recorder起動失敗、GPU再起動失敗で、先行エラーを維持したままcleanup失敗をnoteまたはlogへ残し、同じPopenへ重複signalしない
+- [ ] 実OBS試験前にstrict queryでOBSが0件であることを確認し、原本`C:\dev\lol\obs-portable`が2112 files／403,417,038 bytes／fingerprint `df699e1587d3be30ae841d1c81819031c2e7845cb2d38f869e4e23a27d77f279`と一致する場合だけ続行する。fingerprintはrelative path（`\`を`/`へ変換）のOrdinal順に`path<NUL>size<NUL>file_sha256`を作り、`file_sha256`はlowercase hex、LF結合は末尾LFなしとしたUTF-8 bytes全体のSHA-256とする
+- [ ] GUIDを含む新規TEMP trial rootへ原本からfreshなA/Bを個別コピーし、`/MIR`や既存trialの再利用を行わない。A/Bを起動後、各Popen handle由来のPID、絶対path、raw creation FILETIMEとlease bytesを保存する
+- [ ] Aだけを通常Popen cleanupし、Aの終了とlease削除、Bの生存およびPID／path／raw FILETIME／lease bytes不変を確認する。原本のfile count／bytes／fingerprintも開始時と同一であることを再確認する
+- [ ] 実OBS試験の`finally`では保存した元Popen handleだけでA/Bをcleanupし、strict queryでOBSが0件になった後に限り、trial rootの絶対pathとGUID leafを再検証してそのtrial rootだけを削除する。PID再利用競争は実OBSで発生させずunit testだけで検証する
 
 ## JSON保存
 

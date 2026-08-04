@@ -39,6 +39,7 @@ class RecordingSupervisor:
 
     async def run(self, stop_event: asyncio.Event) -> None:
         self.stop_event = stop_event
+        primary_error: BaseException | None = None
         try:
             settings = self.config_controller.load_config()
             report = self.config_controller.run_preflight(settings, auto_fix=True, force_obs_detect=True)
@@ -125,8 +126,24 @@ class RecordingSupervisor:
                     "録画が完了しました",
                     "試合の録画とセッション情報を保存しました。",
                 )
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            self.shutdown()
+            try:
+                self.shutdown()
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                recordtest._record_cleanup_failure(
+                    primary_error,
+                    cleanup_error,
+                    logger=recordtest.LOGGER,
+                    context=(
+                        "録画監視失敗後のOBS cleanupにも失敗しました。"
+                        "OBSを手動で終了してから再試行してください"
+                    ),
+                )
 
     def request_stop(self) -> None:
         if self.stop_event:

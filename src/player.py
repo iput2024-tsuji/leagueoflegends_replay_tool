@@ -121,6 +121,43 @@ BAN_PICK_POSITION_ORDER = {
     "SUPPORT": 4,
 }
 BAN_PICK_ICON_SIZE = 24
+EVENT_SEEK_PREROLL_SEC = 5.0
+
+
+def _finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def calculate_sync_offset(found_time: Any, sync_game_time: Any) -> float | None:
+    found = _finite_number(found_time)
+    game_time = _finite_number(sync_game_time)
+    if found is None or game_time is None:
+        return None
+    offset = found - game_time
+    return offset if math.isfinite(offset) else None
+
+
+def calculate_event_seek_position(event_time: Any, sync_offset: Any, duration: Any = None) -> float | None:
+    event = _finite_number(event_time)
+    offset = _finite_number(sync_offset)
+    if event is None or offset is None:
+        return None
+
+    seek_position = event + offset - EVENT_SEEK_PREROLL_SEC
+    if not math.isfinite(seek_position):
+        return None
+    seek_position = max(0.0, seek_position)
+
+    video_duration = _finite_number(duration)
+    if video_duration is not None and video_duration > 0.0:
+        seek_position = min(seek_position, video_duration)
+    return seek_position
 
 
 def _ban_pick_champion_name(value: Any) -> str:
@@ -1902,6 +1939,7 @@ class PlayerWidget(QWidget):
                 return False
 
             self.current_video_path = video_path
+            self.duration = 0.0
             self.sync_game_time = data.get("sync_game_time", 0.0)
             self.events = data.get("events", []) or []
             self.events_all = data.get("events_all", []) or []
@@ -1970,11 +2008,13 @@ class PlayerWidget(QWidget):
             self.worker = None
         if generation != self._sync_generation:
             return
-        if found_time < 0:
+        sync_offset = calculate_sync_offset(found_time, self.sync_game_time)
+        normalized_found_time = _finite_number(found_time)
+        if normalized_found_time is None or normalized_found_time < 0 or sync_offset is None:
             self.info_label.setText("⚠️ No Marker Found\nOffset: 0s")
             self.offset = 0
         else:
-            self.offset = found_time - self.sync_game_time
+            self.offset = sync_offset
             self.info_label.setText(f"✅ Synced\nOffset: {self.offset:.2f}s")
         self.update_offset_label()
         self.event_list.setEnabled(True)
@@ -2006,8 +2046,12 @@ class PlayerWidget(QWidget):
         self.event_list.clear()
         self.add_event_item("🎬 Game Start", 0.0, "#4CAF50")
         for evt in events:
+            if not isinstance(evt, dict):
+                continue
+            time_sec = _finite_number(evt.get("EventTime"))
+            if time_sec is None:
+                continue
             name = evt.get("EventName", "Event")
-            time_sec = evt.get("EventTime", 0)
             killer = evt.get("KillerName", "")
             victim = evt.get("VictimName", "")
             category = classify_game_event(evt, self.my_name or self.my_name_short)
@@ -2272,10 +2316,13 @@ class PlayerWidget(QWidget):
         return sync_stopped and clip_stopped
 
     def add_event_item(self, text: str, game_time: float, color_hex: str, category: str | None = None) -> None:
-        m, s = divmod(int(game_time), 60)
+        normalized_game_time = _finite_number(game_time)
+        if normalized_game_time is None:
+            return
+        m, s = divmod(int(normalized_game_time), 60)
         item_text = f"[{m:02d}:{s:02d}] {text}"
         item = QListWidgetItem(item_text)
-        item.setData(Qt.ItemDataRole.UserRole, game_time)
+        item.setData(Qt.ItemDataRole.UserRole, normalized_game_time)
         item.setData(Qt.ItemDataRole.UserRole + 1, category)
         color = QColor(str(color_hex))
         if not color.isValid():
@@ -2283,14 +2330,18 @@ class PlayerWidget(QWidget):
         item.setForeground(color)
         self.event_list.addItem(item)
 
-    def on_event_clicked(self, item: QListWidgetItem) -> None:
-        if self.player is None:
+    def on_event_clicked(self, item: QListWidgetItem | None) -> None:
+        if self.player is None or item is None:
             return
         if self.offset is None:
             return
-        game_time = item.data(Qt.ItemDataRole.UserRole)
-        target = game_time + self.offset
-        seek_pos = max(0, target - 5.0)
+        try:
+            game_time = item.data(Qt.ItemDataRole.UserRole)
+        except (AttributeError, RuntimeError):
+            return
+        seek_pos = calculate_event_seek_position(game_time, self.offset, self.duration)
+        if seek_pos is None:
+            return
         self.player.seek(seek_pos, reference="absolute", precision="exact")
         self.player.pause = False
         self.play_btn.setText("Pause")
@@ -2345,30 +2396,44 @@ class PlayerWidget(QWidget):
     def on_mpv_time_update(self, name: str, time_pos: float | None) -> None:
         if self._player_shutting_down or time_pos is None:
             return
+        normalized_time = _finite_number(time_pos)
+        if normalized_time is None:
+            return
         try:
-            self.mpv_time_pos_changed.emit(float(time_pos))
+            self.mpv_time_pos_changed.emit(normalized_time)
         except Exception:
             pass
 
     def apply_time_update(self, time_pos: float) -> None:
-        if not self.is_slider_pressed and self.duration > 0:
-            val = int((time_pos / self.duration) * 1000)
+        normalized_time = _finite_number(time_pos)
+        if normalized_time is None:
+            return
+        video_duration = _finite_number(self.duration)
+        if video_duration is None or video_duration <= 0.0:
+            video_duration = 0.0
+
+        if not self.is_slider_pressed and video_duration > 0.0:
+            val = int((normalized_time / video_duration) * 1000)
             self.slider.setValue(val)
 
-        cm, cs = divmod(int(time_pos), 60)
-        dm, ds = divmod(int(self.duration), 60)
+        cm, cs = divmod(int(normalized_time), 60)
+        dm, ds = divmod(int(video_duration), 60)
         self.time_label.setText(f"{cm:02d}:{cs:02d} / {dm:02d}:{ds:02d}")
 
     def on_mpv_duration_update(self, name: str, duration: float | None) -> None:
-        if not self._player_shutting_down and duration:
-            try:
-                self.mpv_duration_changed.emit(float(duration))
-            except Exception:
-                pass
+        if self._player_shutting_down:
+            return
+        normalized_duration = _finite_number(duration)
+        if normalized_duration is None or normalized_duration <= 0.0:
+            normalized_duration = 0.0
+        try:
+            self.mpv_duration_changed.emit(normalized_duration)
+        except Exception:
+            pass
 
     def apply_duration_update(self, duration: float) -> None:
-        if duration:
-            self.duration = duration
+        normalized_duration = _finite_number(duration)
+        self.duration = normalized_duration if normalized_duration is not None and normalized_duration > 0.0 else 0.0
 
     def on_slider_pressed(self) -> None:
         self.is_slider_pressed = True

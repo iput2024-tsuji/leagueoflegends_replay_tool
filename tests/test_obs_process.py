@@ -57,6 +57,27 @@ def _assert_actionable_lease_recovery(
     assert "再試行" in message
 
 
+def _forbid_popen_pid_fallbacks(monkeypatch, manager: OBSProcessManager) -> None:
+    def fail_pid_enumeration(*_args, **_kwargs):
+        pytest.fail("Popen termination must not enumerate process IDs")
+
+    def fail_strict_query(*_args, **_kwargs):
+        pytest.fail("Popen termination must not run a strict process query")
+
+    def fail_taskkill(*_args, **_kwargs):
+        pytest.fail("Popen termination must not invoke taskkill")
+
+    monkeypatch.setattr(manager, "list_obs_processes", fail_pid_enumeration)
+    monkeypatch.setattr(manager, "_list_obs_processes_windows", fail_pid_enumeration)
+    monkeypatch.setattr(manager, "query_obs_processes_strict", fail_strict_query)
+    monkeypatch.setattr(
+        manager,
+        "_list_obs_processes_powershell_strict",
+        fail_strict_query,
+    )
+    monkeypatch.setattr(manager, "_terminate_pid", fail_taskkill)
+
+
 class _InstrumentedLeaseThreadLock:
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -1121,6 +1142,220 @@ def test_terminate_popen_api_failure_is_typed_even_when_force_proves_exit(
     assert manager.read_process_lease() is None
 
 
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_cause", "failure_text"),
+    [
+        ("error", OSError, "simulated force wait failure"),
+        ("timeout", subprocess.TimeoutExpired, "timed out after 2 seconds"),
+    ],
+    ids=("non-timeout-error", "timeout"),
+)
+def test_terminate_popen_force_wait_failure_is_typed_and_keeps_live_lease(
+    monkeypatch,
+    tmp_path,
+    failure_kind,
+    expected_cause,
+    failure_text,
+):
+    manager = OBSProcessManager(tmp_path / f"obs-portable-{failure_kind}")
+    identity = _identity(manager)
+    signals = []
+    waits = []
+    injected = (
+        subprocess.TimeoutExpired("obs64.exe", 2)
+        if failure_kind == "timeout"
+        else OSError(failure_text)
+    )
+
+    class StubbornPopen:
+        pid = identity.pid
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired("obs64.exe", timeout)
+            raise injected
+
+        def kill(self):
+            signals.append("kill")
+
+    process = StubbornPopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    lease_before = manager.lease_path.read_bytes()
+    _forbid_popen_pid_fallbacks(monkeypatch, manager)
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process, timeout_sec=0.25)
+
+    assert type(captured.value.__cause__) is expected_cause
+    assert captured.value.__cause__ is injected
+    assert failure_text in str(captured.value.__cause__)
+    assert any(
+        "Popen.wait after kill" in note and failure_text in note
+        for note in captured.value.__notes__
+    )
+    assert any(
+        "final owned-handle verification" in note
+        for note in captured.value.__notes__
+    )
+    assert signals == ["terminate", "kill"]
+    assert waits == [0.25, 2]
+    assert manager.lease_path.read_bytes() == lease_before
+    _assert_actionable_lease_recovery(captured.value, manager)
+
+
+def test_terminate_popen_final_poll_failure_is_typed_after_proven_exit(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    signals = []
+    waits = []
+    poll_failure = OSError("simulated final poll failure")
+
+    class FinalPollFaultPopen:
+        pid = identity.pid
+
+        def __init__(self):
+            self.force_completed = False
+            self.final_poll_fault_injected = False
+
+        def poll(self):
+            if self.force_completed and not self.final_poll_fault_injected:
+                self.final_poll_fault_injected = True
+                raise poll_failure
+            return None
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            if timeout != 2:
+                raise subprocess.TimeoutExpired("obs64.exe", timeout)
+            self.force_completed = True
+            return 0
+
+        def kill(self):
+            signals.append("kill")
+
+    process = FinalPollFaultPopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    _forbid_popen_pid_fallbacks(monkeypatch, manager)
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process, timeout_sec=0)
+
+    assert captured.value.__cause__ is poll_failure
+    assert str(captured.value.__cause__) == "simulated final poll failure"
+    assert any(
+        "final poll: OSError: simulated final poll failure" in note
+        for note in captured.value.__notes__
+    )
+    assert signals == ["terminate", "kill"]
+    assert waits == [0, 2]
+    assert process.force_completed is True
+    assert process.final_poll_fault_injected is True
+    assert manager.read_process_lease() is None
+    _assert_actionable_lease_recovery(captured.value, manager)
+
+
+def test_terminate_popen_final_owned_handle_wait_failure_is_typed_after_exit(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    signals = []
+    waits = []
+    handle_waits = []
+    handle_wait_failure = OSError("simulated final owned handle wait failure")
+
+    class FinalHandleWaitFaultPopen:
+        pid = identity.pid
+        _handle = "owned-handle"
+
+        def __init__(self):
+            self.alive = True
+            self.force_completed = False
+            self.final_handle_wait_fault_injected = False
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            if timeout != 2:
+                raise subprocess.TimeoutExpired("obs64.exe", timeout)
+            self.force_completed = True
+            return 0
+
+        def kill(self):
+            signals.append("kill")
+            self.alive = False
+
+    process = FinalHandleWaitFaultPopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
+    manager.write_process_lease(process)
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: identity,
+    )
+
+    def fail_final_handle_wait(handle, timeout_ms):
+        handle_waits.append((handle, timeout_ms))
+        if (
+            process.force_completed
+            and not process.final_handle_wait_fault_injected
+        ):
+            process.final_handle_wait_fault_injected = True
+            raise handle_wait_failure
+        return False
+
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        fail_final_handle_wait,
+    )
+    _forbid_popen_pid_fallbacks(monkeypatch, manager)
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process, timeout_sec=0)
+
+    assert captured.value.__cause__ is handle_wait_failure
+    assert str(captured.value.__cause__) == (
+        "simulated final owned handle wait failure"
+    )
+    assert any(
+        "final poll owned handle wait: OSError: "
+        "simulated final owned handle wait failure" in note
+        for note in captured.value.__notes__
+    )
+    assert signals == ["terminate", "kill"]
+    assert waits == [0, 2]
+    assert handle_waits
+    assert all(call == ("owned-handle", 0) for call in handle_waits)
+    assert process.force_completed is True
+    assert process.final_handle_wait_fault_injected is True
+    assert manager.read_process_lease() is None
+    _assert_actionable_lease_recovery(captured.value, manager)
+
+
 def test_terminate_popen_kill_failure_and_final_live_keep_lease(
     monkeypatch,
     tmp_path,
@@ -1481,23 +1716,42 @@ def test_terminate_popen_windows_handle_wait_failure_is_typed_after_cleanup(
     assert manager.read_process_lease() is None
 
 
-def test_terminate_popen_poll_handle_disagreement_is_typed_without_signal(
+@pytest.mark.parametrize(
+    ("poll_results", "handle_results", "expected_signals", "expected_waits"),
+    [
+        ([None], [True], [], []),
+        ([0, 0, 0], [False, False, True], ["terminate"], [3.0]),
+    ],
+    ids=("popen-live-handle-exited", "popen-exited-handle-live"),
+)
+def test_terminate_popen_poll_handle_disagreement_is_typed_and_handle_authoritative(
     monkeypatch,
     tmp_path,
+    poll_results,
+    handle_results,
+    expected_signals,
+    expected_waits,
 ):
     manager = OBSProcessManager(tmp_path / "obs-portable")
     identity = _identity(manager)
     signals = []
+    waits = []
 
     class FakePopen:
         pid = identity.pid
         _handle = "owned-handle"
 
         def poll(self):
-            return None
+            if not poll_results:
+                pytest.fail("unexpected additional Popen.poll call")
+            return poll_results.pop(0)
 
         def terminate(self):
             signals.append("terminate")
+
+        def wait(self, timeout):
+            waits.append(timeout)
+            return 0
 
         def kill(self):
             signals.append("kill")
@@ -1507,10 +1761,23 @@ def test_terminate_popen_poll_handle_disagreement_is_typed_without_signal(
     monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
     manager.write_process_lease(process)
     monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: True)
+
+    def observe_handle(handle, timeout_ms):
+        assert handle == "owned-handle"
+        assert timeout_ms == 0
+        if not handle_results:
+            pytest.fail("unexpected additional owned handle wait")
+        return handle_results.pop(0)
+
     monkeypatch.setattr(
         manager,
         "_wait_process_identity_handle",
-        lambda handle, timeout_ms: True,
+        observe_handle,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: identity,
     )
     monkeypatch.setattr(
         manager,
@@ -1520,22 +1787,17 @@ def test_terminate_popen_poll_handle_disagreement_is_typed_without_signal(
             identity.creation_time_filetime,
         ),
     )
-    monkeypatch.setattr(
-        manager,
-        "query_obs_processes_strict",
-        lambda: pytest.fail("Popen cleanup must not enumerate processes"),
-    )
-    monkeypatch.setattr(
-        manager,
-        "_terminate_pid",
-        lambda *args, **kwargs: pytest.fail("Popen cleanup must not signal by PID"),
-    )
+    _forbid_popen_pid_fallbacks(monkeypatch, manager)
 
     with pytest.raises(OBSProcessTerminationError) as captured:
         manager.terminate_process(process)
 
+    assert isinstance(captured.value.__cause__, RuntimeError)
     assert any("state agreement" in note for note in captured.value.__notes__)
-    assert signals == []
+    assert signals == expected_signals
+    assert waits == expected_waits
+    assert poll_results == []
+    assert handle_results == []
     assert manager.read_process_lease() is None
 
 
@@ -1557,29 +1819,99 @@ def test_terminate_popen_malformed_disk_lease_is_not_cleared(
     assert manager.lease_path.read_bytes() == b"{malformed"
 
 
-def test_terminate_popen_lease_unlink_failure_is_typed(
+def test_terminate_popen_exact_lease_delete_boundary_permission_error_is_typed(
     monkeypatch,
     tmp_path,
 ):
     manager = OBSProcessManager(tmp_path / "obs-portable")
     identity = _identity(manager)
-    process = SimpleNamespace(pid=identity.pid, poll=lambda: 0)
+    signals = []
+
+    class ExitedPopen:
+        pid = identity.pid
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def kill(self):
+            signals.append("kill")
+
+    process = ExitedPopen()
     monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
     manager.write_process_lease(process)
     lease_before = manager.lease_path.read_bytes()
-    monkeypatch.setattr(
-        manager,
-        "_delete_process_lease_snapshot_locked",
-        lambda transaction, snapshot: (_ for _ in ()).throw(
-            OBSProcessLeaseError("lease unlink failed")
-        ),
+    lease_identity_before = obs_process_module._file_identity(
+        manager.lease_path.stat()
     )
+    boundary_calls = []
+    deletion_failure = PermissionError("simulated exact lease deletion denial")
+    real_mark_for_deletion = (
+        obs_process_module._OBSDirectoryLease.mark_open_file_for_deletion
+    )
+
+    def deny_exact_lease_deletion(
+        directory_lease,
+        descriptor,
+        name,
+        *,
+        expected_identity,
+    ):
+        if directory_lease.path == manager.obs_dir and name == manager.lease_path.name:
+            descriptor_identity = obs_process_module._file_identity(
+                os.fstat(descriptor)
+            )
+            path_identity = directory_lease.relative_file_identity_or_none(name)
+            boundary_calls.append(
+                {
+                    "descriptor": descriptor,
+                    "name": name,
+                    "expected_identity": expected_identity,
+                    "descriptor_identity": descriptor_identity,
+                    "path_identity": path_identity,
+                }
+            )
+            assert descriptor_identity == expected_identity == lease_identity_before
+            assert path_identity == lease_identity_before
+            raise deletion_failure
+        return real_mark_for_deletion(
+            directory_lease,
+            descriptor,
+            name,
+            expected_identity=expected_identity,
+        )
+
+    monkeypatch.setattr(
+        obs_process_module._OBSDirectoryLease,
+        "mark_open_file_for_deletion",
+        deny_exact_lease_deletion,
+    )
+    _forbid_popen_pid_fallbacks(monkeypatch, manager)
 
     with pytest.raises(OBSProcessTerminationError) as captured:
         manager.terminate_process(process)
 
     assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
+    assert captured.value.__cause__.__cause__ is deletion_failure
+    assert str(captured.value.__cause__.__cause__) == (
+        "simulated exact lease deletion denial"
+    )
+    assert any(
+        "matching v2 lease cleanup: OBSProcessLeaseError" in note
+        for note in captured.value.__notes__
+    )
+    assert len(boundary_calls) == 1
+    assert boundary_calls[0]["name"] == manager.lease_path.name
+    assert boundary_calls[0]["expected_identity"] == lease_identity_before
+    assert boundary_calls[0]["descriptor_identity"] == lease_identity_before
+    assert boundary_calls[0]["path_identity"] == lease_identity_before
+    assert signals == []
     assert manager.lease_path.read_bytes() == lease_before
+    assert obs_process_module._file_identity(manager.lease_path.stat()) == (
+        lease_identity_before
+    )
 
 
 @pytest.mark.parametrize(

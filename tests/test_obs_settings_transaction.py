@@ -592,6 +592,24 @@ def _strict_process_snapshot(*processes, queried_at):
     )
 
 
+@pytest.fixture
+def strict_zero_process_queries(monkeypatch):
+    queried_base_dirs = []
+
+    def query_zero_obs_processes(manager):
+        queried_base_dirs.append(manager.obs_dir)
+        return _strict_process_snapshot(
+            queried_at=100.0 + len(queried_base_dirs),
+        )
+
+    monkeypatch.setattr(
+        obs_bootstrap.OBSProcessManager,
+        "query_obs_processes_strict",
+        query_zero_obs_processes,
+    )
+    return queried_base_dirs
+
+
 def test_shared_settings_stop_uses_strict_before_and_after_snapshots(tmp_path):
     base_dir = (tmp_path / "obs-portable").absolute()
     base_dir.mkdir(parents=True)
@@ -2710,6 +2728,7 @@ def test_stop_callback_cannot_swap_desired_temporary_with_same_bytes(tmp_path):
 def test_journal_phase_crash_resumes_safely(
     monkeypatch,
     tmp_path,
+    strict_zero_process_queries,
     phase,
     position,
     marker_phase,
@@ -2740,11 +2759,17 @@ def test_journal_phase_crash_resumes_safely(
     with obs_bootstrap.obs_config_mutation_guard(base_dir):
         pass
 
+    expected_queries = [] if marker_phase == "preparing" else [base_dir.resolve()]
+    assert strict_zero_process_queries == expected_queries
     assert target.read_bytes() == expected
     _assert_transaction_clean(base_dir)
 
 
-def test_partial_replace_crash_rolls_back_every_target(monkeypatch, tmp_path):
+def test_partial_replace_crash_rolls_back_every_target(
+    monkeypatch,
+    tmp_path,
+    strict_zero_process_queries,
+):
     base_dir = tmp_path / "obs-portable"
     plan, targets = _make_plan(
         base_dir,
@@ -2780,6 +2805,7 @@ def test_partial_replace_crash_rolls_back_every_target(monkeypatch, tmp_path):
     with obs_bootstrap.obs_config_mutation_guard(base_dir):
         pass
 
+    assert strict_zero_process_queries == [base_dir.resolve()]
     assert targets[0].read_bytes() == b"global-old"
     assert targets[1].read_bytes() == b"user-old"
     _assert_transaction_clean(base_dir)
@@ -2788,6 +2814,7 @@ def test_partial_replace_crash_rolls_back_every_target(monkeypatch, tmp_path):
 def test_new_target_is_removed_when_committing_recovery_rolls_back(
     monkeypatch,
     tmp_path,
+    strict_zero_process_queries,
 ):
     base_dir = tmp_path / "obs-portable"
     plan, (target,) = _make_plan(
@@ -2814,11 +2841,16 @@ def test_new_target_is_removed_when_committing_recovery_rolls_back(
     with obs_bootstrap.obs_config_mutation_guard(base_dir):
         pass
 
+    assert strict_zero_process_queries == [base_dir.resolve()]
     assert not target.exists()
     _assert_transaction_clean(base_dir)
 
 
-def test_recovery_rejects_backup_identity_change_after_inventory(monkeypatch, tmp_path):
+def test_recovery_rejects_backup_identity_change_after_inventory(
+    monkeypatch,
+    tmp_path,
+    strict_zero_process_queries,
+):
     base_dir = tmp_path / "obs-portable"
     plan, (target,) = _make_plan(
         base_dir,
@@ -2863,6 +2895,7 @@ def test_recovery_rejects_backup_identity_change_after_inventory(monkeypatch, tm
         with obs_bootstrap.obs_config_mutation_guard(base_dir):
             pass
 
+    assert strict_zero_process_queries == [base_dir.resolve()]
     assert replaced_backup is True
     assert target.read_bytes() == b"desired"
     assert _journal(base_dir)["phase"] == "committing"
@@ -2927,6 +2960,7 @@ def test_all_replaced_targets_are_reopened_before_committed(
 def test_committed_phase_failure_defers_cleanup_to_next_durable_recovery(
     monkeypatch,
     tmp_path,
+    strict_zero_process_queries,
     failure,
     visible_phase,
     expected_after_retry,
@@ -2994,11 +3028,16 @@ def test_committed_phase_failure_defers_cleanup_to_next_durable_recovery(
     with obs_bootstrap.obs_config_mutation_guard(base_dir):
         pass
 
+    assert strict_zero_process_queries == [base_dir.resolve()]
     assert target.read_bytes() == expected_after_retry
     _assert_transaction_clean(base_dir)
 
 
-def test_committed_cleanup_resumes_after_hard_crash(monkeypatch, tmp_path):
+def test_committed_cleanup_resumes_after_hard_crash(
+    monkeypatch,
+    tmp_path,
+    strict_zero_process_queries,
+):
     base_dir = tmp_path / "obs-portable"
     plan, (target,) = _make_plan(
         base_dir,
@@ -3034,6 +3073,7 @@ def test_committed_cleanup_resumes_after_hard_crash(monkeypatch, tmp_path):
     with obs_bootstrap.obs_config_mutation_guard(base_dir):
         pass
 
+    assert strict_zero_process_queries == [base_dir.resolve()]
     assert target.read_bytes() == b"new"
     _assert_transaction_clean(base_dir)
 

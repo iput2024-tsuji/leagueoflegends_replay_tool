@@ -82,7 +82,7 @@ Recording monitoring runs in a `RecorderWorker` separate from the GUI thread. Th
 
 The main responsibilities are separated as follows:
 
-- `OBSClient`: OBS WebSocket communication and OBS control
+- `obs_websocket_client.py` / `OBSClient`: OBS WebSocket communication and OBS control
 - `RiotAPIClient`: Riot local API requests and response parsing
 - `RecordingSessionManager` / `LoLAutoRecorder`: recording workflow orchestration
 - `controllers.py`: settings, audio, analytics, and recording controllers
@@ -123,7 +123,8 @@ Maintainer-authored commits and Pull Requests are managed in Japanese. English I
 ```text
 src/
   app.py                 # PyQt6 GUI and RecorderWorker
-  recordtest.py          # Recording workflow and OBS/Riot clients
+  recordtest.py          # Recording workflow and compatibility facade for existing imports
+  obs_websocket_client.py # OBS WebSocket client and request/response handling
   recording_library.py   # Safe recording and metadata deletion
   player.py              # mpv replay player
   analytics.py           # Data analysis and tactical rules

@@ -2258,6 +2258,177 @@ def test_transaction_temporary_name_cannot_be_planned_as_extra_directory(tmp_pat
     _assert_transaction_clean(base_dir)
 
 
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX}{'a' * 32}",
+        f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX}not-a-token",
+    ],
+)
+@pytest.mark.parametrize("target_kind", ["directory", "write"])
+def test_process_lease_temporary_namespace_is_rejected_before_guard_side_effects(
+    monkeypatch,
+    tmp_path,
+    reserved_name,
+    target_kind,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    safe_plan, (safe_target,) = _make_plan(
+        base_dir,
+        (("config/obs-studio/global.ini", b"original", b"desired"),),
+    )
+    reserved_path = base_dir / reserved_name
+    if target_kind == "write":
+        reserved_path.write_bytes(b"control-original")
+        reserved_snapshot = obs_bootstrap.preflight_obs_config_file(
+            reserved_path,
+            label=reserved_name,
+        )
+        unsafe_plan = obs_bootstrap.OBSConfigTransactionPlan(
+            base_dir=base_dir,
+            directories=(base_dir,),
+            writes=(
+                obs_bootstrap.OBSConfigPlannedWrite(
+                    reserved_snapshot,
+                    b"control-replacement",
+                ),
+            ),
+        )
+    else:
+        unsafe_plan = obs_bootstrap.OBSConfigTransactionPlan(
+            base_dir=safe_plan.base_dir,
+            directories=(*safe_plan.directories, reserved_path),
+            writes=safe_plan.writes,
+        )
+    safe_identity = obs_bootstrap._file_identity(os.stat(safe_target))
+    reserved_identity = (
+        obs_bootstrap._file_identity(os.stat(reserved_path))
+        if reserved_path.exists()
+        else None
+    )
+    callback_calls = 0
+    query_calls = 0
+
+    def before_commit():
+        nonlocal callback_calls
+        callback_calls += 1
+
+    def query(_manager):
+        nonlocal query_calls
+        query_calls += 1
+        raise AssertionError("invalid plan must fail before process query")
+
+    monkeypatch.setattr(
+        obs_bootstrap.OBSProcessManager,
+        "query_obs_processes_strict",
+        query,
+    )
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="process lease"):
+        obs_bootstrap.execute_obs_config_transaction(
+            unsafe_plan,
+            before_commit=before_commit,
+        )
+
+    assert callback_calls == 0
+    assert query_calls == 0
+    assert safe_target.read_bytes() == b"original"
+    assert obs_bootstrap._file_identity(os.stat(safe_target)) == safe_identity
+    if target_kind == "write":
+        assert reserved_path.read_bytes() == b"control-original"
+        assert obs_bootstrap._file_identity(os.stat(reserved_path)) == reserved_identity
+    else:
+        assert not reserved_path.exists()
+    _assert_transaction_clean(base_dir)
+
+
+def test_invalid_process_lease_temp_plan_precedes_stale_journal_recovery(
+    monkeypatch,
+    tmp_path,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    stale_target = _leave_stale_settings_transaction(
+        monkeypatch,
+        base_dir,
+        "committed",
+    )
+    marker = obs_bootstrap.get_obs_settings_transaction_marker(base_dir)
+    marker_bytes = marker.read_bytes()
+    marker_identity = obs_bootstrap._file_identity(os.stat(marker))
+    stale_bytes = stale_target.read_bytes()
+    stale_identity = obs_bootstrap._file_identity(os.stat(stale_target))
+    reserved_name = f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX}{'e' * 32}"
+    reserved_target = base_dir / reserved_name
+    reserved_target.write_bytes(b"control-original")
+    reserved_snapshot = obs_bootstrap.preflight_obs_config_file(
+        reserved_target,
+        label=reserved_name,
+    )
+    reserved_identity = obs_bootstrap._file_identity(os.stat(reserved_target))
+    invalid_plan = obs_bootstrap.OBSConfigTransactionPlan(
+        base_dir=base_dir,
+        directories=(base_dir,),
+        writes=(
+            obs_bootstrap.OBSConfigPlannedWrite(
+                reserved_snapshot,
+                b"control-replacement",
+            ),
+        ),
+    )
+    recovery_callback_calls = 0
+
+    def before_commit():
+        nonlocal recovery_callback_calls
+        recovery_callback_calls += 1
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="process lease"):
+        obs_bootstrap.execute_obs_config_transaction(
+            invalid_plan,
+            before_commit=before_commit,
+        )
+
+    assert recovery_callback_calls == 0
+    assert marker.read_bytes() == marker_bytes
+    assert obs_bootstrap._file_identity(os.stat(marker)) == marker_identity
+    assert stale_target.read_bytes() == stale_bytes
+    assert obs_bootstrap._file_identity(os.stat(stale_target)) == stale_identity
+    assert reserved_target.read_bytes() == b"control-original"
+    assert obs_bootstrap._file_identity(os.stat(reserved_target)) == reserved_identity
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows filesystem names are case-insensitive")
+def test_windows_case_variant_process_lease_temp_is_reserved(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    name = f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX.upper()}{'a' * 32}"
+    plan, (target,) = _make_plan(
+        base_dir,
+        ((name, b"control-original", b"control-replacement"),),
+    )
+    identity = obs_bootstrap._file_identity(os.stat(target))
+
+    with pytest.raises(obs_bootstrap.OBSPathSafetyError, match="予約namespace"):
+        obs_bootstrap.execute_obs_config_transaction(plan)
+
+    assert target.read_bytes() == b"control-original"
+    assert obs_bootstrap._file_identity(os.stat(target)) == identity
+    _assert_transaction_clean(base_dir)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX filesystem names retain native case")
+def test_posix_case_variant_process_lease_temp_is_an_ordinary_target(tmp_path):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    name = f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX.upper()}{'a' * 32}"
+    plan, (target,) = _make_plan(
+        base_dir,
+        ((name, b"ordinary-original", b"ordinary-desired"),),
+    )
+
+    assert obs_bootstrap.execute_obs_config_transaction(plan) == (target,)
+
+    assert target.read_bytes() == b"ordinary-desired"
+    _assert_transaction_clean(base_dir)
+
+
 def test_oversized_desired_payload_is_rejected_before_journal_or_stop(tmp_path):
     base_dir = tmp_path / "obs-portable"
     plan, (target,) = _make_plan(
@@ -2985,6 +3156,81 @@ def test_recovery_rejects_invalid_journal_before_stop(tmp_path, payload):
             pass
 
     assert stop_calls == 0
+
+
+@pytest.mark.parametrize(
+    "reserved_name",
+    [
+        f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX}{'c' * 32}",
+        f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX}invalid-owner",
+    ],
+)
+def test_recovery_rejects_process_lease_temp_journal_before_query_or_mutation(
+    monkeypatch,
+    tmp_path,
+    reserved_name,
+):
+    base_dir = (tmp_path / "obs-portable").absolute()
+    base_dir.mkdir()
+    target = base_dir / reserved_name
+    original = b"control-original"
+    desired = b"control-desired"
+    target.write_bytes(original)
+    journal = {
+        "schema_version": 1,
+        "owner_token": "d" * 32,
+        "phase": "committing",
+        "entries": [
+            {
+                "path": reserved_name,
+                "label": "reserved process lease temporary",
+                "original_exists": True,
+                "original_size": len(original),
+                "original_sha256": hashlib.sha256(original).hexdigest(),
+                "desired_size": len(desired),
+                "desired_sha256": hashlib.sha256(desired).hexdigest(),
+            }
+        ],
+    }
+    marker = obs_bootstrap.get_obs_settings_transaction_marker(base_dir)
+    marker.write_text(json.dumps(journal), encoding="utf-8")
+    marker_bytes = marker.read_bytes()
+    marker_identity = obs_bootstrap._file_identity(os.stat(marker))
+    target_identity = obs_bootstrap._file_identity(os.stat(target))
+    callback_calls = 0
+    query_calls = 0
+
+    def before_recovery() -> None:
+        nonlocal callback_calls
+        callback_calls += 1
+
+    def query(_manager):
+        nonlocal query_calls
+        query_calls += 1
+        raise AssertionError("invalid journal must fail before process query")
+
+    monkeypatch.setattr(
+        obs_bootstrap.OBSProcessManager,
+        "query_obs_processes_strict",
+        query,
+    )
+
+    with pytest.raises(
+        obs_bootstrap.OBSSettingsRecoveryRequiredError,
+        match="process lease",
+    ):
+        with obs_bootstrap.obs_config_mutation_guard(
+            base_dir,
+            before_settings_recovery=before_recovery,
+        ):
+            pass
+
+    assert callback_calls == 0
+    assert query_calls == 0
+    assert target.read_bytes() == original
+    assert obs_bootstrap._file_identity(os.stat(target)) == target_identity
+    assert marker.read_bytes() == marker_bytes
+    assert obs_bootstrap._file_identity(os.stat(marker)) == marker_identity
 
 
 @pytest.mark.parametrize(

@@ -332,6 +332,7 @@ def test_existing_owned_runtime_propagates_cleanup_failure_with_manual_guidance(
 
     class FailingManager:
         lease_path = Path("C:/managed/obs/.lol_replay_obs_lease.json")
+        lease_lock_path = Path("C:/managed/obs/.lol_replay_obs_lease.lock")
 
         def kill_stale_owned_processes(self):
             calls.append("cleanup")
@@ -351,6 +352,7 @@ def test_existing_owned_runtime_propagates_cleanup_failure_with_manual_guidance(
     assert calls == ["cleanup"]
     assert isinstance(captured.value.__cause__, OBSProcessQueryError)
     assert str(FailingManager.lease_path) in str(captured.value)
+    assert str(FailingManager.lease_lock_path) in str(captured.value)
     assert "退避または削除" in str(captured.value)
 
 

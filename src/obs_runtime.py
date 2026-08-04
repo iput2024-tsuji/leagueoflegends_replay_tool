@@ -18,19 +18,33 @@ LOGGER = logging.getLogger("lol_replay.obs_runtime")
 
 def _manual_lease_recovery_guidance(process_manager: Any) -> str:
     lease_path = getattr(process_manager, "lease_path", None)
-    if lease_path is None:
+    lease_lock_path = getattr(process_manager, "lease_lock_path", None)
+    if lease_path is None and lease_lock_path is None:
         return (
             "解決しない場合は、OBSが完全に終了したことを確認してから、"
             "OBS所有情報ファイルを退避または削除して再実行してください。"
         )
-    try:
-        resolved_path = Path(lease_path).resolve()
-    except Exception:
-        resolved_path = Path(str(lease_path))
+
+    def resolved(value: Any) -> Path | None:
+        if value is None:
+            return None
+        try:
+            return Path(value).resolve()
+        except Exception:
+            return Path(str(value))
+
+    resolved_lease = resolved(lease_path)
+    resolved_lock = resolved(lease_lock_path)
+    paths = []
+    if resolved_lease is not None:
+        paths.append(f"所有情報ファイル: {resolved_lease}")
+    if resolved_lock is not None:
+        paths.append(f"所有情報lock: {resolved_lock}")
     return (
         "解決しない場合は、OBSが完全に終了したことを確認してから、"
-        "次のOBS所有情報ファイルを退避または削除して再実行してください。\n"
-        f"所有情報ファイル: {resolved_path}"
+        "表示されたOBS所有情報ファイルを退避または削除し、lockも確認して"
+        "再実行してください。\n"
+        + "\n".join(paths)
     )
 
 

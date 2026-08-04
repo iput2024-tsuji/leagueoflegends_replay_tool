@@ -46,6 +46,40 @@ def _snapshot(*processes: OBSProcessInfo) -> OBSProcessQuerySnapshot:
     return OBSProcessQuerySnapshot(tuple(processes), 100.0)
 
 
+def _assert_actionable_lease_recovery(
+    error: BaseException,
+    manager: OBSProcessManager,
+) -> None:
+    message = str(error)
+    assert str(manager.lease_path) in message
+    assert str(manager.lease_lock_path) in message
+    assert "すべてのOBS Studio" in message
+    assert "再試行" in message
+
+
+class _InstrumentedLeaseThreadLock:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._watched_thread: threading.Thread | None = None
+        self.attempted = threading.Event()
+        self.acquired = threading.Event()
+
+    def watch(self, thread: threading.Thread) -> None:
+        self._watched_thread = thread
+
+    def __enter__(self):
+        watched = threading.current_thread() is self._watched_thread
+        if watched:
+            self.attempted.set()
+        self._lock.acquire()
+        if watched:
+            self.acquired.set()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self._lock.release()
+
+
 def _write_v2_lease(
     manager: OBSProcessManager,
     process: OBSProcessInfo,
@@ -64,6 +98,106 @@ def _write_v2_lease(
         ),
         encoding="utf-8",
     )
+
+
+@pytest.mark.parametrize("operation", ["read", "find", "kill"])
+def test_absent_lease_operations_do_not_create_managed_root(tmp_path, operation):
+    manager = OBSProcessManager(tmp_path / "missing-obs-portable")
+
+    if operation == "read":
+        assert manager.read_process_lease() is None
+    elif operation == "find":
+        assert manager.find_owned_process() is None
+    else:
+        assert manager.kill_stale_owned_processes(timeout_sec=0) == []
+
+    assert not manager.obs_dir.exists()
+    assert not manager.lease_lock_path.exists()
+
+
+def test_absent_lease_in_existing_root_does_not_create_persistent_lock(tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_dir.mkdir(parents=True)
+
+    assert manager.read_process_lease() is None
+
+    assert manager.obs_dir.is_dir()
+    assert not manager.lease_lock_path.exists()
+
+
+def test_absent_lease_probe_reports_root_appearance_with_recovery_paths(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    calls = 0
+
+    class AppearedProbe:
+        def close(self):
+            return None
+
+    def open_absolute(_cls, path, **kwargs):
+        nonlocal calls
+        assert Path(path) == manager.obs_dir
+        assert kwargs == {}
+        calls += 1
+        if calls == 1:
+            raise FileNotFoundError(manager.obs_dir)
+        return AppearedProbe()
+
+    monkeypatch.setattr(
+        obs_process_module._OBSDirectoryLease,
+        "open_absolute",
+        classmethod(open_absolute),
+    )
+
+    with pytest.raises(OBSProcessLeaseError) as captured:
+        manager.read_process_lease()
+
+    message = str(captured.value)
+    assert "不存在確認中に出現" in message
+    assert str(manager.lease_path) in message
+    assert str(manager.lease_lock_path) in message
+    assert "すべてのOBS Studio" in message
+    assert "再試行" in message
+
+
+def test_absent_lease_probe_close_failure_reports_recovery_paths(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_dir.mkdir(parents=True)
+
+    class FailingCloseProbe:
+        path = manager.obs_dir
+
+        def validate_lexical_binding(self):
+            return None
+
+        def relative_file_identity_or_none(self, name):
+            assert name in {manager.lease_path.name, manager.lease_lock_path.name}
+            return None
+
+        def close(self):
+            raise OSError("simulated normal probe close failure")
+
+    monkeypatch.setattr(
+        obs_process_module._OBSDirectoryLease,
+        "open_absolute",
+        classmethod(lambda _cls, path, **kwargs: FailingCloseProbe()),
+    )
+
+    with pytest.raises(OBSProcessLeaseError) as captured:
+        manager.read_process_lease()
+
+    message = str(captured.value)
+    assert "probeを安全にcloseできません" in message
+    assert str(manager.lease_path) in message
+    assert str(manager.lease_lock_path) in message
+    assert "すべてのOBS Studio" in message
+    assert "再試行" in message
+    assert isinstance(captured.value.__cause__, OSError)
 
 
 def test_process_manager_writes_v2_lease_from_popen_handle_identity(
@@ -189,6 +323,68 @@ def test_start_obs_requires_manual_stop_when_lease_failure_process_survives(
 
     assert captured.value.__cause__ is lease_error
     assert process.poll() is None
+
+
+def test_start_obs_does_not_overwrite_existing_lease_and_cleans_only_new_popen(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    existing_identity = _identity(manager, pid=100, unix_seconds=10.0)
+    new_identity = _identity(manager, pid=200, unix_seconds=20.0)
+    existing_process = SimpleNamespace(pid=existing_identity.pid)
+    monkeypatch.setattr(
+        manager,
+        "query_popen_process_identity",
+        lambda process: existing_identity,
+    )
+    manager.write_process_lease(existing_process)
+    existing_raw = manager.lease_path.read_bytes()
+    events = []
+
+    class NewPopen:
+        pid = new_identity.pid
+
+        def __init__(self):
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            events.append("terminate-new")
+            self.alive = False
+
+        def wait(self, timeout):
+            events.append(("wait-new", timeout))
+            return 0
+
+        def kill(self):
+            events.append("kill-new")
+            self.alive = False
+
+    new_process = NewPopen()
+    monkeypatch.setattr(
+        obs_process_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: new_process,
+    )
+    monkeypatch.setattr(
+        manager,
+        "query_popen_process_identity",
+        lambda process: new_identity,
+    )
+
+    with pytest.raises(OBSProcessLeaseError, match="上書きしません"):
+        manager.start_obs(hidden=False)
+
+    assert events == ["terminate-new", ("wait-new", 3.0)]
+    assert manager.lease_path.read_bytes() == existing_raw
+    current = manager.read_process_lease()
+    assert current is not None
+    assert current.pid == existing_identity.pid
 
 
 def test_terminate_popen_clears_only_its_exact_bound_lease(monkeypatch, tmp_path):
@@ -860,8 +1056,8 @@ def test_terminate_popen_lease_unlink_failure_is_typed(
     lease_before = manager.lease_path.read_bytes()
     monkeypatch.setattr(
         manager,
-        "_clear_matching_process_lease",
-        lambda lease: (_ for _ in ()).throw(
+        "_delete_process_lease_snapshot_locked",
+        lambda transaction, snapshot: (_ for _ in ()).throw(
             OBSProcessLeaseError("lease unlink failed")
         ),
     )
@@ -871,6 +1067,65 @@ def test_terminate_popen_lease_unlink_failure_is_typed(
 
     assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
     assert manager.lease_path.read_bytes() == lease_before
+
+
+@pytest.mark.parametrize(
+    ("fail_on_revalidation", "expected_signals"),
+    [(1, []), (2, ["terminate"])],
+    ids=("before-graceful", "between-graceful-and-force"),
+)
+def test_terminate_popen_revalidates_pinned_authorization_before_each_signal(
+    monkeypatch,
+    tmp_path,
+    fail_on_revalidation,
+    expected_signals,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    signals = []
+
+    class StubbornPopen:
+        pid = identity.pid
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            signals.append("terminate")
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("obs", timeout)
+
+        def kill(self):
+            signals.append("kill")
+
+    process = StubbornPopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    lease_before = manager.lease_path.read_bytes()
+    real_revalidate = manager._revalidate_process_lease_snapshot_locked
+    calls = 0
+
+    def fail_selected_revalidation(transaction, snapshot):
+        nonlocal calls
+        calls += 1
+        if calls == fail_on_revalidation:
+            raise OBSProcessLeaseError("simulated authorization loss")
+        return real_revalidate(transaction, snapshot)
+
+    monkeypatch.setattr(
+        manager,
+        "_revalidate_process_lease_snapshot_locked",
+        fail_selected_revalidation,
+    )
+
+    with pytest.raises(OBSProcessTerminationError) as captured:
+        manager.terminate_process(process, timeout_sec=0)
+
+    assert signals == expected_signals
+    assert manager.lease_path.read_bytes() == lease_before
+    assert str(manager.lease_path) in str(captured.value)
+    assert str(manager.lease_lock_path) in str(captured.value)
 
 
 def test_terminate_popen_preserves_a_replaced_same_pid_lease(monkeypatch, tmp_path):
@@ -897,19 +1152,13 @@ def test_terminate_popen_preserves_a_replaced_same_pid_lease(monkeypatch, tmp_pa
             signals.append("kill")
 
     process = ExitedPopen()
-    replacement_process = SimpleNamespace(pid=replacement.pid)
     monkeypatch.setattr(
         manager,
         "query_popen_process_identity",
         lambda candidate: old_identity,
     )
-    monkeypatch.setattr(
-        writer_manager,
-        "query_popen_process_identity",
-        lambda candidate: replacement,
-    )
     manager.write_process_lease(process)
-    writer_manager.write_process_lease(replacement_process)
+    _write_v2_lease(writer_manager, replacement)
     monkeypatch.setattr(
         manager,
         "query_obs_processes_strict",
@@ -927,7 +1176,7 @@ def test_terminate_popen_preserves_a_replaced_same_pid_lease(monkeypatch, tmp_pa
         manager.terminate_process(process)
 
     assert isinstance(captured.value.__cause__, OBSProcessLeaseError)
-    assert "changed" in str(captured.value.__cause__)
+    assert "differs" in str(captured.value.__cause__)
     assert signals == []
     assert writer_manager.lease_path.read_bytes() == lease_before
     final_lease = manager.read_process_lease()
@@ -1073,10 +1322,12 @@ def test_malformed_lease_fails_without_query_clear_or_signal(
     )
     monkeypatch.setattr(manager, "_terminate_pid", lambda *args: pytest.fail("must not signal"))
 
-    with pytest.raises(OBSProcessLeaseError, match="malformed"):
+    with pytest.raises(OBSProcessLeaseError, match="malformed") as captured:
         manager.kill_stale_owned_processes(timeout_sec=0)
 
     assert manager.lease_path.exists()
+    assert str(manager.lease_path) in str(captured.value)
+    assert str(manager.lease_lock_path) in str(captured.value)
 
 
 def test_owned_lookup_fails_on_same_pid_path_with_different_filetime(
@@ -1184,6 +1435,60 @@ def _install_owned_windows_harness(
         lambda handle: events.append(("close", handle)),
     )
     return events
+
+
+@pytest.mark.parametrize(
+    ("fail_on_revalidation", "graceful_expected"),
+    [(1, False), (2, True)],
+    ids=("before-graceful", "before-force"),
+)
+def test_stale_owned_cleanup_revalidates_lease_before_each_signal(
+    monkeypatch,
+    tmp_path,
+    fail_on_revalidation,
+    graceful_expected,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    target = _identity(manager)
+    _write_v2_lease(manager, target)
+    lease_before = manager.lease_path.read_bytes()
+    events = _install_owned_windows_harness(
+        monkeypatch,
+        manager,
+        target,
+        [
+            _snapshot(target),
+            _snapshot(target),
+            _snapshot(target),
+            _snapshot(target),
+            _snapshot(target),
+        ],
+        [False, False, False, False, False, False],
+    )
+    real_revalidate = manager._revalidate_process_lease_snapshot_locked
+    calls = 0
+
+    def fail_selected_revalidation(transaction, snapshot):
+        nonlocal calls
+        calls += 1
+        if calls == fail_on_revalidation:
+            raise OBSProcessLeaseError("simulated stale authorization loss")
+        return real_revalidate(transaction, snapshot)
+
+    monkeypatch.setattr(
+        manager,
+        "_revalidate_process_lease_snapshot_locked",
+        fail_selected_revalidation,
+    )
+
+    with pytest.raises(OBSProcessLeaseError, match="authorization loss"):
+        manager.kill_stale_owned_processes(timeout_sec=0)
+
+    graceful_signals = [event for event in events if event[:1] == ("signal",)]
+    force_signals = [event for event in events if event[:1] == ("force",)]
+    assert bool(graceful_signals) is graceful_expected
+    assert force_signals == []
+    assert manager.lease_path.read_bytes() == lease_before
 
 
 def test_owned_cleanup_stops_only_leased_identity_and_leaves_unrelated_obs(
@@ -1854,18 +2159,27 @@ def test_matching_lease_clear_cannot_delete_a_concurrent_new_lease(
     old_lease = manager.read_process_lease()
     assert old_lease is not None
 
-    unlink_entered = threading.Event()
-    allow_unlink = threading.Event()
+    delete_entered = threading.Event()
+    allow_delete = threading.Event()
     writer_finished = threading.Event()
-    original_unlink = Path.unlink
+    original_delete = manager._delete_process_lease_snapshot_locked
 
-    def blocking_unlink(path, *args, **kwargs):
-        if path == manager.lease_path:
-            unlink_entered.set()
-            assert allow_unlink.wait(timeout=2)
-        return original_unlink(path, *args, **kwargs)
+    def blocking_delete(transaction, snapshot):
+        delete_entered.set()
+        assert allow_delete.wait(timeout=2)
+        return original_delete(transaction, snapshot)
 
-    monkeypatch.setattr(Path, "unlink", blocking_unlink)
+    monkeypatch.setattr(
+        manager,
+        "_delete_process_lease_snapshot_locked",
+        blocking_delete,
+    )
+    thread_lock = _InstrumentedLeaseThreadLock()
+    monkeypatch.setattr(
+        obs_process_module,
+        "_OBS_PROCESS_LEASE_LOCK",
+        thread_lock,
+    )
     monkeypatch.setattr(
         manager,
         "query_popen_process_identity",
@@ -1883,16 +2197,20 @@ def test_matching_lease_clear_cannot_delete_a_concurrent_new_lease(
         writer_finished.set()
 
     writer_thread = threading.Thread(target=write_new_lease)
+    thread_lock.watch(writer_thread)
     clear_thread.start()
-    assert unlink_entered.wait(timeout=2)
+    assert delete_entered.wait(timeout=2)
     writer_thread.start()
-    assert not writer_finished.wait(timeout=0.1)
-    allow_unlink.set()
+    assert thread_lock.attempted.wait(timeout=2)
+    assert not thread_lock.acquired.is_set()
+    assert not writer_finished.is_set()
+    allow_delete.set()
     clear_thread.join(timeout=2)
     writer_thread.join(timeout=2)
 
     assert not clear_thread.is_alive()
     assert not writer_thread.is_alive()
+    assert thread_lock.acquired.is_set()
     assert writer_finished.is_set()
     final_lease = manager.read_process_lease()
     assert final_lease is not None
@@ -1936,6 +2254,12 @@ def test_owned_cleanup_serializes_lease_replacement_before_any_signal(
         return original_query()
 
     monkeypatch.setattr(manager, "query_obs_processes_strict", blocking_query)
+    thread_lock = _InstrumentedLeaseThreadLock()
+    monkeypatch.setattr(
+        obs_process_module,
+        "_OBS_PROCESS_LEASE_LOCK",
+        thread_lock,
+    )
     monkeypatch.setattr(
         writer_manager,
         "query_popen_process_identity",
@@ -1958,16 +2282,20 @@ def test_owned_cleanup_serializes_lease_replacement_before_any_signal(
 
     cleanup_thread = threading.Thread(target=cleanup)
     writer_thread = threading.Thread(target=replace_lease)
+    thread_lock.watch(writer_thread)
     cleanup_thread.start()
     assert cleanup_query_entered.wait(timeout=2)
     writer_thread.start()
-    assert not writer_finished.wait(timeout=0.1)
+    assert thread_lock.attempted.wait(timeout=2)
+    assert not thread_lock.acquired.is_set()
+    assert not writer_finished.is_set()
     allow_cleanup_query.set()
     cleanup_thread.join(timeout=2)
     writer_thread.join(timeout=2)
 
     assert not cleanup_thread.is_alive()
     assert not writer_thread.is_alive()
+    assert thread_lock.acquired.is_set()
     assert thread_errors == []
     assert cleanup_result == [target.pid]
     assert ("signal", target.pid, False) in events
@@ -1975,6 +2303,504 @@ def test_owned_cleanup_serializes_lease_replacement_before_any_signal(
     final_lease = manager.read_process_lease()
     assert final_lease is not None
     assert final_lease.pid == replacement.pid
+
+
+def test_lease_transaction_cleanup_preserves_body_primary_and_notes_all_failures(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    process = SimpleNamespace(pid=identity.pid)
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    real_close = obs_process_module.os.close
+    real_release = obs_process_module._OBSInterProcessLock.release
+    snapshot_descriptor = None
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        if descriptor == snapshot_descriptor:
+            raise OSError("simulated snapshot close failure")
+
+    def release_then_fail(lock):
+        real_release(lock)
+        raise OSError("simulated lock release failure")
+
+    monkeypatch.setattr(obs_process_module.os, "close", close_then_fail)
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_then_fail,
+    )
+
+    with pytest.raises(RuntimeError, match="body primary") as captured:
+        with manager._process_lease_transaction() as transaction:
+            assert transaction is not None
+            snapshot = manager._open_process_lease_snapshot_locked(transaction)
+            assert snapshot is not None
+            snapshot_descriptor = snapshot.descriptor
+            raise RuntimeError("body primary")
+
+    notes = getattr(captured.value, "__notes__", [])
+    assert any("snapshot close failure" in note for note in notes)
+    assert any("lock release failure" in note for note in notes)
+
+
+def test_lease_transaction_raises_first_cleanup_failure_after_successful_body(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    process = SimpleNamespace(pid=identity.pid)
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+    real_close = obs_process_module.os.close
+    real_release = obs_process_module._OBSInterProcessLock.release
+    snapshot_descriptor = None
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        if descriptor == snapshot_descriptor:
+            raise OSError("simulated successful-body close failure")
+
+    def release_then_fail(lock):
+        real_release(lock)
+        raise OSError("simulated later release failure")
+
+    monkeypatch.setattr(obs_process_module.os, "close", close_then_fail)
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_then_fail,
+    )
+
+    with pytest.raises(
+        OBSProcessLeaseError,
+        match="終了処理を安全に完了",
+    ) as captured:
+        with manager._process_lease_transaction() as transaction:
+            assert transaction is not None
+            snapshot = manager._open_process_lease_snapshot_locked(transaction)
+            assert snapshot is not None
+            snapshot_descriptor = snapshot.descriptor
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "successful-body close failure" in str(captured.value.__cause__)
+    assert any(
+        "later release failure" in note
+        for note in getattr(captured.value, "__notes__", [])
+    )
+
+
+@pytest.mark.parametrize("changed_owner", ["lock", "root"])
+def test_orphan_inventory_revalidates_ownership_before_opening_temporary(
+    monkeypatch,
+    tmp_path,
+    changed_owner,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    _write_v2_lease(manager, identity)
+    temporary_path = manager.obs_dir / (
+        f"{obs_process_module.OBS_PROCESS_LEASE_TEMP_PREFIX}{'d' * 32}"
+    )
+    temporary_path.write_bytes(b"orphaned temporary lease")
+    lease_bytes = manager.lease_path.read_bytes()
+    lease_identity = obs_process_module._file_identity(manager.lease_path.stat())
+    temporary_bytes = temporary_path.read_bytes()
+    temporary_identity = obs_process_module._file_identity(temporary_path.stat())
+    inventory_finished = False
+    failure = OSError(f"simulated {changed_owner} change during inventory")
+    opened_names = []
+    real_scandir = obs_process_module.os.scandir
+
+    class InventoryFaultLock:
+        def validate_ownership(self):
+            if changed_owner == "lock" and inventory_finished:
+                raise failure
+
+    class ScandirWithInventoryFault:
+        def __init__(self, path):
+            self._entries = real_scandir(path)
+
+        def __enter__(self):
+            return self._entries.__enter__()
+
+        def __exit__(self, exc_type, exc, traceback):
+            nonlocal inventory_finished
+            try:
+                return self._entries.__exit__(exc_type, exc, traceback)
+            finally:
+                inventory_finished = True
+
+    with obs_process_module._OBSDirectoryLease.open_absolute(
+        manager.obs_dir,
+        mutable=True,
+    ) as root_lease:
+        transaction = obs_process_module._OBSProcessLeaseTransaction(
+            lock=InventoryFaultLock(),
+            root_lease=root_lease,
+        )
+        real_validate_root = root_lease.validate_lexical_binding
+        real_open_file = root_lease.open_file
+
+        def validate_root():
+            if changed_owner == "root" and inventory_finished:
+                raise failure
+            return real_validate_root()
+
+        def track_open_file(name, **kwargs):
+            opened_names.append(name)
+            return real_open_file(name, **kwargs)
+
+        def scandir_inventory(path):
+            assert Path(path) == root_lease.path
+            return ScandirWithInventoryFault(path)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                root_lease,
+                "validate_lexical_binding",
+                validate_root,
+            )
+            patch.setattr(root_lease, "open_file", track_open_file)
+            patch.setattr(obs_process_module.os, "scandir", scandir_inventory)
+            with pytest.raises(OBSProcessLeaseError) as captured:
+                manager._recover_process_lease_temporaries_locked(transaction)
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert captured.value.__cause__ is failure
+    assert opened_names == []
+    assert transaction.commit_occurred is False
+    assert transaction.recovered_temporary_paths == []
+    assert manager.lease_path.read_bytes() == lease_bytes
+    assert obs_process_module._file_identity(manager.lease_path.stat()) == lease_identity
+    assert temporary_path.read_bytes() == temporary_bytes
+    assert obs_process_module._file_identity(temporary_path.stat()) == temporary_identity
+
+
+def test_orphan_recovery_reports_later_snapshot_close_failure_without_removing_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    _write_v2_lease(manager, identity)
+    temporary_path = manager.obs_dir / (
+        f"{obs_process_module.OBS_PROCESS_LEASE_TEMP_PREFIX}{'a' * 32}"
+    )
+    temporary_path.write_bytes(b"orphaned temporary lease")
+    real_open = manager._open_process_lease_snapshot_locked
+    real_close = obs_process_module.os.close
+    snapshot_descriptor = None
+
+    def capture_snapshot(transaction):
+        nonlocal snapshot_descriptor
+        snapshot = real_open(transaction)
+        assert snapshot is not None
+        snapshot_descriptor = snapshot.descriptor
+        return snapshot
+
+    def close_then_fail(descriptor):
+        real_close(descriptor)
+        if descriptor == snapshot_descriptor:
+            raise OSError("simulated snapshot close after orphan recovery")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            manager,
+            "_open_process_lease_snapshot_locked",
+            capture_snapshot,
+        )
+        patch.setattr(obs_process_module.os, "close", close_then_fail)
+        with pytest.raises(OBSProcessLeaseError) as captured:
+            manager.read_process_lease()
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "snapshot close after orphan recovery" in str(captured.value.__cause__)
+    assert any(
+        "削除済み" in note and str(temporary_path) in note
+        for note in getattr(captured.value, "__notes__", [])
+    )
+    assert not temporary_path.exists()
+    assert manager.lease_path.exists()
+    assert manager.read_process_lease() is not None
+
+
+def test_orphan_recovery_reports_later_lock_release_failure_without_removing_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    _write_v2_lease(manager, identity)
+    temporary_path = manager.obs_dir / (
+        f"{obs_process_module.OBS_PROCESS_LEASE_TEMP_PREFIX}{'b' * 32}"
+    )
+    temporary_path.write_bytes(b"orphaned temporary lease")
+    real_release = obs_process_module._OBSInterProcessLock.release
+
+    def release_then_fail(lock):
+        real_release(lock)
+        raise OSError("simulated lock release after orphan recovery")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            obs_process_module._OBSInterProcessLock,
+            "release",
+            release_then_fail,
+        )
+        with pytest.raises(OBSProcessLeaseError) as captured:
+            manager.read_process_lease()
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert isinstance(captured.value.__cause__, OSError)
+    assert "lock release after orphan recovery" in str(captured.value.__cause__)
+    assert any(
+        "削除済み" in note and str(temporary_path) in note
+        for note in getattr(captured.value, "__notes__", [])
+    )
+    assert not temporary_path.exists()
+    assert manager.lease_path.exists()
+    assert manager.read_process_lease() is not None
+
+
+@pytest.mark.parametrize("operation", ["fstat", "lseek", "read"])
+def test_lease_snapshot_io_failure_is_actionable_and_preserves_lease(
+    monkeypatch,
+    tmp_path,
+    operation,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    _write_v2_lease(manager, identity)
+    failure = OSError(f"simulated lease {operation} failure")
+    lease_descriptor = None
+    real_open_file = obs_process_module._OBSDirectoryLease.open_file
+    real_operation = getattr(obs_process_module.os, operation)
+
+    def capture_open_file(directory, name, **kwargs):
+        nonlocal lease_descriptor
+        descriptor = real_open_file(directory, name, **kwargs)
+        if name == manager.lease_path.name and lease_descriptor is None:
+            lease_descriptor = descriptor
+        return descriptor
+
+    def fail_lease_operation(*args):
+        if args[0] == lease_descriptor:
+            raise failure
+        return real_operation(*args)
+
+    with pytest.raises(OBSProcessLeaseError) as captured:
+        with manager._process_lease_transaction(mutating=True) as transaction:
+            assert transaction is not None
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    obs_process_module._OBSDirectoryLease,
+                    "open_file",
+                    capture_open_file,
+                )
+                patch.setattr(obs_process_module.os, operation, fail_lease_operation)
+                manager._open_process_lease_snapshot_locked(transaction)
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert captured.value.__cause__ is failure
+    assert manager.lease_path.exists()
+    assert manager.read_process_lease() is not None
+
+
+def test_lease_snapshot_revalidation_io_failure_is_actionable_and_preserves_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    _write_v2_lease(manager, identity)
+    failure = OSError("simulated lease revalidation failure")
+
+    with pytest.raises(OBSProcessLeaseError) as captured:
+        with manager._process_lease_transaction(mutating=True) as transaction:
+            assert transaction is not None
+            snapshot = manager._open_process_lease_snapshot_locked(transaction)
+            assert snapshot is not None
+
+            def fail_revalidation(_transaction, _descriptor, **_kwargs):
+                raise failure
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    manager,
+                    "_read_process_lease_descriptor_bytes_locked",
+                    fail_revalidation,
+                )
+                manager._revalidate_process_lease_snapshot_locked(
+                    transaction,
+                    snapshot,
+                )
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert captured.value.__cause__ is failure
+    assert manager.lease_path.exists()
+    assert manager.read_process_lease() is not None
+
+
+def test_lease_snapshot_ownership_io_failure_is_actionable_and_preserves_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    _write_v2_lease(manager, identity)
+    failure = OSError("simulated lease ownership revalidation failure")
+
+    with pytest.raises(OBSProcessLeaseError) as captured:
+        with manager._process_lease_transaction(mutating=True) as transaction:
+            assert transaction is not None
+
+            def fail_ownership():
+                raise failure
+
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    transaction,
+                    "validate_ownership",
+                    fail_ownership,
+                )
+                manager._open_process_lease_snapshot_locked(transaction)
+
+    _assert_actionable_lease_recovery(captured.value, manager)
+    assert captured.value.__cause__ is failure
+    assert manager.lease_path.exists()
+    assert manager.read_process_lease() is not None
+
+
+def test_lease_delete_consumes_descriptor_before_reraising_base_exception(
+    monkeypatch,
+    tmp_path,
+):
+    class CloseReportedControlFlow(BaseException):
+        pass
+
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    old_identity = _identity(manager)
+    _write_v2_lease(manager, old_identity)
+    real_close = obs_process_module.os.close
+    snapshot_descriptor = None
+    close_count = 0
+
+    def close_then_report(descriptor):
+        nonlocal close_count
+        real_close(descriptor)
+        if descriptor == snapshot_descriptor:
+            close_count += 1
+            raise CloseReportedControlFlow("simulated post-delete close report")
+
+    with pytest.raises(CloseReportedControlFlow, match="post-delete close report"):
+        with manager._process_lease_transaction(mutating=True) as transaction:
+            assert transaction is not None
+            snapshot = manager._open_process_lease_snapshot_locked(transaction)
+            assert snapshot is not None
+            snapshot_descriptor = snapshot.descriptor
+            with monkeypatch.context() as patch:
+                patch.setattr(obs_process_module.os, "close", close_then_report)
+                manager._delete_process_lease_snapshot_locked(transaction, snapshot)
+
+    assert snapshot.deletion_marked is True
+    assert transaction.snapshot is None
+    assert transaction.commit_occurred is True
+    assert close_count == 1
+    assert not manager.lease_path.exists()
+
+    new_identity = _identity(manager, pid=101, unix_seconds=11.0)
+    process = SimpleNamespace(pid=new_identity.pid)
+    monkeypatch.setattr(
+        manager,
+        "query_popen_process_identity",
+        lambda candidate: new_identity,
+    )
+    manager.write_process_lease(process)
+    assert manager.read_process_lease() == process._lol_replay_obs_process_lease
+
+
+def test_orphan_delete_consumes_descriptor_before_reraising_base_exception(
+    monkeypatch,
+    tmp_path,
+):
+    class CloseReportedControlFlow(BaseException):
+        pass
+
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    _write_v2_lease(manager, identity)
+    temporary_name = (
+        f"{obs_process_module.OBS_PROCESS_LEASE_TEMP_PREFIX}{'c' * 32}"
+    )
+    temporary_path = manager.obs_dir / temporary_name
+    temporary_path.write_bytes(b"orphaned temporary lease")
+    real_open_file = obs_process_module._OBSDirectoryLease.open_file
+    real_close = obs_process_module.os.close
+    temporary_descriptor = None
+    close_count = 0
+
+    def capture_open_file(directory, name, **kwargs):
+        nonlocal temporary_descriptor
+        descriptor = real_open_file(directory, name, **kwargs)
+        if name == temporary_name and temporary_descriptor is None:
+            temporary_descriptor = descriptor
+        return descriptor
+
+    def close_then_report(descriptor):
+        nonlocal close_count
+        real_close(descriptor)
+        if descriptor == temporary_descriptor:
+            close_count += 1
+            raise CloseReportedControlFlow("simulated orphan close report")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            obs_process_module._OBSDirectoryLease,
+            "open_file",
+            capture_open_file,
+        )
+        patch.setattr(obs_process_module.os, "close", close_then_report)
+        with pytest.raises(CloseReportedControlFlow, match="orphan close report"):
+            manager.read_process_lease()
+
+    assert close_count == 1
+    assert not temporary_path.exists()
+    assert manager.lease_path.exists()
+    assert manager.read_process_lease() is not None
+
+
+def test_committed_lease_write_does_not_report_late_lock_release_failure(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+    process = SimpleNamespace(pid=identity.pid)
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    real_release = obs_process_module._OBSInterProcessLock.release
+
+    def release_then_fail(lock):
+        real_release(lock)
+        raise OSError("simulated post-commit release failure")
+
+    monkeypatch.setattr(
+        obs_process_module._OBSInterProcessLock,
+        "release",
+        release_then_fail,
+    )
+
+    manager.write_process_lease(process)
+
+    payload = json.loads(manager.lease_path.read_text(encoding="utf-8"))
+    assert payload["pid"] == identity.pid
+    assert process._lol_replay_obs_process_lease.pid == identity.pid
 
 
 def test_process_manager_reads_latest_portable_mode_log(tmp_path):
@@ -2091,6 +2917,41 @@ def test_windows_process_queries_run_hidden(monkeypatch):
     assert kwargs["creationflags"] == 0x08000000
     assert kwargs["startupinfo"].dwFlags & 1
     assert kwargs["startupinfo"].wShowWindow == 0
+    assert kwargs["timeout"] == obs_process_module._OBS_PROCESS_QUERY_COMMAND_TIMEOUT_SEC
+
+
+def test_wmic_timeout_falls_back_to_bounded_powershell_query(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/wmic_query_timeout").resolve())
+    calls = []
+    timeout_error = subprocess.TimeoutExpired(
+        "wmic",
+        obs_process_module._OBS_PROCESS_QUERY_COMMAND_TIMEOUT_SEC,
+    )
+
+    def run_query(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[0] == "wmic":
+            raise timeout_error
+        assert command[0] == "powershell"
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"ProcessId":456,"ExecutablePath":'
+                '"C:/obs/bin/64bit/obs64.exe","CreationDate":null}'
+            ),
+        )
+
+    monkeypatch.setattr(manager, "_run_hidden", run_query)
+
+    processes = manager._list_obs_processes_windows()
+
+    assert [process.pid for process in processes] == [456]
+    assert [command[0] for command, _kwargs in calls] == ["wmic", "powershell"]
+    assert all(
+        kwargs["timeout"]
+        == obs_process_module._OBS_PROCESS_QUERY_COMMAND_TIMEOUT_SEC
+        for _command, kwargs in calls
+    )
 
 
 def test_strict_process_query_distinguishes_successful_empty_result(monkeypatch):
@@ -2483,7 +3344,7 @@ def test_strict_process_query_rejects_stderr_only_cim_failure(monkeypatch):
     monkeypatch.setattr("src.obs_process.os.name", "nt")
 
     def fail_on_stderr(command, **kwargs):
-        commands.append(command)
+        commands.append((command, kwargs))
         return SimpleNamespace(
             returncode=0,
             stdout="",
@@ -2495,11 +3356,29 @@ def test_strict_process_query_rejects_stderr_only_cim_failure(monkeypatch):
     with pytest.raises(OBSProcessQueryError, match="stderr"):
         manager.query_obs_processes_strict()
 
-    script = commands[0][-1]
+    command, kwargs = commands[0]
+    script = command[-1]
     assert "$ErrorActionPreference = 'Stop'" in script
     assert "Get-CimInstance" in script and "-ErrorAction Stop" in script
     assert "Name='ProcessId'" in script and "[long]$_.ProcessId" in script
     assert "Get-Process" not in script
+    assert kwargs["timeout"] == obs_process_module._OBS_PROCESS_QUERY_COMMAND_TIMEOUT_SEC
+
+
+def test_strict_process_query_timeout_is_a_query_error(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/strict_obs_query_timeout").resolve())
+    monkeypatch.setattr("src.obs_process.os.name", "nt")
+    timeout_error = subprocess.TimeoutExpired("powershell", 10)
+    monkeypatch.setattr(
+        manager,
+        "_run_hidden",
+        lambda *args, **kwargs: (_ for _ in ()).throw(timeout_error),
+    )
+
+    with pytest.raises(OBSProcessQueryError, match="could not be started") as captured:
+        manager.query_obs_processes_strict()
+
+    assert captured.value.__cause__ is timeout_error
 
 
 @pytest.mark.parametrize(
@@ -2563,6 +3442,9 @@ def test_taskkill_runs_hidden_on_windows(monkeypatch):
     assert command == ["taskkill", "/pid", "123", "/f"]
     assert kwargs["creationflags"] == 0x08000000
     assert kwargs["startupinfo"].dwFlags & 1
+    assert kwargs["timeout"] == (
+        obs_process_module._OBS_PROCESS_TERMINATE_COMMAND_TIMEOUT_SEC
+    )
 
 
 def test_taskkill_nonzero_exit_is_not_reported_as_signaled(monkeypatch):
@@ -2571,6 +3453,19 @@ def test_taskkill_nonzero_exit_is_not_reported_as_signaled(monkeypatch):
         manager,
         "_run_hidden",
         lambda *args, **kwargs: SimpleNamespace(returncode=5),
+    )
+
+    assert manager._terminate_pid(123, force=False) is False
+
+
+def test_taskkill_timeout_is_not_reported_as_signaled(monkeypatch):
+    manager = OBSProcessManager(Path("tests/_tmp/taskkill_timeout").resolve())
+    monkeypatch.setattr(
+        manager,
+        "_run_hidden",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("taskkill", 10)
+        ),
     )
 
     assert manager._terminate_pid(123, force=False) is False

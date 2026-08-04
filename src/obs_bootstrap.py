@@ -46,6 +46,9 @@ WINDOWS_LOCK_CONTENTION_ERRORS = _transaction_fs.WINDOWS_LOCK_CONTENTION_ERRORS
 OBS_TRANSACTION_TEMP_COPY = _transaction_fs.OBS_TRANSACTION_TEMP_COPY
 OBS_TRANSACTION_TEMP_WRITE = _transaction_fs.OBS_TRANSACTION_TEMP_WRITE
 OBS_TRANSACTION_TEMP_JOURNAL = _transaction_fs.OBS_TRANSACTION_TEMP_JOURNAL
+OBS_PROCESS_LEASE_FILE_NAME = _transaction_fs.OBS_PROCESS_LEASE_FILE_NAME
+OBS_PROCESS_LEASE_LOCK_NAME = _transaction_fs.OBS_PROCESS_LEASE_LOCK_NAME
+OBS_PROCESS_LEASE_TEMP_PREFIX = _transaction_fs.OBS_PROCESS_LEASE_TEMP_PREFIX
 WINDOWS_RESERVED_PATH_NAMES = _transaction_fs.WINDOWS_RESERVED_PATH_NAMES
 _filesystem_name_key = _transaction_fs._filesystem_name_key
 _filesystem_parts_key = _transaction_fs._filesystem_parts_key
@@ -178,7 +181,8 @@ STARTUP_SETTINGS = {
 STARTUP_SETTINGS_SECTION = "General"
 OBS_COPY_SKIP_NAMES = frozenset(
     {
-        ".lol_replay_obs_lease.json",
+        OBS_PROCESS_LEASE_FILE_NAME,
+        OBS_PROCESS_LEASE_LOCK_NAME,
         ".lol_replay_obs_copy_in_progress",
         ".lol_replay_obs_copy_lock",
         ".lol_replay_obs_settings_transaction.json",
@@ -189,9 +193,15 @@ OBS_COPY_IN_PROGRESS_MARKER_NAME = ".lol_replay_obs_copy_in_progress"
 OBS_COPY_LOCK_NAME = ".lol_replay_obs_copy_lock"
 OBS_SETTINGS_TRANSACTION_MARKER_NAME = ".lol_replay_obs_settings_transaction.json"
 OBS_FINALIZE_INVENTORY_SKIP_NAMES = frozenset(
-    {OBS_COPY_IN_PROGRESS_MARKER_NAME, OBS_COPY_LOCK_NAME}
+    {
+        OBS_COPY_IN_PROGRESS_MARKER_NAME,
+        OBS_COPY_LOCK_NAME,
+        OBS_PROCESS_LEASE_LOCK_NAME,
+    }
 )
-OBS_FINALIZER_CALLBACK_INVENTORY_SKIP_NAMES = frozenset({OBS_COPY_LOCK_NAME})
+OBS_FINALIZER_CALLBACK_INVENTORY_SKIP_NAMES = frozenset(
+    {OBS_COPY_LOCK_NAME, OBS_PROCESS_LEASE_LOCK_NAME}
+)
 OBS_COPY_JOURNAL_SCHEMA_VERSION = 4
 OBS_COPY_JOURNAL_COMPATIBLE_SCHEMA_VERSIONS = frozenset({3, 4})
 OBS_MIGRATION_PHASE_COPYING = "copying"
@@ -1849,6 +1859,55 @@ def _validate_settings_target_components(parts: tuple[str, ...]) -> None:
             raise OBSPathSafetyError(
                 f"transaction一時file形式のcomponentを設定targetにできません: {part}"
             )
+    if not parts:
+        return
+    try:
+        process_lease_temporary = _is_obs_process_lease_temporary_name(parts[0])
+    except _UnsafeOBSMigrationPathError as exc:
+        raise OBSPathSafetyError(
+            "設定targetのroot componentが不正なOBS process lease予約namespaceです: "
+            f"{parts[0]}"
+        ) from exc
+    if process_lease_temporary:
+        raise OBSPathSafetyError(
+            "OBS process lease一時fileを設定targetにできません: "
+            f"{parts[0]}"
+        )
+
+
+def _prevalidate_settings_plan_process_lease_namespace(
+    plan: OBSConfigTransactionPlan,
+) -> None:
+    """Reject lease-control targets before guard recovery can call user code."""
+
+    base_dir = _absolute_path(plan.base_dir)
+
+    def relative_parts(path: str | Path) -> tuple[str, ...]:
+        absolute = _absolute_path(path)
+        try:
+            relative = absolute.relative_to(base_dir)
+        except ValueError as exc:
+            raise OBSPathSafetyError(
+                f"設定transaction targetが管理OBS root外です: {absolute}"
+            ) from exc
+        if not relative.parts:
+            return ()
+        for part in relative.parts:
+            _validate_single_path_component(part)
+        return tuple(relative.parts)
+
+    for directory in plan.directories:
+        parts = relative_parts(directory)
+        if parts:
+            _validate_settings_target_components(parts)
+    for write in plan.writes:
+        parts = relative_parts(write.snapshot.path)
+        if not parts:
+            raise OBSPathSafetyError(
+                "管理OBS root自体を設定targetにできません: "
+                f"{_absolute_path(write.snapshot.path)}"
+            )
+        _validate_settings_target_components(parts)
 
 
 def _validated_settings_transaction_plan(
@@ -3543,6 +3602,7 @@ def execute_obs_config_transaction(
 ) -> tuple[Path, ...]:
     """Prepare and atomically commit one recoverable multi-file OBS update."""
 
+    _prevalidate_settings_plan_process_lease_namespace(plan)
     with obs_config_mutation_guard(
         plan.base_dir,
         before_settings_recovery=before_commit,
@@ -4462,7 +4522,39 @@ def _is_internal_inventory_path(
     relative_parts: tuple[str, ...],
     ignored_root_name_keys: frozenset[str],
 ) -> bool:
-    return _filesystem_name_key(relative_parts[0]) in ignored_root_name_keys
+    root_name = relative_parts[0]
+    if _is_obs_process_lease_temporary_name(root_name):
+        return True
+    return _filesystem_name_key(root_name) in ignored_root_name_keys
+
+
+def _is_obs_process_lease_temporary_name(
+    name: str,
+    *,
+    root: Path | None = None,
+) -> bool:
+    prefix_key = _filesystem_name_key(OBS_PROCESS_LEASE_TEMP_PREFIX)
+    if not _filesystem_name_key(name).startswith(prefix_key):
+        return False
+    suffix = name[len(OBS_PROCESS_LEASE_TEMP_PREFIX) :]
+    if (
+        not name.startswith(OBS_PROCESS_LEASE_TEMP_PREFIX)
+        or len(suffix) != 32
+        or any(character not in "0123456789abcdef" for character in suffix)
+    ):
+        recovery = ""
+        if root is not None:
+            absolute_root = _absolute_path(root)
+            recovery = (
+                f" root={absolute_root}"
+                f" lease={absolute_root / OBS_PROCESS_LEASE_FILE_NAME}"
+                f" lock={absolute_root / OBS_PROCESS_LEASE_LOCK_NAME}。"
+                "すべてのOBS Studioと関連toolを終了してから再試行してください。"
+            )
+        raise _UnsafeOBSMigrationPathError(
+            f"予約されたOBS所有一時file名が不正です: {name}.{recovery}"
+        )
+    return True
 
 
 
@@ -5096,6 +5188,14 @@ def _build_obs_tree_inventory(
                 ] = []
                 for entry in iterator:
                     _validate_single_path_component(entry.name)
+                    if (
+                        directory.path == root
+                        and _is_obs_process_lease_temporary_name(
+                            entry.name,
+                            root=root,
+                        )
+                    ):
+                        continue
                     child_path = directory.path / entry.name
                     try:
                         child_stat = entry.stat(follow_symlinks=False)
@@ -6276,7 +6376,7 @@ class OBSBootstrapper:
             get_legacy_marker_path(self.base_dir),
             get_obs_global_ini_path(self.base_dir),
             get_obs_user_ini_path(self.base_dir),
-            self.base_dir / ".lol_replay_obs_lease.json",
+            self.base_dir / OBS_PROCESS_LEASE_FILE_NAME,
         ]
         if include_websocket:
             websocket_path = get_obs_websocket_config_path(self.base_dir)

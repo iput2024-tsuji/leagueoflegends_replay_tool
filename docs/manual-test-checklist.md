@@ -130,10 +130,20 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 - [ ] 通常Popenのbound lease欠落・破損・handle identity不一致、disk上のlease破損・差し替え・削除失敗を個別に発生させ、成功扱いせず既存leaseを維持する
 - [ ] 通常Popen終了とWebSocket切断が同時に失敗する場合、終了失敗を主因として表示し、切断を一度試行した事実と切断失敗をnoteまたはlogで確認する
 - [ ] portable mode不一致、起動直後identity取得失敗、Recorder起動失敗、GPU再起動失敗で、先行エラーを維持したままcleanup失敗をnoteまたはlogへ残し、同じPopenへ重複signalしない
-- [ ] 実OBS試験前にstrict queryでOBSが0件であることを確認し、原本`C:\dev\lol\obs-portable`が2112 files／403,417,038 bytes／fingerprint `df699e1587d3be30ae841d1c81819031c2e7845cb2d38f869e4e23a27d77f279`と一致する場合だけ続行する。fingerprintはrelative path（`\`を`/`へ変換）のOrdinal順に`path<NUL>size<NUL>file_sha256`を作り、`file_sha256`はlowercase hex、LF結合は末尾LFなしとしたUTF-8 bytes全体のSHA-256とする
-- [ ] GUIDを含む新規TEMP trial rootへ原本からfreshなA/Bを個別コピーし、`/MIR`や既存trialの再利用を行わない。A/Bを起動後、各Popen handle由来のPID、絶対path、raw creation FILETIMEとlease bytesを保存する
-- [ ] Aだけを通常Popen cleanupし、Aの終了とlease削除、Bの生存およびPID／path／raw FILETIME／lease bytes不変を確認する。原本のfile count／bytes／fingerprintも開始時と同一であることを再確認する
-- [ ] 実OBS試験の`finally`では保存した元Popen handleだけでA/Bをcleanupし、strict queryでOBSが0件になった後に限り、trial rootの絶対pathとGUID leafを再検証してそのtrial rootだけを削除する。PID再利用競争は実OBSで発生させずunit testだけで検証する
+- [ ] 後段の実OBS A/Bコピーとは別に用意した同一の破棄可能な専用OBS rootで、holder process Aが `.lol_replay_obs_lease.lock` を取得したことをeventで確認してからreader process Bを開始し、Bが待機すること、Aのrelease後だけBが進むこと、両processの終了コードとlock再利用を確認する。固定sleepで順序を推測しない
+- [ ] Windowsの子processを、専用lock取得後かつ厳密形式の `.lol_replay_obs_lease.tmp.<32 lowercase hex>` 永続化後に強制終了し、次のprocessが同じlockを取得して一時fileだけを回収し、既存leaseとOBS本体を変更しないことを確認する
+- [ ] Windowsでschema v2 leaseをtransaction中に固定し、別processからのin-place write、replace、deleteがshare violationで拒否されること、元transactionが同じraw bytes／physical identityを再検証できることを確認する。POSIXで同等試験を行う場合は、同じprocess間lockを守る協調writer間の保証として記録する
+- [ ] 既存leaseがある状態で別のruntime起動を競合させ、既存bytesを上書きせず、負けた起動が自分の新しい`Popen`だけをcleanupすることを確認する
+- [ ] 通常`Popen`終了とstale owned cleanupの両方で、graceful直前とforce直前にlease bytes／identityまたは対象handle identityを差し替えるfault injectionを行い、認可を失った段階以降のsignalを発行せずleaseを維持することを確認する。実OBSのPID再利用は発生させない
+- [ ] 古いlease handleへdelete-on-closeを設定し、そのhandleをcloseした直後に協調writerが同じpathへ新しいleaseを作成しても、外側transaction終了後まで新leaseが保持されることを確認する
+- [ ] OBSコピー／設定inventory中は、厳密形式のprocess lease一時fileを内容を開く前に除外し、専用lockはmetadata固定のため開く場合があっても最終比較対象から除外すること、主leaseの変更はfinalizerが検知すること、予約prefixの不正な名前は絶対root／lease／lock pathと全OBS・関連toolの終了／再試行案内を伴うRecoveryになることを確認する
+- [ ] 実OBS試験前にstrict queryでOBSが0件であることを確認する。試験対象原本のcanonical absolute path、取得元／version、file count、総bytes、fingerprintを事前にIssue／PRで承認済みbaselineとして記録し、開始時にすべて完全一致する場合だけ続行する。fingerprintはrelative path（`\`を`/`へ変換）のOrdinal順に`path<NUL>size<NUL>file_sha256`を作り、`file_sha256`はlowercase hex、LF結合は末尾LFなしとしたUTF-8 bytes全体のSHA-256とする。開始時と終了時のpath、取得元／version、file count、総bytes、fingerprintをPRの試験証跡へ記録する
+- [ ] hash／copy前と起動直前の両方でstrict queryがOBS 0件であることを確認し、開始時、copy直後、A停止後、終了時の原本inventoryをPRの試験証跡へ記録する
+- [ ] OSのexclusive directory createを使ってGUIDを含む新規TEMP trial rootをatomicに作り、原本からfreshなA/Bを個別コピーする。`/MIR`や既存trialの再利用を行わない。原本、A、Bのdirectory physical identityが相互に異なり、相互のancestorでないこと、全entryにreparse point、special file、hardlinkがなく、起動前のA/B inventoryが原本と双方向一致し、process leaseと予約一時fileが存在しないことを確認する
+- [ ] 各copyを`manager.start_obs(env=manager.isolated_env(), hidden=True)`で直接起動し、返されたPopenを強参照する。Popen handle identityとstrict snapshotを照合し、A起動後はAだけ、B起動後はA+Bだけのexact identityであることと、各copyのportable mode `true`をboundedに確認する。global OBS 1件を前提とする上位起動helperはBに使用しない
+- [ ] A/B双方についてPID、絶対path、raw creation FILETIME、parsed schema、lease bytes／SHA-256／physical identity、段階別strict snapshot、終了return codeをtrial外のPRまたはtask logへ保存し、成功時にtrialを削除しても証跡を残す。process、portable mode、helper、inventoryの照会はboundedにし、timeout、query失敗、malformed結果を0件や成功として扱わない
+- [ ] Bの`_process_lease_transaction()`で同じlease snapshot／descriptorをA停止前から停止後のraw bytes／physical identity／parsed lease再検証まで固定する。そのtransaction中にBの`read_process_lease()`や終了処理を再入せず、contextを完全に終了してからBを停止する。Aだけを通常Popen cleanupし、Aの終了とlease削除、Bの生存およびPID／path／raw FILETIME／lease不変を確認する。原本のfile count／bytes／fingerprintも開始時と同一であることを再確認する
+- [ ] 実OBS試験の`finally`ではPopenごとに取得済み、cleanup試行済み、正常完了を記録し、正常完了済みhandleへ再度signalせず、未完了の保存済み元Popen handleだけをcleanupする。`start_obs()`がcleanupにも失敗してPopenを返さない場合はPID指定へfallbackせず即時中止し、strict／helper照会結果とtrial pathを記録して手動確認する。主試験、全cleanup、元handleの終了、lease消滅、strict queryによるOBS 0件、trial配下executableのhelper process 0件、原本baseline不変をすべて確認できた場合に限り、作成時と同じtrial root physical identity、canonical TEMP直下のGUID leaf、trial直下がA/Bだけであること、原本tree外、全descendantのnon-reparse／通常file・directory／regular fileのsingle-link、原本・A・B間のphysical identity非共有を再検証して、そのtrial rootだけを削除する。いずれかが失敗または確認不能ならtrial rootを削除せず絶対pathを記録する。PID再利用競争は実OBSで発生させずunit testだけで検証する
 
 ## JSON保存
 

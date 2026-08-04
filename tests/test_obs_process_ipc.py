@@ -1,6 +1,7 @@
 import json
 import multiprocessing
 import os
+from multiprocessing.connection import wait as wait_for_connections
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,9 @@ from src import obs_process as obs_process_module
 from src.obs_process import (
     OBS_PROCESS_LEASE_SCHEMA_VERSION,
     OBS_PROCESS_LEASE_TEMP_PREFIX,
+    OBSProcessInfo,
     OBSProcessManager,
+    OBSProcessQuerySnapshot,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -86,6 +89,78 @@ def _write_lease_after_signal(path: str, payload: bytes, connection) -> None:
         raise RuntimeError("parent did not authorize the replacement lease")
     Path(path).write_bytes(payload)
     connection.send("written")
+
+
+def _start_obs_with_serialized_admission(
+    obs_dir: str,
+    worker_id: int,
+    start_event,
+    allow_publish,
+    connection,
+) -> None:
+    manager = OBSProcessManager(obs_dir)
+    unix_seconds = 100.0 + worker_id
+    identity = OBSProcessInfo(
+        pid=1000 + worker_id,
+        executable_path=manager.obs_exe,
+        creation_time=unix_seconds,
+        creation_time_filetime=int(
+            (unix_seconds + 11_644_473_600) * 10_000_000
+        ),
+    )
+    real_acquire = obs_process_module._OBSInterProcessLock.acquire
+
+    def reporting_acquire(lock, *args, **kwargs):
+        acquired = real_acquire(lock, *args, **kwargs)
+        connection.send(("attempt", worker_id, acquired))
+        return acquired
+
+    class FakePopen:
+        pid = identity.pid
+
+        def __init__(self) -> None:
+            self.alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            connection.send(("signal", worker_id, "terminate"))
+            self.alive = False
+
+        def wait(self, timeout):
+            return 0
+
+        def kill(self):
+            connection.send(("signal", worker_id, "kill"))
+            self.alive = False
+
+    def query():
+        connection.send(("query", worker_id))
+        return OBSProcessQuerySnapshot((), 100.0 + worker_id)
+
+    def popen(*_args, **_kwargs):
+        connection.send(("popen", worker_id))
+        if not allow_publish.wait(timeout=15):
+            raise TimeoutError("parent did not authorize lease publication")
+        return FakePopen()
+
+    obs_process_module._OBSInterProcessLock.acquire = reporting_acquire
+    obs_process_module.subprocess.Popen = popen
+    manager.query_obs_processes_strict = query
+    manager.query_popen_process_identity = lambda candidate: identity
+    connection.send(("ready", worker_id))
+    if not start_event.wait(timeout=15):
+        connection.send(("result", worker_id, "setup-timeout"))
+        return
+    try:
+        process = manager.start_obs(hidden=False)
+    except BaseException as exc:
+        connection.send(
+            ("result", worker_id, "error", type(exc).__name__, str(exc))
+        )
+    else:
+        connection.send(("result", worker_id, "success", process.pid))
 
 
 def _receive(connection, *, timeout: float = 15.0):
@@ -224,3 +299,107 @@ def test_windows_new_lease_created_after_pinned_close_is_preserved(tmp_path):
             writer.terminate()
             writer.join(timeout=5)
         writer.close()
+
+
+def test_windows_concurrent_starters_create_one_popen_and_one_lease(tmp_path):
+    obs_dir = tmp_path / "obs-portable"
+    manager = OBSProcessManager(obs_dir)
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.write_bytes(b"fake obs")
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    allow_publish = context.Event()
+    pipes = [context.Pipe() for _ in range(2)]
+    parents = [pair[0] for pair in pipes]
+    children = [pair[1] for pair in pipes]
+    processes = [
+        context.Process(
+            target=_start_obs_with_serialized_admission,
+            args=(
+                str(obs_dir),
+                worker_id,
+                start_event,
+                allow_publish,
+                children[worker_id],
+            ),
+        )
+        for worker_id in range(2)
+    ]
+    messages = []
+    results = []
+    popen_workers = []
+    try:
+        for process in processes:
+            process.start()
+        ready_workers = set()
+        while len(ready_workers) < 2:
+            ready = wait_for_connections(parents, timeout=15)
+            assert ready, "children did not report readiness"
+            for connection in ready:
+                message = connection.recv()
+                messages.append(message)
+                if message[0] == "ready":
+                    ready_workers.add(message[1])
+
+        start_event.set()
+        contended_workers = set()
+        while not popen_workers or not (
+            contended_workers - set(popen_workers)
+        ):
+            ready = wait_for_connections(parents, timeout=15)
+            assert ready, "starters did not reach causal lock contention"
+            for connection in ready:
+                message = connection.recv()
+                messages.append(message)
+                if message[0] == "popen":
+                    popen_workers.append(message[1])
+                elif message[0] == "attempt" and message[2] is False:
+                    contended_workers.add(message[1])
+            assert len(popen_workers) <= 1
+
+        allow_publish.set()
+        while len(results) < 2:
+            ready = wait_for_connections(parents, timeout=15)
+            assert ready, "starters did not report bounded results"
+            for connection in ready:
+                message = connection.recv()
+                messages.append(message)
+                if message[0] == "popen":
+                    popen_workers.append(message[1])
+                elif message[0] == "result":
+                    results.append(message)
+
+        for process in processes:
+            _join_cleanly(process)
+
+        successes = [message for message in results if message[2] == "success"]
+        failures = [message for message in results if message[2] == "error"]
+        assert len(successes) == 1
+        assert len(failures) == 1
+        assert failures[0][3] == "OBSProcessLeaseError"
+        assert "既存のOBS所有情報" in failures[0][4]
+        losing_worker = failures[0][1]
+        assert any(
+            message == ("attempt", losing_worker, True)
+            for message in messages
+        )
+        assert popen_workers == [successes[0][1]]
+        assert not any(message[0] == "signal" for message in messages)
+        lease = manager.read_process_lease()
+        assert lease is not None
+        assert lease.schema_version == OBS_PROCESS_LEASE_SCHEMA_VERSION
+        assert lease.pid == successes[0][3]
+        assert tuple(obs_dir.glob(f"{OBS_PROCESS_LEASE_TEMP_PREFIX}*")) == ()
+        assert manager.lease_lock_path.read_bytes() == b"\0"
+    finally:
+        start_event.set()
+        allow_publish.set()
+        for parent in parents:
+            parent.close()
+        for child in children:
+            child.close()
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+            process.close()

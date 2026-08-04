@@ -1789,37 +1789,93 @@ class OBSProcessManager:
         popen_kwargs: dict[str, Any] = {"cwd": str(self.working_dir), "env": env or os.environ.copy()}
         if hidden:
             popen_kwargs.update(self._hidden_subprocess_kwargs())
-        process = subprocess.Popen(cmd, **popen_kwargs)
-        try:
-            self.write_process_lease(process)
-        except BaseException as lease_error:
+
+        with self._process_lease_transaction(mutating=True) as transaction:
+            if transaction is None:
+                raise AssertionError("mutating lease transaction did not acquire a lock")
+            self._validate_obs_start_admission_locked(transaction)
+            process = subprocess.Popen(cmd, **popen_kwargs)
             try:
-                self._terminate_unleased_popen_process(process)
-            except BaseException as cleanup_error:
-                cleanup_failure = OBSProcessLeaseCleanupError(
-                    "OBSの所有情報を確立できず、起動したOBSの終了処理も"
-                    f"安全に完了できませんでした (PID {process.pid})。"
-                    "タスク マネージャーでOBSを確認し、残っている場合は"
-                    "手動終了してから再実行してください。"
-                )
-                add_note = getattr(cleanup_failure, "add_note", None)
-                if callable(add_note):
-                    add_note(
-                        "Lease establishment failed first: "
-                        f"{type(lease_error).__name__}: {lease_error}"
+                self._write_process_lease_locked(transaction, process)
+            except BaseException as lease_error:
+                try:
+                    self._terminate_unleased_popen_process(process)
+                except BaseException as cleanup_error:
+                    cleanup_failure = OBSProcessLeaseCleanupError(
+                        "OBSの所有情報を確立できず、起動したOBSの終了処理も"
+                        f"安全に完了できませんでした (PID {process.pid})。"
+                        "タスク マネージャーでOBSを確認し、残っている場合は"
+                        "手動終了してから再実行してください。"
                     )
-                    add_note(
-                        "Automatic process cleanup also failed: "
-                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    add_note = getattr(cleanup_failure, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "Lease establishment failed first: "
+                            f"{type(lease_error).__name__}: {lease_error}"
+                        )
+                        add_note(
+                            "Automatic process cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    self.logger.critical(
+                        "New OBS process cleanup failed after lease failure: pid=%s error=%s",
+                        process.pid,
+                        cleanup_error,
                     )
-                self.logger.critical(
-                    "New OBS process cleanup failed after lease failure: pid=%s error=%s",
-                    process.pid,
-                    cleanup_error,
+                    raise cleanup_failure from lease_error
+                raise
+            return process
+
+    def _validate_obs_start_admission_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+    ) -> None:
+        """Fail closed before creating a managed OBS Popen."""
+
+        if self._open_process_lease_snapshot_locked(transaction) is not None:
+            raise self._lease_recovery_error(
+                "既存のOBS所有情報があるため新しいPopenを生成しません。"
+            )
+
+        try:
+            snapshot = self.query_obs_processes_strict()
+            processes = validate_obs_process_query_snapshot(
+                snapshot,
+                label="OBS start admission",
+            )
+        except (OBSProcessQueryError, OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "OBS起動前のstrict process確認を安全に完了できないため"
+                "新しいPopenを生成しません。",
+                cause=exc,
+            ) from exc
+
+        managed = tuple(
+            process for process in processes if self.is_managed_process(process)
+        )
+        if managed:
+            pids = ", ".join(str(process.pid) for process in managed)
+            raise self._lease_recovery_error(
+                "OBS所有情報がない状態で管理対象OBSが既に実行中です。"
+                "新しいPopenを生成せず、既存processへsignalしません。"
+                f"タスク マネージャーで手動確認してください (PID {pids})。"
+            )
+
+        try:
+            transaction.validate_ownership()
+            if self._open_process_lease_snapshot_locked(transaction) is not None:
+                raise self._lease_recovery_error(
+                    "OBS起動前のstrict process確認中に所有情報が出現したため"
+                    "新しいPopenを生成しません。"
                 )
-                raise cleanup_failure from lease_error
+        except OBSProcessLeaseError:
             raise
-        return process
+        except (OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "OBS起動直前の所有transactionを再検証できないため"
+                "新しいPopenを生成しません。",
+                cause=exc,
+            ) from exc
 
     def latest_log_path(self, since: float | None = None) -> Path | None:
         logs_dir = self.obs_dir / "config" / "obs-studio" / "logs"

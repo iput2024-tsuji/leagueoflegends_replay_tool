@@ -397,12 +397,17 @@ def test_clip_export_reports_when_resolved_ffmpeg_disappears_before_execution(
     assert resolved == str(selected)
 
     selected.unlink()
+
+    def missing_process_factory(_command):
+        raise FileNotFoundError
+
     worker = ClipExportWorker(
         resolved,
         tmp_path / "input.mp4",
         tmp_path / "clips" / "output.mp4",
         start_sec=1.0,
         end_sec=2.0,
+        process_factory=missing_process_factory,
     )
     failures = []
     completed = []

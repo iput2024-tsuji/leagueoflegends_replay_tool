@@ -9,7 +9,13 @@ from pathlib import Path
 
 import pytest
 
-from src import obs_bootstrap, obs_transaction_fs
+from src import obs_bootstrap, obs_process as obs_process_module, obs_transaction_fs
+from src.obs_process import (
+    OBSProcessInfo,
+    OBSProcessLeaseError,
+    OBSProcessManager,
+    OBSProcessQuerySnapshot,
+)
 
 _POSIX_MOUNT_ID_AVAILABLE = (
     os.name != "nt" and Path("/proc/self/fdinfo").is_dir()
@@ -27,6 +33,118 @@ def _assert_no_transaction_artifacts(destination: Path) -> None:
     assert not obs_bootstrap.get_obs_copy_in_progress_marker(destination).exists()
     assert not obs_bootstrap.get_obs_copy_lock_path(destination).exists()
     assert not destination.exists()
+
+
+def _physical_identity(path: Path) -> tuple[int, int, int]:
+    return obs_transaction_fs._file_identity(path.stat())
+
+
+def _assert_runtime_alias_rejected_before_popen(
+    monkeypatch,
+    managed_root: Path,
+    alias_executable: Path,
+    *,
+    supported: bool,
+) -> None:
+    manager = OBSProcessManager(managed_root)
+    process = OBSProcessInfo(
+        pid=10300,
+        executable_path=alias_executable,
+        creation_time=103.0,
+        creation_time_filetime=116_444_737_030_000_000,
+    )
+    snapshot = OBSProcessQuerySnapshot((process,), 103.0)
+    manager.lease_lock_path.write_bytes(b"\0")
+    lock_raw = manager.lease_lock_path.read_bytes()
+    lock_identity = _physical_identity(manager.lease_lock_path)
+    managed_identity = _physical_identity(manager.obs_exe)
+    alias_identity = _physical_identity(alias_executable)
+    assert alias_identity == managed_identity
+    if supported:
+        with (
+            obs_process_module._pin_obs_executable_identity(
+                manager.obs_exe
+            ) as managed_pin,
+            obs_process_module._pin_obs_executable_identity(
+                alias_executable
+            ) as alias_pin,
+        ):
+            assert alias_pin.physical_identity == managed_pin.physical_identity
+
+    with monkeypatch.context() as admission_patch:
+        admission_patch.setattr(
+            manager,
+            "query_obs_processes_strict",
+            lambda: snapshot,
+        )
+        admission_patch.setattr(
+            obs_process_module.subprocess,
+            "Popen",
+            lambda *args, **kwargs: pytest.fail(
+                "physical alias must prevent Popen"
+            ),
+        )
+        admission_patch.setattr(
+            manager,
+            "_terminate_pid",
+            lambda *args, **kwargs: pytest.fail(
+                "admission must not signal a PID"
+            ),
+        )
+
+        expected = r"PID 10300" if supported else "物理identity"
+        with pytest.raises(OBSProcessLeaseError, match=expected):
+            manager.start_obs(hidden=False)
+
+    assert snapshot.processes == (process,)
+    assert not manager.lease_path.exists()
+    assert manager.lease_lock_path.read_bytes() == lock_raw
+    assert _physical_identity(manager.lease_lock_path) == lock_identity
+    assert _physical_identity(manager.obs_exe) == managed_identity
+    assert _physical_identity(alias_executable) == alias_identity
+
+
+def _assert_strict_row_alias_bound(
+    monkeypatch,
+    managed_root: Path,
+    cim_path: Path,
+    handle_path: Path,
+) -> None:
+    manager = OBSProcessManager(managed_root)
+    identity = OBSProcessInfo(
+        pid=10301,
+        executable_path=handle_path,
+        creation_time=103.01,
+        creation_time_filetime=116_444_737_030_100_000,
+    )
+    wait_calls = []
+    closed = []
+    monkeypatch.setattr(
+        manager,
+        "_open_process_identity_handle",
+        lambda pid: "handle-10301",
+    )
+    monkeypatch.setattr(
+        manager,
+        "_query_process_identity_from_handle",
+        lambda handle, pid: identity,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_wait_process_identity_handle",
+        lambda handle, timeout_ms: wait_calls.append((handle, timeout_ms)) or False,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_close_process_identity_handle",
+        lambda handle: closed.append(handle),
+    )
+
+    bound = manager._bind_strict_process_row_to_handle(identity.pid, cim_path)
+
+    assert bound is identity
+    assert wait_calls == [("handle-10301", 0), ("handle-10301", 0)]
+    assert closed == ["handle-10301"]
 
 
 def _windows_short_path(path: Path) -> Path:
@@ -102,6 +220,97 @@ def _windows_subst_root(target: Path):
             text=True,
             check=False,
         )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 runtime aliasの実APIテスト")
+def test_windows_runtime_admission_rejects_short_name_physical_alias(
+    monkeypatch,
+    tmp_path,
+):
+    managed_root = tmp_path / "managed-runtime-installation-long-name"
+    executable = _write_fake_obs(managed_root, b"runtime-short-name")
+    alias = _windows_short_path(executable)
+
+    _assert_strict_row_alias_bound(
+        monkeypatch,
+        managed_root,
+        executable,
+        alias,
+    )
+    _assert_runtime_alias_rejected_before_popen(
+        monkeypatch,
+        managed_root,
+        alias,
+        supported=True,
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume GUID runtime aliasの実APIテスト")
+def test_windows_runtime_admission_rejects_volume_guid_physical_alias(
+    monkeypatch,
+    tmp_path,
+):
+    managed_root = tmp_path / "managed-runtime-volume-guid"
+    executable = _write_fake_obs(managed_root, b"runtime-volume-guid")
+    alias = _windows_volume_guid_path(executable)
+
+    _assert_strict_row_alias_bound(
+        monkeypatch,
+        managed_root,
+        executable,
+        alias,
+    )
+    _assert_runtime_alias_rejected_before_popen(
+        monkeypatch,
+        managed_root,
+        alias,
+        supported=True,
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows SUBST runtime aliasの実APIテスト")
+def test_windows_runtime_admission_fails_closed_for_subst_alias(
+    monkeypatch,
+    tmp_path,
+):
+    managed_root = tmp_path / "managed-runtime-subst"
+    executable = _write_fake_obs(managed_root, b"runtime-subst")
+    with _windows_subst_root(tmp_path) as alias_root:
+        alias = alias_root / executable.relative_to(tmp_path)
+        _assert_runtime_alias_rejected_before_popen(
+            monkeypatch,
+            managed_root,
+            alias,
+            supported=False,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction runtime aliasの実APIテスト")
+def test_windows_runtime_admission_fails_closed_for_junction_alias(
+    monkeypatch,
+    tmp_path,
+):
+    managed_root = tmp_path / "managed-runtime-junction"
+    executable = _write_fake_obs(managed_root, b"runtime-junction")
+    alias_root = tmp_path / "runtime-junction-alias"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(alias_root), str(managed_root)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(completed.stderr or completed.stdout or "mklink /J failed")
+    alias = alias_root / executable.relative_to(managed_root)
+    try:
+        _assert_runtime_alias_rejected_before_popen(
+            monkeypatch,
+            managed_root,
+            alias,
+            supported=False,
+        )
+    finally:
+        os.rmdir(alias_root)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 aliasの実APIテスト")

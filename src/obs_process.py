@@ -6,22 +6,48 @@ import logging
 import math
 import os
 import re
+import secrets
+import stat
 import subprocess
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+try:
+    from . import obs_transaction_fs as _transaction_fs
+except ImportError:
+    import obs_transaction_fs as _transaction_fs
+
 LOGGER = logging.getLogger("lol_replay.obs_process")
 
 OBS_PROCESS_LEASE_SCHEMA_VERSION = 2
+OBS_PROCESS_LEASE_MAX_BYTES = 64 * 1024
+OBS_PROCESS_LEASE_FILE_NAME = _transaction_fs.OBS_PROCESS_LEASE_FILE_NAME
+OBS_PROCESS_LEASE_LOCK_NAME = _transaction_fs.OBS_PROCESS_LEASE_LOCK_NAME
+OBS_PROCESS_LEASE_TEMP_PREFIX = _transaction_fs.OBS_PROCESS_LEASE_TEMP_PREFIX
 _WINDOWS_FILETIME_UNIX_EPOCH_SECONDS = 11_644_473_600
 _OBS_PROCESS_LEASE_LOCK = threading.RLock()
 _POPEN_OBS_PROCESS_LEASE_ATTRIBUTE = "_lol_replay_obs_process_lease"
 _OWNED_EXIT_STRICT_REQUERY_DELAY_SEC = 0.05
+_OBS_PROCESS_LEASE_LOCK_TIMEOUT_SEC = 10.0
+_OBS_PROCESS_LEASE_LOCK_POLL_SEC = 0.02
+_OBS_PROCESS_QUERY_COMMAND_TIMEOUT_SEC = 10.0
+_OBS_PROCESS_TERMINATE_COMMAND_TIMEOUT_SEC = 10.0
+_OBS_PROCESS_LEASE_TEMP_NAME_PATTERN = re.compile(
+    rf"^{re.escape(OBS_PROCESS_LEASE_TEMP_PREFIX)}[0-9a-f]{{32}}$"
+)
+
+_OBSDirectoryLease = _transaction_fs._OBSDirectoryLease
+_OBSInterProcessLock = _transaction_fs._OBSInterProcessLock
+_OBSMigrationLockBusyError = _transaction_fs._OBSMigrationLockBusyError
+OBSPathSafetyError = _transaction_fs.OBSPathSafetyError
+_file_identity = _transaction_fs._file_identity
+_filesystem_name_key = _transaction_fs._filesystem_name_key
 
 
 @dataclass(frozen=True)
@@ -189,6 +215,28 @@ class OBSProcessLease:
     process_creation_time_filetime: int | None = None
 
 
+@dataclass
+class _OBSProcessLeaseFileSnapshot:
+    descriptor: int
+    identity: tuple[int, int, int]
+    raw_bytes: bytes
+    lease: OBSProcessLease
+    deletion_marked: bool = False
+
+
+@dataclass
+class _OBSProcessLeaseTransaction:
+    lock: Any
+    root_lease: Any
+    snapshot: _OBSProcessLeaseFileSnapshot | None = None
+    commit_occurred: bool = False
+    recovered_temporary_paths: list[Path] = field(default_factory=list)
+
+    def validate_ownership(self) -> None:
+        self.lock.validate_ownership()
+        self.root_lease.validate_lexical_binding()
+
+
 class OBSProcessManager:
     """アプリ管理OBSだけを対象に起動・終了する安全境界。"""
 
@@ -197,7 +245,672 @@ class OBSProcessManager:
         self.obs_exe = (self.obs_dir / "bin" / "64bit" / "obs64.exe").resolve()
         self.working_dir = self.obs_exe.parent
         self.logger = logger or LOGGER
-        self.lease_path = self.obs_dir / ".lol_replay_obs_lease.json"
+        self.lease_path = self.obs_dir / OBS_PROCESS_LEASE_FILE_NAME
+        self.lease_lock_path = self.obs_dir / OBS_PROCESS_LEASE_LOCK_NAME
+
+    def _lease_recovery_error(
+        self,
+        detail: str,
+        *,
+        cause: BaseException | None = None,
+    ) -> OBSProcessLeaseError:
+        error = OBSProcessLeaseError(
+            f"{detail} lease={self.lease_path} lock={self.lease_lock_path}。"
+            "すべてのOBS Studioと関連toolを終了し、同じ操作を再試行してください。"
+        )
+        if cause is not None:
+            error.__cause__ = cause
+        return error
+
+    def _close_descriptor_preserving_primary(
+        self,
+        descriptor: int,
+        *,
+        primary_error: BaseException | None,
+        label: str,
+    ) -> None:
+        try:
+            os.close(descriptor)
+        except BaseException as close_error:
+            if primary_error is None:
+                raise
+            add_note = getattr(primary_error, "add_note", None)
+            if callable(add_note):
+                add_note(
+                    f"{label}: {type(close_error).__name__}: {close_error}"
+                )
+            self.logger.critical("%s: %s", label, close_error)
+
+    def _nonmutating_process_lease_transaction_required(self) -> bool:
+        """Probe a stable absent state without creating the managed root/lock."""
+
+        probe_error: BaseException | None = None
+        try:
+            probe = _OBSDirectoryLease.open_absolute(self.obs_dir)
+        except FileNotFoundError:
+            try:
+                appeared = _OBSDirectoryLease.open_absolute(self.obs_dir)
+            except FileNotFoundError:
+                return False
+            else:
+                race_error = self._lease_recovery_error(
+                    "OBS rootが所有情報の不存在確認中に出現しました。"
+                )
+                try:
+                    appeared.close()
+                except BaseException as close_error:
+                    add_note = getattr(race_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "Appeared OBS root probe close also failed: "
+                            f"{type(close_error).__name__}: {close_error}"
+                        )
+                    self.logger.critical(
+                        "Appeared OBS root probe close also failed: %s",
+                        close_error,
+                    )
+                raise race_error
+        except (OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "OBS rootの所有情報を安全に確認できません。",
+                cause=exc,
+            ) from exc
+
+        try:
+            def observe() -> tuple[
+                tuple[int, int, int] | None,
+                tuple[int, int, int] | None,
+                tuple[str, ...],
+            ]:
+                probe.validate_lexical_binding()
+                lease_identity = probe.relative_file_identity_or_none(
+                    self.lease_path.name
+                )
+                lock_identity = probe.relative_file_identity_or_none(
+                    self.lease_lock_path.name
+                )
+                temporary_names: list[str] = []
+                with os.scandir(probe.path) as entries:
+                    prefix_key = _filesystem_name_key(
+                        OBS_PROCESS_LEASE_TEMP_PREFIX
+                    )
+                    for entry in entries:
+                        if not _filesystem_name_key(entry.name).startswith(
+                            prefix_key
+                        ):
+                            continue
+                        if (
+                            _OBS_PROCESS_LEASE_TEMP_NAME_PATTERN.fullmatch(
+                                entry.name
+                            )
+                            is None
+                        ):
+                            raise self._lease_recovery_error(
+                                "予約されたOBS所有一時file名が不正です: "
+                                f"{probe.path / entry.name}。"
+                            )
+                        temporary_names.append(entry.name)
+                probe.validate_lexical_binding()
+                return (
+                    lease_identity,
+                    lock_identity,
+                    tuple(
+                        sorted(
+                            temporary_names,
+                            key=lambda name: (_filesystem_name_key(name), name),
+                        )
+                    ),
+                )
+
+            before = observe()
+            after = observe()
+            if after != before:
+                raise self._lease_recovery_error(
+                    "OBS所有control namespaceが不存在確認中に変化しました。"
+                )
+            return any(item for item in before)
+        except OBSProcessLeaseError as exc:
+            probe_error = exc
+            raise
+        except (OSError, OBSPathSafetyError) as exc:
+            error = self._lease_recovery_error(
+                "OBS所有control namespaceを安全に確認できません。",
+                cause=exc,
+            )
+            probe_error = error
+            raise error from exc
+        except BaseException as exc:
+            probe_error = exc
+            raise
+        finally:
+            try:
+                probe.close()
+            except BaseException as close_error:
+                if probe_error is None:
+                    raise self._lease_recovery_error(
+                        "OBS root probeを安全にcloseできません。",
+                        cause=close_error,
+                    ) from close_error
+                add_note = getattr(probe_error, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        "OBS root probe close also failed: "
+                        f"{type(close_error).__name__}: {close_error}"
+                    )
+                self.logger.critical(
+                    "OBS root probe close also failed: %s",
+                    close_error,
+                )
+
+    @contextmanager
+    def _process_lease_transaction(self, *, mutating: bool = False):
+        """Serialize every semantic lease operation across threads/processes."""
+
+        with _OBS_PROCESS_LEASE_LOCK:
+            if (
+                not mutating
+                and not self._nonmutating_process_lease_transaction_required()
+            ):
+                yield None
+                return
+
+            lock = _OBSInterProcessLock(self.lease_lock_path)
+            deadline = time.monotonic() + _OBS_PROCESS_LEASE_LOCK_TIMEOUT_SEC
+            transaction: _OBSProcessLeaseTransaction | None = None
+            primary_error: BaseException | None = None
+            cleanup_error: BaseException | None = None
+            cleanup_failures: list[tuple[str, BaseException]] = []
+            lock_acquired = False
+
+            def record_cleanup_error(label: str, error: BaseException) -> None:
+                nonlocal cleanup_error
+                cleanup_failures.append((label, error))
+                target = primary_error or cleanup_error
+                if target is not None:
+                    add_note = getattr(target, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            f"{label}: {type(error).__name__}: {error}"
+                        )
+                    self.logger.critical("%s: %s", label, error)
+                else:
+                    cleanup_error = error
+
+            try:
+                while True:
+                    try:
+                        acquired = lock.acquire(create_parent=True)
+                    except (OSError, OBSPathSafetyError) as exc:
+                        raise self._lease_recovery_error(
+                            "OBS所有情報のprocess間lockを安全に取得できません。",
+                            cause=exc,
+                        ) from exc
+                    if acquired:
+                        lock_acquired = True
+                        break
+                    if time.monotonic() >= deadline:
+                        raise self._lease_recovery_error(
+                            "OBS所有情報のprocess間lockが使用中です。"
+                        )
+                    time.sleep(_OBS_PROCESS_LEASE_LOCK_POLL_SEC)
+
+                transaction = _OBSProcessLeaseTransaction(
+                    lock=lock,
+                    root_lease=lock.directory_lease,
+                )
+                try:
+                    transaction.validate_ownership()
+                    self._recover_process_lease_temporaries_locked(transaction)
+                except OBSProcessLeaseError:
+                    raise
+                except (OSError, OBSPathSafetyError) as exc:
+                    raise self._lease_recovery_error(
+                        "OBS所有transactionのroot/lockを安全に検証できません。",
+                        cause=exc,
+                    ) from exc
+                yield transaction
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                if transaction is not None:
+                    snapshot = transaction.snapshot
+                    transaction.snapshot = None
+                    if snapshot is not None:
+                        try:
+                            os.close(snapshot.descriptor)
+                        except BaseException as close_error:
+                            record_cleanup_error(
+                                "Pinned lease descriptor close failed",
+                                close_error,
+                            )
+                if lock_acquired:
+                    try:
+                        lock.release()
+                    except BaseException as release_error:
+                        record_cleanup_error(
+                            "OBS lease IPC lock release failed",
+                            release_error,
+                        )
+                if primary_error is None and cleanup_error is not None:
+                    if transaction is not None and transaction.commit_occurred:
+                        self.logger.critical(
+                            "OBS lease cleanup failed after an irreversible commit: %s",
+                            cleanup_error,
+                        )
+                    else:
+                        error = self._lease_recovery_error(
+                            "OBS所有transactionの終了処理を安全に完了できません。",
+                            cause=cleanup_error,
+                        )
+                        add_note = getattr(error, "add_note", None)
+                        if callable(add_note):
+                            for label, failure in cleanup_failures:
+                                add_note(
+                                    f"{label}: {type(failure).__name__}: {failure}"
+                                )
+                            if transaction is not None:
+                                for path in transaction.recovered_temporary_paths:
+                                    add_note(
+                                        "孤立したOBS所有一時fileは削除済みです: "
+                                        f"{path}"
+                                    )
+                        raise error from cleanup_error
+
+    def _list_process_lease_temporary_names_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+    ) -> tuple[str, ...]:
+        names: list[str] = []
+        prefix_key = _filesystem_name_key(OBS_PROCESS_LEASE_TEMP_PREFIX)
+        try:
+            transaction.validate_ownership()
+            with os.scandir(transaction.root_lease.path) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if not _filesystem_name_key(name).startswith(prefix_key):
+                        continue
+                    if _OBS_PROCESS_LEASE_TEMP_NAME_PATTERN.fullmatch(name) is None:
+                        raise self._lease_recovery_error(
+                            f"予約されたOBS所有一時file名が不正です: "
+                            f"{transaction.root_lease.path / name}。"
+                        )
+                    names.append(name)
+            transaction.validate_ownership()
+        except OBSProcessLeaseError:
+            raise
+        except (OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "OBS所有一時fileを列挙できません。",
+                cause=exc,
+            ) from exc
+        return tuple(sorted(names, key=lambda name: (_filesystem_name_key(name), name)))
+
+    def _recover_process_lease_temporaries_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+    ) -> None:
+        for name in self._list_process_lease_temporary_names_locked(transaction):
+            temporary_path = transaction.root_lease.path / name
+            descriptor: int | None = None
+            primary_error: BaseException | None = None
+            try:
+                descriptor = transaction.root_lease.open_file(
+                    name,
+                    write=False,
+                    create_exclusive=False,
+                    delete=True,
+                    share_write=False,
+                    share_delete=False,
+                )
+                identity = _file_identity(os.fstat(descriptor))
+                self._read_process_lease_descriptor_bytes_locked(
+                    transaction,
+                    descriptor,
+                    name=name,
+                    expected_identity=identity,
+                    allow_empty=True,
+                )
+                close_failure = transaction.root_lease.delete_open_file_on_close(
+                    descriptor,
+                    name,
+                    expected_identity=identity,
+                )
+                descriptor = None
+                transaction.recovered_temporary_paths.append(temporary_path)
+                if close_failure is not None:
+                    self.logger.critical(
+                        "OBS lease temporary deletion committed but close failed: %s: %s",
+                        temporary_path,
+                        close_failure,
+                    )
+                    if not isinstance(close_failure, Exception):
+                        raise close_failure
+            except (OSError, OBSPathSafetyError) as exc:
+                error = self._lease_recovery_error(
+                    f"孤立したOBS所有一時fileを安全に回収できません: "
+                    f"{temporary_path}。",
+                    cause=exc,
+                )
+                primary_error = error
+                raise error from exc
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                if descriptor is not None:
+                    self._close_descriptor_preserving_primary(
+                        descriptor,
+                        primary_error=primary_error,
+                        label="OBS lease temporary descriptor close also failed",
+                    )
+
+        if self._list_process_lease_temporary_names_locked(transaction):
+            raise self._lease_recovery_error(
+                "回収中に新しいOBS所有一時fileが出現しました。"
+            )
+
+    def _read_process_lease_descriptor_bytes_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+        descriptor: int,
+        *,
+        name: str,
+        expected_identity: tuple[int, int, int],
+        allow_empty: bool = False,
+    ) -> bytes:
+        try:
+            return self._read_process_lease_descriptor_bytes_unwrapped_locked(
+                transaction,
+                descriptor,
+                name=name,
+                expected_identity=expected_identity,
+                allow_empty=allow_empty,
+            )
+        except OBSProcessLeaseError:
+            raise
+        except (OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "OBS所有fileを固定handleから安全に読み取れません: "
+                f"{transaction.root_lease.path / name}。",
+                cause=exc,
+            ) from exc
+
+    def _read_process_lease_descriptor_bytes_unwrapped_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+        descriptor: int,
+        *,
+        name: str,
+        expected_identity: tuple[int, int, int],
+        allow_empty: bool = False,
+    ) -> bytes:
+        transaction.validate_ownership()
+        before = os.fstat(descriptor)
+        if (
+            _file_identity(before) != expected_identity
+            or not stat.S_ISREG(before.st_mode)
+            or int(before.st_nlink) != 1
+            or int(before.st_size) > OBS_PROCESS_LEASE_MAX_BYTES
+            or (not allow_empty and int(before.st_size) <= 0)
+        ):
+            raise self._lease_recovery_error(
+                f"OBS所有fileの物理状態が不正です: {transaction.root_lease.path / name}。"
+            )
+        if transaction.root_lease._relative_file_identity(name) != expected_identity:
+            raise self._lease_recovery_error(
+                f"OBS所有fileのpath bindingが変化しました: "
+                f"{transaction.root_lease.path / name}。"
+            )
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        raw = os.read(descriptor, OBS_PROCESS_LEASE_MAX_BYTES + 1)
+        after = os.fstat(descriptor)
+        if (
+            len(raw) > OBS_PROCESS_LEASE_MAX_BYTES
+            or len(raw) != int(before.st_size)
+            or _file_identity(after) != expected_identity
+            or int(after.st_size) != int(before.st_size)
+            or int(after.st_mtime_ns) != int(before.st_mtime_ns)
+            or transaction.root_lease._relative_file_identity(name)
+            != expected_identity
+        ):
+            raise self._lease_recovery_error(
+                f"OBS所有fileが読み取り中に変化しました: "
+                f"{transaction.root_lease.path / name}。"
+            )
+        transaction.validate_ownership()
+        return raw
+
+    def _parse_process_lease_bytes(self, raw: bytes) -> OBSProcessLease:
+        try:
+            if not raw or len(raw) > OBS_PROCESS_LEASE_MAX_BYTES:
+                raise ValueError("lease payload size is invalid")
+            data = json.loads(raw.decode("utf-8"))
+            if type(data) is not dict:
+                raise ValueError("lease payload is not an object")
+            raw_version = data.get("version", 1)
+            if type(raw_version) is not int or raw_version not in {
+                1,
+                OBS_PROCESS_LEASE_SCHEMA_VERSION,
+            }:
+                raise ValueError("unsupported lease version")
+            raw_pid = data.get("pid")
+            if type(raw_pid) is not int or raw_pid <= 0:
+                raise ValueError("invalid lease pid")
+            raw_path = data.get("executable_path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise ValueError("invalid lease executable path")
+            executable_path = Path(raw_path.strip())
+            if not _is_absolute_obs_process_path(executable_path):
+                raise ValueError("lease executable path is not absolute")
+            if executable_path.is_absolute():
+                executable_path = executable_path.resolve()
+
+            raw_created_at = data.get("created_at")
+            if (
+                isinstance(raw_created_at, bool)
+                or not isinstance(raw_created_at, (int, float))
+                or not math.isfinite(float(raw_created_at))
+                or float(raw_created_at) <= 0
+            ):
+                raise ValueError("invalid lease creation time")
+
+            raw_process_time = data.get("process_creation_time")
+            process_creation_time = None
+            if raw_process_time is not None:
+                if (
+                    isinstance(raw_process_time, bool)
+                    or not isinstance(raw_process_time, (int, float))
+                    or not math.isfinite(float(raw_process_time))
+                    or float(raw_process_time) <= 0
+                ):
+                    raise ValueError("invalid process creation time")
+                process_creation_time = float(raw_process_time)
+
+            raw_filetime = data.get("process_creation_time_filetime")
+            process_creation_time_filetime = None
+            if raw_filetime is not None:
+                if type(raw_filetime) is not int or raw_filetime <= 0:
+                    raise ValueError("invalid raw process creation FILETIME")
+                process_creation_time_filetime = raw_filetime
+
+            if raw_version == OBS_PROCESS_LEASE_SCHEMA_VERSION:
+                if (
+                    process_creation_time is None
+                    or process_creation_time_filetime is None
+                ):
+                    raise ValueError("v2 lease is missing complete process identity")
+                filetime_seconds = (
+                    process_creation_time_filetime / 10_000_000
+                    - _WINDOWS_FILETIME_UNIX_EPOCH_SECONDS
+                )
+                if abs(process_creation_time - filetime_seconds) > 0.001:
+                    raise ValueError("v2 lease creation values disagree")
+
+            return OBSProcessLease(
+                schema_version=raw_version,
+                pid=raw_pid,
+                executable_path=executable_path,
+                created_at=float(raw_created_at),
+                process_creation_time=process_creation_time,
+                process_creation_time_filetime=process_creation_time_filetime,
+            )
+        except OBSProcessLeaseError:
+            raise
+        except Exception as exc:
+            raise OBSProcessLeaseError("OBS process lease is malformed") from exc
+
+    def _open_process_lease_snapshot_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+    ) -> _OBSProcessLeaseFileSnapshot | None:
+        if transaction.snapshot is not None:
+            self._revalidate_process_lease_snapshot_locked(
+                transaction,
+                transaction.snapshot,
+            )
+            return transaction.snapshot
+
+        try:
+            transaction.validate_ownership()
+        except (OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "OBS所有情報を固定する前にroot/lockを再検証できません。",
+                cause=exc,
+            ) from exc
+        descriptor: int | None = None
+        primary_error: BaseException | None = None
+        try:
+            descriptor = transaction.root_lease.open_file(
+                self.lease_path.name,
+                write=False,
+                create_exclusive=False,
+                delete=True,
+                share_write=False,
+                share_delete=False,
+            )
+        except FileNotFoundError:
+            return None
+        except (OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "OBS所有情報を同一handleへ固定できません。",
+                cause=exc,
+            ) from exc
+
+        try:
+            identity = _file_identity(os.fstat(descriptor))
+            raw = self._read_process_lease_descriptor_bytes_locked(
+                transaction,
+                descriptor,
+                name=self.lease_path.name,
+                expected_identity=identity,
+            )
+            try:
+                lease = self._parse_process_lease_bytes(raw)
+            except OBSProcessLeaseError as exc:
+                raise self._lease_recovery_error(
+                    "OBS所有情報のJSON/schemaがmalformedです。",
+                    cause=exc,
+                ) from exc
+            snapshot = _OBSProcessLeaseFileSnapshot(
+                descriptor=descriptor,
+                identity=identity,
+                raw_bytes=raw,
+                lease=lease,
+            )
+            transaction.snapshot = snapshot
+            descriptor = None
+            return snapshot
+        except OBSProcessLeaseError as exc:
+            primary_error = exc
+            raise
+        except (OSError, OBSPathSafetyError) as exc:
+            error = self._lease_recovery_error(
+                "OBS所有情報を固定handleから安全に読み取れません。",
+                cause=exc,
+            )
+            primary_error = error
+            raise error from exc
+        except BaseException as exc:
+            primary_error = exc
+            raise
+        finally:
+            if descriptor is not None:
+                self._close_descriptor_preserving_primary(
+                    descriptor,
+                    primary_error=primary_error,
+                    label="Pinned OBS lease descriptor close also failed",
+                )
+
+    def _revalidate_process_lease_snapshot_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+        snapshot: _OBSProcessLeaseFileSnapshot,
+    ) -> None:
+        try:
+            if transaction.snapshot is not snapshot or snapshot.deletion_marked:
+                raise self._lease_recovery_error(
+                    "OBS所有情報の固定snapshotは現在のtransactionに属しません。"
+                )
+            raw = self._read_process_lease_descriptor_bytes_locked(
+                transaction,
+                snapshot.descriptor,
+                name=self.lease_path.name,
+                expected_identity=snapshot.identity,
+            )
+            if (
+                raw != snapshot.raw_bytes
+                or self._parse_process_lease_bytes(raw) != snapshot.lease
+            ):
+                raise self._lease_recovery_error(
+                    "OBS所有情報がtransaction中に変化しました。"
+                )
+        except OBSProcessLeaseError as exc:
+            if (
+                str(self.lease_path) in str(exc)
+                and str(self.lease_lock_path) in str(exc)
+            ):
+                raise
+            raise self._lease_recovery_error(
+                "OBS所有情報の固定snapshotを再検証できません。",
+                cause=exc,
+            ) from exc
+        except (OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "OBS所有情報の固定snapshotを再検証できません。",
+                cause=exc,
+            ) from exc
+
+    def _delete_process_lease_snapshot_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+        snapshot: _OBSProcessLeaseFileSnapshot,
+    ) -> None:
+        self._revalidate_process_lease_snapshot_locked(transaction, snapshot)
+        try:
+            close_failure = transaction.root_lease.delete_open_file_on_close(
+                snapshot.descriptor,
+                self.lease_path.name,
+                expected_identity=snapshot.identity,
+            )
+            snapshot.deletion_marked = True
+            transaction.commit_occurred = True
+            if close_failure is not None:
+                self.logger.critical(
+                    "OBS lease deletion committed but close failed: %s: %s",
+                    self.lease_path,
+                    close_failure,
+                )
+                if not isinstance(close_failure, Exception):
+                    raise close_failure
+        except (OSError, OBSPathSafetyError) as exc:
+            raise self._lease_recovery_error(
+                "検証済みOBS所有情報を同一handleから削除できません。",
+                cause=exc,
+            ) from exc
+        finally:
+            if snapshot.deletion_marked:
+                transaction.snapshot = None
 
     def list_obs_processes(self) -> list[OBSProcessInfo]:
         if os.name != "nt":
@@ -239,26 +952,35 @@ class OBSProcessManager:
         return bool(self.unmanaged_processes())
 
     def find_owned_process(self) -> OBSProcessInfo | None:
-        with _OBS_PROCESS_LEASE_LOCK:
-            return self._find_owned_process_locked()
+        with self._process_lease_transaction() as transaction:
+            if transaction is None:
+                return None
+            return self._find_owned_process_locked(transaction)
 
-    def _find_owned_process_locked(self) -> OBSProcessInfo | None:
-        lease = self._read_process_lease_locked()
-        if lease is None:
+    def _find_owned_process_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+    ) -> OBSProcessInfo | None:
+        lease_snapshot = self._open_process_lease_snapshot_locked(transaction)
+        if lease_snapshot is None:
             return None
+        lease = lease_snapshot.lease
         _snapshot, process = self._query_owned_process_for_lease(
             lease,
             label="owned process lookup",
         )
         if process is None:
-            self._clear_matching_process_lease_locked(lease)
+            self._delete_process_lease_snapshot_locked(
+                transaction,
+                lease_snapshot,
+            )
             return None
         if lease.schema_version != OBS_PROCESS_LEASE_SCHEMA_VERSION:
-            raise OBSProcessLeaseError(
+            raise self._lease_recovery_error(
                 "Legacy OBS process lease cannot authorize a live process"
             )
         if not self.is_owned_process(process, lease):
-            raise OBSProcessLeaseError(
+            raise self._lease_recovery_error(
                 "Live OBS process identity does not match its ownership lease"
             )
         return process
@@ -285,11 +1007,11 @@ class OBSProcessManager:
         if process is None:
             return snapshot, None
         if lease.schema_version != OBS_PROCESS_LEASE_SCHEMA_VERSION:
-            raise OBSProcessLeaseError(
+            raise self._lease_recovery_error(
                 "Legacy OBS process lease refers to a live PID"
             )
         if not self.is_owned_process(process, lease):
-            raise OBSProcessLeaseError(
+            raise self._lease_recovery_error(
                 "OBS process lease PID was reused or its identity changed"
             )
         return snapshot, process
@@ -590,30 +1312,58 @@ class OBSProcessManager:
     def kill_stale_owned_processes(self, timeout_sec: float = 3.0) -> list[int]:
         """Stop only the exact v2 identity recorded by this application's lease."""
 
-        with _OBS_PROCESS_LEASE_LOCK:
-            return self._kill_stale_owned_processes_locked(timeout_sec=timeout_sec)
+        with self._process_lease_transaction() as transaction:
+            if transaction is None:
+                return []
+            return self._kill_stale_owned_processes_locked(
+                transaction,
+                timeout_sec=timeout_sec,
+            )
 
     def _kill_stale_owned_processes_locked(
         self,
+        transaction: _OBSProcessLeaseTransaction,
         *,
         timeout_sec: float,
     ) -> list[int]:
-        lease = self._read_process_lease_locked()
-        if lease is None:
+        lease_snapshot = self._open_process_lease_snapshot_locked(transaction)
+        if lease_snapshot is None:
             return []
+        lease = lease_snapshot.lease
         _snapshot, process = self._query_owned_process_for_lease(
             lease,
             label="stale owned process lookup",
         )
         if process is None:
-            self._clear_matching_process_lease_locked(lease)
+            self._delete_process_lease_snapshot_locked(
+                transaction,
+                lease_snapshot,
+            )
             return []
+
+        def validate_authorization() -> None:
+            self._revalidate_process_lease_snapshot_locked(
+                transaction,
+                lease_snapshot,
+            )
+            if lease_snapshot.lease != lease or not self.is_owned_process(
+                process,
+                lease,
+            ):
+                raise self._lease_recovery_error(
+                    "OBS停止認可のv2 identityが一致しません。"
+                )
 
         result = self.terminate_owned_process_strict(
             process,
             timeout_sec=timeout_sec,
+            validate_authorization=validate_authorization,
         )
-        self._clear_matching_process_lease_locked(lease)
+        validate_authorization()
+        self._delete_process_lease_snapshot_locked(
+            transaction,
+            lease_snapshot,
+        )
         return [item.pid for item in result.signaled_processes]
 
     def terminate_owned_process_strict(
@@ -622,6 +1372,7 @@ class OBSProcessManager:
         *,
         timeout_sec: float = 3.0,
         poll_interval: float = 0.1,
+        validate_authorization: Callable[[], None] | None = None,
     ) -> OBSStrictTerminationResult:
         """Stop one fixed owned identity while leaving unrelated OBS untouched."""
 
@@ -645,11 +1396,13 @@ class OBSProcessManager:
                 expected,
                 timeout_sec=timeout_sec,
                 poll_interval=poll_interval,
+                validate_authorization=validate_authorization,
             )
         return self._terminate_owned_process_without_handle(
             expected,
             timeout_sec=timeout_sec,
             poll_interval=poll_interval,
+            validate_authorization=validate_authorization,
         )
 
     def _query_owned_target_strict(
@@ -673,6 +1426,7 @@ class OBSProcessManager:
         *,
         timeout_sec: float,
         poll_interval: float,
+        validate_authorization: Callable[[], None] | None,
     ) -> OBSStrictTerminationResult:
         """Test fallback; Windows production uses the handle-bound implementation."""
 
@@ -684,6 +1438,8 @@ class OBSProcessManager:
             return OBSStrictTerminationResult((), before)
 
         signaled = False
+        if validate_authorization is not None:
+            validate_authorization()
         if self._terminate_pid(expected.pid, force=False):
             signaled = True
         else:
@@ -722,6 +1478,8 @@ class OBSProcessManager:
             )
             if current is None:
                 continue
+            if validate_authorization is not None:
+                validate_authorization()
             if not self._terminate_pid(expected.pid, force=True):
                 after, current = self._query_owned_target_strict(
                     expected,
@@ -745,6 +1503,7 @@ class OBSProcessManager:
         *,
         timeout_sec: float,
         poll_interval: float,
+        validate_authorization: Callable[[], None] | None,
     ) -> OBSStrictTerminationResult:
         """Bind graceful verification and forced termination to one held handle."""
 
@@ -820,6 +1579,8 @@ class OBSProcessManager:
                 )
             if self._wait_process_identity_handle(handle, timeout_ms=0):
                 return self._finish_naturally_exited_owned_handle(expected, handle)
+            if validate_authorization is not None:
+                validate_authorization()
             if self._terminate_pid(expected.pid, force=False):
                 signaled = True
             else:
@@ -915,6 +1676,8 @@ class OBSProcessManager:
                     )
                 if self._wait_process_identity_handle(handle, timeout_ms=0):
                     continue
+                if validate_authorization is not None:
+                    validate_authorization()
                 if self._terminate_process_identity_handle(handle):
                     signaled = True
                 elif not self._wait_process_identity_handle(handle, timeout_ms=0):
@@ -1278,11 +2041,35 @@ class OBSProcessManager:
         lease is removed only after that same handle is proven exited.
         """
 
-        self._terminate_popen_process(
-            process,
-            timeout_sec=timeout_sec,
-            require_bound_lease=True,
-        )
+        if process is None:
+            return
+        try:
+            with self._process_lease_transaction() as transaction:
+                lease_snapshot = (
+                    None
+                    if transaction is None
+                    else self._open_process_lease_snapshot_locked(transaction)
+                )
+                self._terminate_popen_process(
+                    process,
+                    timeout_sec=timeout_sec,
+                    require_bound_lease=True,
+                    transaction=transaction,
+                    lease_snapshot=lease_snapshot,
+                )
+        except OBSProcessTerminationError:
+            raise
+        except OBSProcessLeaseError as exc:
+            try:
+                pid = int(process.pid)
+            except Exception:
+                pid = -1
+            error = OBSProcessTerminationError(
+                "OBS Popenの停止認可を固定できなかったためsignalを送信しませんでした。"
+                f" PID={pid} lease={self.lease_path} lock={self.lease_lock_path}。"
+                "すべてのOBS Studioと関連toolを終了し、再試行してください。"
+            )
+            raise error from exc
 
     def _terminate_unleased_popen_process(
         self,
@@ -1295,6 +2082,8 @@ class OBSProcessManager:
             process,
             timeout_sec=timeout_sec,
             require_bound_lease=False,
+            transaction=None,
+            lease_snapshot=None,
         )
 
     def _terminate_popen_process(
@@ -1303,6 +2092,8 @@ class OBSProcessManager:
         *,
         timeout_sec: float,
         require_bound_lease: bool,
+        transaction: _OBSProcessLeaseTransaction | None,
+        lease_snapshot: _OBSProcessLeaseFileSnapshot | None,
     ) -> None:
         """Shared handle-only termination primitive for leased and new Popen."""
 
@@ -1349,12 +2140,58 @@ class OBSProcessManager:
             except Exception as exc:
                 failures.append(("bound v2 lease validation", exc))
 
-        if require_bound_lease and lease is None:
+        if require_bound_lease:
+            if lease_snapshot is None:
+                failures.append(
+                    (
+                        "disk v2 lease authorization",
+                        OBSProcessLeaseError(
+                            "The bound Popen has no pinned disk ownership lease"
+                        ),
+                    )
+                )
+            elif lease is not None and lease_snapshot.lease != lease:
+                failures.append(
+                    (
+                        "disk v2 lease authorization",
+                        OBSProcessLeaseError(
+                            "The pinned disk lease differs from the bound Popen lease"
+                        ),
+                    )
+                )
+
+        if require_bound_lease and (
+            lease is None
+            or lease_snapshot is None
+            or lease_snapshot.lease != lease
+        ):
             self._raise_popen_termination_error(
                 pid=pid,
                 exited=exited,
                 failures=failures,
             )
+
+        def validate_signal_authorization() -> None:
+            if not require_bound_lease:
+                return
+            if transaction is None or lease_snapshot is None or lease is None:
+                raise OBSProcessLeaseError(
+                    "Popen termination is missing its pinned lease transaction"
+                )
+            self._revalidate_process_lease_snapshot_locked(
+                transaction,
+                lease_snapshot,
+            )
+            current_bound = self._validate_bound_popen_lease(
+                process,
+                getattr(process, _POPEN_OBS_PROCESS_LEASE_ATTRIBUTE, None),
+                pid,
+                process_exited=False,
+            )
+            if current_bound != lease or lease_snapshot.lease != lease:
+                raise OBSProcessLeaseError(
+                    "Popen termination authorization changed before its signal"
+                )
 
         if exited is not True:
             observed_after_lease = self._observe_popen_exit(
@@ -1369,17 +2206,27 @@ class OBSProcessManager:
         graceful_wait_succeeded = False
         if exited is not True:
             try:
+                validate_signal_authorization()
+            except Exception as exc:
+                failures.append(("pre-terminate authorization", exc))
+                self._raise_popen_termination_error(
+                    pid=pid,
+                    exited=exited,
+                    failures=failures,
+                )
+            try:
                 process.terminate()
             except Exception as exc:
                 failures.append(("Popen.terminate", exc))
-            try:
-                process.wait(timeout=max(0.0, timeout_sec))
-                graceful_wait_succeeded = True
-            except subprocess.TimeoutExpired:
-                # A graceful timeout is the expected transition to force cleanup.
-                pass
-            except Exception as exc:
-                failures.append(("Popen.wait after terminate", exc))
+            else:
+                try:
+                    process.wait(timeout=max(0.0, timeout_sec))
+                    graceful_wait_succeeded = True
+                except subprocess.TimeoutExpired:
+                    # A graceful timeout is the expected transition to force cleanup.
+                    pass
+                except Exception as exc:
+                    failures.append(("Popen.wait after terminate", exc))
             exited = self._observe_popen_exit(
                 process,
                 pid=pid,
@@ -1392,16 +2239,26 @@ class OBSProcessManager:
         force_wait_succeeded = False
         if exited is not True:
             try:
+                validate_signal_authorization()
+            except Exception as exc:
+                failures.append(("pre-kill authorization", exc))
+                self._raise_popen_termination_error(
+                    pid=pid,
+                    exited=exited,
+                    failures=failures,
+                )
+            try:
                 process.kill()
             except Exception as exc:
                 failures.append(("Popen.kill", exc))
-            try:
-                process.wait(timeout=2)
-                force_wait_succeeded = True
-            except subprocess.TimeoutExpired as exc:
-                failures.append(("Popen.wait after kill", exc))
-            except Exception as exc:
-                failures.append(("Popen.wait after kill", exc))
+            else:
+                try:
+                    process.wait(timeout=2)
+                    force_wait_succeeded = True
+                except subprocess.TimeoutExpired as exc:
+                    failures.append(("Popen.wait after kill", exc))
+                except Exception as exc:
+                    failures.append(("Popen.wait after kill", exc))
             exited = self._observe_popen_exit(
                 process,
                 pid=pid,
@@ -1419,9 +2276,25 @@ class OBSProcessManager:
                 )
             )
 
-        if exited is True and lease is not None:
+        if (
+            exited is True
+            and lease is not None
+            and transaction is not None
+            and lease_snapshot is not None
+        ):
             try:
-                self._clear_matching_process_lease(lease)
+                self._revalidate_process_lease_snapshot_locked(
+                    transaction,
+                    lease_snapshot,
+                )
+                if lease_snapshot.lease != lease:
+                    raise OBSProcessLeaseError(
+                        "Pinned lease changed before Popen cleanup"
+                    )
+                self._delete_process_lease_snapshot_locked(
+                    transaction,
+                    lease_snapshot,
+                )
             except Exception as exc:
                 failures.append(("matching v2 lease cleanup", exc))
 
@@ -1446,7 +2319,10 @@ class OBSProcessManager:
         )
         error = OBSProcessTerminationError(
             f"{state} PID={pid}。OBSが残っている場合は手動で終了し、"
-            "OBS所有情報を確認してから再試行してください。"
+            "OBS所有情報を確認してから再試行してください。 "
+            f"lease={self.lease_path} lock={self.lease_lock_path}。"
+            "解決しない場合はすべてのOBS Studioと関連toolを終了してから"
+            "再試行してください。"
         )
         add_note = getattr(error, "add_note", None)
         if callable(add_note):
@@ -1600,15 +2476,28 @@ class OBSProcessManager:
         return poll_exited
 
     def write_process_lease(self, process: subprocess.Popen[Any]) -> None:
-        with _OBS_PROCESS_LEASE_LOCK:
-            self._write_process_lease_locked(process)
+        with self._process_lease_transaction(mutating=True) as transaction:
+            if transaction is None:
+                raise AssertionError("mutating lease transaction did not acquire a lock")
+            self._write_process_lease_locked(transaction, process)
 
-    def _write_process_lease_locked(self, process: subprocess.Popen[Any]) -> None:
-        temporary = self.lease_path.with_name(
-            f"{self.lease_path.name}.{int(process.pid)}.{time.time_ns()}.tmp"
-        )
+    def _write_process_lease_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+        process: subprocess.Popen[Any],
+    ) -> None:
+        if self._open_process_lease_snapshot_locked(transaction) is not None:
+            raise self._lease_recovery_error(
+                "既存のOBS所有情報があるため新しいleaseを上書きしません。"
+            )
+
+        temporary_name = f"{OBS_PROCESS_LEASE_TEMP_PREFIX}{secrets.token_hex(16)}"
+        temporary_path = transaction.root_lease.path / temporary_name
+        descriptor: int | None = None
+        temporary_identity: tuple[int, int, int] | None = None
+        published = False
+        operation_error: BaseException | None = None
         try:
-            self.obs_dir.mkdir(parents=True, exist_ok=True)
             process_info = self.query_popen_process_identity(process)
             validate_obs_process_query_snapshot(
                 OBSProcessQuerySnapshot((process_info,), time.time()),
@@ -1642,138 +2531,177 @@ class OBSProcessManager:
                 "process_creation_time": lease.process_creation_time,
                 "process_creation_time_filetime": lease.process_creation_time_filetime,
             }
-            with open(temporary, "x", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temporary, self.lease_path)
-            if self._read_process_lease_locked() != lease:
+            raw = json.dumps(payload, indent=2).encode("utf-8")
+            if not raw or len(raw) > OBS_PROCESS_LEASE_MAX_BYTES:
+                raise OBSProcessLeaseError(
+                    "Generated OBS process lease exceeds the safety limit"
+                )
+            descriptor = transaction.root_lease.open_file(
+                temporary_name,
+                write=True,
+                create_exclusive=True,
+                delete=True,
+                share_write=False,
+                share_delete=False,
+            )
+            temporary_identity = _file_identity(os.fstat(descriptor))
+            _transaction_fs._write_all(descriptor, raw)
+            os.fsync(descriptor)
+            if self._read_process_lease_descriptor_bytes_locked(
+                transaction,
+                descriptor,
+                name=temporary_name,
+                expected_identity=temporary_identity,
+            ) != raw:
+                raise OBSProcessLeaseError(
+                    "Temporary OBS process lease readback differs from its payload"
+                )
+            transaction.validate_ownership()
+            transaction.root_lease.publish_open_file_no_replace(
+                descriptor,
+                temporary_name,
+                self.lease_path.name,
+            )
+            published = True
+            transaction.commit_occurred = True
+            committed = self._read_process_lease_descriptor_bytes_locked(
+                transaction,
+                descriptor,
+                name=self.lease_path.name,
+                expected_identity=temporary_identity,
+            )
+            if committed != raw or self._parse_process_lease_bytes(committed) != lease:
                 raise OBSProcessLeaseError(
                     "Committed OBS process lease does not match its verified identity"
                 )
             setattr(process, _POPEN_OBS_PROCESS_LEASE_ATTRIBUTE, lease)
-        except Exception as e:
-            try:
-                temporary.unlink(missing_ok=True)
-            except Exception:
-                pass
+        except BaseException as e:
+            operation_error = e
+            if descriptor is not None and temporary_identity is not None and not published:
+                try:
+                    target_identity = (
+                        transaction.root_lease.relative_file_identity_or_none(
+                            self.lease_path.name
+                        )
+                    )
+                    temporary_current_identity = (
+                        transaction.root_lease.relative_file_identity_or_none(
+                            temporary_name
+                        )
+                    )
+                    if target_identity == temporary_identity:
+                        published = True
+                        transaction.commit_occurred = True
+                    elif (
+                        temporary_current_identity == temporary_identity
+                        and target_identity is None
+                    ):
+                        close_failure = (
+                            transaction.root_lease.delete_open_file_on_close(
+                                descriptor,
+                                temporary_name,
+                                expected_identity=temporary_identity,
+                            )
+                        )
+                        descriptor = None
+                        if close_failure is not None:
+                            self.logger.critical(
+                                "OBS lease temporary cleanup committed but close failed: "
+                                "%s: %s",
+                                temporary_path,
+                                close_failure,
+                            )
+                            add_note = getattr(e, "add_note", None)
+                            if callable(add_note):
+                                add_note(
+                                    "Temporary lease cleanup close reported after commit: "
+                                    f"{type(close_failure).__name__}: {close_failure}"
+                                )
+                            if not isinstance(close_failure, Exception):
+                                raise close_failure
+                    else:
+                        add_note = getattr(e, "add_note", None)
+                        if callable(add_note):
+                            add_note(
+                                "OBS lease publish state is commit-uncertain; neither "
+                                "pathname was modified during recovery."
+                            )
+                except Exception as cleanup_error:
+                    add_note = getattr(e, "add_note", None)
+                    if callable(add_note):
+                        add_note(
+                            "Temporary lease cleanup also failed: "
+                            f"{type(cleanup_error).__name__}: {cleanup_error}"
+                        )
+                    self.logger.critical(
+                        "Temporary lease cleanup also failed: %s",
+                        cleanup_error,
+                    )
             if isinstance(e, OBSProcessLeaseError):
-                raise
-            raise OBSProcessLeaseError(
-                "Failed to establish the v2 OBS process ownership lease"
+                if (
+                    str(self.lease_path) in str(e)
+                    and str(self.lease_lock_path) in str(e)
+                ):
+                    raise
+                raise self._lease_recovery_error(
+                    f"Failed to establish the v2 OBS process ownership lease: {e}",
+                    cause=e,
+                ) from e
+            raise self._lease_recovery_error(
+                "Failed to establish the v2 OBS process ownership lease",
+                cause=e,
             ) from e
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError as close_error:
+                    if published:
+                        self.logger.critical(
+                            "Committed OBS lease descriptor close failed: %s: %s",
+                            self.lease_path,
+                            close_error,
+                        )
+                    elif operation_error is not None:
+                        add_note = getattr(operation_error, "add_note", None)
+                        if callable(add_note):
+                            add_note(
+                                "Temporary lease descriptor close also failed: "
+                                f"{type(close_error).__name__}: {close_error}"
+                            )
 
     def read_process_lease(self) -> OBSProcessLease | None:
-        with _OBS_PROCESS_LEASE_LOCK:
-            return self._read_process_lease_locked()
+        with self._process_lease_transaction() as transaction:
+            if transaction is None:
+                return None
+            return self._read_process_lease_locked(transaction)
 
-    def _read_process_lease_locked(self) -> OBSProcessLease | None:
-        try:
-            with open(self.lease_path, encoding="utf-8") as f:
-                data = json.load(f)
-        except FileNotFoundError:
-            return None
-        except Exception as exc:
-            raise OBSProcessLeaseError("Cannot read the OBS process lease") from exc
-
-        try:
-            if type(data) is not dict:
-                raise ValueError("lease payload is not an object")
-            raw_version = data.get("version", 1)
-            if type(raw_version) is not int or raw_version not in {
-                1,
-                OBS_PROCESS_LEASE_SCHEMA_VERSION,
-            }:
-                raise ValueError("unsupported lease version")
-            raw_pid = data.get("pid")
-            if type(raw_pid) is not int or raw_pid <= 0:
-                raise ValueError("invalid lease pid")
-            raw_path = data.get("executable_path")
-            if not isinstance(raw_path, str) or not raw_path.strip():
-                raise ValueError("invalid lease executable path")
-            executable_path = Path(raw_path.strip())
-            if not _is_absolute_obs_process_path(executable_path):
-                raise ValueError("lease executable path is not absolute")
-            if executable_path.is_absolute():
-                executable_path = executable_path.resolve()
-
-            raw_created_at = data.get("created_at")
-            if (
-                isinstance(raw_created_at, bool)
-                or not isinstance(raw_created_at, (int, float))
-                or not math.isfinite(float(raw_created_at))
-                or float(raw_created_at) <= 0
-            ):
-                raise ValueError("invalid lease creation time")
-
-            raw_process_time = data.get("process_creation_time")
-            process_creation_time = None
-            if raw_process_time is not None:
-                if (
-                    isinstance(raw_process_time, bool)
-                    or not isinstance(raw_process_time, (int, float))
-                    or not math.isfinite(float(raw_process_time))
-                    or float(raw_process_time) <= 0
-                ):
-                    raise ValueError("invalid process creation time")
-                process_creation_time = float(raw_process_time)
-
-            raw_filetime = data.get("process_creation_time_filetime")
-            process_creation_time_filetime = None
-            if raw_filetime is not None:
-                if type(raw_filetime) is not int or raw_filetime <= 0:
-                    raise ValueError("invalid raw process creation FILETIME")
-                process_creation_time_filetime = raw_filetime
-
-            if raw_version == OBS_PROCESS_LEASE_SCHEMA_VERSION:
-                if (
-                    process_creation_time is None
-                    or process_creation_time_filetime is None
-                ):
-                    raise ValueError("v2 lease is missing complete process identity")
-                filetime_seconds = (
-                    process_creation_time_filetime / 10_000_000
-                    - _WINDOWS_FILETIME_UNIX_EPOCH_SECONDS
-                )
-                if abs(process_creation_time - filetime_seconds) > 0.001:
-                    raise ValueError("v2 lease creation values disagree")
-
-            return OBSProcessLease(
-                schema_version=raw_version,
-                pid=raw_pid,
-                executable_path=executable_path,
-                created_at=float(raw_created_at),
-                process_creation_time=process_creation_time,
-                process_creation_time_filetime=process_creation_time_filetime,
-            )
-        except OBSProcessLeaseError:
-            raise
-        except Exception as exc:
-            raise OBSProcessLeaseError("OBS process lease is malformed") from exc
+    def _read_process_lease_locked(
+        self,
+        transaction: _OBSProcessLeaseTransaction,
+    ) -> OBSProcessLease | None:
+        snapshot = self._open_process_lease_snapshot_locked(transaction)
+        return None if snapshot is None else snapshot.lease
 
     def _clear_matching_process_lease(self, expected: OBSProcessLease) -> None:
-        with _OBS_PROCESS_LEASE_LOCK:
-            self._clear_matching_process_lease_locked(expected)
+        with self._process_lease_transaction() as transaction:
+            if transaction is None:
+                return
+            self._clear_matching_process_lease_locked(transaction, expected)
 
     def _clear_matching_process_lease_locked(
         self,
+        transaction: _OBSProcessLeaseTransaction,
         expected: OBSProcessLease,
     ) -> None:
-        current = self._read_process_lease_locked()
-        if current is None:
+        snapshot = self._open_process_lease_snapshot_locked(transaction)
+        if snapshot is None:
             return
-        if current != expected:
-            raise OBSProcessLeaseError(
+        if snapshot.lease != expected:
+            raise self._lease_recovery_error(
                 "OBS process lease changed before verified cleanup"
             )
-        try:
-            self.lease_path.unlink()
-        except FileNotFoundError:
-            return
-        except Exception as exc:
-            raise OBSProcessLeaseError(
-                "Verified OBS process lease could not be cleared"
-            ) from exc
+        self._delete_process_lease_snapshot_locked(transaction, snapshot)
 
     def isolated_env(self) -> dict[str, str]:
         isolated_root = self.obs_dir / "temp_appdata"
@@ -1806,6 +2734,7 @@ class OBSProcessManager:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=_OBS_PROCESS_QUERY_COMMAND_TIMEOUT_SEC,
             )
             if completed.returncode == 0 and completed.stdout.strip():
                 return self._parse_wmic_csv(completed.stdout)
@@ -1827,6 +2756,7 @@ class OBSProcessManager:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=_OBS_PROCESS_QUERY_COMMAND_TIMEOUT_SEC,
             )
             if completed.returncode != 0 or not completed.stdout.strip():
                 return []
@@ -1871,6 +2801,7 @@ class OBSProcessManager:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=_OBS_PROCESS_QUERY_COMMAND_TIMEOUT_SEC,
             )
         except Exception as exc:
             raise OBSProcessQueryError("PowerShell OBS process query could not be started") from exc
@@ -2207,6 +3138,7 @@ class OBSProcessManager:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
+                timeout=_OBS_PROCESS_TERMINATE_COMMAND_TIMEOUT_SEC,
             )
             if completed.returncode == 0:
                 return True

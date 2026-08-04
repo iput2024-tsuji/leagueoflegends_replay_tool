@@ -1941,6 +1941,67 @@ def test_obs_inventory_rejects_orphaned_journal_temporary(tmp_path):
         obs_bootstrap._build_obs_tree_inventory(source)
 
 
+def test_obs_inventory_skips_strict_process_lease_temporary(tmp_path):
+    source = tmp_path / "legacy"
+    _write_fake_obs(source)
+    temporary = source / f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX}{'a' * 32}"
+    temporary.write_bytes(b"partial lease")
+
+    entries = obs_bootstrap._build_obs_tree_inventory(source)
+
+    assert all(entry.relative_parts != (temporary.name,) for entry in entries)
+
+
+def test_obs_inventory_rejects_malformed_process_lease_temporary_name(tmp_path):
+    source = tmp_path / "legacy"
+    _write_fake_obs(source)
+    malformed = source / f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX}not-a-token"
+    malformed.write_bytes(b"partial lease")
+
+    with pytest.raises(
+        obs_bootstrap.OBSPathSafetyError,
+        match="所有一時file名",
+    ) as captured:
+        obs_bootstrap._build_obs_tree_inventory(source)
+
+    message = str(captured.value)
+    absolute_source = source.resolve()
+    assert str(absolute_source) in message
+    assert str(absolute_source / obs_bootstrap.OBS_PROCESS_LEASE_FILE_NAME) in message
+    assert str(absolute_source / obs_bootstrap.OBS_PROCESS_LEASE_LOCK_NAME) in message
+    assert "すべてのOBS Studio" in message
+    assert "再試行" in message
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows pinned lease temporary sharing")
+def test_obs_inventory_does_not_open_a_pinned_process_lease_temporary(tmp_path):
+    source = tmp_path / "legacy"
+    _write_fake_obs(source)
+    name = f"{obs_bootstrap.OBS_PROCESS_LEASE_TEMP_PREFIX}{'b' * 32}"
+
+    with obs_bootstrap._OBSDirectoryLease.open_absolute(
+        source,
+        mutable=True,
+    ) as root_lease:
+        descriptor = root_lease.open_file(
+            name,
+            write=True,
+            create_exclusive=True,
+            delete=True,
+            share_write=False,
+            share_delete=False,
+        )
+        try:
+            os.write(descriptor, b"active lease writer")
+            entries = obs_bootstrap._build_obs_tree_inventory(
+                source,
+                root_lease=root_lease,
+            )
+            assert all(entry.relative_parts != (name,) for entry in entries)
+        finally:
+            os.close(descriptor)
+
+
 def test_obs_migration_rejects_changed_stale_source_fingerprint(tmp_path):
     source = tmp_path / "legacy"
     destination = tmp_path / "obs-portable"

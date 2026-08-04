@@ -21,6 +21,9 @@ WINDOWS_LOCK_CONTENTION_ERRORS = frozenset({32, 33})
 OBS_TRANSACTION_TEMP_COPY = "copy"
 OBS_TRANSACTION_TEMP_WRITE = "write"
 OBS_TRANSACTION_TEMP_JOURNAL = "journal"
+OBS_PROCESS_LEASE_FILE_NAME = ".lol_replay_obs_lease.json"
+OBS_PROCESS_LEASE_LOCK_NAME = ".lol_replay_obs_lease.lock"
+OBS_PROCESS_LEASE_TEMP_PREFIX = ".lol_replay_obs_lease.tmp."
 WINDOWS_RESERVED_PATH_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
     | {f"com{number}" for number in range(1, 10)}
@@ -369,6 +372,7 @@ def _windows_open_relative_handle(
     desired_access: int,
     disposition: int,
     directory: bool,
+    share_write: bool = True,
     share_delete: bool = True,
 ) -> int:
     _validate_single_path_component(name)
@@ -402,7 +406,9 @@ def _windows_open_relative_handle(
             ctypes.byref(io_status),
             None,
             _WINDOWS_FILE_ATTRIBUTE_NORMAL,
-            0x0001 | 0x0002 | (0x0004 if share_delete else 0),
+            0x0001
+            | (0x0002 if share_write else 0)
+            | (0x0004 if share_delete else 0),
             disposition,
             create_options,
             None,
@@ -556,6 +562,8 @@ def _windows_rename_open_file(
     file_handle: int,
     destination_directory_handle: int,
     target_name: str,
+    *,
+    replace_existing: bool = True,
 ) -> None:
     _validate_single_path_component(target_name)
     name_bytes = target_name.encode("utf-16-le")
@@ -565,7 +573,7 @@ def _windows_rename_open_file(
     buffer_size = buffer_offset + len(name_bytes)
     buffer = ctypes.create_string_buffer(buffer_size)
     ctypes.memset(buffer, 0, len(buffer))
-    ctypes.cast(buffer, ctypes.POINTER(wintypes.BYTE))[0] = 1
+    ctypes.cast(buffer, ctypes.POINTER(wintypes.BYTE))[0] = int(replace_existing)
     ctypes.cast(
         ctypes.byref(buffer, root_offset),
         ctypes.POINTER(wintypes.HANDLE),
@@ -1167,6 +1175,7 @@ class _OBSDirectoryLease:
         write: bool,
         create_exclusive: bool,
         delete: bool = False,
+        share_write: bool = True,
         share_delete: bool = True,
     ) -> int:
         _validate_single_path_component(name)
@@ -1192,6 +1201,7 @@ class _OBSDirectoryLease:
                 desired_access=desired_access,
                 disposition=disposition,
                 directory=False,
+                share_write=share_write,
                 share_delete=share_delete,
             )
             try:
@@ -1262,6 +1272,7 @@ class _OBSDirectoryLease:
                 msvcrt.get_osfhandle(descriptor),
                 self.native_handle,
                 target_name,
+                replace_existing=True,
             )
         else:
             os.rename(
@@ -1277,6 +1288,129 @@ class _OBSDirectoryLease:
         os.fsync(descriptor)
         self.flush_metadata()
         self.validate_lexical_binding()
+
+    def publish_open_file_no_replace(
+        self,
+        descriptor: int,
+        temporary_name: str,
+        target_name: str,
+    ) -> None:
+        """Atomically publish one open temporary without replacing a target.
+
+        Once the native rename/link succeeds, a later flush, verification, or
+        POSIX temporary-unlink failure is commit-uncertain: the target may
+        already be published and callers must not retry as if no commit
+        occurred.  On POSIX, a failed temporary unlink deliberately leaves the
+        two-link inode for the next transaction to reject rather than deleting
+        either pathname speculatively.
+        """
+
+        _validate_single_path_component(temporary_name)
+        _validate_single_path_component(target_name)
+        if not self.mutable:
+            raise _UnsafeOBSMigrationPathError(
+                f"read-only directory leaseではpublishできません: {self.path / target_name}"
+            )
+        self.validate_lexical_binding()
+        expected_identity = _file_identity(os.fstat(descriptor))
+        if self._relative_file_identity(temporary_name) != expected_identity:
+            raise _UnsafeOBSMigrationPathError(
+                f"publish前に一時file identityが変化しました: {self.path / temporary_name}"
+            )
+        if self.relative_file_identity_or_none(target_name) is not None:
+            raise FileExistsError(self.path / target_name)
+        if os.name == "nt":
+            _windows_rename_open_file(
+                msvcrt.get_osfhandle(descriptor),
+                self.native_handle,
+                target_name,
+                replace_existing=False,
+            )
+        else:
+            os.link(
+                temporary_name,
+                target_name,
+                src_dir_fd=self.native_handle,
+                dst_dir_fd=self.native_handle,
+                follow_symlinks=False,
+            )
+            os.unlink(temporary_name, dir_fd=self.native_handle)
+        if self._relative_file_identity(target_name) != expected_identity:
+            raise _UnsafeOBSMigrationPathError(
+                f"publish後に確定file identityが変化しました: {self.path / target_name}"
+            )
+        if int(os.fstat(descriptor).st_nlink) != 1:
+            raise _UnsafeOBSMigrationPathError(
+                f"publish後のfileが単一hardlinkではありません: {self.path / target_name}"
+            )
+        os.fsync(descriptor)
+        self.flush_metadata()
+        self.validate_lexical_binding()
+
+    def mark_open_file_for_deletion(
+        self,
+        descriptor: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int, int],
+    ) -> None:
+        """Delete the path through the already-authorized open file handle."""
+
+        _validate_single_path_component(name)
+        if not self.mutable:
+            raise _UnsafeOBSMigrationPathError(
+                f"read-only directory leaseでは削除できません: {self.path / name}"
+            )
+        self.validate_lexical_binding()
+        opened = os.fstat(descriptor)
+        if (
+            _file_identity(opened) != expected_identity
+            or not stat.S_ISREG(opened.st_mode)
+            or int(opened.st_nlink) != 1
+        ):
+            raise _UnsafeOBSMigrationPathError(
+                f"削除前にopen file identityが変化しました: {self.path / name}"
+            )
+        if self._relative_file_identity(name) != expected_identity:
+            raise _UnsafeOBSMigrationPathError(
+                f"削除前にfile path identityが変化しました: {self.path / name}"
+            )
+        if os.name == "nt":
+            _windows_mark_open_file_for_deletion(msvcrt.get_osfhandle(descriptor))
+        else:
+            os.unlink(name, dir_fd=self.native_handle)
+
+    def delete_open_file_on_close(
+        self,
+        descriptor: int,
+        name: str,
+        *,
+        expected_identity: tuple[int, int, int],
+    ) -> BaseException | None:
+        """Commit deletion through ``descriptor`` and consume its ownership.
+
+        Every safety check is completed by ``mark_open_file_for_deletion``.
+        On Windows the open handle pins the authorized physical file through
+        ``FileDispositionInfo``.  POSIX uses a directory-relative unlink and
+        therefore provides this identity guarantee only to writers following
+        the same IPC-lock protocol; a non-cooperative pathname swap cannot be
+        excluded there.  After deletion succeeds (or becomes delete-pending on
+        Windows), any exception reported by close is returned only as diagnostic
+        information.  Once the deletion mark succeeds the descriptor is
+        logically consumed even when close reports a ``BaseException``; callers
+        must never try to close that descriptor number again.
+        """
+
+        self.mark_open_file_for_deletion(
+            descriptor,
+            name,
+            expected_identity=expected_identity,
+        )
+        try:
+            os.close(descriptor)
+        except BaseException as exc:
+            return exc
+        return None
 
     def unlink_file(self, name: str, *, expected_identity: tuple[int, int, int]) -> None:
         _validate_single_path_component(name)

@@ -1,3 +1,4 @@
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -10,6 +11,13 @@ from src import obs_bootstrap, obs_transaction_fs
 _POSIX_MOUNT_ID_AVAILABLE = (
     os.name != "nt" and Path("/proc/self/fdinfo").is_dir()
 )
+
+
+def _create_file_after_event(path: str, create_now, created) -> None:
+    if not create_now.wait(15):
+        raise TimeoutError("parent did not release target creation")
+    Path(path).write_bytes(b"concurrent")
+    created.set()
 
 
 def test_obs_bootstrap_reexports_filesystem_compatibility_api():
@@ -381,6 +389,384 @@ def test_windows_relative_replace_and_unlink_release_handles_for_subprocess_reop
     )
     assert completed.returncode == 0, completed.stderr
     assert target.read_bytes() == b"reopened"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lease file sharing semantics")
+def test_windows_pin_rejects_external_replace_in_place_write_delete_until_close(
+    tmp_path,
+):
+    root = tmp_path / "managed"
+    root.mkdir()
+    target = root / "lease.json"
+    replacement = root / "replacement.json"
+    target.write_bytes(b"owned")
+    replacement.write_bytes(b"replacement")
+    replace_script = (
+        "import os, sys; "
+        "\ntry: os.replace(sys.argv[1], sys.argv[2])"
+        "\nexcept OSError as exc:"
+        "\n assert exc.winerror in {5, 32, 33}, repr(exc); print('blocked')"
+        "\nelse: raise AssertionError('replace unexpectedly succeeded')"
+    )
+    write_script = (
+        "import ctypes, sys; from ctypes import wintypes; "
+        "kernel32=ctypes.WinDLL('kernel32', use_last_error=True); "
+        "kernel32.CreateFileW.argtypes=[wintypes.LPCWSTR,wintypes.DWORD,"
+        "wintypes.DWORD,wintypes.LPVOID,wintypes.DWORD,wintypes.DWORD,"
+        "wintypes.HANDLE]; kernel32.CreateFileW.restype=wintypes.HANDLE; "
+        "handle=kernel32.CreateFileW(sys.argv[1],0x40000000,0x7,None,3,0x80,None); "
+        "invalid=ctypes.c_void_p(-1).value; "
+        "assert int(handle)==invalid and ctypes.get_last_error() in {5,32,33}, "
+        "(handle,ctypes.get_last_error()); print('blocked')"
+    )
+    delete_script = (
+        "import os, sys; "
+        "\ntry: os.unlink(sys.argv[1])"
+        "\nexcept OSError as exc:"
+        "\n assert exc.winerror in {5, 32, 33}, repr(exc); print('blocked')"
+        "\nelse: raise AssertionError('delete unexpectedly succeeded')"
+    )
+
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(
+        root,
+        mutable=True,
+    ) as lease:
+        descriptor = lease.open_file(
+            target.name,
+            write=False,
+            create_exclusive=False,
+            delete=True,
+            share_write=False,
+            share_delete=False,
+        )
+        try:
+            replaced = subprocess.run(
+                [sys.executable, "-c", replace_script, str(replacement), str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            written = subprocess.run(
+                [sys.executable, "-c", write_script, str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            deleted = subprocess.run(
+                [sys.executable, "-c", delete_script, str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            assert replaced.returncode == 0, (replaced.stdout, replaced.stderr)
+            assert written.returncode == 0, (written.stdout, written.stderr)
+            assert deleted.returncode == 0, (deleted.stdout, deleted.stderr)
+            assert replaced.stdout.strip() == "blocked"
+            assert written.stdout.strip() == "blocked"
+            assert deleted.stdout.strip() == "blocked"
+            assert replacement.read_bytes() == b"replacement"
+            assert target.exists()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            assert os.read(descriptor, 16) == b"owned"
+        finally:
+            os.close(descriptor)
+
+    os.replace(replacement, target)
+    assert target.read_bytes() == b"replacement"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows delete-on-close semantics")
+def test_windows_marks_the_same_open_identity_for_delete_on_close(tmp_path):
+    root = tmp_path / "managed"
+    root.mkdir()
+    target = root / "lease.json"
+    target.write_bytes(b"owned")
+
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(
+        root,
+        mutable=True,
+    ) as lease:
+        descriptor = lease.open_file(
+            target.name,
+            write=False,
+            create_exclusive=False,
+            delete=True,
+            share_write=False,
+            share_delete=False,
+        )
+        identity = obs_transaction_fs._file_identity(os.fstat(descriptor))
+        close_error = lease.delete_open_file_on_close(
+            descriptor,
+            target.name,
+            expected_identity=identity,
+        )
+        assert close_error is None
+        assert not target.exists()
+
+        target.write_bytes(b"new lease")
+
+    assert target.read_bytes() == b"new lease"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows delete commit boundary")
+def test_windows_delete_commit_returns_close_failure_as_diagnostic(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "managed"
+    root.mkdir()
+    target = root / "lease.json"
+    target.write_bytes(b"owned")
+    real_close = obs_transaction_fs.os.close
+
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(
+        root,
+        mutable=True,
+    ) as lease:
+        descriptor = lease.open_file(
+            target.name,
+            write=False,
+            create_exclusive=False,
+            delete=True,
+            share_write=False,
+            share_delete=False,
+        )
+        identity = obs_transaction_fs._file_identity(os.fstat(descriptor))
+
+        def close_then_report_failure(candidate):
+            real_close(candidate)
+            if candidate == descriptor:
+                raise OSError("simulated close report failure")
+
+        monkeypatch.setattr(obs_transaction_fs.os, "close", close_then_report_failure)
+        close_error = lease.delete_open_file_on_close(
+            descriptor,
+            target.name,
+            expected_identity=identity,
+        )
+
+        assert isinstance(close_error, OSError)
+        assert "close report failure" in str(close_error)
+        assert not target.exists()
+
+
+def test_delete_commit_consumes_descriptor_after_non_exception_close_report(
+    monkeypatch,
+    tmp_path,
+):
+    class CloseReportedControlFlow(BaseException):
+        pass
+
+    root = tmp_path / "managed"
+    root.mkdir()
+    target = root / "lease.json"
+    target.write_bytes(b"old lease")
+    reported = CloseReportedControlFlow("simulated post-close control flow")
+    real_close = obs_transaction_fs.os.close
+
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(
+        root,
+        mutable=True,
+    ) as lease:
+        descriptor = lease.open_file(
+            target.name,
+            write=False,
+            create_exclusive=False,
+            delete=True,
+            share_write=False,
+            share_delete=False,
+        )
+        identity = obs_transaction_fs._file_identity(os.fstat(descriptor))
+        close_calls = 0
+
+        def close_then_report(candidate):
+            nonlocal close_calls
+            if candidate == descriptor:
+                close_calls += 1
+                real_close(candidate)
+                raise reported
+            real_close(candidate)
+
+        monkeypatch.setattr(obs_transaction_fs.os, "close", close_then_report)
+        close_failure = lease.delete_open_file_on_close(
+            descriptor,
+            target.name,
+            expected_identity=identity,
+        )
+
+        assert close_failure is reported
+        assert close_calls == 1
+        assert not target.exists()
+        target.write_bytes(b"new lease")
+        assert target.read_bytes() == b"new lease"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows no-clobber rename semantics")
+def test_windows_no_clobber_publish_rejects_target_created_after_precheck(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "managed"
+    root.mkdir()
+    temporary = root / "lease.tmp"
+    target = root / "lease.json"
+    context = multiprocessing.get_context("spawn")
+    create_now = context.Event()
+    created = context.Event()
+    child = context.Process(
+        target=_create_file_after_event,
+        args=(str(target), create_now, created),
+    )
+    child.start()
+    real_rename = obs_transaction_fs._windows_rename_open_file
+
+    def create_target_then_rename(*args, **kwargs):
+        create_now.set()
+        assert created.wait(15)
+        return real_rename(*args, **kwargs)
+
+    monkeypatch.setattr(
+        obs_transaction_fs,
+        "_windows_rename_open_file",
+        create_target_then_rename,
+    )
+    descriptor = None
+    try:
+        with obs_transaction_fs._OBSDirectoryLease.open_absolute(
+            root,
+            mutable=True,
+        ) as lease:
+            descriptor = lease.open_file(
+                temporary.name,
+                write=True,
+                create_exclusive=True,
+                delete=True,
+            )
+            os.write(descriptor, b"temporary")
+            os.fsync(descriptor)
+            identity = obs_transaction_fs._file_identity(os.fstat(descriptor))
+
+            with pytest.raises(FileExistsError):
+                lease.publish_open_file_no_replace(
+                    descriptor,
+                    temporary.name,
+                    target.name,
+                )
+
+            assert target.read_bytes() == b"concurrent"
+            assert lease._relative_file_identity(temporary.name) == identity
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            assert os.read(descriptor, 32) == b"temporary"
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        create_now.set()
+        child.join(timeout=15)
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=5)
+            child.close()
+            pytest.fail("target creator child did not exit")
+        exitcode = child.exitcode
+        child.close()
+        assert exitcode == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows publish commit boundary")
+def test_windows_no_clobber_publish_reports_post_native_failure_as_commit_uncertain(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "managed"
+    root.mkdir()
+    temporary = root / "lease.tmp"
+    target = root / "lease.json"
+    real_rename = obs_transaction_fs._windows_rename_open_file
+
+    def rename_then_fail(*args, **kwargs):
+        real_rename(*args, **kwargs)
+        raise OSError("simulated post-publish failure")
+
+    monkeypatch.setattr(
+        obs_transaction_fs,
+        "_windows_rename_open_file",
+        rename_then_fail,
+    )
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(
+        root,
+        mutable=True,
+    ) as lease:
+        descriptor = lease.open_file(
+            temporary.name,
+            write=True,
+            create_exclusive=True,
+            delete=True,
+        )
+        try:
+            os.write(descriptor, b"published")
+            os.fsync(descriptor)
+            identity = obs_transaction_fs._file_identity(os.fstat(descriptor))
+
+            with pytest.raises(OSError, match="post-publish failure"):
+                lease.publish_open_file_no_replace(
+                    descriptor,
+                    temporary.name,
+                    target.name,
+                )
+
+            assert not temporary.exists()
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            assert os.read(descriptor, 32) == b"published"
+            assert lease._relative_file_identity(target.name) == identity
+        finally:
+            os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX link/unlink commit boundary")
+def test_posix_no_clobber_publish_keeps_commit_uncertain_double_link(
+    monkeypatch,
+    tmp_path,
+):
+    root = tmp_path / "managed"
+    root.mkdir()
+    temporary = root / "lease.tmp"
+    target = root / "lease.json"
+    real_unlink = obs_transaction_fs.os.unlink
+
+    def fail_temporary_unlink(path, *, dir_fd=None):
+        if path == temporary.name and dir_fd is not None:
+            raise OSError("simulated temporary unlink failure")
+        return real_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(obs_transaction_fs.os, "unlink", fail_temporary_unlink)
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(
+        root,
+        mutable=True,
+    ) as lease:
+        descriptor = lease.open_file(
+            temporary.name,
+            write=True,
+            create_exclusive=True,
+            delete=True,
+        )
+        try:
+            os.write(descriptor, b"published")
+            os.fsync(descriptor)
+            with pytest.raises(OSError, match="temporary unlink failure"):
+                lease.publish_open_file_no_replace(
+                    descriptor,
+                    temporary.name,
+                    target.name,
+                )
+            assert temporary.read_bytes() == b"published"
+            assert target.read_bytes() == b"published"
+            assert os.stat(temporary).st_ino == os.stat(target).st_ino
+            assert os.fstat(descriptor).st_nlink == 2
+        finally:
+            os.close(descriptor)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows access mask regression")

@@ -3,6 +3,8 @@ param(
   [string]$PythonExe = "",
   [string]$BuildProvenance = "",
   [string]$BuildProvenanceSha256 = "",
+  [string]$InnoSetupRoot = "",
+  [string]$InnoSetupProvenance = "",
   [switch]$SkipTests,
   [switch]$SkipBuild,
   [switch]$SkipSelfCheck
@@ -73,6 +75,56 @@ function Assert-BuildProvenance {
 
 Assert-BuildProvenance
 
+$resolvedInnoSetupRoot = $null
+$resolvedInnoSetupProvenance = $null
+if (
+  [string]::IsNullOrWhiteSpace($InnoSetupRoot) -xor
+  [string]::IsNullOrWhiteSpace($InnoSetupProvenance)
+) {
+  throw "検証済みInno Setupはrootとprovenanceを必ず同時に指定してください。"
+}
+if (-not [string]::IsNullOrWhiteSpace($InnoSetupRoot)) {
+  $resolvedInnoSetupRoot = (
+    Resolve-Path -LiteralPath $InnoSetupRoot -ErrorAction Stop
+  ).Path
+  $resolvedInnoSetupProvenance = (
+    Resolve-Path -LiteralPath $InnoSetupProvenance -ErrorAction Stop
+  ).Path
+  if (-not (Test-Path -LiteralPath $resolvedInnoSetupRoot -PathType Container)) {
+    throw "Inno Setup rootが見つかりません: $InnoSetupRoot"
+  }
+  if (-not (Test-Path -LiteralPath $resolvedInnoSetupProvenance -PathType Leaf)) {
+    throw "Inno Setup provenanceが見つかりません: $InnoSetupProvenance"
+  }
+}
+if ($resolvedBuildProvenance -and -not $resolvedInnoSetupRoot) {
+  throw "build provenanceを使うinstaller buildには検証済みInno Setup rootとprovenanceが必要です。"
+}
+
+function Assert-InnoSetupProvenance {
+  if (-not $resolvedInnoSetupRoot) {
+    return
+  }
+  if (-not $selectedPython) {
+    throw "Inno Setup provenanceを検査するPythonが見つかりません。"
+  }
+  $arguments = @(
+    "-m", "scripts.inno_setup_provenance", "verify",
+    "--components", (Join-Path $repoRoot "compliance\components.json"),
+    "--install-root", $resolvedInnoSetupRoot,
+    "--provenance", $resolvedInnoSetupProvenance
+  )
+  if ($resolvedBuildProvenance) {
+    $arguments += @("--build-provenance", $resolvedBuildProvenance)
+  }
+  & $selectedPython @arguments
+  if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+  }
+}
+
+Assert-InnoSetupProvenance
+
 if (-not $SkipTests) {
   if (-not $selectedPython) {
     throw "Python が見つからないためテストを実行できません。"
@@ -131,24 +183,33 @@ if (-not $SkipSelfCheck) {
 }
 Assert-BuildProvenance
 
-$isccCandidates = @()
-$isccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
-if ($isccCommand) {
-  $isccCandidates += $isccCommand.Source
+$isccPath = $null
+if ($resolvedInnoSetupRoot) {
+  $isccPath = Join-Path $resolvedInnoSetupRoot "ISCC.exe"
+} else {
+  $isccCandidates = @()
+  $isccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+  if ($isccCommand) {
+    $isccCandidates += $isccCommand.Source
+  }
+  if (${env:ProgramFiles(x86)}) {
+    $isccCandidates += Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
+  }
+  if ($env:ProgramFiles) {
+    $isccCandidates += Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"
+  }
+  if ($env:LOCALAPPDATA) {
+    $isccCandidates += Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
+  }
+  $isccPath = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
-if (${env:ProgramFiles(x86)}) {
-  $isccCandidates += Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
-}
-if ($env:ProgramFiles) {
-  $isccCandidates += Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"
-}
-if ($env:LOCALAPPDATA) {
-  $isccCandidates += Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"
-}
-$isccPath = $isccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $isccPath) {
   throw "Inno Setup 6 が見つかりません。winget install --id JRSoftware.InnoSetup -e を実行してください。"
 }
+if (-not (Test-Path -LiteralPath $isccPath -PathType Leaf)) {
+  throw "ISCC.exeが見つかりません: $isccPath"
+}
+Assert-InnoSetupProvenance
 
 $installerDir = Join-Path $repoRoot "dist\installer"
 New-Item -ItemType Directory -Path $installerDir -Force | Out-Null
@@ -165,5 +226,19 @@ if (-not (Test-Path $installerPath)) {
   throw "インストーラーが生成されませんでした: $installerPath"
 }
 Assert-BuildProvenance
+Assert-InnoSetupProvenance
+
+$expectedInnoCopyright = "Copyright © 1997-2026 Jordan Russell. Portions Copyright © 2000-2026 Martijn Laan."
+$expectedInnoWebsite = "https://www.innosetup.com"
+$expectedInnoDescription = "LoL Replay Tool Setup - Inno Setup $expectedInnoWebsite"
+$expectedPublisher = "LoL Replay Tool Contributors"
+$installerVersionInfo = (Get-Item -LiteralPath $installerPath).VersionInfo
+if (
+  $installerVersionInfo.LegalCopyright.Trim() -cne $expectedInnoCopyright -or
+  $installerVersionInfo.FileDescription.Trim() -cne $expectedInnoDescription -or
+  $installerVersionInfo.CompanyName.Trim() -cne $expectedPublisher
+) {
+  throw "生成installerのpublisher、Inno Setup copyrightまたはwebsite表示が一致しません。"
+}
 
 Write-Host "Installer build complete: $installerPath"

@@ -2097,5 +2097,254 @@
       ]
     }
   ],
+  "installer_components": [
+    {
+      "component": "inno-setup",
+      "version": "6.7.3",
+      "license": "Inno Setup License",
+      "homepage": "https://jrsoftware.org/isinfo.php",
+      "packaged_in_distribution": true,
+      "source_status": "verified_corresponding_source",
+      "source_tag": {
+        "repository": "jrsoftware/issrc",
+        "tag": "is-6_7_3",
+        "tag_object": "c7af86b4b2fd03371185df2b09a1dca8d472ab70",
+        "commit": "4adf37ed7f3fd2bd11c6836ba056e3de170fbabf",
+        "verified_signature": true
+      },
+      "source_archives": [
+        {
+          "filename": "issrc-is-6_7_3.zip",
+          "url": "https://github.com/jrsoftware/issrc/archive/refs/tags/is-6_7_3.zip",
+          "sha256": "db98c24bc0280278c708f9bb1b42794216f0c8fe0d28b60eaa0e2f293bdaddd3",
+          "size": 5749717
+        }
+      ],
+      "upstream_license": {
+        "url": "https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_3/license.txt",
+        "sha256": "2e5346868c2a18434489824e11d65c3031620f792fefc415d05f19cd441abf5c",
+        "size": 1521
+      },
+      "license_materials": [
+        {
+          "path": "licenses/inno-setup/LICENSE.txt",
+          "sha256": "0c81595601bce47eeef8d865d5da7f9ca2c6a12235b7482b29f5ab23ed02ee5a"
+        }
+      ],
+      "official_installer": {
+        "filename": "innosetup-6.7.3.exe",
+        "url": "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe",
+        "sha256": "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732",
+        "size": 10592232,
+        "release_repository": "jrsoftware/issrc",
+        "release_tag": "is-6_7_3",
+        "release_attestation_required": true,
+        "authenticode": {
+          "status": "Valid",
+          "subject": "CN=Pyrsys B.V., O=Pyrsys B.V., S=Noord-Holland, C=NL",
+          "thumbprint": "E0AB19C8D38CBF9C44709925122A7A02F8C70CB7"
+        }
+      },
+      "public_keys": [
+        {
+          "filename": "def01.ispublickey",
+          "url": "https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_3/def01.ispublickey",
+          "size": 248,
+          "sha256": "3b0b7e1e478c9ab327746a990512e2b245c9231e88a7fdd60d7874dd439db562",
+          "key_id": "def0147c3bbc17ab99bf7b7a9c2de1390283f38972152418d7c2a4a7d7131a38"
+        },
+        {
+          "filename": "def02.ispublickey",
+          "url": "https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_3/def02.ispublickey",
+          "size": 248,
+          "sha256": "32bea6bceb4ac7c4e6b3becdf3fb38de77378c5e76d494ab907d87cfab9e597b",
+          "key_id": "def020edee3c4835fd54d85eff8b66d4d899b22a777353ca4a114b652e5e7a28"
+        }
+      ],
+      "toolchain_files": [
+        {
+          "path": "ISCC.exe",
+          "role": "command-line compiler entry point",
+          "size": 1456272,
+          "sha256": "0a8757031b33777e4c9cbffee40f11a5062b36d25cbe144c1db73b6102b80ad7",
+          "authenticode": true
+        },
+        {
+          "path": "ISCmplr.dll",
+          "role": "compiler engine",
+          "size": 1524880,
+          "sha256": "85a1e3090d3a5b85319f001b7c8f9ecfad45f37eff030a67bbe29ef58b7aa2c3",
+          "authenticode": true,
+          "issig_key": "def02.ispublickey"
+        },
+        {
+          "path": "ISCmplr.dll.issig",
+          "role": "compiler engine upstream signature",
+          "size": 367,
+          "sha256": "5c4b4b0fc6958934918c611eb509ecf63827a2bb36ce61fcb538fc5897b3a7ea"
+        },
+        {
+          "path": "ISPP.dll",
+          "role": "preprocessor engine",
+          "size": 1006736,
+          "sha256": "bde04be7f4a55ca56afb6b06600d7cbe8326fac468ac3f2885b80eefb3ed2a7a",
+          "authenticode": true,
+          "issig_key": "def02.ispublickey"
+        },
+        {
+          "path": "ISPP.dll.issig",
+          "role": "preprocessor engine upstream signature",
+          "size": 364,
+          "sha256": "5f66c7d86af3be12522f044541b747f293c8131268e16d27c622bfc14f7250c9"
+        },
+        {
+          "path": "ISPPBuiltins.iss",
+          "role": "preprocessor built-ins",
+          "size": 11302,
+          "sha256": "bc765e1121a95dc602ca1248b484418cecc6db9d4b6f4dae58e9a2c35262527c"
+        },
+        {
+          "path": "Setup.e32",
+          "role": "classic Setup and Uninstall stub",
+          "size": 4427264,
+          "sha256": "a80d75ba8d8c336050c37f7707de8bb017cc93597329e0ea18d474156b3e0da5",
+          "issig_key": "def02.ispublickey"
+        },
+        {
+          "path": "Setup.e32.issig",
+          "role": "classic Setup and Uninstall stub upstream signature",
+          "size": 365,
+          "sha256": "09dbd2458c48a249eeda5ae2705a4315192cc96ecd1b233136f11799d5dff175"
+        },
+        {
+          "path": "SetupCustomStyle.e32",
+          "role": "selected modern-style Setup and Uninstall stub",
+          "size": 5810688,
+          "sha256": "9675a2a5c78c66b691cc80270031da42bebad5725fbf60853cb4e5f90251bd5e",
+          "issig_key": "def02.ispublickey"
+        },
+        {
+          "path": "SetupCustomStyle.e32.issig",
+          "role": "modern-style Setup and Uninstall stub upstream signature",
+          "size": 376,
+          "sha256": "cb513ff3e47a9c52341620ebd787e968f9c71fd012c6836e78fb039013e8256f"
+        },
+        {
+          "path": "SetupLdr.e32",
+          "role": "selected x86 Setup loader",
+          "size": 950272,
+          "sha256": "5475964893adbb33ccc420ad4d88bbdff27dfaaca7580cd6058ea2798893490d",
+          "issig_key": "def02.ispublickey"
+        },
+        {
+          "path": "SetupLdr.e32.issig",
+          "role": "x86 Setup loader upstream signature",
+          "size": 367,
+          "sha256": "12441b9477b0363993f06e325767f8b925a20e895e364fa8460754ee39ca6c08"
+        },
+        {
+          "path": "Default.isl",
+          "role": "default compiler messages",
+          "size": 21993,
+          "sha256": "42a5f6f7dbbddf26cc278f67db5d894235ce1d126a6856702e31bd02023a1316"
+        },
+        {
+          "path": "Languages/Japanese.isl",
+          "role": "selected installer language",
+          "size": 28186,
+          "sha256": "d5450537bb128112347bf86a4bdc3a4be0605414df0bc4fc90f55aaef1ba369b"
+        },
+        {
+          "path": "islzma.dll",
+          "role": "LZMA compression library",
+          "size": 139408,
+          "sha256": "8af307ce3738ab1d37cc7e76b2f76615e2045597d4367c3e40d52b5f2fbd353d",
+          "authenticode": true,
+          "issig_key": "def01.ispublickey"
+        },
+        {
+          "path": "islzma.dll.issig",
+          "role": "LZMA compression library upstream signature",
+          "size": 365,
+          "sha256": "c49d4b2cc6499846118dc376c9c66081744531edc932ffa979698d68ec0662b2"
+        },
+        {
+          "path": "islzma32.exe",
+          "role": "x86 LZMA worker fallback",
+          "size": 203408,
+          "sha256": "fd977c3ac44c56997d2b4fd6647e97e2457c43991a6ae26a4b2252c0eabdfebb",
+          "authenticode": true,
+          "issig_key": "def01.ispublickey"
+        },
+        {
+          "path": "islzma32.exe.issig",
+          "role": "x86 LZMA worker upstream signature",
+          "size": 367,
+          "sha256": "81039bd05963f8b02e1396a6fb5f3f7df7fd1ce1655f7a960f6c0b549489c562"
+        },
+        {
+          "path": "islzma64.exe",
+          "role": "selected x64 LZMA worker",
+          "size": 226448,
+          "sha256": "87a50495aff580b78cad57906a765d3cf28ca508cfa95c24c1247c286ddf71b2",
+          "authenticode": true,
+          "issig_key": "def01.ispublickey"
+        },
+        {
+          "path": "islzma64.exe.issig",
+          "role": "x64 LZMA worker upstream signature",
+          "size": 367,
+          "sha256": "e74ea022afb90bbff710d9952a1069767c970484b1be596771ae7d109932f716"
+        },
+        {
+          "path": "ISSigTool.exe",
+          "role": "upstream signature verifier used only during build preparation",
+          "size": 919184,
+          "sha256": "aea490d45665a88c0c832d25647d21c1b87962efedb25668caec05678e0fd7c6",
+          "authenticode": true
+        },
+        {
+          "path": "license.txt",
+          "role": "upstream Inno Setup license",
+          "size": 1521,
+          "sha256": "2e5346868c2a18434489824e11d65c3031620f792fefc415d05f19cd441abf5c"
+        }
+      ],
+      "distribution_boundary": {
+        "published_artifact": "LoLReplayTool-Setup-<version>.exe",
+        "compiler_only_inputs": [
+          "ISCC.exe",
+          "ISCmplr.dll",
+          "ISPP.dll",
+          "ISPPBuiltins.iss",
+          "Default.isl",
+          "Languages/Japanese.isl",
+          "islzma.dll",
+          "islzma32.exe",
+          "islzma64.exe",
+          "ISSigTool.exe"
+        ],
+        "embedded_code_inputs": [
+          "SetupLdr.e32",
+          "SetupCustomStyle.e32",
+          "LZMA decompression code carried by the selected Setup stub"
+        ],
+        "uninstaller_origin": "SetupCustomStyle.e32",
+        "compiler_files_copied_to_application_root": false,
+        "source_evidence": [
+          "Projects/Src/Compiler.SetupCompiler.pas",
+          "Projects/Src/Setup.dpr",
+          "Projects/Src/SetupLdr.dpr",
+          "Projects/Src/Compression.LZMACompressor.pas",
+          "Projects/Src/Compression.LZMADecompressor.pas",
+          "Projects/Src/Compression.LZMADecompressor/Lzma2Decode/ISLzmaDec.c"
+        ]
+      },
+      "generated_installer_markers": {
+        "legal_copyright": "Copyright © 1997-2026 Jordan Russell. Portions Copyright © 2000-2026 Martijn Laan.",
+        "file_description": "LoL Replay Tool Setup - Inno Setup https://www.innosetup.com"
+      }
+    }
+  ],
   "runtime_downloads": []
 }

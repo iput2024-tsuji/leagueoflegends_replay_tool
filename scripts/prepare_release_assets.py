@@ -36,6 +36,13 @@ from scripts.collect_licenses import (
     verified_wheel_record_inventory,
 )
 from scripts.external_runtime_policy import is_user_provided_runtime_path
+from scripts.inno_setup_provenance import (
+    INNO_COMPONENT,
+    INNO_VERSION,
+    InnoSetupProvenanceError,
+    validate_build_provenance as validate_inno_build_provenance,
+    validate_component_lock as validate_inno_component_lock,
+)
 
 MAX_GITHUB_ASSET_SIZE = 2_000_000_000
 TARGET_SOURCE_PART_SIZE = 1_500_000_000
@@ -303,6 +310,7 @@ def _component_entries(lock: dict[str, Any]) -> list[dict[str, Any]]:
     result = [lock["python"]]
     result.extend(lock.get("runtime_components", []))
     result.extend(lock.get("build_components", []))
+    result.extend(lock.get("installer_components", []))
     return result
 
 
@@ -865,6 +873,10 @@ def _python_native_profile_errors(lock: dict[str, Any]) -> list[str]:
 
 def release_gate_errors(lock: dict[str, Any]) -> list[str]:
     errors = _runtime_download_policy_errors(lock)
+    try:
+        validate_inno_component_lock(lock)
+    except InnoSetupProvenanceError as exc:
+        errors.append(f"inno-setup: {exc}")
     if not _completed_review(lock, "historical_remediation"):
         errors.append(
             "v0.5.2-historical-remediation: review evidence is incomplete"
@@ -880,6 +892,7 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
         lock["python"],
         *lock.get("runtime_components", []),
         *[component for component in lock.get("build_components", []) if component.get("packaged_in_distribution")],
+        *lock.get("installer_components", []),
     ]
     for component in source_required_components:
         archives = component.get("source_archives")
@@ -956,6 +969,7 @@ def source_archive_records(lock: dict[str, Any]) -> list[dict[str, Any]]:
         for component in [
             *lock.get("runtime_components", []),
             *[item for item in lock.get("build_components", []) if item.get("packaged_in_distribution")],
+            *lock.get("installer_components", []),
         ]
     }
     for component in _component_entries(lock):
@@ -2900,6 +2914,35 @@ def verify_license_archive(
         raise ReleaseAssetError(f"Cannot verify license archive {path}: {exc}") from exc
 
 
+def _inno_identity_from_license_archive(
+    path: Path,
+    lock: dict[str, Any],
+) -> str:
+    """Validate the sealed Inno provenance carried by the license asset."""
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = _validated_zip_members(
+                archive,
+                label=f"license materials archive {path.name}",
+            )
+            provenance_info = members.get("licenses/build-provenance.json")
+            if provenance_info is None:
+                raise ReleaseAssetError(
+                    f"{path.name} is missing licenses/build-provenance.json."
+                )
+            build_provenance = _load_zip_json(
+                archive,
+                provenance_info,
+                label=f"build provenance in {path.name}",
+            )
+        return validate_inno_build_provenance(build_provenance, lock)
+    except InnoSetupProvenanceError as exc:
+        raise ReleaseAssetError(
+            f"Inno Setup build provenance is invalid: {exc}"
+        ) from exc
+
+
 def parse_sha256sums(path: Path) -> dict[str, str]:
     _require_regular_file(path, label="SHA256SUMS")
     try:
@@ -2957,6 +3000,30 @@ def verify_release_asset_payload(
     ):
         raise ReleaseAssetError(
             "Release asset list contains an invalid build provenance SHA256."
+        )
+    installer_build = payload.get("installer_build")
+    if not isinstance(installer_build, dict) or set(installer_build) != {
+        "component",
+        "version",
+        "inno_setup_provenance_sha256",
+        "installer_sha256",
+    }:
+        raise ReleaseAssetError(
+            "Release asset list contains invalid installer build provenance."
+        )
+    if (
+        installer_build.get("component") != INNO_COMPONENT
+        or installer_build.get("version") != INNO_VERSION
+        or not isinstance(installer_build.get("inno_setup_provenance_sha256"), str)
+        or SHA256_PATTERN.fullmatch(
+            installer_build["inno_setup_provenance_sha256"]
+        )
+        is None
+        or not isinstance(installer_build.get("installer_sha256"), str)
+        or SHA256_PATTERN.fullmatch(installer_build["installer_sha256"]) is None
+    ):
+        raise ReleaseAssetError(
+            "Release asset list contains invalid Inno Setup or installer identity."
         )
     raw_assets = payload.get("assets")
     if not isinstance(raw_assets, list) or not raw_assets:
@@ -3049,6 +3116,12 @@ def verify_release_asset_payload(
         if checksum_records[asset.name] != actual_hash:
             raise ReleaseAssetError(f"SHA256SUMS mismatch for {asset.name}: {actual_hash}")
 
+    installers = [asset for asset in assets if asset.name == expected_installer]
+    if sha256_file(installers[0]) != installer_build["installer_sha256"]:
+        raise ReleaseAssetError(
+            "Installer hash differs from its recorded Inno Setup provenance."
+        )
+
     application_sources = [asset for asset in assets if asset.name == expected_source]
     validate_application_source(application_sources[0], version, source_commit)
 
@@ -3071,6 +3144,11 @@ def verify_release_asset_payload(
         license_archives[0],
         expected_build_provenance_sha256=build_provenance_sha256,
     )
+    inno_identity = _inno_identity_from_license_archive(license_archives[0], lock)
+    if inno_identity != installer_build["inno_setup_provenance_sha256"]:
+        raise ReleaseAssetError(
+            "Installer and sealed Inno Setup provenance identities differ."
+        )
 
 
 def verify_release_asset_list(
@@ -3148,6 +3226,12 @@ def create_release_assets(
 
     lock = _load_lock(components_file)
     _assert_runtime_downloads_disabled(lock)
+    try:
+        inno_identity = validate_inno_build_provenance(build_provenance, lock)
+    except InnoSetupProvenanceError as exc:
+        raise ReleaseAssetError(
+            f"Release assets require verified Inno Setup provenance: {exc}"
+        ) from exc
     gates = release_gate_errors(lock)
     if enforce_release_gates and gates:
         raise ReleaseAssetError("Release legal gates remain: " + " | ".join(gates))
@@ -3176,6 +3260,12 @@ def create_release_assets(
         "version": version,
         "source_commit": source_commit,
         "build_provenance_sha256": actual_build_provenance_sha256,
+        "installer_build": {
+            "component": INNO_COMPONENT,
+            "version": INNO_VERSION,
+            "inno_setup_provenance_sha256": inno_identity,
+            "installer_sha256": sha256_file(installer),
+        },
         "assets": [str(path.resolve()) for path in assets],
         "sha256sums": str(checksum_path.resolve()),
     }

@@ -53,6 +53,26 @@ wheel内native sourceの未確認は公開を止めるRelease gateです。生�
 component分類を記録する技術的なinventoryであり、ライセンス本文や法的確認に
 代わるものではありません。
 
+Inno Setup 6.7.3 is a build-time toolchain whose selected Setup/Uninstall
+stubs and LZMA decompression code are embedded in the public installer. The
+compiler, LZMA compression components and other build-only files are not
+redistributed in the installed application. The exact official source archive is locked to
+`https://github.com/jrsoftware/issrc/archive/refs/tags/is-6_7_3.zip`; its URL,
+size and SHA256, together with the compiler/stub identities, are recorded in
+`licenses/components.json` and the sealed build provenance. That archive is
+included in a numbered third-party source Release asset. The pinned Inno Setup
+License text is distributed at `licenses/inno-setup/LICENSE.txt`.
+
+Inno Setup 6.7.3はbuild時のtoolchainであり、選択したSetup/Uninstall stubと
+LZMA展開コードが公開するインストーラーへ埋め込まれます。compiler、LZMA圧縮
+component、その他のbuild専用ファイルはインストール後のアプリケーションには
+再配布しません。正確な公式source archiveは
+`https://github.com/jrsoftware/issrc/archive/refs/tags/is-6_7_3.zip`に固定し、
+URL、size、SHA256、compiler/stubの識別情報を`licenses/components.json`と
+sealed build provenanceへ記録します。このarchiveは番号付き第三者source Release
+資産に収録し、固定したInno Setup License本文は
+`licenses/inno-setup/LICENSE.txt`で配布します。
+
 The current lock includes verified candidates for LoL Replay Tool, Python,
 PyQt6, obsws-python, OpenCV and the FFmpeg codec library in opencv-python.
 It does not yet prove complete source coverage for every runtime wheel.

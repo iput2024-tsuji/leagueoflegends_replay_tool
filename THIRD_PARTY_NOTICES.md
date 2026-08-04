@@ -29,6 +29,7 @@ LoL Replay Toolは`GPL-3.0-only`で提供され、プロジェクトのライセ
 | Mesa `opengl32sw.dll` in the Qt wheel | Software OpenGL fallback | MIT and bundled component licenses; exact source/build provenance remains a Release gate |
 | aiohttp, Requests and supporting packages | Network clients | Component-specific permissive licenses included with the packages |
 | PyInstaller bootloader | Executable packaging bootloader | GPL-2.0-or-later with the PyInstaller bootloader exception |
+| Inno Setup 6.7.3 | Setup/Uninstall stubs and LZMA decompression code embedded in the public installer; LZMA compression tools are build-only inputs | Inno Setup License; the pinned license text is copied with the distribution materials |
 
 The exact locked component versions and artifact patterns, plus source URLs and
 hashes where verified, are recorded in `licenses/components.json`. Missing
@@ -38,7 +39,8 @@ provenance, and Microsoft runtime exception evidence are Release gates. The gene
 `licenses/distribution-manifest.json` records relative paths, hashes and
 component classifications observed in the completed build. It is a technical
 inventory, not a controlling legal record. Copied package license texts are
-under `licenses/python-packages/`.
+under `licenses/python-packages/`. The pinned Inno Setup license is copied to
+`licenses/inno-setup/LICENSE.txt`.
 
 正確なcomponentバージョンと成果物pattern、および検証できたsource URL/hashは
 `licenses/components.json`に記録します。runtime source archiveの欠落、
@@ -48,7 +50,25 @@ Mesaのprovenance、Microsoft runtime例外根拠の未確認は
 `licenses/distribution-manifest.json`は、完成したビルドで確認した相対path、
 hash、component分類の技術的なinventoryであり、法的に支配的な記録では
 ありません。パッケージから収集したライセンス本文は
-`licenses/python-packages/`にあります。
+`licenses/python-packages/`、固定したInno Setupのライセンス本文は
+`licenses/inno-setup/LICENSE.txt`にあります。
+
+Inno Setup 6.7.3 contributes the Setup/Uninstall stubs and LZMA decompression
+code embedded in the public installer; these are not files in the installed
+application directory. The compiler, LZMA compression components and other
+supporting tools are build-only inputs and are not redistributed. The exact
+compiler, stub and worker identities are recorded in `licenses/components.json`
+and the sealed build provenance. The matching fixed official source archive is
+placed in a numbered `LoLReplayTool-third-party-sources-<version>-NN.zip`
+Release asset.
+
+Inno Setup 6.7.3のSetup/Uninstall stubとLZMA展開コードは、公開する
+インストーラーに埋め込まれますが、インストール後のアプリケーション
+ディレクトリへ個別ファイルとして配置されるものではありません。compiler、
+LZMA圧縮component、その他の補助toolはbuild時だけの入力で、再配布しません。
+正確なcompiler、stub、workerの識別情報は`licenses/components.json`とsealed build
+provenanceに記録し、対応する固定済み公式source archiveは番号付きの
+`LoLReplayTool-third-party-sources-<version>-NN.zip` Release資産へ収録します。
 
 Corresponding-source information is in `SOURCE_OFFER.md`. Instructions for
 replacing the dynamically linked Qt libraries are in `QT_RELINKING.md`.
@@ -108,5 +128,9 @@ compliance gateを完了扱いにはしません。source、provenance、履歴�
 - opencv-python notices:
   https://github.com/opencv/opencv-python/blob/master/LICENSE-3RD-PARTY.txt
 - PyInstaller: https://pyinstaller.org/en/stable/license.html
+- Inno Setup license:
+  https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_3/license.txt
+- Inno Setup 6.7.3 source:
+  https://github.com/jrsoftware/issrc/archive/refs/tags/is-6_7_3.zip
 - OBS Studio: https://github.com/obsproject/obs-studio/blob/master/COPYING
 - FFmpeg: https://ffmpeg.org/legal.html

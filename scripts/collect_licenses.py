@@ -18,6 +18,11 @@ from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from scripts.inno_setup_provenance import (
+    InnoSetupProvenanceError,
+    validate_build_provenance as validate_inno_build_provenance,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_REQUIREMENTS = REPO_ROOT / "requirements.txt"
 COMPONENTS_FILE = REPO_ROOT / "compliance" / "components.json"
@@ -493,6 +498,65 @@ def collect_python_runtime_license(
     }
 
 
+def collect_installer_component_license(
+    component: dict[str, Any],
+    destination: Path,
+    *,
+    seen_targets: dict[str, Path],
+) -> dict[str, object]:
+    """Copy one repository-locked installer build component license."""
+
+    materials = component.get("license_materials")
+    if not isinstance(materials, list) or not materials:
+        raise RuntimeError(
+            f"Installer component has no license materials: {component.get('component')}"
+        )
+    copied: list[str] = []
+    hashes: dict[str, str] = {}
+    for material in materials:
+        if not isinstance(material, dict):
+            raise RuntimeError("Installer component license material is invalid.")
+        relative = safe_relative_path(str(material.get("path", "")))
+        if not relative.parts or relative.parts[0] != "licenses":
+            raise RuntimeError(
+                "Installer component license material must be under licenses/: "
+                f"{relative.as_posix()}"
+            )
+        manifest_relative = Path(*relative.parts[1:])
+        if not manifest_relative.parts:
+            raise RuntimeError("Installer component license material path is empty.")
+        source = REPO_ROOT / relative
+        if not is_meaningful_license_file(source):
+            raise RuntimeError(
+                f"Installer component license material is missing: {relative.as_posix()}"
+            )
+        actual_hash = sha256_file(source)
+        expected_hash = material.get("sha256")
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                "Installer component license material differs from lock: "
+                f"{relative.as_posix()}"
+            )
+        target = destination / manifest_relative
+        _reserve_target(target, seen_targets)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        relative_text = manifest_relative.as_posix()
+        copied.append(relative_text)
+        hashes[relative_text] = actual_hash
+    return {
+        "component": str(component["component"]),
+        "name": str(component["component"]),
+        "version": str(component["version"]),
+        "expected_license": str(component["license"]),
+        "observed_license": str(component["license"]),
+        "homepage": str(component.get("homepage", "")),
+        "license_files": copied,
+        "license_file_sha256": hashes,
+        "substantive_license_files": copied,
+    }
+
+
 def probe_python_native_runtime(component_lock: dict[str, Any]) -> dict[str, Any]:
     python_lock = component_lock["python"]
     version = sys.version.split()[0]
@@ -845,6 +909,10 @@ def _validated_build_provenance(
         raise RuntimeError(f"Cannot read build provenance: {exc}") from exc
     if not isinstance(payload, dict) or payload.get("schema_version") != 1:
         raise RuntimeError("Unsupported build provenance schema.")
+    try:
+        validate_inno_build_provenance(payload, component_lock)
+    except InnoSetupProvenanceError as exc:
+        raise RuntimeError(f"Inno Setup build provenance is invalid: {exc}") from exc
     if payload.get("component_lock_sha256") != sha256_file(components_file):
         raise RuntimeError("Build provenance component lock hash differs.")
     if payload.get("python_version") != sys.version.split()[0]:
@@ -1052,6 +1120,14 @@ def collect_licenses(
                 component=str(locked_component["component"]),
                 binary_archive=locked_component.get("binary_archive"),
                 verified_binary_components=verified_binary_components,
+                seen_targets=seen_targets,
+            )
+        )
+    for installer_component in component_lock.get("installer_components", []):
+        manifest.append(
+            collect_installer_component_license(
+                installer_component,
+                destination,
                 seen_targets=seen_targets,
             )
         )

@@ -5,12 +5,14 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 POWERSHELL = shutil.which("pwsh")
 INSTALLER_SCRIPT = Path("scripts/build_installer.ps1").resolve()
+INNO_CAPTURE_NAME = "captured Inno verification arguments.json"
 
 
 def _write_installer_harness(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -51,6 +53,9 @@ def _run_installer(
         pytest.skip("pwsh is unavailable")
     environment = os.environ.copy()
     environment["INSTALLER_ARGUMENT_CAPTURE"] = str(capture)
+    environment["INNO_VERIFICATION_ARGUMENT_CAPTURE"] = str(
+        capture.with_name(INNO_CAPTURE_NAME)
+    )
     return subprocess.run(
         [
             POWERSHELL,
@@ -93,6 +98,41 @@ def _fake_python(repository: Path, relative: str) -> Path:
     return python.resolve()
 
 
+def _fake_verifying_python(repository: Path, relative: str) -> Path:
+    suffix = ".cmd" if os.name == "nt" else ".sh"
+    python = repository / f"{relative}{suffix}"
+    python.parent.mkdir(parents=True, exist_ok=True)
+    capture_script = repository / "capture Inno verification.py"
+    capture_script.write_text(
+        """import json
+import os
+import sys
+from pathlib import Path
+
+Path(os.environ["INNO_VERIFICATION_ARGUMENT_CAPTURE"]).write_text(
+    json.dumps(sys.argv[1:]),
+    encoding="utf-8",
+)
+""",
+        encoding="utf-8",
+    )
+    if os.name == "nt":
+        launcher = (
+            f'@"{Path(sys.executable).resolve()}" '
+            f'"{capture_script.resolve()}" %*\n'
+        )
+    else:
+        launcher = (
+            "#!/bin/sh\n"
+            f'exec "{Path(sys.executable).resolve()}" '
+            f'"{capture_script.resolve()}" "$@"\n'
+        )
+    python.write_text(launcher, encoding="utf-8")
+    if os.name != "nt":
+        python.chmod(0o755)
+    return python.resolve()
+
+
 def test_installer_forwards_explicit_python_as_named_argument(tmp_path):
     repository, installer, capture = _write_installer_harness(tmp_path)
     python = _fake_python(repository, "runtime with spaces/python custom.exe")
@@ -114,12 +154,20 @@ def test_installer_forwards_python_and_provenance_by_name_with_spaced_paths(
     tmp_path,
 ):
     repository, installer, capture = _write_installer_harness(tmp_path)
-    python = _fake_python(repository, "runtime with spaces/python custom.exe")
+    python = _fake_verifying_python(
+        repository,
+        "runtime with spaces/python custom",
+    )
     provenance = repository / "provenance material" / "build provenance.json"
     provenance.parent.mkdir(parents=True)
     provenance.write_bytes(b'{"schema_version": 1}\n')
     provenance = provenance.resolve()
     provenance_sha256 = hashlib.sha256(provenance.read_bytes()).hexdigest()
+    inno_root = repository / "verified Inno Setup root"
+    inno_root.mkdir()
+    inno_provenance = repository / "provenance material" / "Inno provenance.json"
+    inno_provenance.write_bytes(b'{"schema_version": 1}\n')
+    inno_provenance = inno_provenance.resolve()
 
     result = _run_installer(
         installer,
@@ -130,12 +178,32 @@ def test_installer_forwards_python_and_provenance_by_name_with_spaced_paths(
         str(provenance),
         "-BuildProvenanceSha256",
         provenance_sha256,
+        "-InnoSetupRoot",
+        str(inno_root),
+        "-InnoSetupProvenance",
+        str(inno_provenance),
     )
 
     captured = _captured_arguments(capture, result)
     assert Path(captured["PythonExe"]).resolve() == python
     assert Path(captured["BuildProvenance"]).resolve() == provenance
     assert captured["BuildProvenanceSha256"] == provenance_sha256
+    verification_arguments = json.loads(
+        capture.with_name(INNO_CAPTURE_NAME).read_text(encoding="utf-8")
+    )
+    assert verification_arguments == [
+        "-m",
+        "scripts.inno_setup_provenance",
+        "verify",
+        "--components",
+        str(repository / "compliance" / "components.json"),
+        "--install-root",
+        str(inno_root.resolve()),
+        "--provenance",
+        str(inno_provenance),
+        "--build-provenance",
+        str(provenance),
+    ]
 
 
 @pytest.mark.parametrize(

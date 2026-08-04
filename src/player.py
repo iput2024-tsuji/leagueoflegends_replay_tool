@@ -4,11 +4,14 @@ import ctypes
 import importlib
 import json
 import logging
+import math
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -567,6 +570,22 @@ class SyncWorker(QThread):
         self.finished.emit(found_time)
 
 
+def _open_clip_export_process(command: list[str]) -> Any:
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    return subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=creationflags,
+    )
+
+
+_CLIP_STDOUT_EOF = object()
+
+
 class ClipExportWorker(QThread):
     progress = pyqtSignal(int, str)
     warning = pyqtSignal(str)
@@ -574,7 +593,14 @@ class ClipExportWorker(QThread):
     export_failed = pyqtSignal(str)
 
     def __init__(
-        self, ffmpeg_path: str | Path, input_path: str | Path, output_path: str | Path, start_sec: float, end_sec: float
+        self,
+        ffmpeg_path: str | Path,
+        input_path: str | Path,
+        output_path: str | Path,
+        start_sec: float,
+        end_sec: float,
+        *,
+        process_factory: Callable[[list[str]], Any] | None = None,
     ) -> None:
         super().__init__()
         self.ffmpeg_path = str(ffmpeg_path)
@@ -585,6 +611,12 @@ class ClipExportWorker(QThread):
         self.duration_sec = max(0.0, self.end_sec - self.start_sec)
         self.process = None
         self._cancel_requested = False
+        self._terminal_state: str | None = None
+        self._process_factory = process_factory or _open_clip_export_process
+        self._process_lock = threading.Lock()
+        self._termination_requested_process = None
+        self._termination_request_succeeded: bool | None = None
+        self._termination_request_error: str | None = None
 
     ENCODER_PROFILES = [
         (
@@ -606,45 +638,193 @@ class ClipExportWorker(QThread):
         ),
         ("libx264", ["-c:v", "libx264", "-preset", "fast", "-crf", "18"]),
     ]
+    PROCESS_EXIT_TIMEOUT_SEC = 5.0
+    PROCESS_POLL_INTERVAL_SEC = 0.05
 
     def cancel(self) -> None:
-        self._cancel_requested = True
-        process = self.process
-        if process and process.poll() is None:
+        with self._process_lock:
+            if self._terminal_state is not None:
+                return
+            self._cancel_requested = True
+            process = self.process
+        if process is not None:
+            self._terminate_process_once(process)
+
+    def _is_cancel_requested(self) -> bool:
+        with self._process_lock:
+            return self._cancel_requested
+
+    def _attach_process(self, process: Any) -> None:
+        with self._process_lock:
+            self.process = process
+            self._termination_requested_process = None
+            self._termination_request_succeeded = None
+            self._termination_request_error = None
+            cancel_requested = self._cancel_requested
+        if cancel_requested:
+            self._terminate_process_once(process)
+
+    def _detach_process(self, process: Any) -> None:
+        with self._process_lock:
+            if self.process is process:
+                self.process = None
+
+    def _terminate_process_once(self, process: Any) -> tuple[bool, str | None]:
+        with self._process_lock:
+            if self._termination_requested_process is process:
+                return bool(self._termination_request_succeeded), self._termination_request_error
+            try:
+                is_running = process.poll() is None
+            except Exception:
+                is_running = True
+            if not is_running:
+                return True, None
+            self._termination_requested_process = process
             try:
                 process.terminate()
-            except Exception:
-                pass
+            except Exception as e:
+                error = f"FFmpegプロセスへterminateを送信できませんでした: {e}"
+                self._termination_request_succeeded = False
+                self._termination_request_error = error
+                return False, error
+            self._termination_request_succeeded = True
+            self._termination_request_error = None
+            return True, None
+
+    def _stop_process_after_error(self, process: Any) -> tuple[bool, str | None]:
+        terminate_succeeded, terminate_error = self._terminate_process_once(process)
+        if not terminate_succeeded:
+            return False, f"{terminate_error}\nFFmpegプロセスが残っている可能性があります。"
+        try:
+            process.wait(timeout=self.PROCESS_EXIT_TIMEOUT_SEC)
+        except subprocess.TimeoutExpired:
+            return (
+                False,
+                "FFmpegプロセスの終了確認がタイムアウトしました。"
+                "FFmpegプロセスが残っている可能性があります。",
+            )
+        except Exception as e:
+            return (
+                False,
+                f"FFmpegプロセスの終了を確認できませんでした: {e}\n"
+                "FFmpegプロセスが残っている可能性があります。",
+            )
+        return True, None
+
+    def _cancelled_attempt_result(self, process: Any) -> tuple[bool, str, bool]:
+        retry_safe, process_cleanup_error = self._stop_process_after_error(process)
+        detail = "キャンセルされました。"
+        if process_cleanup_error:
+            detail = f"{detail}\n{process_cleanup_error}"
+        return False, detail, retry_safe
+
+    @staticmethod
+    def _start_stdout_reader(stdout: Any) -> tuple[queue.Queue[Any], threading.Event]:
+        output_events: queue.Queue[Any] = queue.Queue()
+        stop_requested = threading.Event()
+        if stdout is None:
+            output_events.put(_CLIP_STDOUT_EOF)
+            return output_events, stop_requested
+
+        def read_output() -> None:
+            try:
+                for line in stdout:
+                    if stop_requested.is_set():
+                        break
+                    output_events.put(line)
+            except Exception as e:
+                if not stop_requested.is_set():
+                    output_events.put(e)
+            finally:
+                output_events.put(_CLIP_STDOUT_EOF)
+
+        threading.Thread(
+            target=read_output,
+            name="clip-export-ffmpeg-output",
+            daemon=True,
+        ).start()
+        return output_events, stop_requested
+
+    def _remove_partial_output(self) -> str | None:
+        try:
+            Path(self.output_path).unlink(missing_ok=True)
+        except Exception as e:
+            return f"部分出力ファイルを削除できませんでした: {e}"
+        return None
+
+    def _emit_failure(self, message: str) -> None:
+        with self._process_lock:
+            if self._terminal_state is not None:
+                return
+            self._terminal_state = "failed"
+        self.export_failed.emit(message)
+
+    def _emit_success(self) -> bool:
+        with self._process_lock:
+            if self._cancel_requested or self._terminal_state is not None:
+                return False
+            self._terminal_state = "finished"
+        self.progress.emit(100, "クリップ出力が完了しました。")
+        self.export_finished.emit(self.output_path)
+        return True
+
+    def _cancel_with_cleanup(self, cleanup_error: str | None = None, *, cleanup_attempted: bool = False) -> None:
+        message = "クリップ出力をキャンセルしました。"
+        if not cleanup_attempted:
+            cleanup_error = self._remove_partial_output()
+        if cleanup_error:
+            message = f"{message}\n{cleanup_error}"
+        self._emit_failure(message)
 
     def run(self) -> None:
         if self.duration_sec <= 0:
-            self.export_failed.emit("クリップ範囲が不正です。終了時間は開始時間より後にしてください。")
+            self._emit_failure("クリップ範囲が不正です。終了時間は開始時間より後にしてください。")
             return
 
         output_parent = Path(self.output_path).parent
         try:
             output_parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
-            self.export_failed.emit(f"出力先ディレクトリを作成できません: {e}")
+            self._emit_failure(f"出力先ディレクトリを作成できません: {e}")
             return
 
         failures = []
         for encoder_name, encoder_args in self.ENCODER_PROFILES:
-            if self._cancel_requested:
-                self.export_failed.emit("クリップ出力をキャンセルしました。")
+            if self._is_cancel_requested():
+                self._cancel_with_cleanup()
                 return
 
-            try:
-                Path(self.output_path).unlink(missing_ok=True)
-            except Exception:
-                pass
+            cleanup_error = self._remove_partial_output()
+            if cleanup_error:
+                self._emit_failure(cleanup_error)
+                return
 
             self.progress.emit(0, f"{encoder_name} でクリップを書き出しています...")
-            ok, detail = self._run_ffmpeg_with_encoder(encoder_name, encoder_args)
+            ok, detail, retry_safe = self._run_ffmpeg_with_encoder(encoder_name, encoder_args)
             if ok:
-                self.progress.emit(100, "クリップ出力が完了しました。")
-                self.export_finished.emit(self.output_path)
+                if self._emit_success():
+                    return
+                self._cancel_with_cleanup()
                 return
+
+            if not retry_safe:
+                if self._is_cancel_requested():
+                    message = "クリップ出力のキャンセル後に安全な終了を確認できませんでした。"
+                else:
+                    message = "FFmpegの実行に失敗し、安全な終了を確認できないためfallbackを中止しました。"
+                self._emit_failure(f"{message}\n[{encoder_name}] {detail}")
+                return
+
+            if self._is_cancel_requested():
+                self._cancel_with_cleanup()
+                return
+
+            cleanup_error = self._remove_partial_output()
+            if self._is_cancel_requested():
+                self._cancel_with_cleanup(cleanup_error, cleanup_attempted=True)
+                return
+            if cleanup_error:
+                detail = f"{detail}\n{cleanup_error}"
 
             failures.append(f"[{encoder_name}] {detail}")
             if encoder_name == "h264_nvenc":
@@ -654,7 +834,7 @@ class ClipExportWorker(QThread):
             if encoder_name != self.ENCODER_PROFILES[-1][0]:
                 self.progress.emit(0, f"{encoder_name} が使えないためCPUエンコードへ切り替えます...")
 
-        self.export_failed.emit("FFmpegの実行に失敗しました。\n" + "\n\n".join(failures[-3:]))
+        self._emit_failure("FFmpegの実行に失敗しました。\n" + "\n\n".join(failures[-3:]))
 
     def _build_ffmpeg_command(self, encoder_args: list[str]) -> list[str]:
         return [
@@ -688,41 +868,79 @@ class ClipExportWorker(QThread):
             self.output_path,
         ]
 
-    def _run_ffmpeg_with_encoder(self, encoder_name: str, encoder_args: list[str]) -> tuple[bool, str]:
+    def _run_ffmpeg_with_encoder(
+        self,
+        encoder_name: str,
+        encoder_args: list[str],
+    ) -> tuple[bool, str, bool]:
         cmd = self._build_ffmpeg_command(encoder_args)
         tail = []
+        process = None
+        reader_stop_requested = None
         try:
-            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=creationflags,
-            )
-            if self.process.stdout:
-                for line in self.process.stdout:
-                    if self._cancel_requested:
-                        self.cancel()
-                        break
-                    line = line.strip()
-                    if line:
-                        tail.append(line)
-                        tail = tail[-12:]
-                    self._handle_progress_line(line, encoder_name)
+            process = self._process_factory(cmd)
+            self._attach_process(process)
+            if self._is_cancel_requested():
+                return self._cancelled_attempt_result(process)
+            output_events, reader_stop_requested = self._start_stdout_reader(process.stdout)
+            while True:
+                if self._is_cancel_requested():
+                    reader_stop_requested.set()
+                    return self._cancelled_attempt_result(process)
+                try:
+                    output_event = output_events.get(timeout=self.PROCESS_POLL_INTERVAL_SEC)
+                except queue.Empty:
+                    continue
+                if output_event is _CLIP_STDOUT_EOF:
+                    break
+                if isinstance(output_event, Exception):
+                    raise output_event
+                line = output_event.strip()
+                if line:
+                    tail.append(line)
+                    tail = tail[-12:]
+                self._handle_progress_line(line, encoder_name)
 
-            return_code = self.process.wait()
-            if self._cancel_requested:
-                return False, "キャンセルされました。"
+            while True:
+                if self._is_cancel_requested():
+                    reader_stop_requested.set()
+                    return self._cancelled_attempt_result(process)
+                try:
+                    return_code = process.wait(timeout=self.PROCESS_POLL_INTERVAL_SEC)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            if self._is_cancel_requested():
+                return False, "キャンセルされました。", True
             if return_code == 0:
-                return True, ""
-            return False, "\n".join(tail) if tail else f"exit code: {return_code}"
-        except FileNotFoundError:
-            return False, "FFmpegが見つかりません。bin/ffmpeg.exe を配置してください。"
+                output_path = Path(self.output_path)
+                try:
+                    if not output_path.is_file():
+                        return False, "FFmpegは正常終了しましたが、出力ファイルが作成されませんでした。", True
+                    if output_path.stat().st_size <= 0:
+                        return False, "FFmpegは正常終了しましたが、出力ファイルが空です。", True
+                except OSError as e:
+                    return False, f"FFmpeg出力を確認できませんでした: {e}", True
+                return True, "", True
+            return False, "\n".join(tail) if tail else f"exit code: {return_code}", True
         except Exception as e:
-            return False, str(e)
+            if reader_stop_requested is not None:
+                reader_stop_requested.set()
+            if isinstance(e, FileNotFoundError) and process is None:
+                return False, "FFmpegが見つかりません。bin/ffmpeg.exe を配置してください。", True
+            retry_safe = True
+            process_cleanup_error = None
+            if process is not None:
+                retry_safe, process_cleanup_error = self._stop_process_after_error(process)
+            detail = str(e)
+            if process_cleanup_error:
+                detail = f"{detail}\n{process_cleanup_error}"
+            return False, detail, retry_safe
+        finally:
+            if reader_stop_requested is not None:
+                reader_stop_requested.set()
+            if process is not None:
+                self._detach_process(process)
 
     def _handle_progress_line(self, line: str, encoder_name: str) -> None:
         if not line or "=" not in line:
@@ -737,7 +955,7 @@ class ClipExportWorker(QThread):
         elif key == "out_time":
             out_sec = self._parse_ffmpeg_time(value)
 
-        if out_sec is None:
+        if out_sec is None or not math.isfinite(out_sec):
             return
         percent = int(max(0, min(100, (out_sec / self.duration_sec) * 100)))
         self.progress.emit(percent, f"出力中... {percent}% ({encoder_name})")

@@ -64,6 +64,10 @@ class OBSProcessLeaseCleanupError(OBSProcessLeaseError):
     """Raised when a lease failure leaves the newly started process live."""
 
 
+class OBSProcessTerminationError(OBSProcessQueryError):
+    """Raised when a Popen-owned OBS cleanup cannot be proven complete."""
+
+
 def _is_absolute_obs_process_path(path: Path) -> bool:
     """Accept host-absolute paths and absolute Windows paths parsed on POSIX."""
 
@@ -1026,28 +1030,14 @@ class OBSProcessManager:
         try:
             self.write_process_lease(process)
         except BaseException as lease_error:
-            cleanup_error: BaseException | None = None
             try:
-                self.terminate_process(process)
-            except BaseException as exc:
-                cleanup_error = exc
-            try:
-                stopped = process.poll() is not None
-            except BaseException as exc:
-                cleanup_error = cleanup_error or exc
-                stopped = False
-            if not stopped:
-                try:
-                    process.kill()
-                    process.wait(timeout=2)
-                    stopped = process.poll() is not None
-                except BaseException as exc:
-                    cleanup_error = cleanup_error or exc
-            if not stopped:
+                self._terminate_unleased_popen_process(process)
+            except BaseException as cleanup_error:
                 cleanup_failure = OBSProcessLeaseCleanupError(
-                    "OBSの所有情報を確立できず、起動したOBS "
-                    f"(PID {process.pid}) も自動終了できませんでした。"
-                    "タスク マネージャーでこのOBSを手動終了してから再実行してください。"
+                    "OBSの所有情報を確立できず、起動したOBSの終了処理も"
+                    f"安全に完了できませんでした (PID {process.pid})。"
+                    "タスク マネージャーでOBSを確認し、残っている場合は"
+                    "手動終了してから再実行してください。"
                 )
                 add_note = getattr(cleanup_failure, "add_note", None)
                 if callable(add_note):
@@ -1055,13 +1045,12 @@ class OBSProcessManager:
                         "Lease establishment failed first: "
                         f"{type(lease_error).__name__}: {lease_error}"
                     )
-                    if cleanup_error is not None:
-                        add_note(
-                            "Automatic process cleanup also failed: "
-                            f"{type(cleanup_error).__name__}: {cleanup_error}"
-                        )
+                    add_note(
+                        "Automatic process cleanup also failed: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}"
+                    )
                 self.logger.critical(
-                    "New OBS process remained live after lease failure: pid=%s error=%s",
+                    "New OBS process cleanup failed after lease failure: pid=%s error=%s",
                     process.pid,
                     cleanup_error,
                 )
@@ -1276,32 +1265,339 @@ class OBSProcessManager:
             process,
         )
 
-    def terminate_process(self, process: subprocess.Popen[Any] | None, timeout_sec: float = 3.0) -> None:
+    def terminate_process(
+        self,
+        process: subprocess.Popen[Any] | None,
+        timeout_sec: float = 3.0,
+    ) -> None:
+        """Stop exactly one Popen-owned process and prove its handle exited.
+
+        This path deliberately does not enumerate processes or signal by PID. The
+        ``Popen`` methods operate on the handle owned by the caller, so a later
+        same-PID replacement cannot become a termination target. A bound v2
+        lease is removed only after that same handle is proven exited.
+        """
+
+        self._terminate_popen_process(
+            process,
+            timeout_sec=timeout_sec,
+            require_bound_lease=True,
+        )
+
+    def _terminate_unleased_popen_process(
+        self,
+        process: subprocess.Popen[Any] | None,
+        timeout_sec: float = 3.0,
+    ) -> None:
+        """Stop a newly created Popen whose lease establishment failed."""
+
+        self._terminate_popen_process(
+            process,
+            timeout_sec=timeout_sec,
+            require_bound_lease=False,
+        )
+
+    def _terminate_popen_process(
+        self,
+        process: subprocess.Popen[Any] | None,
+        *,
+        timeout_sec: float,
+        require_bound_lease: bool,
+    ) -> None:
+        """Shared handle-only termination primitive for leased and new Popen."""
+
         if process is None:
             return
-        lease = getattr(process, _POPEN_OBS_PROCESS_LEASE_ATTRIBUTE, None)
-        if type(lease) is not OBSProcessLease or lease.pid != int(process.pid):
-            lease = None
-        if process.poll() is not None:
-            if lease is not None:
-                self._clear_matching_process_lease(lease)
-            return
+
         try:
-            process.terminate()
-            process.wait(timeout=timeout_sec)
-        except Exception:
+            pid = int(process.pid)
+            if pid <= 0:
+                raise ValueError("PID must be positive")
+        except Exception as exc:
+            raise OBSProcessTerminationError(
+                "OBS PopenのPIDを安全に確認できませんでした。"
+                "OBSを手動で終了してから再試行してください。"
+            ) from exc
+
+        failures: list[tuple[str, BaseException]] = []
+        exited = self._observe_popen_exit(
+            process,
+            pid=pid,
+            label="initial poll",
+            failures=failures,
+        )
+        raw_lease = getattr(process, _POPEN_OBS_PROCESS_LEASE_ATTRIBUTE, None)
+        lease: OBSProcessLease | None = None
+        if raw_lease is None:
+            if require_bound_lease:
+                failures.append(
+                    (
+                        "bound v2 lease validation",
+                        OBSProcessLeaseError(
+                            "Popen is missing its bound v2 OBS process lease"
+                        ),
+                    )
+                )
+        else:
+            try:
+                lease = self._validate_bound_popen_lease(
+                    process,
+                    raw_lease,
+                    pid,
+                    process_exited=exited is True,
+                )
+            except Exception as exc:
+                failures.append(("bound v2 lease validation", exc))
+
+        if require_bound_lease and lease is None:
+            self._raise_popen_termination_error(
+                pid=pid,
+                exited=exited,
+                failures=failures,
+            )
+
+        if exited is not True:
+            observed_after_lease = self._observe_popen_exit(
+                process,
+                pid=pid,
+                label="post-lease-validation poll",
+                failures=failures,
+            )
+            if observed_after_lease is True:
+                exited = True
+
+        graceful_wait_succeeded = False
+        if exited is not True:
+            try:
+                process.terminate()
+            except Exception as exc:
+                failures.append(("Popen.terminate", exc))
+            try:
+                process.wait(timeout=max(0.0, timeout_sec))
+                graceful_wait_succeeded = True
+            except subprocess.TimeoutExpired:
+                # A graceful timeout is the expected transition to force cleanup.
+                pass
+            except Exception as exc:
+                failures.append(("Popen.wait after terminate", exc))
+            exited = self._observe_popen_exit(
+                process,
+                pid=pid,
+                label="post-terminate poll",
+                failures=failures,
+            )
+            if exited is None and graceful_wait_succeeded:
+                exited = True
+
+        force_wait_succeeded = False
+        if exited is not True:
             try:
                 process.kill()
+            except Exception as exc:
+                failures.append(("Popen.kill", exc))
+            try:
                 process.wait(timeout=2)
-            except Exception as e:
-                self.logger.warning(
-                    "Failed to kill managed OBS process: %s",
-                    e,
-                    exc_info=True,
+                force_wait_succeeded = True
+            except subprocess.TimeoutExpired as exc:
+                failures.append(("Popen.wait after kill", exc))
+            except Exception as exc:
+                failures.append(("Popen.wait after kill", exc))
+            exited = self._observe_popen_exit(
+                process,
+                pid=pid,
+                label="final poll",
+                failures=failures,
+            )
+            if exited is None and force_wait_succeeded:
+                exited = True
+
+        if exited is not True:
+            failures.append(
+                (
+                    "final owned-handle verification",
+                    RuntimeError("the original Popen handle is still live or unknown"),
                 )
-                return
-        if lease is not None:
-            self._clear_matching_process_lease(lease)
+            )
+
+        if exited is True and lease is not None:
+            try:
+                self._clear_matching_process_lease(lease)
+            except Exception as exc:
+                failures.append(("matching v2 lease cleanup", exc))
+
+        if failures:
+            self._raise_popen_termination_error(
+                pid=pid,
+                exited=exited,
+                failures=failures,
+            )
+
+    def _raise_popen_termination_error(
+        self,
+        *,
+        pid: int,
+        exited: bool | None,
+        failures: list[tuple[str, BaseException]],
+    ) -> None:
+        state = (
+            "元のOBS processの終了は確認しましたが、終了処理を完全に確定できませんでした。"
+            if exited is True
+            else "元のOBS processが終了したことを確認できませんでした。"
+        )
+        error = OBSProcessTerminationError(
+            f"{state} PID={pid}。OBSが残っている場合は手動で終了し、"
+            "OBS所有情報を確認してから再試行してください。"
+        )
+        add_note = getattr(error, "add_note", None)
+        if callable(add_note):
+            for label, failure in failures:
+                add_note(f"{label}: {type(failure).__name__}: {failure}")
+        self.logger.error(
+            "Popen-owned OBS cleanup failed for pid=%s: %s",
+            pid,
+            "; ".join(
+                f"{label}={type(failure).__name__}: {failure}"
+                for label, failure in failures
+            ),
+        )
+        raise error from failures[0][1]
+
+    def _validate_bound_popen_lease(
+        self,
+        process: subprocess.Popen[Any],
+        raw_lease: Any,
+        pid: int,
+        *,
+        process_exited: bool,
+    ) -> OBSProcessLease:
+        """Validate a Popen-attached v2 lease without consulting PID listings."""
+
+        if type(raw_lease) is not OBSProcessLease:
+            raise OBSProcessLeaseError("Bound OBS process lease is malformed")
+        lease = raw_lease
+        if (
+            lease.schema_version != OBS_PROCESS_LEASE_SCHEMA_VERSION
+            or lease.pid != pid
+            or isinstance(lease.created_at, bool)
+            or not isinstance(lease.created_at, (int, float))
+            or not math.isfinite(float(lease.created_at))
+            or float(lease.created_at) <= 0
+            or lease.process_creation_time is None
+            or lease.process_creation_time_filetime is None
+            or not _obs_process_paths_equal(lease.executable_path, self.obs_exe)
+        ):
+            raise OBSProcessLeaseError(
+                "Bound OBS process lease does not contain the complete Popen identity"
+            )
+        expected = OBSProcessInfo(
+            pid=lease.pid,
+            executable_path=lease.executable_path,
+            creation_time=lease.process_creation_time,
+            creation_time_filetime=lease.process_creation_time_filetime,
+        )
+        validate_obs_process_query_snapshot(
+            OBSProcessQuerySnapshot((expected,), time.time()),
+            label="bound Popen lease",
+        )
+        filetime_seconds = (
+            lease.process_creation_time_filetime / 10_000_000
+            - _WINDOWS_FILETIME_UNIX_EPOCH_SECONDS
+        )
+        if abs(float(lease.process_creation_time) - filetime_seconds) > 0.001:
+            raise OBSProcessLeaseError(
+                "Bound OBS process lease creation values disagree"
+            )
+
+        # A real Windows Popen retains its process handle after exit. Querying
+        # that handle binds lease cleanup to the original kernel object without
+        # a PID lookup. Lightweight test doubles may not expose ``_handle``.
+        handle = getattr(process, "_handle", None)
+        if self._uses_windows_process_identity_handles() and handle is not None:
+            if process_exited:
+                creation_time, creation_filetime = (
+                    self._query_process_creation_from_handle(handle, pid)
+                )
+                # QueryFullProcessImageNameW can fail after exit. The executable
+                # path was verified while live before this frozen lease was
+                # attached to the same Popen; PID and raw FILETIME remain
+                # queryable from the retained handle after exit.
+                actual = OBSProcessInfo(
+                    pid=pid,
+                    executable_path=lease.executable_path,
+                    creation_time=creation_time,
+                    creation_time_filetime=creation_filetime,
+                )
+            else:
+                try:
+                    actual = self._query_process_identity_from_handle(handle, pid)
+                except OSError:
+                    # The process can exit after the initial handle wait but
+                    # before QueryFullProcessImageNameW. Only a newly signaled
+                    # same handle may fall back to the immutable live-bound path
+                    # plus PID/raw creation FILETIME.
+                    if not self._wait_process_identity_handle(
+                        handle,
+                        timeout_ms=0,
+                    ):
+                        raise
+                    creation_time, creation_filetime = (
+                        self._query_process_creation_from_handle(handle, pid)
+                    )
+                    actual = OBSProcessInfo(
+                        pid=pid,
+                        executable_path=lease.executable_path,
+                        creation_time=creation_time,
+                        creation_time_filetime=creation_filetime,
+                    )
+            validate_obs_process_query_snapshot(
+                OBSProcessQuerySnapshot((actual,), time.time()),
+                label="bound Popen handle identity",
+            )
+            if not _obs_process_identities_equal(expected, actual):
+                raise OBSProcessLeaseError(
+                    "Bound OBS process lease does not match the Popen handle identity"
+                )
+        return lease
+
+    def _observe_popen_exit(
+        self,
+        process: subprocess.Popen[Any],
+        *,
+        pid: int,
+        label: str,
+        failures: list[tuple[str, BaseException]],
+    ) -> bool | None:
+        """Observe only the caller-owned Popen/handle; never resolve its PID."""
+
+        poll_exited: bool | None = None
+        try:
+            poll_exited = process.poll() is not None
+        except Exception as exc:
+            failures.append((label, exc))
+
+        handle_exited: bool | None = None
+        handle = getattr(process, "_handle", None)
+        if self._uses_windows_process_identity_handles() and handle is not None:
+            try:
+                handle_exited = self._wait_process_identity_handle(
+                    handle,
+                    timeout_ms=0,
+                )
+            except Exception as exc:
+                failures.append((f"{label} owned handle wait", exc))
+
+        if handle_exited is not None:
+            if poll_exited is not None and poll_exited != handle_exited:
+                failures.append(
+                    (
+                        f"{label} state agreement",
+                        RuntimeError(
+                            f"Popen.poll and owned handle disagree for pid={pid}"
+                        ),
+                    )
+                )
+            return handle_exited
+        return poll_exited
 
     def write_process_lease(self, process: subprocess.Popen[Any]) -> None:
         with _OBS_PROCESS_LEASE_LOCK:
@@ -1786,17 +2082,12 @@ class OBSProcessManager:
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
-        kernel32.GetProcessId.restype = wintypes.DWORD
-        pid = int(kernel32.GetProcessId(handle))
-        if pid <= 0:
-            raise ctypes.WinError(ctypes.get_last_error())
-        if pid != int(expected_pid):
-            raise OBSProcessQueryError(
-                "Windows process handle PID does not match the expected PID"
-            )
+        creation_time, creation_ticks = self._query_process_creation_from_handle(
+            handle,
+            expected_pid,
+        )
 
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         capacity = wintypes.DWORD(32768)
         path_buffer = ctypes.create_unicode_buffer(capacity.value)
         kernel32.QueryFullProcessImageNameW.argtypes = [
@@ -1813,6 +2104,34 @@ class OBSProcessManager:
             ctypes.byref(capacity),
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+
+        return OBSProcessInfo(
+            pid=int(expected_pid),
+            executable_path=Path(path_buffer.value),
+            creation_time=creation_time,
+            creation_time_filetime=creation_ticks,
+        )
+
+    def _query_process_creation_from_handle(
+        self,
+        handle: Any,
+        expected_pid: int,
+    ) -> tuple[float, int]:
+        """Read PID and creation FILETIME, including after process exit."""
+
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+        kernel32.GetProcessId.restype = wintypes.DWORD
+        pid = int(kernel32.GetProcessId(handle))
+        if pid <= 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if pid != int(expected_pid):
+            raise OBSProcessQueryError(
+                "Windows process handle PID does not match the expected PID"
+            )
 
         creation = wintypes.FILETIME()
         exit_time = wintypes.FILETIME()
@@ -1837,13 +2156,11 @@ class OBSProcessManager:
         creation_ticks = (
             int(creation.dwHighDateTime) << 32
         ) | int(creation.dwLowDateTime)
-        creation_time = creation_ticks / 10_000_000 - 11_644_473_600
-        return OBSProcessInfo(
-            pid=pid,
-            executable_path=Path(path_buffer.value),
-            creation_time=creation_time,
-            creation_time_filetime=creation_ticks,
+        creation_time = (
+            creation_ticks / 10_000_000
+            - _WINDOWS_FILETIME_UNIX_EPOCH_SECONDS
         )
+        return creation_time, creation_ticks
 
     def _wait_process_identity_handle(self, handle: Any, *, timeout_ms: int) -> bool:
         import ctypes

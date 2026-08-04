@@ -176,28 +176,72 @@ class OBSRuntimeManager:
                     "既存のOBSを終了してから再実行してください。"
                 )
 
-        obs_client = recordtest.ObsWebSocketClient(
-            config=config,
-            obs_process=launched_process,
-            status_cb=status_cb,
-            max_retries=max_retries,
-            retry_delay=retry_delay,
-        )
-        recorder = recordtest.LoLAutoRecorder(
-            config=config,
-            obs_process=launched_process,
-            status_cb=status_cb,
-            auto_setup=auto_setup,
-            obs_client=obs_client,
-        )
+        obs_client = None
+        recorder = None
         try:
+            obs_client = recordtest.ObsWebSocketClient(
+                config=config,
+                obs_process=launched_process,
+                status_cb=status_cb,
+                max_retries=max_retries,
+                retry_delay=retry_delay,
+            )
+            recorder = recordtest.LoLAutoRecorder(
+                config=config,
+                obs_process=launched_process,
+                status_cb=status_cb,
+                auto_setup=auto_setup,
+                obs_client=obs_client,
+            )
             recorder.open()
-        except Exception:
-            if launched_process:
-                try:
-                    recorder.shutdown_obs()
-                except Exception:
-                    pass
+        except BaseException as primary_error:
+            def record_cleanup_failure(
+                cleanup_error: BaseException,
+                *,
+                context: str,
+                primary: BaseException = primary_error,
+            ) -> None:
+                add_note = getattr(primary, "add_note", None)
+                if callable(add_note):
+                    add_note(
+                        f"{context}: {type(cleanup_error).__name__}: "
+                        f"{cleanup_error}"
+                    )
+                LOGGER.error(
+                    "%s while preserving the original startup error: %s",
+                    context,
+                    cleanup_error,
+                )
+
+            if recorder is not None:
+                if not getattr(recorder, "_open_cleanup_attempted", False):
+                    try:
+                        recorder.shutdown_obs()
+                    except BaseException as cleanup_error:
+                        record_cleanup_failure(
+                            cleanup_error,
+                            context="Recorder起動失敗後のOBS cleanupにも失敗しました",
+                        )
+            else:
+                if launched_process:
+                    try:
+                        process_manager.terminate_process(launched_process)
+                    except BaseException as cleanup_error:
+                        record_cleanup_failure(
+                            cleanup_error,
+                            context="Recorder構築失敗後のOBS cleanupにも失敗しました",
+                        )
+                if obs_client is not None:
+                    try:
+                        obs_client.disconnect()
+                    except BaseException as cleanup_error:
+                        record_cleanup_failure(
+                            cleanup_error,
+                            context=(
+                                "Recorder構築失敗後のWebSocket cleanupにも"
+                                "失敗しました"
+                            ),
+                        )
             raise
         return RecorderRuntime(
             recorder=recorder,

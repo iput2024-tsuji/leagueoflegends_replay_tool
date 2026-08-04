@@ -179,6 +179,38 @@ def test_recording_supervisor_runs_one_session_and_cleans_up():
     assert recording_controller.runtime.close_calls == [False]
 
 
+def test_recording_supervisor_keeps_body_primary_when_shutdown_fails():
+    primary_error = recordtest.RecorderError("wait for game failed")
+    cleanup_error = RuntimeError("owned OBS cleanup failed")
+
+    class FailingRecorder(FakeRecorder):
+        async def wait_for_game_start_async(self):
+            self.calls.append("wait_for_game_start_async")
+            raise primary_error
+
+    recorder = FailingRecorder()
+    recording_controller = FakeRecordingController(recorder)
+
+    def fail_close(finalize_session=False):
+        recording_controller.runtime.close_calls.append(finalize_session)
+        recorder.calls.append("runtime_close")
+        raise cleanup_error
+
+    recording_controller.runtime.close = fail_close
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+    )
+
+    with pytest.raises(recordtest.RecorderError) as captured:
+        run(run_supervisor(supervisor))
+
+    assert captured.value is primary_error
+    assert recording_controller.runtime.close_calls == [False]
+    assert any("owned OBS cleanup failed" in note for note in primary_error.__notes__)
+    assert any("手動で終了" in note for note in primary_error.__notes__)
+
+
 def test_recording_supervisor_notifies_completion_after_game_process_clears():
     notifications = []
     recorder = FakeRecorder()

@@ -15,12 +15,18 @@ class FakeRecorder:
         self.finalize_called = 0
         self.fail_finalize = False
         self.fail_disconnect = False
+        self.open_error = None
+        self.shutdown_error = None
 
     def open(self):
         self.open_called += 1
+        if self.open_error is not None:
+            raise self.open_error
 
     def shutdown_obs(self):
         self.shutdown_called += 1
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
 
     def disconnect_obs(self):
         self.disconnect_called += 1
@@ -142,6 +148,182 @@ def test_runtime_still_closes_obs_when_finalize_fails(monkeypatch):
     assert recorder.finalize_called == 1
     assert recorder.shutdown_called == 1
     assert recorder.disconnect_called == 0
+
+
+def test_runtime_open_keeps_primary_and_notes_shutdown_failure(monkeypatch):
+    recorder = FakeRecorder()
+    primary_error = recordtest.RecorderError("recorder open failed")
+    cleanup_error = OBSProcessQueryError("owned process cleanup failed")
+    recorder.open_error = primary_error
+    recorder.shutdown_error = cleanup_error
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "down"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: object())
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda *args, **kwargs: recorder)
+
+    with pytest.raises(recordtest.RecorderError) as captured:
+        OBSRuntimeManager().open_recorder(
+            recordtest.AppConfig.from_dict({}),
+            auto_launch=True,
+        )
+
+    assert captured.value is primary_error
+    assert recorder.shutdown_called == 1
+    assert any("owned process cleanup failed" in note for note in primary_error.__notes__)
+
+
+def test_runtime_open_does_not_repeat_recorder_owned_cleanup(monkeypatch):
+    recorder = FakeRecorder()
+    primary_error = recordtest.RecorderError("recorder open failed")
+    recorder.open_error = primary_error
+    recorder._open_cleanup_attempted = True
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "down"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: object())
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda *args, **kwargs: recorder)
+
+    with pytest.raises(recordtest.RecorderError) as captured:
+        OBSRuntimeManager().open_recorder(
+            recordtest.AppConfig.from_dict({}),
+            auto_launch=True,
+        )
+
+    assert captured.value is primary_error
+    assert recorder.shutdown_called == 0
+
+
+def test_runtime_constructor_failure_cleans_launched_process_once(monkeypatch):
+    launched_process = object()
+    primary_error = recordtest.RecorderError("recorder constructor failed")
+    cleanup_calls = []
+    disconnect_calls = []
+
+    class ProcessManager:
+        def __init__(self, obs_dir):
+            pass
+
+        def terminate_process(self, process):
+            cleanup_calls.append(process)
+
+    class ObsClient:
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+
+    obs_client = ObsClient()
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "down"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: launched_process)
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", lambda *args, **kwargs: obs_client)
+    monkeypatch.setattr(
+        recordtest,
+        "LoLAutoRecorder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(primary_error),
+    )
+
+    with pytest.raises(recordtest.RecorderError) as captured:
+        OBSRuntimeManager().open_recorder(
+            recordtest.AppConfig.from_dict({}),
+            auto_launch=True,
+        )
+
+    assert captured.value is primary_error
+    assert cleanup_calls == [launched_process]
+    assert disconnect_calls == ["disconnect"]
+
+
+def test_runtime_borrowed_constructor_failure_disconnects_partial_client(monkeypatch):
+    primary_error = recordtest.RecorderError("recorder constructor failed")
+    disconnect_calls = []
+
+    class ProcessManager:
+        def __init__(self, obs_dir):
+            pass
+
+        def terminate_process(self, process):
+            raise AssertionError("borrowed startup must not terminate a process")
+
+    class ObsClient:
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", lambda *args, **kwargs: ObsClient())
+    monkeypatch.setattr(
+        recordtest,
+        "LoLAutoRecorder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(primary_error),
+    )
+
+    with pytest.raises(recordtest.RecorderError) as captured:
+        OBSRuntimeManager().open_recorder(recordtest.AppConfig.from_dict({}))
+
+    assert captured.value is primary_error
+    assert disconnect_calls == ["disconnect"]
+
+
+def test_runtime_borrowed_open_base_exception_runs_cleanup_and_keeps_primary(monkeypatch):
+    class StartupAbort(BaseException):
+        pass
+
+    recorder = FakeRecorder()
+    primary_error = StartupAbort("recorder open aborted")
+    cleanup_error = OBSProcessQueryError("borrowed connection cleanup failed")
+    recorder.open_error = primary_error
+    recorder.shutdown_error = cleanup_error
+    monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda *args, **kwargs: recorder)
+
+    with pytest.raises(StartupAbort) as captured:
+        OBSRuntimeManager().open_recorder(recordtest.AppConfig.from_dict({}))
+
+    assert captured.value is primary_error
+    assert recorder.shutdown_called == 1
+    assert any("borrowed connection cleanup failed" in note for note in primary_error.__notes__)
+
+
+def test_runtime_constructor_failure_notes_process_cleanup_failure(monkeypatch):
+    launched_process = object()
+    primary_error = recordtest.RecorderError("recorder constructor failed")
+    cleanup_error = OBSProcessQueryError("owned process cleanup failed")
+    cleanup_calls = []
+
+    class ProcessManager:
+        def __init__(self, obs_dir):
+            pass
+
+        def terminate_process(self, process):
+            cleanup_calls.append(process)
+            raise cleanup_error
+
+    class ObsClient:
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "down"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: launched_process)
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", lambda *args, **kwargs: ObsClient())
+    monkeypatch.setattr(
+        recordtest,
+        "LoLAutoRecorder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(primary_error),
+    )
+
+    with pytest.raises(recordtest.RecorderError) as captured:
+        OBSRuntimeManager().open_recorder(
+            recordtest.AppConfig.from_dict({}),
+            auto_launch=True,
+        )
+
+    assert captured.value is primary_error
+    assert cleanup_calls == [launched_process]
+    assert any("owned process cleanup failed" in note for note in primary_error.__notes__)
 
 
 def test_existing_owned_runtime_propagates_cleanup_failure_with_manual_guidance():

@@ -14,6 +14,26 @@ except ImportError:
     from obs_runtime import OBSRuntimeManager, RecorderRuntime
 
 
+def _close_runtime_preserving_primary(
+    runtime: RecorderRuntime,
+    primary_error: BaseException | None,
+) -> None:
+    try:
+        runtime.close()
+    except BaseException as cleanup_error:
+        if primary_error is None:
+            raise
+        recordtest._record_cleanup_failure(
+            primary_error,
+            cleanup_error,
+            logger=recordtest.LOGGER,
+            context=(
+                "OBS設定操作失敗後のruntime cleanupにも失敗しました。"
+                "OBSを手動で終了してから再試行してください"
+            ),
+        )
+
+
 class ConfigController:
     """設定ファイル、補完、プレフライトをUIから分離して扱う。"""
 
@@ -173,6 +193,7 @@ class AudioSettingsController:
     def refresh_audio_devices(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=True)
         runtime = None
+        primary_error: BaseException | None = None
         with recordtest.OBS_OPERATION_LOCK:
             try:
                 runtime = self._open_recorder(config, auto_launch=auto_launch)
@@ -182,27 +203,35 @@ class AudioSettingsController:
                     "config": report["config"],
                     "obs_launched": runtime.owns_process,
                 }
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
                 if runtime:
-                    runtime.close()
+                    _close_runtime_preserving_primary(runtime, primary_error)
 
     def apply_audio_settings(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
         runtime = None
+        primary_error: BaseException | None = None
         with recordtest.OBS_OPERATION_LOCK:
             try:
                 runtime = self._open_recorder(config, auto_launch=auto_launch)
                 runtime.recorder.apply_audio_profile(config)
                 self.config_controller.save_config(report["config"])
                 return {"config": report["config"], "obs_launched": runtime.owns_process}
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
                 if runtime:
-                    runtime.close()
+                    _close_runtime_preserving_primary(runtime, primary_error)
 
     def apply_runtime_output_settings(self, data: dict[str, Any]) -> bool:
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
         with recordtest.OBS_OPERATION_LOCK:
             runtime = None
+            primary_error: BaseException | None = None
             try:
                 runtime = self._open_recorder(
                     config,
@@ -212,9 +241,12 @@ class AudioSettingsController:
                 )
                 runtime.recorder.apply_record_output_settings()
                 return True
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
                 if runtime:
-                    runtime.close()
+                    _close_runtime_preserving_primary(runtime, primary_error)
 
 
 class RecordingController:

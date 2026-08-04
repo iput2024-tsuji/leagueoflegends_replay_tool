@@ -128,15 +128,20 @@ class RecordingSupervisor:
                 )
         except BaseException as exc:
             primary_error = exc
-            raise
         finally:
+            cleanup_error: BaseException | None = None
             try:
                 self.shutdown()
-            except BaseException as cleanup_error:
-                if primary_error is None:
-                    raise
-                recordtest._record_cleanup_failure(
-                    primary_error,
+            except BaseException as exc:
+                cleanup_error = exc
+
+        selected_error = primary_error
+        if cleanup_error is not None:
+            if selected_error is None:
+                selected_error = cleanup_error
+            else:
+                selected_error = recordtest._select_cleanup_control_flow_error(
+                    selected_error,
                     cleanup_error,
                     logger=recordtest.LOGGER,
                     context=(
@@ -144,30 +149,92 @@ class RecordingSupervisor:
                         "OBSを手動で終了してから再試行してください"
                     ),
                 )
+        if selected_error is not None:
+            raise selected_error
 
     def request_stop(self) -> None:
-        if self.stop_event:
+        if self.stop_event is not None:
             self.stop_event.set()
-        if self.recorder:
+        if self.recorder is not None:
             self.recorder.request_stop()
 
     def shutdown(self) -> None:
-        if not self.recorder:
-            return
-        self.recorder.request_stop()
-        if self._has_session_data() and not self._is_session_finalized() and not self.session_finalize_attempted:
-            self._finalize_aborted("shutdown requested")
-        elif not self._is_session_finalized():
-            self.recorder.stop_recording()
-        if self.runtime:
-            self.runtime.close(finalize_session=False)
-        else:
-            self.recorder.shutdown_obs()
-        self.session_completed = False
-        self.session_should_finalize = False
-        self.session_finalize_attempted = False
-        self.runtime = None
-        self.recorder = None
+        recorder = self.recorder
+        runtime = self.runtime
+        selected_error: BaseException | None = None
+
+        def remember_cleanup_error(error: BaseException, *, context: str) -> None:
+            nonlocal selected_error
+            if selected_error is None:
+                selected_error = error
+                return
+            selected_error = recordtest._select_cleanup_control_flow_error(
+                selected_error,
+                error,
+                logger=recordtest.LOGGER,
+                context=context,
+            )
+
+        try:
+            if recorder is not None:
+                try:
+                    recorder.request_stop()
+                except BaseException as cleanup_error:
+                    remember_cleanup_error(
+                        cleanup_error,
+                        context="録画監視終了時の停止要求にも失敗しました",
+                    )
+
+                try:
+                    if (
+                        self._has_session_data()
+                        and not self._is_session_finalized()
+                        and not self.session_finalize_attempted
+                    ):
+                        self._finalize_aborted("shutdown requested")
+                    elif not self._is_session_finalized():
+                        recorder.stop_recording()
+                except BaseException as cleanup_error:
+                    remember_cleanup_error(
+                        cleanup_error,
+                        context="録画監視終了時のセッション停止処理にも失敗しました",
+                    )
+
+            try:
+                if runtime is not None:
+                    runtime.close(finalize_session=False)
+                elif recorder is not None:
+                    recorder.shutdown_obs()
+            except BaseException as cleanup_error:
+                owner_cleanup_context = (
+                    "録画監視終了時の所有OBS cleanupにも失敗しました。"
+                    "OBSを手動で終了してから再試行してください"
+                )
+                if selected_error is None:
+                    selected_error = cleanup_error
+                    add_note = getattr(cleanup_error, "add_note", None)
+                    if callable(add_note):
+                        add_note(owner_cleanup_context)
+                    recordtest.LOGGER.error(
+                        "%s: %s: %s",
+                        owner_cleanup_context,
+                        type(cleanup_error).__name__,
+                        cleanup_error,
+                    )
+                else:
+                    remember_cleanup_error(
+                        cleanup_error,
+                        context=owner_cleanup_context,
+                    )
+        finally:
+            self.session_completed = False
+            self.session_should_finalize = False
+            self.session_finalize_attempted = False
+            self.runtime = None
+            self.recorder = None
+
+        if selected_error is not None:
+            raise selected_error
 
     def _finalize_aborted(self, reason: str) -> Any:
         marker = getattr(self.recorder, "mark_session_aborted", None)

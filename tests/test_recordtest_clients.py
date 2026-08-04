@@ -1,10 +1,12 @@
 import asyncio
 import configparser
+import inspect
 import json
 import multiprocessing
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -1694,6 +1696,191 @@ def test_obs_websocket_timeout_is_wrapped_as_recorder_error():
     assert "timed out" in str(exc.value)
 
 
+def test_obs_connection_disconnects_falsey_client_once(monkeypatch):
+    disconnect_calls = []
+
+    class FalseyClient:
+        def __bool__(self):
+            return False
+
+        def get_version(self):
+            return SimpleNamespace(obs_version="31.0.0")
+
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+
+    client = FalseyClient()
+    monkeypatch.setattr(recordtest.obs, "ReqClient", lambda **_kwargs: client)
+
+    ok, detail = recordtest.test_obs_connection("example.test", 4455, "secret")
+
+    assert ok is True
+    assert "31.0.0" in detail
+    assert disconnect_calls == ["disconnect"]
+
+
+def test_obs_connection_keeps_primary_control_flow_when_disconnect_fails(monkeypatch):
+    primary_error = KeyboardInterrupt("connection check interrupted")
+    primary_cause = RuntimeError("connection cause")
+    primary_context = ValueError("connection context")
+    primary_error.__cause__ = primary_cause
+    primary_error.__context__ = primary_context
+    primary_error.__suppress_context__ = True
+    disconnect_calls = []
+
+    class Client:
+        def get_version(self):
+            raise primary_error
+
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+            raise OSError("disconnect failed")
+
+    monkeypatch.setattr(recordtest.obs, "ReqClient", lambda **_kwargs: Client())
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        recordtest.test_obs_connection("example.test", 4455, "secret")
+
+    assert captured.value is primary_error
+    assert primary_error.__cause__ is primary_cause
+    assert primary_error.__context__ is primary_context
+    assert primary_error.__suppress_context__ is True
+    assert disconnect_calls == ["disconnect"]
+    assert any(
+        "disconnect failed" in note
+        for note in getattr(primary_error, "__notes__", [])
+    )
+
+
+def test_obs_connection_cleanup_control_flow_supersedes_normal_failure(monkeypatch):
+    primary_error = OSError("connection failed")
+    cleanup_error = SystemExit("disconnect interrupted")
+    cleanup_cause = RuntimeError("disconnect cause")
+    cleanup_context = ValueError("disconnect context")
+    cleanup_error.__cause__ = cleanup_cause
+    cleanup_error.__context__ = cleanup_context
+    cleanup_error.__suppress_context__ = True
+    disconnect_calls = []
+
+    class Client:
+        def get_version(self):
+            raise primary_error
+
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+            raise cleanup_error
+
+    monkeypatch.setattr(recordtest.obs, "ReqClient", lambda **_kwargs: Client())
+
+    with pytest.raises(SystemExit) as captured:
+        recordtest.test_obs_connection("example.test", 4455, "secret")
+
+    assert captured.value is cleanup_error
+    assert cleanup_error.__cause__ is cleanup_cause
+    assert cleanup_error.__context__ is cleanup_context
+    assert cleanup_error.__suppress_context__ is True
+    assert disconnect_calls == ["disconnect"]
+    assert any(
+        "connection failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
+def test_obs_connection_keeps_first_control_flow_across_disconnect(monkeypatch):
+    primary_error = asyncio.CancelledError("connection cancelled")
+    cleanup_error = SystemExit("disconnect interrupted")
+    disconnect_calls = []
+
+    class Client:
+        def get_version(self):
+            raise primary_error
+
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+            raise cleanup_error
+
+    monkeypatch.setattr(recordtest.obs, "ReqClient", lambda **_kwargs: Client())
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        recordtest.test_obs_connection("example.test", 4455, "secret")
+
+    assert captured.value is primary_error
+    assert disconnect_calls == ["disconnect"]
+    assert any(
+        "disconnect interrupted" in note
+        for note in getattr(primary_error, "__notes__", [])
+    )
+
+
+def test_obs_connection_keeps_typed_failure_and_reports_disconnect_failure(
+    monkeypatch,
+):
+    primary_error = OSError("connection failed")
+    disconnect_calls = []
+    log_calls = []
+
+    class Client:
+        def get_version(self):
+            raise primary_error
+
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+            raise TimeoutError("disconnect failed")
+
+    monkeypatch.setattr(recordtest.obs, "ReqClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(
+        recordtest.LOGGER,
+        "error",
+        lambda *args, **_kwargs: log_calls.append(args),
+    )
+
+    ok, detail = recordtest.test_obs_connection("example.test", 4455, "secret")
+
+    assert ok is False
+    assert "connection failed" in detail
+    assert disconnect_calls == ["disconnect"]
+    assert any(
+        "disconnect failed" in " ".join(str(value) for value in args)
+        for args in log_calls
+    )
+    assert any(
+        "disconnect failed" in note
+        for note in getattr(primary_error, "__notes__", [])
+    )
+
+
+def test_obs_connection_reports_normal_disconnect_failure_after_success(
+    monkeypatch,
+):
+    disconnect_calls = []
+    log_calls = []
+
+    class Client:
+        def get_version(self):
+            return SimpleNamespace(obs_version="31.0.0")
+
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+            raise OSError("disconnect failed after success")
+
+    monkeypatch.setattr(recordtest.obs, "ReqClient", lambda **_kwargs: Client())
+    monkeypatch.setattr(
+        recordtest.LOGGER,
+        "error",
+        lambda *args, **_kwargs: log_calls.append(args),
+    )
+
+    ok, detail = recordtest.test_obs_connection("example.test", 4455, "secret")
+
+    assert ok is True
+    assert "31.0.0" in detail
+    assert disconnect_calls == ["disconnect"]
+    assert any(
+        "disconnect failed after success" in " ".join(str(value) for value in args)
+        for args in log_calls
+    )
+
+
 def test_obs_disconnect_clears_raw_client_even_when_socket_errors():
     class BrokenRawClient:
         def disconnect(self):
@@ -1705,6 +1892,25 @@ def test_obs_disconnect_clears_raw_client_even_when_socket_errors():
     with pytest.raises(TimeoutError):
         client.disconnect()
 
+    assert client.raw_client is None
+
+
+def test_obs_disconnect_clears_and_disconnects_falsey_raw_client():
+    disconnect_calls = []
+
+    class FalseyRawClient:
+        def __bool__(self):
+            return False
+
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+
+    client = recordtest.ObsWebSocketClient(config=app_config())
+    client.client = FalseyRawClient()
+
+    client.disconnect()
+
+    assert disconnect_calls == ["disconnect"]
     assert client.raw_client is None
 
 
@@ -1775,6 +1981,83 @@ def test_obs_shutdown_keeps_termination_primary_and_notes_disconnect_failure(
         for note in captured.value.__notes__
     )
     assert client.raw_client is None
+
+
+def test_obs_shutdown_disconnect_control_flow_supersedes_normal_termination_failure(
+    monkeypatch,
+):
+    termination_error = OBSProcessTerminationError("owned handle remained live")
+    disconnect_error = SystemExit("websocket disconnect interrupted")
+    disconnect_cause = RuntimeError("disconnect cause")
+    disconnect_error.__cause__ = disconnect_cause
+    disconnect_error.__suppress_context__ = True
+    disconnect_calls = []
+
+    class FailingProcessManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def terminate_process(self, process):
+            raise termination_error
+
+    class BrokenRawClient:
+        def disconnect(self):
+            disconnect_calls.append("disconnect")
+            raise disconnect_error
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", FailingProcessManager)
+    client = recordtest.ObsWebSocketClient(
+        config=app_config(),
+        obs_process=SimpleNamespace(pid=101),
+    )
+    client.client = BrokenRawClient()
+
+    with pytest.raises(SystemExit) as captured:
+        client.shutdown()
+
+    assert captured.value is disconnect_error
+    assert disconnect_error.__cause__ is disconnect_cause
+    assert disconnect_error.__suppress_context__ is True
+    assert disconnect_calls == ["disconnect"]
+    assert any(
+        "owned handle remained live" in note
+        for note in getattr(disconnect_error, "__notes__", [])
+    )
+    assert client.raw_client is None
+
+
+def test_obs_shutdown_keeps_first_control_flow_across_disconnect_cleanup(
+    monkeypatch,
+):
+    termination_error = KeyboardInterrupt("process termination interrupted")
+    disconnect_error = SystemExit("websocket disconnect interrupted")
+
+    class FailingProcessManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def terminate_process(self, process):
+            raise termination_error
+
+    class BrokenRawClient:
+        def disconnect(self):
+            raise disconnect_error
+
+    monkeypatch.setattr(recordtest, "OBSProcessManager", FailingProcessManager)
+    client = recordtest.ObsWebSocketClient(
+        config=app_config(),
+        obs_process=SimpleNamespace(pid=101),
+    )
+    client.client = BrokenRawClient()
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        client.shutdown()
+
+    assert captured.value is termination_error
+    assert any(
+        "websocket disconnect interrupted" in note
+        for note in getattr(termination_error, "__notes__", [])
+    )
 
 
 def test_obs_shutdown_retry_does_not_revalidate_terminated_process(monkeypatch):
@@ -1911,6 +2194,202 @@ def test_launch_log_query_failure_stops_same_handle_once_and_notes_cleanup_failu
     assert any("owned handle remained live" in note for note in captured.value.__notes__)
 
 
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
+)
+def test_started_identity_control_flow_is_pure_validation_and_preserves_object(
+    error_type,
+):
+    process = SimpleNamespace(pid=101)
+    primary_error = error_type("identity capture interrupted")
+    terminate_calls = []
+
+    class Manager:
+        def query_obs_processes_strict(self):
+            raise primary_error
+
+        def terminate_process(self, candidate):
+            terminate_calls.append(candidate)
+
+    with pytest.raises(error_type) as captured:
+        recordtest._capture_started_obs_process_identity(Manager(), process)
+
+    assert captured.value is primary_error
+    assert terminate_calls == []
+
+
+def test_started_identity_return_boundary_interruption_cleans_handle_once(
+    monkeypatch,
+):
+    process = SimpleNamespace(pid=101)
+    identity = obs_bootstrap.OBSProcessInfo(
+        pid=101,
+        executable_path=Path("C:/managed/obs/bin/64bit/obs64.exe"),
+        creation_time=1000.0,
+        creation_time_filetime=116_444_746_000_000_000,
+    )
+    primary_error = KeyboardInterrupt("identity handoff interrupted")
+    terminate_calls = []
+
+    class Manager:
+        def isolated_env(self):
+            return {}
+
+        def start_obs(self, **kwargs):
+            return process
+
+        def hide_main_windows(self, *args, **kwargs):
+            pytest.fail("interruption must happen before portable verification")
+
+        def terminate_process(self, candidate):
+            terminate_calls.append(candidate)
+
+    monkeypatch.setattr(
+        recordtest,
+        "_capture_started_obs_process_identity",
+        lambda *args, **kwargs: identity,
+    )
+    source_lines, first_line = inspect.getsourcelines(
+        recordtest._start_hidden_obs_and_verify_portable
+    )
+    target_line = first_line + next(
+        index
+        for index, line in enumerate(source_lines)
+        if "hidden_windows =" in line
+    )
+    previous_trace = sys.gettrace()
+
+    def interrupt_after_identity_assignment(frame, event, arg):
+        if (
+            frame.f_code
+            is recordtest._start_hidden_obs_and_verify_portable.__code__
+            and event == "line"
+            and frame.f_lineno == target_line
+        ):
+            sys.settrace(previous_trace)
+            raise primary_error
+        return interrupt_after_identity_assignment
+
+    sys.settrace(interrupt_after_identity_assignment)
+    try:
+        with pytest.raises(KeyboardInterrupt) as captured:
+            recordtest._start_hidden_obs_and_verify_portable(
+                Manager(),
+                obs_dir_abs="C:/managed/obs",
+                obs_exe="C:/managed/obs/bin/64bit/obs64.exe",
+            )
+    finally:
+        sys.settrace(previous_trace)
+
+    assert captured.value is primary_error
+    assert terminate_calls == [process]
+
+
+def test_portable_verification_control_flow_keeps_primary_and_notes_cleanup(
+    monkeypatch,
+):
+    process = SimpleNamespace(pid=101)
+    primary_error = SystemExit("window verification interrupted")
+    cleanup_error = OBSProcessTerminationError("owned handle remained live")
+    terminate_calls = []
+    identity = obs_bootstrap.OBSProcessInfo(
+        pid=101,
+        executable_path=Path("C:/managed/obs/bin/64bit/obs64.exe"),
+        creation_time=1000.0,
+        creation_time_filetime=116_444_746_000_000_000,
+    )
+
+    class Manager:
+        def isolated_env(self):
+            return {}
+
+        def start_obs(self, **kwargs):
+            return process
+
+        def hide_main_windows(self, *args, **kwargs):
+            raise primary_error
+
+        def terminate_process(self, candidate):
+            terminate_calls.append(candidate)
+            raise cleanup_error
+
+    monkeypatch.setattr(
+        recordtest,
+        "_capture_started_obs_process_identity",
+        lambda *args, **kwargs: identity,
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        recordtest._start_hidden_obs_and_verify_portable(
+            Manager(),
+            obs_dir_abs="C:/managed/obs",
+            obs_exe="C:/managed/obs/bin/64bit/obs64.exe",
+        )
+
+    assert captured.value is primary_error
+    assert terminate_calls == [process]
+    assert any("owned handle remained live" in note for note in primary_error.__notes__)
+
+
+def test_portable_verification_cleanup_control_flow_supersedes_normal_failure(
+    monkeypatch,
+):
+    process = SimpleNamespace(pid=101)
+    identity = obs_bootstrap.OBSProcessInfo(
+        pid=101,
+        executable_path=Path("C:/managed/obs/bin/64bit/obs64.exe"),
+        creation_time=1000.0,
+        creation_time_filetime=116_444_746_000_000_000,
+    )
+    verification_error = OSError("portable log query failed")
+    cleanup_error = SystemExit("portable cleanup interrupted")
+    cleanup_cause = RuntimeError("cleanup cause")
+    cleanup_error.__cause__ = cleanup_cause
+    cleanup_error.__suppress_context__ = True
+    terminate_calls = []
+
+    class Manager:
+        def isolated_env(self):
+            return {}
+
+        def start_obs(self, **kwargs):
+            return process
+
+        def hide_main_windows(self, *args, **kwargs):
+            return 0
+
+        def latest_log_portable_mode(self, since=None):
+            raise verification_error
+
+        def terminate_process(self, candidate):
+            terminate_calls.append(candidate)
+            raise cleanup_error
+
+    monkeypatch.setattr(
+        recordtest,
+        "_capture_started_obs_process_identity",
+        lambda *args, **kwargs: identity,
+    )
+    monkeypatch.setattr(recordtest.time, "sleep", lambda *args: None)
+
+    with pytest.raises(SystemExit) as captured:
+        recordtest._start_hidden_obs_and_verify_portable(
+            Manager(),
+            obs_dir_abs="C:/managed/obs",
+            obs_exe="C:/managed/obs/bin/64bit/obs64.exe",
+        )
+
+    assert captured.value is cleanup_error
+    assert cleanup_error.__cause__ is cleanup_cause
+    assert cleanup_error.__suppress_context__ is True
+    assert terminate_calls == [process]
+    assert any(
+        "portable log query failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
 def test_started_handle_cleanup_propagates_manager_error_even_if_poll_says_exited():
     process = SimpleNamespace(pid=101, poll=lambda: 0)
     termination_error = OBSProcessTerminationError("poll failed before exit proof")
@@ -1979,6 +2458,60 @@ def test_setup_obs_sync_elements_propagates_success_path_cleanup_failure(
     assert shutdown_calls == ["shutdown"]
 
 
+def test_setup_obs_sync_elements_reports_falsey_launched_process(monkeypatch, tmp_path):
+    shutdown_calls = []
+
+    class FalseyProcess:
+        pid = 101
+
+        def __bool__(self):
+            return False
+
+    launched_process = FalseyProcess()
+
+    class ProcessManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class Recorder:
+        _open_cleanup_attempted = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def open(self):
+            pass
+
+        def apply_record_output_settings(self):
+            pass
+
+        def apply_audio_profile(self, cfg):
+            pass
+
+        def shutdown_obs(self):
+            shutdown_calls.append("shutdown")
+
+    monkeypatch.setattr(recordtest, "ensure_recording_dirs", lambda config: None)
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "down"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: launched_process)
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", Recorder)
+
+    result = recordtest._setup_obs_sync_elements_locked(
+        {
+            "obs": {"obs_dir": str(tmp_path / "obs-portable")},
+            "paths": {
+                "recordings_dir": str(tmp_path / "recordings"),
+                "json_dir": str(tmp_path / "json"),
+            },
+        }
+    )
+
+    assert result["obs_launched"] is True
+    assert shutdown_calls == ["shutdown"]
+
+
 def test_setup_obs_sync_elements_keeps_body_primary_and_notes_cleanup_failure(
     monkeypatch,
     tmp_path,
@@ -2026,6 +2559,55 @@ def test_setup_obs_sync_elements_keeps_body_primary_and_notes_cleanup_failure(
     assert any("owned handle remained live" in note for note in primary_error.__notes__)
 
 
+def test_setup_obs_sync_cleanup_control_flow_supersedes_normal_body_failure(
+    monkeypatch,
+    tmp_path,
+):
+    launched_process = SimpleNamespace(pid=101)
+    primary_error = recordtest.RecorderError("setup body failed")
+    cleanup_error = asyncio.CancelledError("setup cleanup cancelled")
+
+    class ProcessManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class Recorder:
+        _open_cleanup_attempted = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def open(self):
+            raise primary_error
+
+        def shutdown_obs(self):
+            raise cleanup_error
+
+    monkeypatch.setattr(recordtest, "ensure_recording_dirs", lambda config: None)
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "down"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: launched_process)
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", Recorder)
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        recordtest._setup_obs_sync_elements_locked(
+            {
+                "obs": {"obs_dir": str(tmp_path / "obs-portable")},
+                "paths": {
+                    "recordings_dir": str(tmp_path / "recordings"),
+                    "json_dir": str(tmp_path / "json"),
+                },
+            }
+        )
+
+    assert captured.value is cleanup_error
+    assert any(
+        "setup body failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
 def test_recorder_open_keeps_primary_and_marks_cleanup_attempt(monkeypatch, tmp_path):
     primary_error = recordtest.RecorderError("connect failed")
     cleanup_error = OBSProcessTerminationError("owned handle remained live")
@@ -2062,6 +2644,182 @@ def test_recorder_open_keeps_primary_and_marks_cleanup_attempt(monkeypatch, tmp_
     assert shutdown_calls == ["shutdown"]
     assert recorder._open_cleanup_attempted is True
     assert any("owned handle remained live" in note for note in primary_error.__notes__)
+
+
+def test_recorder_open_cleans_the_same_falsey_obs_client_once(tmp_path):
+    primary_error = recordtest.RecorderError("connect failed")
+    calls = []
+
+    class FalseyClient:
+        obs_process = SimpleNamespace(pid=101)
+
+        def __bool__(self):
+            return False
+
+        def connect(self):
+            calls.append("connect")
+            raise primary_error
+
+        def shutdown(self):
+            calls.append("shutdown")
+
+    client = FalseyClient()
+    recorder = recordtest.LoLAutoRecorder(
+        config=recordtest.AppConfig.from_dict(
+            {
+                "obs": {"obs_dir": str(tmp_path / "obs-portable")},
+                "paths": {
+                    "recordings_dir": str(tmp_path / "recordings"),
+                    "json_dir": str(tmp_path / "json"),
+                },
+            }
+        ),
+        obs_client=client,
+        auto_setup=False,
+    )
+
+    with pytest.raises(recordtest.RecorderError) as captured:
+        recorder.open()
+
+    assert captured.value is primary_error
+    assert recorder.obs_client is client
+    assert calls == ["connect", "shutdown"]
+    assert recorder._open_cleanup_attempted is True
+
+
+def test_recorder_open_cleanup_control_flow_supersedes_normal_startup_failure(
+    tmp_path,
+):
+    primary_error = recordtest.RecorderError("connect failed")
+    cleanup_error = SystemExit("recorder cleanup interrupted")
+    cleanup_cause = RuntimeError("recorder cleanup cause")
+    cleanup_error.__cause__ = cleanup_cause
+    cleanup_error.__suppress_context__ = True
+
+    class Client:
+        obs_process = SimpleNamespace(pid=101)
+
+        def connect(self):
+            raise primary_error
+
+        def shutdown(self):
+            raise cleanup_error
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=recordtest.AppConfig.from_dict(
+            {
+                "obs": {"obs_dir": str(tmp_path / "obs-portable")},
+                "paths": {
+                    "recordings_dir": str(tmp_path / "recordings"),
+                    "json_dir": str(tmp_path / "json"),
+                },
+            }
+        ),
+        obs_client=Client(),
+        auto_setup=False,
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        recorder.open()
+
+    assert captured.value is cleanup_error
+    assert cleanup_error.__cause__ is cleanup_cause
+    assert cleanup_error.__suppress_context__ is True
+    assert recorder._open_cleanup_attempted is True
+    assert any(
+        "connect failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [KeyboardInterrupt, SystemExit, asyncio.CancelledError],
+)
+def test_recorder_open_preserves_control_flow_and_runs_cleanup_once(
+    tmp_path,
+    error_type,
+):
+    primary_error = error_type("recorder startup interrupted")
+    cleanup_error = OBSProcessTerminationError("owned handle remained live")
+    shutdown_calls = []
+
+    class Client:
+        obs_process = SimpleNamespace(pid=101)
+
+        def connect(self):
+            raise primary_error
+
+        def shutdown(self):
+            shutdown_calls.append("shutdown")
+            raise cleanup_error
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=recordtest.AppConfig.from_dict(
+            {
+                "obs": {"obs_dir": str(tmp_path / "obs-portable")},
+                "paths": {
+                    "recordings_dir": str(tmp_path / "recordings"),
+                    "json_dir": str(tmp_path / "json"),
+                },
+            }
+        ),
+        obs_client=Client(),
+        auto_setup=False,
+    )
+
+    with pytest.raises(error_type) as captured:
+        recorder.open()
+
+    assert captured.value is primary_error
+    assert recorder._open_cleanup_attempted is True
+    assert shutdown_calls == ["shutdown"]
+    assert any("owned handle remained live" in note for note in primary_error.__notes__)
+
+
+def test_setup_borrowed_open_interruption_does_not_disconnect_twice(
+    monkeypatch,
+    tmp_path,
+):
+    primary_error = KeyboardInterrupt("borrowed recorder open interrupted")
+    disconnect_calls = []
+
+    class ProcessManager:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class Recorder:
+        def __init__(self, *args, **kwargs):
+            self._open_cleanup_attempted = False
+
+        def open(self):
+            self._open_cleanup_attempted = True
+            disconnect_calls.append("disconnect")
+            raise primary_error
+
+        def disconnect_obs(self):
+            disconnect_calls.append("disconnect")
+
+    monkeypatch.setattr(recordtest, "ensure_recording_dirs", lambda config: None)
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "down"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", Recorder)
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        recordtest._setup_obs_sync_elements_locked(
+            {
+                "obs": {"obs_dir": str(tmp_path / "obs-portable")},
+                "paths": {
+                    "recordings_dir": str(tmp_path / "recordings"),
+                    "json_dir": str(tmp_path / "json"),
+                },
+            },
+            auto_launch=False,
+        )
+
+    assert captured.value is primary_error
+    assert disconnect_calls == ["disconnect"]
 
 
 def test_recorder_disconnect_cleans_state_when_client_disconnect_fails(tmp_path):
@@ -2162,6 +2920,61 @@ def test_cli_recorder_keeps_body_primary_when_shutdown_fails(monkeypatch):
     assert any("手動で終了" in note for note in primary_error.__notes__)
 
 
+def test_cli_cleanup_control_flow_supersedes_normal_body_failure():
+    primary_error = OSError("recording wait failed")
+    cleanup_error = SystemExit("shutdown interrupted")
+    cleanup_cause = RuntimeError("shutdown cause")
+    cleanup_error.__cause__ = cleanup_cause
+    cleanup_error.__suppress_context__ = True
+
+    class App:
+        def stop_recording(self):
+            pass
+
+        def shutdown_obs(self):
+            raise cleanup_error
+
+    with pytest.raises(SystemExit) as captured:
+        recordtest._cleanup_cli_recorder(App(), primary_error)
+
+    assert captured.value is cleanup_error
+    assert cleanup_error.__cause__ is cleanup_cause
+    assert cleanup_error.__suppress_context__ is True
+    assert any(
+        "recording wait failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+    assert any(
+        "手動で終了" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
+def test_cli_cleanup_keeps_first_control_flow_and_attempts_later_cleanup():
+    primary_error = OSError("recording wait failed")
+    first_cleanup_error = SystemExit("stop recording interrupted")
+    later_cleanup_error = KeyboardInterrupt("shutdown interrupted")
+    calls = []
+
+    class App:
+        def stop_recording(self):
+            calls.append("stop")
+            raise first_cleanup_error
+
+        def shutdown_obs(self):
+            calls.append("shutdown")
+            raise later_cleanup_error
+
+    with pytest.raises(SystemExit) as captured:
+        recordtest._cleanup_cli_recorder(App(), primary_error)
+
+    assert captured.value is first_cleanup_error
+    assert calls == ["stop", "shutdown"]
+    notes = getattr(first_cleanup_error, "__notes__", [])
+    assert any("recording wait failed" in note for note in notes)
+    assert any("shutdown interrupted" in note for note in notes)
+
+
 def test_cli_constructor_failure_cleans_raw_process_once_and_keeps_primary(monkeypatch):
     primary_error = OSError("recorder constructor failed")
     cleanup_error = OBSProcessTerminationError("owned OBS cleanup failed")
@@ -2211,6 +3024,104 @@ def test_cli_constructor_failure_cleans_raw_process_once_and_keeps_primary(monke
     assert any("手動で終了" in note for note in primary_error.__notes__)
 
 
+def test_cli_constructor_control_flow_cleans_raw_process_once(monkeypatch):
+    primary_error = asyncio.CancelledError("recorder constructor cancelled")
+    process = SimpleNamespace(pid=101)
+    cleanup_calls = []
+    config = SimpleNamespace(obs=SimpleNamespace(obs_dir="C:/managed/obs"))
+
+    class ProcessManager:
+        def __init__(self, obs_dir, logger=None):
+            assert obs_dir == config.obs.obs_dir
+
+        def terminate_process(self, candidate):
+            cleanup_calls.append(candidate)
+
+    monkeypatch.setattr(recordtest, "load_settings", lambda: {})
+    monkeypatch.setattr(
+        recordtest,
+        "run_preflight_checks",
+        lambda *args, **kwargs: {
+            "config": {},
+            "changed": False,
+            "warnings": [],
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        recordtest.AppConfig,
+        "from_dict",
+        classmethod(lambda cls, data: config),
+    )
+    monkeypatch.setattr(recordtest, "setup_environment", lambda candidate: None)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda candidate: process)
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(
+        recordtest,
+        "LoLAutoRecorder",
+        lambda **kwargs: (_ for _ in ()).throw(primary_error),
+    )
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        asyncio.run(recordtest.run_cli_recorder())
+
+    assert captured.value is primary_error
+    assert cleanup_calls == [process]
+
+
+def test_cli_constructor_cleanup_control_flow_supersedes_normal_failure(
+    monkeypatch,
+):
+    primary_error = OSError("recorder constructor failed")
+    cleanup_error = SystemExit("raw process cleanup interrupted")
+    process = SimpleNamespace(pid=101)
+    cleanup_calls = []
+    config = SimpleNamespace(obs=SimpleNamespace(obs_dir="C:/managed/obs"))
+
+    class ProcessManager:
+        def __init__(self, obs_dir, logger=None):
+            assert obs_dir == config.obs.obs_dir
+
+        def terminate_process(self, candidate):
+            cleanup_calls.append(candidate)
+            raise cleanup_error
+
+    monkeypatch.setattr(recordtest, "load_settings", lambda: {})
+    monkeypatch.setattr(
+        recordtest,
+        "run_preflight_checks",
+        lambda *args, **kwargs: {
+            "config": {},
+            "changed": False,
+            "warnings": [],
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        recordtest.AppConfig,
+        "from_dict",
+        classmethod(lambda cls, data: config),
+    )
+    monkeypatch.setattr(recordtest, "setup_environment", lambda candidate: None)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda candidate: process)
+    monkeypatch.setattr(recordtest, "OBSProcessManager", ProcessManager)
+    monkeypatch.setattr(
+        recordtest,
+        "LoLAutoRecorder",
+        lambda **kwargs: (_ for _ in ()).throw(primary_error),
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        asyncio.run(recordtest.run_cli_recorder())
+
+    assert captured.value is cleanup_error
+    assert cleanup_calls == [process]
+    assert any(
+        "recorder constructor failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
 def test_cli_open_cleanup_is_not_repeated_by_outer_finally(monkeypatch):
     primary_error = OSError("recorder open failed")
     calls = []
@@ -2257,6 +3168,135 @@ def test_cli_open_cleanup_is_not_repeated_by_outer_finally(monkeypatch):
 
     assert captured.value is primary_error
     assert calls == ["open", "shutdown_obs"]
+
+
+def test_cli_startup_keyboard_interrupt_is_reraised_after_single_open_cleanup(
+    monkeypatch,
+):
+    primary_error = KeyboardInterrupt("startup interrupted")
+    calls = []
+    config = SimpleNamespace()
+
+    class App:
+        _open_cleanup_attempted = False
+
+        def open(self):
+            calls.append("open")
+            self._open_cleanup_attempted = True
+            calls.append("shutdown_obs")
+            raise primary_error
+
+        def shutdown_obs(self):
+            calls.append("shutdown_obs")
+
+    app = App()
+    monkeypatch.setattr(recordtest, "load_settings", lambda: {})
+    monkeypatch.setattr(
+        recordtest,
+        "run_preflight_checks",
+        lambda *args, **kwargs: {
+            "config": {},
+            "changed": False,
+            "warnings": [],
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        recordtest.AppConfig,
+        "from_dict",
+        classmethod(lambda cls, data: config),
+    )
+    monkeypatch.setattr(recordtest, "setup_environment", lambda candidate: None)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda candidate: SimpleNamespace(pid=101))
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda **kwargs: app)
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        asyncio.run(recordtest.run_cli_recorder())
+
+    assert captured.value is primary_error
+    assert calls == ["open", "shutdown_obs"]
+
+
+def test_cli_keyboard_interrupt_after_handoff_is_graceful(monkeypatch):
+    calls = []
+    config = SimpleNamespace()
+
+    class App:
+        _open_cleanup_attempted = False
+
+        def open(self):
+            calls.append("open")
+
+        def apply_audio_profile(self, candidate):
+            calls.append("apply_audio_profile")
+
+        def reset_session(self):
+            calls.append("reset_session")
+
+        async def wait_for_game_start_async(self):
+            calls.append("wait_for_game_start_async")
+            raise KeyboardInterrupt("user pressed Ctrl+C")
+
+        def stop_recording(self):
+            calls.append("stop_recording")
+
+        def shutdown_obs(self):
+            calls.append("shutdown_obs")
+
+    app = App()
+    monkeypatch.setattr(recordtest, "load_settings", lambda: {})
+    monkeypatch.setattr(
+        recordtest,
+        "run_preflight_checks",
+        lambda *args, **kwargs: {
+            "config": {},
+            "changed": False,
+            "warnings": [],
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(
+        recordtest.AppConfig,
+        "from_dict",
+        classmethod(lambda cls, data: config),
+    )
+    monkeypatch.setattr(recordtest, "setup_environment", lambda candidate: None)
+    monkeypatch.setattr(
+        recordtest,
+        "launch_obs",
+        lambda candidate: SimpleNamespace(pid=101),
+    )
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda **kwargs: app)
+
+    asyncio.run(recordtest.run_cli_recorder())
+
+    assert calls == [
+        "open",
+        "apply_audio_profile",
+        "reset_session",
+        "wait_for_game_start_async",
+        "stop_recording",
+        "shutdown_obs",
+    ]
+
+
+def test_cli_typed_preflight_error_still_exits_with_status_one(monkeypatch):
+    monkeypatch.setattr(recordtest, "load_settings", lambda: {})
+    monkeypatch.setattr(
+        recordtest,
+        "run_preflight_checks",
+        lambda *args, **kwargs: {
+            "config": {},
+            "changed": False,
+            "warnings": [],
+            "errors": ["typed preflight failure"],
+        },
+    )
+
+    with pytest.raises(SystemExit) as captured:
+        asyncio.run(recordtest.run_cli_recorder())
+
+    assert captured.value.code == 1
 
 
 def test_disable_obs_global_audio_devices_disables_profile_and_live_inputs():
@@ -2954,6 +3994,143 @@ def test_launch_obs_gpu_plan_failure_cleans_started_process(monkeypatch, tmp_pat
         recordtest.launch_obs(_fake_launch_config(tmp_path))
 
     assert preflight_calls == 2
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert manager.active_processes == {}
+
+
+def test_launch_obs_encoder_probe_cancellation_cleans_started_handle_once(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(monkeypatch)
+    primary_error = asyncio.CancelledError("encoder probe cancelled")
+    monkeypatch.setattr(
+        recordtest,
+        "_wait_for_obs_startup_encoder_selection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(primary_error),
+    )
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert captured.value is primary_error
+    assert manager.start_count == 1
+    assert manager.terminated_pids == [101]
+    assert manager.strict_signal_pids == []
+    assert manager.active_processes == {}
+
+
+def test_launch_obs_cleanup_control_flow_supersedes_normal_encoder_failure(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(monkeypatch)
+    primary_error = OSError("encoder probe failed")
+    cleanup_error = SystemExit("encoder cleanup interrupted")
+    terminate_calls = []
+
+    monkeypatch.setattr(
+        recordtest,
+        "_wait_for_obs_startup_encoder_selection",
+        lambda *args, **kwargs: (_ for _ in ()).throw(primary_error),
+    )
+
+    def interrupt_termination(self, process, timeout_sec=3.0):
+        terminate_calls.append(process.pid)
+        raise cleanup_error
+
+    monkeypatch.setattr(manager, "terminate_process", interrupt_termination)
+
+    with pytest.raises(SystemExit) as captured:
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert captured.value is cleanup_error
+    assert terminate_calls == [101]
+    assert any(
+        "encoder probe failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+
+
+def test_launch_obs_gpu_stop_interruption_is_not_signaled_twice(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    primary_error = KeyboardInterrupt("GPU stop interrupted")
+    terminate_calls = []
+
+    def interrupt_termination(self, process, timeout_sec=3.0):
+        terminate_calls.append(process.pid)
+        raise primary_error
+
+    monkeypatch.setattr(manager, "terminate_process", interrupt_termination)
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
+    assert captured.value is primary_error
+    assert terminate_calls == [101]
+    assert manager.strict_signal_pids == []
+    assert manager.active_processes == {
+        101: manager.process_handles[101].identity,
+    }
+    assert any("同じPopenへ再度signalせず" in note for note in primary_error.__notes__)
+
+
+def test_launch_obs_fails_closed_when_gpu_transaction_skips_stop_callback(
+    monkeypatch,
+    tmp_path,
+):
+    obs_dir = (tmp_path / "obs-portable").resolve()
+    obs_exe = obs_dir / "bin" / "64bit" / "obs64.exe"
+    obs_exe.parent.mkdir(parents=True)
+    obs_exe.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(recordtest, "MANAGED_PORTABLE_OBS_DIR", obs_dir)
+    manager = _install_fake_obs_launch(
+        monkeypatch,
+        before_encoder_kinds=[],
+        after_encoder_kinds=["obs_nvenc_h264_tex", "obs_x264"],
+    )
+    original_transaction = recordtest._execute_obs_startup_settings_transaction
+    transaction_calls = 0
+
+    def skip_second_stop_callback(*args, **kwargs):
+        nonlocal transaction_calls
+        transaction_calls += 1
+        if transaction_calls == 2:
+            return ({}, [])
+        return original_transaction(*args, **kwargs)
+
+    monkeypatch.setattr(
+        recordtest,
+        "_execute_obs_startup_settings_transaction",
+        skip_second_stop_callback,
+    )
+
+    with pytest.raises(recordtest.RecorderError, match="停止完了証跡なし"):
+        recordtest.launch_obs(_fake_launch_config(tmp_path))
+
     assert manager.start_count == 1
     assert manager.terminated_pids == [101]
     assert manager.active_processes == {}

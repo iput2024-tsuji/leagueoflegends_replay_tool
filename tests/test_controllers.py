@@ -4,7 +4,11 @@ from unittest.mock import Mock
 import pytest
 
 from src import recordtest
-from src.controllers import AudioSettingsController, ConfigController
+from src.controllers import (
+    AudioSettingsController,
+    ConfigController,
+    _close_runtime_preserving_primary,
+)
 
 
 class FakeRuntime:
@@ -129,6 +133,70 @@ def test_connection_test_launches_and_closes_managed_obs(monkeypatch):
     assert "接続成功" in detail
     assert runtime_manager.calls[0][1]["auto_launch"] is True
     assert runtime_manager.runtime.closed is True
+
+
+def test_connection_test_cleanup_helper_preserves_control_flow_primary():
+    primary_error = KeyboardInterrupt("connection test interrupted")
+    cleanup_error = RuntimeError("connection runtime close failed")
+
+    class Runtime:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise cleanup_error
+
+    runtime = Runtime()
+
+    with pytest.raises(KeyboardInterrupt) as captured:
+        try:
+            raise primary_error
+        except BaseException as exc:
+            _close_runtime_preserving_primary(runtime, exc)
+            raise
+
+    assert captured.value is primary_error
+    assert runtime.close_calls == 1
+    assert any("connection runtime close failed" in note for note in primary_error.__notes__)
+
+
+def test_connection_cleanup_control_flow_supersedes_normal_primary():
+    primary_error = OSError("connection test failed")
+    cleanup_error = SystemExit("runtime close interrupted")
+    cleanup_cause = RuntimeError("runtime close cause")
+    cleanup_error.__cause__ = cleanup_cause
+    cleanup_error.__suppress_context__ = True
+
+    class Runtime:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            raise cleanup_error
+
+    runtime = Runtime()
+
+    with pytest.raises(SystemExit) as captured:
+        try:
+            raise primary_error
+        except BaseException as exc:
+            _close_runtime_preserving_primary(runtime, exc)
+            raise
+
+    assert captured.value is cleanup_error
+    assert cleanup_error.__cause__ is cleanup_cause
+    assert cleanup_error.__suppress_context__ is True
+    assert runtime.close_calls == 1
+    assert any(
+        "connection test failed" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
+    assert any(
+        "手動で終了" in note
+        for note in getattr(cleanup_error, "__notes__", [])
+    )
 
 
 def test_apply_auto_defaults_preserves_setup_completed_without_forced_detection(monkeypatch):

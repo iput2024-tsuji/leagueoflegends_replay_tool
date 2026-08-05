@@ -37,8 +37,10 @@ from scripts.collect_licenses import (
 )
 from scripts.external_runtime_policy import is_user_provided_runtime_path
 from scripts.pyinstaller_runtime_policy import (
+    RUNTIME_POLICY_AUDIT_FILENAME,
     is_root_vcomp_name,
     is_windows_os_runtime_name,
+    validate_windows_runtime_policy_audit,
 )
 from src.license_info import validate_distribution_documents
 
@@ -632,6 +634,11 @@ def _parse_pyinstaller_tocs(collect_path: Path) -> dict[str, Any]:
             "PyInstaller Analysis contains excluded host Windows runtime binaries: "
             + ", ".join(sorted(unexpected_windows_runtime, key=str.casefold))
         )
+    runtime_policy_audit_path = build_dir / RUNTIME_POLICY_AUDIT_FILENAME
+    runtime_policy_summary = validate_windows_runtime_policy_audit(
+        runtime_policy_audit_path,
+        binaries,
+    )
     datas = _typed_toc_entries(
         analysis[18], label="Analysis datas", allowed_types={"DATA"}
     )
@@ -824,6 +831,8 @@ def _parse_pyinstaller_tocs(collect_path: Path) -> dict[str, Any]:
         "exe": exe,
         "bootloader": executable_entries[0],
         "collect_entries": collect_entries,
+        "runtime_policy_audit_path": runtime_policy_audit_path,
+        "runtime_policy_summary": runtime_policy_summary,
     }
 
 
@@ -1901,6 +1910,136 @@ def _inventory_digest(records: list[dict[str, Any]]) -> str:
     return hashlib.sha256(serialized).hexdigest()
 
 
+def _normalized_runtime_policy_summary(
+    summary: dict[str, Any],
+    source_owners: dict[str, str],
+    python_core_sources: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    normalized = dict(summary)
+    raw_records = normalized.pop("_raw_binaries", None)
+    if not isinstance(raw_records, list):
+        raise ValueError("PyInstaller runtime policy raw inventory is unavailable.")
+    excluded_records = normalized.get("excluded_binaries")
+    if not isinstance(excluded_records, list):
+        raise ValueError("PyInstaller runtime policy exclusions are unavailable.")
+    excluded_by_index = {
+        record.get("raw_index"): record
+        for record in excluded_records
+        if isinstance(record, dict)
+    }
+    if len(excluded_by_index) != len(excluded_records):
+        raise ValueError("PyInstaller runtime policy exclusion indexes are invalid.")
+
+    repository_root = Path(__file__).resolve().parents[1]
+    environment_root = Path(sys.prefix).resolve()
+    public_records: list[dict[str, Any]] = []
+    for expected_index, record in enumerate(raw_records):
+        if not isinstance(record, dict) or record.get("raw_index") != expected_index:
+            raise ValueError("PyInstaller runtime policy raw record is invalid.")
+        source = Path(str(record.get("source", "")))
+        excluded = excluded_by_index.get(expected_index)
+        public_record = {
+            "raw_index": expected_index,
+            "destination": record.get("destination"),
+            "type": record.get("type"),
+            "size": record.get("size"),
+            "sha256": record.get("sha256"),
+        }
+        if excluded is not None:
+            public_record.update(
+                {
+                    "decision": "excluded",
+                    "source": excluded.get("source"),
+                    "source_component": excluded.get("source_boundary"),
+                    "reason": excluded.get("reason"),
+                }
+            )
+        else:
+            source_key = _path_key(source)
+            owner = source_owners.get(source_key)
+            python_core = python_core_sources.get(source_key)
+            final_path = f"_internal/{record['destination']}"
+            component = _classify_toc_entry(
+                {
+                    "toc_name": str(record["destination"]),
+                    "path": final_path,
+                    "source": str(source),
+                    "type": str(record["type"]),
+                },
+                source_owners,
+                python_core_sources,
+            )
+            if component is None:
+                raise ValueError(
+                    "PyInstaller runtime policy retained source has no verified owner: "
+                    f"{record['destination']}"
+                )
+            if owner is not None:
+                try:
+                    relative = source.resolve().relative_to(environment_root).as_posix()
+                except (OSError, ValueError) as exc:
+                    raise ValueError(
+                        "Locked wheel runtime source escapes the build environment: "
+                        f"{record['destination']}"
+                    ) from exc
+                safe_relative = _safe_relative(relative)
+                if safe_relative is None:
+                    raise ValueError(
+                        "Locked wheel runtime source has an unsafe relative path: "
+                        f"{record['destination']}"
+                    )
+                source_identifier = f"{owner}/{safe_relative}"
+            elif python_core is not None:
+                locked_path = _safe_relative(python_core.get("path"))
+                if locked_path is None:
+                    raise ValueError(
+                        "Python runtime source lock has an unsafe path: "
+                        f"{record['destination']}"
+                    )
+                source_identifier = f"python-runtime/{locked_path}"
+            elif _is_relative_to(source, repository_root):
+                relative = source.resolve().relative_to(
+                    repository_root.resolve()
+                ).as_posix()
+                safe_relative = _safe_relative(relative)
+                if safe_relative is None:
+                    raise ValueError(
+                        "Repository runtime source has an unsafe path: "
+                        f"{record['destination']}"
+                    )
+                source_identifier = f"repository/{safe_relative}"
+            else:
+                raise ValueError(
+                    "PyInstaller runtime policy retained source cannot be normalized: "
+                    f"{record['destination']}"
+                )
+            public_record.update(
+                {
+                    "decision": "retained",
+                    "source": source_identifier,
+                    "source_component": component,
+                }
+            )
+        if _safe_relative(public_record.get("source")) is None:
+            raise ValueError(
+                "PyInstaller runtime policy normalized source is unsafe: "
+                f"{record['destination']}"
+            )
+        public_records.append(public_record)
+    if len(public_records) != normalized.get("raw_binary_count"):
+        raise ValueError("PyInstaller runtime policy normalized raw count differs.")
+    normalized["raw_binaries"] = public_records
+    normalized["normalized_raw_inventory_sha256"] = hashlib.sha256(
+        json.dumps(
+            public_records,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return normalized
+
+
 def _validate_pyinstaller_build(
     distribution_root: Path,
     toc_path: Path,
@@ -2286,6 +2425,11 @@ def _validate_pyinstaller_build(
                 repository_root / "scripts" / "pyinstaller_runtime_policy.py"
             ),
         ]
+        runtime_policy_summary = _normalized_runtime_policy_summary(
+            parsed["runtime_policy_summary"],
+            source_owners,
+            python_core_sources,
+        )
         summary = {
             "toc_files": toc_files,
             "build_executable": {
@@ -2321,6 +2465,28 @@ def _validate_pyinstaller_build(
                 "sha256": sha256_file(python_library),
             },
             "build_policy_sources": build_policy_sources,
+            "runtime_policy_audit": runtime_policy_summary,
+            "provenance_binding": {
+                "runtime_policy_audit_sha256": runtime_policy_summary[
+                    "artifact"
+                ]["sha256"],
+                "runtime_policy_payload_sha256": runtime_policy_summary[
+                    "artifact"
+                ]["payload_sha256"],
+                "raw_inventory_sha256": runtime_policy_summary[
+                    "raw_inventory_sha256"
+                ],
+                "normalized_raw_inventory_sha256": runtime_policy_summary[
+                    "normalized_raw_inventory_sha256"
+                ],
+                "analysis_toc_sha256": toc_files["Analysis-00.toc"][
+                    "sha256"
+                ],
+                "collect_toc_sha256": toc_files["COLLECT-00.toc"]["sha256"],
+                "build_provenance_sha256": package_manifest.get(
+                    "build_provenance_sha256"
+                ),
+            },
         }
         return [], summary
     except (
@@ -3277,6 +3443,291 @@ def _write_distribution_manifest(
     return manifest_path
 
 
+def _validate_runtime_policy_manifest_binding(
+    pyinstaller_summary: dict[str, Any],
+    package_manifest: dict[str, Any],
+) -> list[str]:
+    runtime_audit = pyinstaller_summary.get("runtime_policy_audit")
+    binding = pyinstaller_summary.get("provenance_binding")
+    if runtime_audit is None and binding is None:
+        return []
+    errors: list[str] = []
+    if not isinstance(runtime_audit, dict) or not isinstance(binding, dict):
+        return [
+            "Distribution manifest runtime policy audit binding is incomplete."
+        ]
+    expected_runtime_keys = {
+        "artifact",
+        "policy",
+        "pyinstaller_version",
+        "raw_inventory_sha256",
+        "policy_result_sha256",
+        "normalized_raw_inventory_sha256",
+        "raw_binary_count",
+        "retained_binary_count",
+        "excluded_binary_count",
+        "allowed_source_boundaries",
+        "excluded_binaries",
+        "raw_binaries",
+    }
+    if set(runtime_audit) != expected_runtime_keys:
+        errors.append("Distribution manifest runtime policy structure changed.")
+    artifact = runtime_audit.get("artifact")
+    if not isinstance(artifact, dict):
+        errors.append("Distribution manifest runtime policy artifact is missing.")
+        artifact = {}
+    elif set(artifact) != {"filename", "size", "sha256", "payload_sha256"}:
+        errors.append("Distribution manifest runtime policy artifact structure changed.")
+    if artifact.get("filename") != RUNTIME_POLICY_AUDIT_FILENAME:
+        errors.append("Distribution manifest runtime policy artifact name differs.")
+    if not isinstance(artifact.get("size"), int) or artifact.get("size", 0) <= 0:
+        errors.append("Distribution manifest runtime policy artifact size is invalid.")
+    for field in ("sha256", "payload_sha256"):
+        value = artifact.get(field)
+        if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+            errors.append(
+                f"Distribution manifest runtime policy artifact {field} is invalid."
+            )
+    for field in (
+        "raw_inventory_sha256",
+        "policy_result_sha256",
+        "normalized_raw_inventory_sha256",
+    ):
+        value = runtime_audit.get(field)
+        if not isinstance(value, str) or SHA256_PATTERN.fullmatch(value) is None:
+            errors.append(
+                f"Distribution manifest runtime policy {field} is invalid."
+            )
+    counts = [
+        runtime_audit.get("raw_binary_count"),
+        runtime_audit.get("retained_binary_count"),
+        runtime_audit.get("excluded_binary_count"),
+    ]
+    if not all(isinstance(value, int) and value >= 0 for value in counts) or (
+        counts[0] != counts[1] + counts[2]
+    ):
+        errors.append("Distribution manifest runtime policy counts are inconsistent.")
+    boundaries = runtime_audit.get("allowed_source_boundaries")
+    if (
+        not isinstance(boundaries, list)
+        or not all(isinstance(value, str) and value for value in boundaries)
+        or len(boundaries) != len(set(boundaries))
+    ):
+        errors.append("Distribution manifest runtime policy boundaries are invalid.")
+        boundaries = []
+    excluded = runtime_audit.get("excluded_binaries")
+    if not isinstance(excluded, list):
+        errors.append("Distribution manifest runtime policy exclusions are missing.")
+        excluded = []
+    elif isinstance(counts[2], int) and len(excluded) != counts[2]:
+        errors.append("Distribution manifest runtime policy exclusion count differs.")
+    for record in excluded:
+        if not isinstance(record, dict):
+            errors.append("Distribution manifest runtime policy exclusion is invalid.")
+            continue
+        if set(record) != {
+            "raw_index",
+            "destination",
+            "source",
+            "source_boundary",
+            "type",
+            "size",
+            "sha256",
+            "reason",
+        }:
+            errors.append(
+                "Distribution manifest runtime policy exclusion structure changed."
+            )
+        destination = _safe_relative(record.get("destination"))
+        source = _safe_relative(record.get("source"))
+        boundary = record.get("source_boundary")
+        if destination is None:
+            errors.append(
+                "Distribution manifest runtime policy exclusion destination is unsafe."
+            )
+        if (
+            source is None
+            or not isinstance(boundary, str)
+            or boundary not in boundaries
+            or not source.startswith(f"{boundary}/")
+        ):
+            errors.append(
+                "Distribution manifest runtime policy exclusion source is unsafe."
+            )
+        digest = record.get("sha256")
+        if (
+            not isinstance(record.get("size"), int)
+            or record.get("size", -1) < 0
+            or not isinstance(digest, str)
+            or SHA256_PATTERN.fullmatch(digest) is None
+            or record.get("type") != "BINARY"
+            or record.get("reason")
+            not in {"supported-windows-os-runtime", "redundant-root-vcomp"}
+        ):
+            errors.append(
+                "Distribution manifest runtime policy exclusion metadata is invalid."
+            )
+    raw_records = runtime_audit.get("raw_binaries")
+    if not isinstance(raw_records, list):
+        errors.append(
+            "Distribution manifest runtime policy normalized raw inventory is missing."
+        )
+        raw_records = []
+    elif isinstance(counts[0], int) and len(raw_records) != counts[0]:
+        errors.append(
+            "Distribution manifest runtime policy normalized raw count differs."
+        )
+    seen_destinations: set[str] = set()
+    excluded_indexes: set[int] = set()
+    retained_indexes: set[int] = set()
+    for index, record in enumerate(raw_records):
+        if not isinstance(record, dict) or record.get("raw_index") != index:
+            errors.append(
+                "Distribution manifest runtime policy normalized raw record is invalid."
+            )
+            continue
+        decision = record.get("decision")
+        expected_record_keys = {
+            "raw_index",
+            "destination",
+            "source",
+            "source_component",
+            "type",
+            "size",
+            "sha256",
+            "decision",
+        }
+        if decision == "excluded":
+            expected_record_keys.add("reason")
+        if set(record) != expected_record_keys:
+            errors.append(
+                "Distribution manifest runtime policy normalized raw structure "
+                "changed."
+            )
+        destination = _safe_relative(record.get("destination"))
+        source = _safe_relative(record.get("source"))
+        destination_key = destination.casefold() if destination is not None else ""
+        if (
+            destination is None
+            or destination_key in seen_destinations
+            or source is None
+            or not isinstance(record.get("source_component"), str)
+            or re.fullmatch(
+                r"[a-z0-9][a-z0-9.-]*",
+                record["source_component"],
+            )
+            is None
+            or record.get("type") not in {"BINARY", "EXTENSION"}
+            or not isinstance(record.get("size"), int)
+            or record.get("size", -1) < 0
+            or not isinstance(record.get("sha256"), str)
+            or SHA256_PATTERN.fullmatch(record["sha256"]) is None
+        ):
+            errors.append(
+                "Distribution manifest runtime policy normalized raw metadata is invalid."
+            )
+        seen_destinations.add(destination_key)
+        if decision == "excluded":
+            excluded_indexes.add(index)
+            if record.get("reason") not in {
+                "supported-windows-os-runtime",
+                "redundant-root-vcomp",
+            }:
+                errors.append(
+                    "Distribution manifest runtime policy normalized exclusion reason "
+                    "is invalid."
+                )
+        elif decision == "retained":
+            retained_indexes.add(index)
+            if "reason" in record:
+                errors.append(
+                    "Distribution manifest runtime policy retained record has a reason."
+                )
+        else:
+            errors.append(
+                "Distribution manifest runtime policy normalized decision is invalid."
+            )
+    declared_excluded_indexes = {
+        record.get("raw_index")
+        for record in excluded
+        if isinstance(record, dict)
+    }
+    if (
+        excluded_indexes != declared_excluded_indexes
+        or excluded_indexes & retained_indexes
+        or excluded_indexes | retained_indexes != set(range(len(raw_records)))
+    ):
+        errors.append(
+            "Distribution manifest runtime policy normalized decisions are not a "
+            "partition."
+        )
+    raw_by_index = {
+        record.get("raw_index"): record
+        for record in raw_records
+        if isinstance(record, dict)
+    }
+    for record in excluded:
+        if not isinstance(record, dict):
+            continue
+        raw_record = raw_by_index.get(record.get("raw_index"))
+        if raw_record is None or any(
+            raw_record.get(raw_field) != record.get(excluded_field)
+            for raw_field, excluded_field in (
+                ("destination", "destination"),
+                ("source", "source"),
+                ("source_component", "source_boundary"),
+                ("type", "type"),
+                ("size", "size"),
+                ("sha256", "sha256"),
+                ("reason", "reason"),
+            )
+        ):
+            errors.append(
+                "Distribution manifest runtime policy normalized exclusion differs."
+            )
+    normalized_digest = hashlib.sha256(
+        json.dumps(
+            raw_records,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    if runtime_audit.get("normalized_raw_inventory_sha256") != normalized_digest:
+        errors.append(
+            "Distribution manifest runtime policy normalized raw SHA256 differs."
+        )
+    toc_files = pyinstaller_summary.get("toc_files")
+    if not isinstance(toc_files, dict):
+        toc_files = {}
+    expected_binding = {
+        "runtime_policy_audit_sha256": artifact.get("sha256"),
+        "runtime_policy_payload_sha256": artifact.get("payload_sha256"),
+        "raw_inventory_sha256": runtime_audit.get("raw_inventory_sha256"),
+        "normalized_raw_inventory_sha256": runtime_audit.get(
+            "normalized_raw_inventory_sha256"
+        ),
+        "analysis_toc_sha256": (
+            toc_files.get("Analysis-00.toc", {}).get("sha256")
+            if isinstance(toc_files.get("Analysis-00.toc"), dict)
+            else None
+        ),
+        "collect_toc_sha256": (
+            toc_files.get("COLLECT-00.toc", {}).get("sha256")
+            if isinstance(toc_files.get("COLLECT-00.toc"), dict)
+            else None
+        ),
+        "build_provenance_sha256": package_manifest.get(
+            "build_provenance_sha256"
+        ),
+    }
+    if binding != expected_binding:
+        errors.append(
+            "Distribution manifest runtime policy external provenance binding differs."
+        )
+    return errors
+
+
 def _validate_existing_distribution_manifest(
     distribution_root: Path,
     manifest_path: Path,
@@ -3330,8 +3781,15 @@ def _validate_existing_distribution_manifest(
     recorded_pyinstaller = payload.get("pyinstaller_build")
     if not isinstance(recorded_pyinstaller, dict):
         errors.append("Distribution manifest complete PyInstaller inventory is missing.")
-    elif pyinstaller_summary is not None and recorded_pyinstaller != pyinstaller_summary:
-        errors.append("Distribution manifest PyInstaller inventory does not match.")
+    else:
+        errors.extend(
+            _validate_runtime_policy_manifest_binding(
+                recorded_pyinstaller,
+                package_manifest,
+            )
+        )
+        if pyinstaller_summary is not None and recorded_pyinstaller != pyinstaller_summary:
+            errors.append("Distribution manifest PyInstaller inventory does not match.")
 
     records = payload.get("files")
     if not isinstance(records, list):

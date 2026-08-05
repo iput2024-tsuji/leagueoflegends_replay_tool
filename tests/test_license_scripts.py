@@ -450,7 +450,17 @@ def _write_minimal_pyinstaller_tocs(tmp_path: Path) -> dict[str, Path]:
         str(_stdlib_root() / "struct.py"),
         "PYMODULE",
     )
-    binary = ("demo.dll", str(tmp_path / "demo.dll"), "BINARY")
+    demo_binary = tmp_path / "demo.dll"
+    demo_binary.write_bytes(b"demo binary")
+    binary = ("demo.dll", str(demo_binary), "BINARY")
+    wheel_vcomp = tmp_path / "sklearn" / ".libs" / "vcomp140.dll"
+    wheel_vcomp.parent.mkdir(parents=True)
+    wheel_vcomp.write_bytes(b"locked wheel vcomp")
+    wheel_vcomp_entry = (
+        "sklearn\\.libs\\vcomp140.dll",
+        str(wheel_vcomp),
+        "BINARY",
+    )
     data = ("base_library.zip", str(tmp_path / "base_library.zip"), "DATA")
     runtime_scripts = [
         (name, str(tmp_path / f"{name}.py"), "PYSOURCE")
@@ -480,7 +490,7 @@ def _write_minimal_pyinstaller_tocs(tmp_path: Path) -> dict[str, Path]:
         sys.version,
         analysis_scripts,
         [struct_module, demo_module],
-        [binary],
+        [binary, wheel_vcomp_entry],
         [],
         [],
         [data],
@@ -568,6 +578,7 @@ def _write_minimal_pyinstaller_tocs(tmp_path: Path) -> dict[str, Path]:
                 "EXECUTABLE",
             ),
             binary,
+            wheel_vcomp_entry,
             data,
         ],
     )
@@ -583,6 +594,10 @@ def _write_minimal_pyinstaller_tocs(tmp_path: Path) -> dict[str, Path]:
         path = build_dir / name
         path.write_text(repr(payload), encoding="utf-8")
         paths[name] = path
+    runtime_policy.apply_windows_runtime_policy(
+        analysis[15],
+        audit_path=build_dir / runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME,
+    )
     return paths
 
 
@@ -1957,37 +1972,85 @@ def test_system_vcomp_is_not_accepted_as_a_redistributable_source(
     )
 
 
-def test_windows_runtime_policy_excludes_host_runtime_and_retains_wheel_vcomp(
+def _write_runtime_binary(path: Path, payload: bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return path
+
+
+def _locked_wheel_vcomp(tmp_path: Path) -> tuple[str, str, str]:
+    source = _write_runtime_binary(
+        tmp_path / "sklearn" / ".libs" / "vcomp140.dll",
+        b"locked wheel vcomp",
+    )
+    return (r"sklearn\.libs\vcomp140.dll", str(source), "BINARY")
+
+
+def test_windows_runtime_policy_excludes_only_approved_host_sources(
+    monkeypatch,
     tmp_path,
 ):
-    wheel_vcomp = tmp_path / "sklearn" / ".libs" / "vcomp140.dll"
+    windows_root = tmp_path / "Windows"
+    system32 = windows_root / "System32"
+    sdk_root = tmp_path / "Windows Kits" / "10"
+    sdk_redist = sdk_root / "Redist" / "ucrt" / "DLLs" / "x64"
+    monkeypatch.setenv("SystemRoot", str(windows_root))
+    monkeypatch.delenv("WINDIR", raising=False)
+    monkeypatch.setenv("UniversalCRTSdkDir", str(sdk_root))
+    monkeypatch.delenv("WindowsSdkDir", raising=False)
+
+    system_api = _write_runtime_binary(
+        system32 / "api-ms-win-core-file-l1-2-0.dll",
+        b"system api",
+    )
+    sdk_ucrt = _write_runtime_binary(
+        sdk_redist / "ucrtbase.dll",
+        b"sdk ucrt",
+    )
+    system_vcomp = _write_runtime_binary(
+        system32 / "VCOMP140.DLL",
+        b"system vcomp",
+    )
+    wheel_vcomp = _locked_wheel_vcomp(tmp_path)
+    demo = _write_runtime_binary(tmp_path / "demo.pyd", b"extension")
     binaries = [
         (
-            "api-ms-win-core-file-l1-2-0.dll",
-            r"C:\Windows\System32\api.dll",
+            "API-MS-WIN-CORE-FILE-L1-2-0.DLL",
+            str(system_api),
             "BINARY",
         ),
-        (
-            "api-ms-win-crt-runtime-l1-1-0.dll",
-            r"C:\Windows\System32\crt.dll",
-            "BINARY",
-        ),
-        ("ucrtbase.dll", r"C:\Windows\System32\ucrtbase.dll", "BINARY"),
-        ("VCOMP140.DLL", r"C:\Windows\System32\VCOMP140.DLL", "BINARY"),
-        (
-            r"sklearn\.libs\vcomp140.dll",
-            str(wheel_vcomp),
-            "BINARY",
-        ),
-        ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION"),
+        ("ucrtbase.dll", str(sdk_ucrt), "BINARY"),
+        ("vcomp140.dll", str(system_vcomp), "BINARY"),
+        wheel_vcomp,
+        ("demo.pyd", str(demo), "EXTENSION"),
     ]
+    audit_path = tmp_path / runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME
 
-    filtered = runtime_policy.apply_windows_runtime_policy(binaries)
+    filtered = runtime_policy.apply_windows_runtime_policy(
+        binaries,
+        audit_path=audit_path,
+    )
+    summary = runtime_policy.validate_windows_runtime_policy_audit(
+        audit_path,
+        filtered,
+    )
 
-    assert filtered == [
-        (r"sklearn\.libs\vcomp140.dll", str(wheel_vcomp), "BINARY"),
-        ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION"),
+    assert filtered == [wheel_vcomp, ("demo.pyd", str(demo), "EXTENSION")]
+    assert summary["raw_binary_count"] == 5
+    assert summary["retained_binary_count"] == 2
+    assert summary["excluded_binary_count"] == 3
+    assert summary["allowed_source_boundaries"] == [
+        "windows-system32",
+        "windows-sdk-ucrt-redist",
     ]
+    assert {record["source_boundary"] for record in summary["excluded_binaries"]} == {
+        "windows-system32",
+        "windows-sdk-ucrt-redist",
+    }
+    assert all(
+        not Path(record["source"]).is_absolute()
+        for record in summary["excluded_binaries"]
+    )
     assert runtime_policy.is_windows_os_runtime_name("ucrtbase.dll")
     assert runtime_policy.is_windows_os_runtime_name(
         "API-MS-WIN-CORE-FILE-L1-2-0.DLL"
@@ -1997,16 +2060,269 @@ def test_windows_runtime_policy_excludes_host_runtime_and_retains_wheel_vcomp(
     )
 
 
-def test_windows_runtime_policy_fails_without_exact_wheel_vcomp(tmp_path):
-    with pytest.raises(RuntimeError, match="exactly one locked scikit-learn"):
+def test_windows_runtime_policy_fails_closed_for_unapproved_same_name_source(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
+    monkeypatch.delenv("UniversalCRTSdkDir", raising=False)
+    monkeypatch.delenv("WindowsSdkDir", raising=False)
+    wheel_ucrt = _write_runtime_binary(
+        tmp_path / "wheel" / "ucrtbase.dll",
+        b"wheel ucrt",
+    )
+
+    with pytest.raises(RuntimeError, match="unapproved source"):
         runtime_policy.apply_windows_runtime_policy(
-            [("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION")]
+            [
+                ("ucrtbase.dll", str(wheel_ucrt), "BINARY"),
+                _locked_wheel_vcomp(tmp_path),
+            ]
         )
 
-    duplicate = (
-        r"sklearn\.libs\vcomp140.dll",
-        str(tmp_path / "vcomp140.dll"),
-        "BINARY",
+
+def test_windows_runtime_policy_audit_detects_source_and_payload_tampering(
+    tmp_path,
+):
+    wheel_vcomp = _locked_wheel_vcomp(tmp_path)
+    demo = _write_runtime_binary(tmp_path / "demo.pyd", b"extension")
+    filtered = [wheel_vcomp, ("demo.pyd", str(demo), "EXTENSION")]
+    audit_path = tmp_path / runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME
+    runtime_policy.apply_windows_runtime_policy(filtered, audit_path=audit_path)
+
+    original = audit_path.read_text(encoding="utf-8")
+    payload = json.loads(original)
+    payload["retained_raw_indexes"] = [0]
+    audit_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="canonical payload SHA256"):
+        runtime_policy.validate_windows_runtime_policy_audit(audit_path, filtered)
+
+    audit_path.write_text(original, encoding="utf-8")
+    demo.write_bytes(b"changed after audit")
+    with pytest.raises(ValueError, match="source changed after audit"):
+        runtime_policy.validate_windows_runtime_policy_audit(audit_path, filtered)
+
+
+def test_windows_runtime_policy_rejects_partition_and_casefold_duplicates(
+    tmp_path,
+):
+    wheel_vcomp = _locked_wheel_vcomp(tmp_path)
+    first = _write_runtime_binary(tmp_path / "first.dll", b"first")
+    second = _write_runtime_binary(tmp_path / "second.dll", b"second")
+    with pytest.raises(RuntimeError, match="duplicate binary destination"):
+        runtime_policy.apply_windows_runtime_policy(
+            [
+                ("Demo.dll", str(first), "BINARY"),
+                ("demo.DLL", str(second), "BINARY"),
+                wheel_vcomp,
+            ]
+        )
+
+    audit_path = tmp_path / runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME
+    runtime_policy.apply_windows_runtime_policy(
+        [wheel_vcomp, ("first.dll", str(first), "BINARY")],
+        audit_path=audit_path,
     )
+    payload = json.loads(audit_path.read_text(encoding="utf-8"))
+    payload["retained_raw_indexes"] = [0]
+    unsigned = dict(payload)
+    unsigned.pop("payload_sha256")
+    payload["payload_sha256"] = runtime_policy._canonical_json_sha256(unsigned)
+    audit_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="partition differs"):
+        runtime_policy.validate_windows_runtime_policy_audit(
+            audit_path,
+            [wheel_vcomp, ("first.dll", str(first), "BINARY")],
+        )
+
+
+def test_windows_runtime_policy_fails_without_exact_wheel_vcomp(tmp_path):
+    demo = _write_runtime_binary(tmp_path / "demo.pyd", b"demo")
+    with pytest.raises(RuntimeError, match="exactly one locked scikit-learn"):
+        runtime_policy.apply_windows_runtime_policy(
+            [("demo.pyd", str(demo), "EXTENSION")]
+        )
+
+    duplicate = _locked_wheel_vcomp(tmp_path)
     with pytest.raises(RuntimeError, match="duplicate binary destination"):
         runtime_policy.apply_windows_runtime_policy([duplicate, duplicate])
+
+
+def _fake_analysis_type(save_guts):
+    analysis_type = type(
+        "Analysis",
+        (),
+        {
+            "_GUTS": tuple(
+                (name, None) for name in runtime_policy.ANALYSIS_GUTS_FIELDS
+            ),
+            "_save_guts": save_guts,
+        },
+    )
+    analysis_type.__module__ = "PyInstaller.building.build_main"
+    return analysis_type
+
+
+def _fake_analysis(tmp_path: Path, save_guts):
+    analysis = _fake_analysis_type(save_guts)()
+    for field in runtime_policy.ANALYSIS_GUTS_FIELDS:
+        setattr(analysis, field, [])
+    analysis.binaries = [_locked_wheel_vcomp(tmp_path)]
+    analysis.datas = []
+    analysis.tocfilename = str((tmp_path / "Analysis-00.toc").resolve())
+    return analysis
+
+
+def test_private_analysis_contract_is_saved_and_re_read(tmp_path):
+    def save_guts(self):
+        payload = tuple(
+            getattr(self, name) for name in runtime_policy.ANALYSIS_GUTS_FIELDS
+        )
+        Path(self.tocfilename).write_text(repr(payload), encoding="utf-8")
+
+    analysis = _fake_analysis(tmp_path, save_guts)
+
+    audit_path = runtime_policy.apply_windows_runtime_policy_to_analysis(analysis)
+
+    assert audit_path.name == runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME
+    assert audit_path.is_file()
+    saved = ast.literal_eval(Path(analysis.tocfilename).read_text(encoding="utf-8"))
+    assert saved[runtime_policy.ANALYSIS_BINARY_INDEX] == analysis.binaries
+
+
+def test_private_analysis_contract_fails_on_shape_or_saved_toc_change(tmp_path):
+    def save_wrong_guts(self):
+        payload = [
+            getattr(self, name) for name in runtime_policy.ANALYSIS_GUTS_FIELDS
+        ]
+        payload[runtime_policy.ANALYSIS_BINARY_INDEX] = []
+        Path(self.tocfilename).write_text(repr(tuple(payload)), encoding="utf-8")
+
+    wrong_saved = _fake_analysis(tmp_path, save_wrong_guts)
+    with pytest.raises(RuntimeError, match="Saved PyInstaller Analysis binaries"):
+        runtime_policy.apply_windows_runtime_policy_to_analysis(wrong_saved)
+
+    valid = _fake_analysis(tmp_path / "shape", save_wrong_guts)
+    valid._GUTS = valid._GUTS[:-1]
+    with pytest.raises(RuntimeError, match="_GUTS fields changed"):
+        runtime_policy.apply_windows_runtime_policy_to_analysis(valid)
+
+
+def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance():
+    package_manifest = {"build_provenance_sha256": "a" * 64}
+    artifact = {
+        "filename": runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME,
+        "size": 123,
+        "sha256": "b" * 64,
+        "payload_sha256": "c" * 64,
+    }
+    raw_records = [
+        {
+            "raw_index": 0,
+            "destination": "VCOMP140.DLL",
+            "source": "windows-system32/VCOMP140.DLL",
+            "source_component": "windows-system32",
+            "type": "BINARY",
+            "size": 12,
+            "sha256": "f" * 64,
+            "decision": "excluded",
+            "reason": "redundant-root-vcomp",
+        },
+        {
+            "raw_index": 1,
+            "destination": "sklearn/.libs/vcomp140.dll",
+            "source": "scikit-learn/Lib/site-packages/sklearn/.libs/vcomp140.dll",
+            "source_component": "microsoft-vc-runtime",
+            "type": "BINARY",
+            "size": 34,
+            "sha256": "1" * 64,
+            "decision": "retained",
+        },
+    ]
+    normalized_digest = hashlib.sha256(
+        json.dumps(
+            raw_records,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    summary = {
+        "toc_files": {
+            "Analysis-00.toc": {"sha256": "2" * 64},
+            "COLLECT-00.toc": {"sha256": "3" * 64},
+        },
+        "runtime_policy_audit": {
+            "artifact": artifact,
+            "policy": runtime_policy.RUNTIME_POLICY_NAME,
+            "pyinstaller_version": metadata.version("PyInstaller"),
+            "raw_inventory_sha256": "d" * 64,
+            "policy_result_sha256": "e" * 64,
+            "normalized_raw_inventory_sha256": normalized_digest,
+            "raw_binary_count": 2,
+            "retained_binary_count": 1,
+            "excluded_binary_count": 1,
+            "allowed_source_boundaries": ["windows-system32"],
+            "raw_binaries": raw_records,
+            "excluded_binaries": [
+                {
+                    "raw_index": 0,
+                    "destination": "VCOMP140.DLL",
+                    "source": "windows-system32/VCOMP140.DLL",
+                    "source_boundary": "windows-system32",
+                    "type": "BINARY",
+                    "size": 12,
+                    "sha256": "f" * 64,
+                    "reason": "redundant-root-vcomp",
+                }
+            ],
+        },
+        "provenance_binding": {
+            "runtime_policy_audit_sha256": "b" * 64,
+            "runtime_policy_payload_sha256": "c" * 64,
+            "raw_inventory_sha256": "d" * 64,
+            "normalized_raw_inventory_sha256": normalized_digest,
+            "analysis_toc_sha256": "2" * 64,
+            "collect_toc_sha256": "3" * 64,
+            "build_provenance_sha256": "a" * 64,
+        },
+    }
+
+    assert compliance._validate_runtime_policy_manifest_binding(
+        summary,
+        package_manifest,
+    ) == []
+
+    leaked = copy.deepcopy(summary)
+    leaked["runtime_policy_audit"]["excluded_binaries"][0]["source"] = (
+        "C:/Windows/System32/VCOMP140.DLL"
+    )
+    assert any(
+        "exclusion source is unsafe" in error
+        for error in compliance._validate_runtime_policy_manifest_binding(
+            leaked,
+            package_manifest,
+        )
+    )
+
+    unbound = copy.deepcopy(summary)
+    unbound["provenance_binding"]["build_provenance_sha256"] = "0" * 64
+    assert any(
+        "external provenance binding differs" in error
+        for error in compliance._validate_runtime_policy_manifest_binding(
+            unbound,
+            package_manifest,
+        )
+    )
+
+    extra_path = copy.deepcopy(summary)
+    extra_path["runtime_policy_audit"]["raw_binaries"][1][
+        "original_source"
+    ] = r"C:\runner\venv\sklearn\.libs\vcomp140.dll"
+    assert any(
+        "normalized raw structure changed" in error
+        for error in compliance._validate_runtime_policy_manifest_binding(
+            extra_path,
+            package_manifest,
+        )
+    )

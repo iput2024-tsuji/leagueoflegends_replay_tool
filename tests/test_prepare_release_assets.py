@@ -2388,5 +2388,5 @@ def test_build_scripts_accept_verified_python_and_provenance():
     assert '$buildArgs = @{}' in installer
     assert '@("-PythonExe", $selectedPython)' not in installer
     assert '-m PyInstaller --noconfirm --clean "LoLReplayTool.spec"' in build
-    assert "apply_windows_runtime_policy(a.binaries)" in spec
-    assert "a._save_guts()" in spec
+    assert "apply_windows_runtime_policy_to_analysis(a)" in spec
+    assert "a._save_guts()" not in spec

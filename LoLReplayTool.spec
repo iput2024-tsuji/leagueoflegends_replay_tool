@@ -1,6 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from scripts.pyinstaller_runtime_policy import apply_windows_runtime_policy
+from scripts.pyinstaller_runtime_policy import (
+    apply_windows_runtime_policy_to_analysis,
+)
 
 a = Analysis(
     ["main.py"],
@@ -19,10 +21,10 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-a.binaries = apply_windows_runtime_policy(a.binaries)
-# Analysis writes its cache before the spec can apply the runtime policy. Keep
-# the provenance TOC aligned with the exact set later handed to COLLECT.
-a._save_guts()
+# Analysis writes its cache before the spec can apply the runtime policy. The
+# helper records the raw inventory, applies the policy, then verifies the
+# private cache contract after re-saving the filtered Analysis TOC.
+apply_windows_runtime_policy_to_analysis(a)
 pyz = PYZ(a.pure)
 
 exe = EXE(

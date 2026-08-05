@@ -2273,12 +2273,16 @@ def test_windows_runtime_policy_rejects_leaf_reparse_source(tmp_path):
         )
 
 
-def test_windows_runtime_policy_rejects_parent_reparse_boundary_escape(tmp_path):
+def test_windows_runtime_policy_rejects_parent_reparse_boundary_escape(
+    request,
+    tmp_path,
+):
     approved = tmp_path / "approved"
     approved.mkdir()
     outside = tmp_path / "outside"
     source = _write_runtime_binary(outside / "ucrtbase.dll", b"outside")
     linked_parent = approved / "redirected"
+    junction_created = False
     try:
         linked_parent.symlink_to(outside, target_is_directory=True)
     except OSError as exc:
@@ -2298,6 +2302,19 @@ def test_windows_runtime_policy_rejects_parent_reparse_boundary_escape(tmp_path)
                 "Creating a parent junction is unavailable on this runner: "
                 f"{junction.stderr.strip() or junction.stdout.strip()}"
             )
+        junction_created = True
+
+    def remove_parent_reparse() -> None:
+        try:
+            linked_parent.lstat()
+        except FileNotFoundError:
+            return
+        if junction_created:
+            linked_parent.rmdir()
+        else:
+            linked_parent.unlink()
+
+    request.addfinalizer(remove_parent_reparse)
 
     with pytest.raises(RuntimeError, match="unapproved source"):
         runtime_policy.apply_windows_runtime_policy(
@@ -2307,7 +2324,6 @@ def test_windows_runtime_policy_rejects_parent_reparse_boundary_escape(tmp_path)
             ],
             source_boundaries=[("approved", approved)],
         )
-    linked_parent.rmdir()
 
 
 def test_windows_runtime_policy_rejects_source_replacement_while_hashing(

@@ -365,3 +365,7 @@ try {
       -Prefix "LoLReplayTool-installer-negative-"
   }
 }
+
+# The expected inner audit failure leaves the native process status at 1.
+# Reset it only after both the protected checks and cleanup finish successfully.
+$global:LASTEXITCODE = 0

@@ -539,6 +539,49 @@ def test_failure_isolation_runner_accepts_only_payload_mismatch_failure() -> Non
     assert "意図したpayload不一致以外" in source
 
 
+@pytest.mark.skipif(POWERSHELL is None, reason="PowerShell is unavailable")
+@pytest.mark.parametrize(
+    ("protected_flow", "expected_returncode"),
+    [
+        ("$global:LASTEXITCODE = 1\ntry { } finally { }", 0),
+        ('try { throw "body failure" } finally { }', 1),
+        ('try { } finally { throw "cleanup failure" }', 1),
+    ],
+)
+def test_failure_isolation_runner_resets_exit_code_only_after_cleanup(
+    tmp_path: Path,
+    protected_flow: str,
+    expected_returncode: int,
+) -> None:
+    source = (
+        REPOSITORY_ROOT / "scripts" / "test_installer_audit_failure.ps1"
+    ).read_text(encoding="utf-8")
+    success_reset = "$global:LASTEXITCODE = 0"
+
+    assert source.rstrip().endswith(success_reset)
+    assert source.count(success_reset) == 1
+
+    harness = tmp_path / "failure-isolation-exit-code.ps1"
+    harness.write_text(
+        '$ErrorActionPreference = "Stop"\n'
+        + protected_flow
+        + "\n"
+        + success_reset
+        + "\n",
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-File", str(harness)],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    assert result.returncode == expected_returncode
+
+
 def test_failure_isolation_runner_keeps_mismatch_dist_outside_audit_temp() -> None:
     source = (
         REPOSITORY_ROOT / "scripts" / "test_installer_audit_failure.ps1"

@@ -16,6 +16,11 @@ from src import obs_bootstrap
 from src.obs_bootstrap import OBSBootstrapper
 from src.obs_process import OBSProcessQueryError
 
+_WINDOWS_NOTIFICATION_CACHE_ONLY = pytest.mark.skipif(
+    os.name != "nt",
+    reason="change notification cacheは信頼できるWindows local volume専用",
+)
+
 
 def _process_handle_count() -> int | None:
     if os.name == "nt":
@@ -1107,6 +1112,7 @@ def test_copy_progress_query_does_not_mutate_clean_destination(tmp_path):
     assert not lock_path.exists()
 
 
+@_WINDOWS_NOTIFICATION_CACHE_ONLY
 def test_copy_progress_cached_clean_result_invalidates_for_nested_temporary(
     tmp_path,
 ):
@@ -1149,6 +1155,7 @@ def test_copy_progress_cached_clean_result_fails_closed_for_new_reparse(tmp_path
     assert external_sentinel.read_bytes() == b"do not traverse"
 
 
+@_WINDOWS_NOTIFICATION_CACHE_ONLY
 def test_copy_progress_cache_rejects_replaced_root_identity(tmp_path):
     destination = tmp_path / "obs-portable"
     parked = tmp_path / "parked-obs-portable"
@@ -1172,6 +1179,7 @@ def test_copy_progress_cache_rejects_replaced_root_identity(tmp_path):
     assert first_monitor.closed is True
 
 
+@_WINDOWS_NOTIFICATION_CACHE_ONLY
 def test_copy_progress_cache_monitor_error_forces_rescan(monkeypatch, tmp_path):
     destination = tmp_path / "obs-portable"
     _write_fake_obs(destination, b"clean destination")
@@ -1268,6 +1276,90 @@ def test_copy_progress_monitor_registration_failure_uses_legacy_double_scan(
     assert not obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume trust boundaryの回帰")
+@pytest.mark.parametrize(
+    ("drive_type", "filesystem_name"),
+    (
+        (4, "NTFS"),
+        (3, "unsupported-fs"),
+    ),
+    ids=("remote-volume", "unsupported-filesystem"),
+)
+def test_copy_progress_untrusted_windows_volume_uses_legacy_double_scan(
+    monkeypatch,
+    tmp_path,
+    drive_type,
+    filesystem_name,
+):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+    fake_volume_root = "\\\\?\\Volume{test-volume}\\"
+    scandir_calls = 0
+    real_scandir = obs_bootstrap.os.scandir
+
+    def track_scandir(*args, **kwargs):
+        nonlocal scandir_calls
+        scandir_calls += 1
+        return real_scandir(*args, **kwargs)
+
+    monkeypatch.setattr(
+        obs_bootstrap._transaction_fs,
+        "_windows_physical_volume_root_for_handle",
+        lambda _handle, *, path: fake_volume_root,
+    )
+    monkeypatch.setattr(
+        obs_bootstrap._transaction_fs,
+        "_windows_volume_details",
+        lambda _volume_root: (drive_type, 0, filesystem_name),
+    )
+    monkeypatch.setattr(obs_bootstrap.os, "scandir", track_scandir)
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert scandir_calls >= 4
+    assert not obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume topologyの回帰")
+def test_copy_progress_changed_volume_topology_forces_rescan(
+    monkeypatch,
+    tmp_path,
+):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    key = obs_bootstrap._filesystem_path_key(destination)
+    _identity, original_monitor = obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE[key]
+    original_volume = original_monitor._windows_volume
+    assert original_volume is not None
+    changed_volume = obs_bootstrap._transaction_fs._WindowsNotificationVolumeFingerprint(
+        volume_root=original_volume.volume_root,
+        volume_serial=original_volume.volume_serial,
+        filesystem_name=(
+            "refs" if original_volume.filesystem_name != "refs" else "ntfs"
+        ),
+        drive_type=original_volume.drive_type,
+    )
+    scandir_calls = 0
+    real_scandir = obs_bootstrap.os.scandir
+
+    def track_scandir(*args, **kwargs):
+        nonlocal scandir_calls
+        scandir_calls += 1
+        return real_scandir(*args, **kwargs)
+
+    monkeypatch.setattr(
+        obs_bootstrap._transaction_fs,
+        "_windows_notification_volume_fingerprint_for_volume_root",
+        lambda _volume_root: changed_volume,
+    )
+    monkeypatch.setattr(obs_bootstrap.os, "scandir", track_scandir)
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert scandir_calls > 0
+    assert original_monitor.closed is True
+    assert obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE[key][1] is not original_monitor
+
+
 def test_copy_progress_monitor_does_not_block_temporary_rename_or_unlink(tmp_path):
     destination = tmp_path / "obs-portable"
     _write_fake_obs(destination, b"clean destination")
@@ -1313,6 +1405,7 @@ def test_copy_progress_monitor_does_not_block_actual_migration(tmp_path):
     )
 
 
+@_WINDOWS_NOTIFICATION_CACHE_ONLY
 def test_copy_progress_cached_queries_are_serialized_per_process(tmp_path):
     destination = tmp_path / "obs-portable"
     _write_fake_obs(destination, b"clean destination")
@@ -1331,13 +1424,14 @@ def test_copy_progress_cached_queries_are_serialized_per_process(tmp_path):
 
 
 @pytest.mark.skipif(
-    "fork" not in multiprocessing.get_all_start_methods(),
-    reason="fork後のmonitor cache分離回帰",
+    os.name == "nt" or "fork" not in multiprocessing.get_all_start_methods(),
+    reason="fork可能な非Windows runtimeのfallback回帰",
 )
-def test_copy_progress_monitor_cache_is_rebuilt_after_fork(tmp_path):
+def test_copy_progress_unsupported_monitor_cache_stays_empty_after_fork(tmp_path):
     destination = tmp_path / "obs-portable"
     _write_fake_obs(destination, b"clean destination")
     assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert not obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE
 
     context = multiprocessing.get_context("fork")
     result_queue = context.Queue()
@@ -1358,10 +1452,11 @@ def test_copy_progress_monitor_cache_is_rebuilt_after_fork(tmp_path):
     assert result is False
     assert cache_pid == child_pid
     assert child_pid != os.getpid()
-    assert cache_size == 1
-    assert len(obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE) == 1
+    assert cache_size == 0
+    assert not obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE
 
 
+@_WINDOWS_NOTIFICATION_CACHE_ONLY
 def test_copy_progress_monitor_cache_is_bounded_and_closes_lru_roots(tmp_path):
     roots = []
     first_monitor = None

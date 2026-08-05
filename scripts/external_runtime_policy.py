@@ -1,35 +1,107 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
-FORBIDDEN_RUNTIME_DIRECTORIES = frozenset({"obs-portable", "obs-studio"})
-FORBIDDEN_RUNTIME_EXECUTABLES = frozenset(
-    {"obs64.exe", "ffmpeg.exe", "ffprobe.exe", "ffplay.exe"}
+FORBIDDEN_RUNTIME_DIRECTORIES = frozenset(
+    {"ffmpeg", "obs-portable", "obs-studio"}
 )
+FORBIDDEN_RUNTIME_EXECUTABLES = frozenset(
+    {"obs32.exe", "obs64.exe", "ffmpeg.exe", "ffprobe.exe", "ffplay.exe"}
+)
+FORBIDDEN_RUNTIME_PACKAGE_SUFFIXES = (
+    ".exe",
+    ".msi",
+    ".zip",
+    ".7z",
+    ".rar",
+    ".tar",
+    ".tar.gz",
+    ".tar.xz",
+)
+RUNTIME_PACKAGE_BASE_NAMES = ("ffmpeg", "obs-studio")
+RUNTIME_VARIANT_TOKENS = frozenset(
+    {
+        "amd64",
+        "arm64",
+        "build",
+        "builds",
+        "essentials",
+        "full",
+        "git",
+        "gpl",
+        "installer",
+        "latest",
+        "lgpl",
+        "master",
+        "portable",
+        "release",
+        "setup",
+        "shared",
+        "static",
+        "win",
+        "win32",
+        "win64",
+        "windows",
+        "x64",
+        "x86",
+    }
+)
+RUNTIME_VERSION_TOKEN = re.compile(r"(?:v|n)?\d[a-z0-9]*\Z")
+
+
+def _is_runtime_variant_name(value: str) -> bool:
+    name = value.casefold()
+    for base in RUNTIME_PACKAGE_BASE_NAMES:
+        if name == base:
+            return True
+        if not any(name.startswith(f"{base}{separator}") for separator in "-_."):
+            continue
+        remainder = name[len(base) + 1 :]
+        tokens = [token for token in re.split(r"[-_.]+", remainder) if token]
+        if tokens and all(
+            token in RUNTIME_VARIANT_TOKENS
+            or RUNTIME_VERSION_TOKEN.fullmatch(token) is not None
+            for token in tokens
+        ):
+            return True
+    return False
+
+
+def _is_runtime_package_file(name: str) -> bool:
+    folded = name.casefold()
+    for suffix in sorted(FORBIDDEN_RUNTIME_PACKAGE_SUFFIXES, key=len, reverse=True):
+        if folded.endswith(suffix):
+            return _is_runtime_variant_name(folded[: -len(suffix)])
+    return False
 
 
 class ExternalRuntimePolicyError(RuntimeError):
     """The tracked-source inventory could not be checked safely."""
 
 
-def is_user_provided_runtime_path(relative: str) -> bool:
+def is_user_provided_runtime_path(
+    relative: str,
+    *,
+    is_directory: bool = False,
+) -> bool:
     path = PurePosixPath(relative.replace("\\", "/"))
     directory_names = {part.casefold() for part in path.parts[:-1]}
     name = path.name.casefold()
-    is_obs_package = name.startswith("obs-studio-") and name.endswith(
-        (".exe", ".msi", ".zip", ".7z")
-    )
-    is_ffmpeg_archive = name.startswith("ffmpeg-") and name.endswith((".zip", ".7z"))
     return bool(
-        directory_names & FORBIDDEN_RUNTIME_DIRECTORIES
+        any(
+            directory in FORBIDDEN_RUNTIME_DIRECTORIES
+            or _is_runtime_variant_name(directory)
+            for directory in directory_names
+        )
         or name in FORBIDDEN_RUNTIME_DIRECTORIES
+        or (is_directory and _is_runtime_variant_name(name))
         or name in FORBIDDEN_RUNTIME_EXECUTABLES
-        or is_obs_package
-        or is_ffmpeg_archive
+        or _is_runtime_package_file(name)
     )
 
 

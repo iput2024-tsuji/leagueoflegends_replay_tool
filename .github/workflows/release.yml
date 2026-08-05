@@ -276,6 +276,24 @@ jobs:
             -InnoSetupRoot $env:INNO_SETUP_ROOT `
             -InnoSetupProvenance $env:INNO_SETUP_PROVENANCE
 
+      - name: Audit finished installer contents
+        shell: pwsh
+        run: |
+          .\scripts\audit_installer_contents.ps1 `
+            -InstallerPath ".\dist\installer\LoLReplayTool-Setup-$env:APP_VERSION.exe" `
+            -DistributionRoot .\dist\LoLReplayTool `
+            -TempRoot $env:RUNNER_TEMP `
+            -PythonExe $env:RELEASE_PYTHON
+
+      - name: Test installer audit failure isolation
+        shell: pwsh
+        run: |
+          .\scripts\test_installer_audit_failure.ps1 `
+            -InstallerPath ".\dist\installer\LoLReplayTool-Setup-$env:APP_VERSION.exe" `
+            -DistributionRoot .\dist\LoLReplayTool `
+            -TempRoot $env:RUNNER_TEMP `
+            -PythonExe $env:RELEASE_PYTHON
+
       - name: Create and verify release assets
         id: release_assets
         shell: pwsh

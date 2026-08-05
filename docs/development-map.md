@@ -10,7 +10,8 @@ LoL Replay Toolの変更箇所を判断するための開発者向け地図で�
 | `src/app.py` | PyQt6画面、画面遷移、`RecorderWorker`、設定UI | UIスレッドを止めないこと、ワーカー終了、手動GUI確認 |
 | `src/controllers.py` | UIから設定・録画・分析処理を呼ぶ境界 | UIと外部依存を直接結合しないこと |
 | `src/recording_supervisor.py` | 監視、録画、終了、保存、通知をつなぐアプリケーションフロー | 正常終了、部分保存、中断、次試合監視 |
-| `src/recordtest.py` | `LoLAutoRecorder`、OBSクライアント、Live Client/LCU連携、録画処理 | 非同期状態遷移、外部API失敗、既存テストのモック境界 |
+| `src/recordtest.py` | `LoLAutoRecorder`、Live Client/LCU連携、録画処理、既存import互換facade | 非同期状態遷移、外部API失敗、既存テストのモック境界 |
+| `src/obs_websocket_client.py` | `ObsWebSocketClient`、OBS接続、request/response、シーン・入力・録画・音声制御 | 認証、タイムアウト、再試行、`recordtest`のimport・monkeypatch互換性 |
 | `src/obs_runtime.py` | OBSプロセス所有権とRecorder生成 | 管理対象OBSだけを制御・終了すること |
 | `src/obs_process.py` | OBS起動、プロセス探索、ログ診断、終了 | Windows実機、既存OBSとの衝突、プロセス取り違え |
 | `src/obs_bootstrap.py` | portable OBSの設定ファイル生成・補正 | 既存設定の移行、WebSocket認証、INI互換性 |

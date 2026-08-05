@@ -1,3 +1,4 @@
+import ctypes
 import errno
 import json
 import multiprocessing
@@ -5,6 +6,7 @@ import os
 import stat
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -13,6 +15,48 @@ import pytest
 from src import obs_bootstrap
 from src.obs_bootstrap import OBSBootstrapper
 from src.obs_process import OBSProcessQueryError
+
+
+def _process_handle_count() -> int | None:
+    if os.name == "nt":
+        count = ctypes.c_ulong()
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.GetProcessHandleCount.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel32.GetProcessHandleCount.restype = ctypes.c_int
+        process_handle = kernel32.GetCurrentProcess()
+        if not kernel32.GetProcessHandleCount(process_handle, ctypes.byref(count)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(count.value)
+    descriptor_root = Path("/proc/self/fd")
+    if descriptor_root.is_dir():
+        return len(os.listdir(descriptor_root))
+    return None
+
+
+def _query_tree_snapshot(root: Path) -> tuple[tuple[str, str, int, int], ...]:
+    entries = []
+    for path in root.rglob("*"):
+        metadata = path.stat(follow_symlinks=False)
+        entries.append(
+            (
+                path.relative_to(root).as_posix(),
+                "directory" if stat.S_ISDIR(metadata.st_mode) else "file",
+                int(metadata.st_size),
+                int(metadata.st_mtime_ns),
+            )
+        )
+    return tuple(sorted(entries))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_copy_query_monitor_cache():
+    obs_bootstrap._clear_obs_copy_query_monitor_cache()
+    yield
+    obs_bootstrap._clear_obs_copy_query_monitor_cache()
 
 
 @contextmanager
@@ -55,6 +99,17 @@ def _hold_obs_migration_during_copy(source: str, destination: str, entered) -> N
 
     obs_bootstrap._write_all = hold_after_copy_write
     obs_bootstrap.migrate_legacy_obs_installation(destination, [source])
+
+
+def _query_copy_progress_after_fork(destination: str, result_queue) -> None:
+    result_queue.put(
+        (
+            obs_bootstrap.is_obs_copy_in_progress(destination),
+            obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE_PID,
+            os.getpid(),
+            len(obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE),
+        )
+    )
 
 
 def _write_fake_obs(source: Path, contents: bytes = b"obs") -> Path:
@@ -1050,6 +1105,478 @@ def test_copy_progress_query_does_not_mutate_clean_destination(tmp_path):
     assert after == before
     assert executable.read_bytes() == b"clean destination"
     assert not lock_path.exists()
+
+
+def test_copy_progress_cached_clean_result_invalidates_for_nested_temporary(
+    tmp_path,
+):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert (
+        obs_bootstrap._filesystem_path_key(destination)
+        in obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE
+    )
+
+    target = destination / "config" / "obs-studio" / "global.ini"
+    target.parent.mkdir(parents=True)
+    temporary = obs_bootstrap._transaction_copy_temporary_path(
+        target,
+        "a" * 32,
+    )
+    temporary.write_bytes(b"manual orphan")
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
+    assert temporary.read_bytes() == b"manual orphan"
+
+    temporary.unlink()
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+
+
+def test_copy_progress_cached_clean_result_fails_closed_for_new_reparse(tmp_path):
+    destination = tmp_path / "obs-portable"
+    external = tmp_path / "external"
+    _write_fake_obs(destination, b"clean destination")
+    external.mkdir()
+    external_sentinel = external / "sentinel.bin"
+    external_sentinel.write_bytes(b"do not traverse")
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    _create_directory_link(destination / "linked-external", external)
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
+    assert external_sentinel.read_bytes() == b"do not traverse"
+
+
+def test_copy_progress_cache_rejects_replaced_root_identity(tmp_path):
+    destination = tmp_path / "obs-portable"
+    parked = tmp_path / "parked-obs-portable"
+    _write_fake_obs(destination, b"first root")
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    key = obs_bootstrap._filesystem_path_key(destination)
+    first_identity, first_monitor = (
+        obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE[key]
+    )
+
+    destination.rename(parked)
+    _write_fake_obs(destination, b"replacement root")
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    second_identity, second_monitor = (
+        obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE[key]
+    )
+    assert second_identity != first_identity
+    assert second_monitor is not first_monitor
+    assert first_monitor.closed is True
+
+
+def test_copy_progress_cache_monitor_error_forces_rescan(monkeypatch, tmp_path):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    key = obs_bootstrap._filesystem_path_key(destination)
+    _identity, failed_monitor = obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE[key]
+
+    def fail_poll():
+        raise obs_bootstrap._OBSRecursiveChangeMonitorUnavailable(
+            "simulated notification API failure"
+        )
+
+    monkeypatch.setattr(failed_monitor, "has_changes", fail_poll)
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert failed_monitor.closed is True
+    assert obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE[key][1] is not failed_monitor
+
+
+def test_copy_progress_change_notification_never_validates_a_raced_scan(
+    monkeypatch,
+    tmp_path,
+):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+
+    class SignalledMonitor:
+        def __init__(self):
+            self.closed = False
+            self.watched = []
+
+        def watch_directory(self, directory):
+            self.watched.append(directory.path)
+
+        def has_changes(self):
+            return True
+
+        def close(self):
+            self.closed = True
+
+    monitor = SignalledMonitor()
+    monkeypatch.setattr(
+        obs_bootstrap._OBSRecursiveChangeMonitor,
+        "open",
+        lambda _root: monitor,
+    )
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
+    assert monitor.watched
+    assert monitor.closed is True
+    assert not obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE
+
+
+def test_copy_progress_monitor_registration_failure_uses_legacy_double_scan(
+    monkeypatch,
+    tmp_path,
+):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+
+    class UnavailableMonitor:
+        def __init__(self):
+            self.closed = False
+
+        def watch_directory(self, _directory):
+            raise obs_bootstrap._OBSRecursiveChangeMonitorUnavailable(
+                "simulated watch limit"
+            )
+
+        def close(self):
+            self.closed = True
+
+    monitor = UnavailableMonitor()
+    scandir_calls = 0
+    real_scandir = obs_bootstrap.os.scandir
+
+    def track_scandir(*args, **kwargs):
+        nonlocal scandir_calls
+        scandir_calls += 1
+        return real_scandir(*args, **kwargs)
+
+    monkeypatch.setattr(
+        obs_bootstrap._OBSRecursiveChangeMonitor,
+        "open",
+        lambda _root: monitor,
+    )
+    monkeypatch.setattr(obs_bootstrap.os, "scandir", track_scandir)
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert monitor.closed is True
+    # Two root-journal scans plus the legacy before/after tree inventories.
+    assert scandir_calls >= 4
+    assert not obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE
+
+
+def test_copy_progress_monitor_does_not_block_temporary_rename_or_unlink(tmp_path):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+
+    target = destination / "config" / "obs-studio" / "global.ini"
+    target.parent.mkdir(parents=True)
+    temporary = obs_bootstrap._transaction_write_temporary_path(
+        target,
+        "a" * 32,
+    )
+    temporary.write_bytes(b"rename without blocking")
+    temporary.replace(target)
+    target.unlink()
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert not temporary.exists()
+    assert not target.exists()
+
+
+def test_copy_progress_monitor_does_not_block_actual_migration(tmp_path):
+    source = tmp_path / "legacy"
+    destination = tmp_path / "obs-portable"
+    source_executable = _write_fake_obs(source, b"migrated executable")
+    source_config = source / "config" / "obs-studio" / "global.ini"
+    source_config.parent.mkdir(parents=True)
+    source_config.write_bytes(b"migrated config")
+    destination.mkdir()
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert obs_bootstrap.migrate_legacy_obs_installation(
+        destination,
+        [source],
+    ) == source.resolve()
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    assert (destination / source_executable.relative_to(source)).read_bytes() == (
+        b"migrated executable"
+    )
+    assert (destination / source_config.relative_to(source)).read_bytes() == (
+        b"migrated config"
+    )
+
+
+def test_copy_progress_cached_queries_are_serialized_per_process(tmp_path):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = tuple(
+            executor.map(
+                obs_bootstrap.is_obs_copy_in_progress,
+                (destination,) * 32,
+            )
+        )
+
+    assert results == (False,) * 32
+    assert len(obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE) == 1
+
+
+@pytest.mark.skipif(
+    "fork" not in multiprocessing.get_all_start_methods(),
+    reason="fork後のmonitor cache分離回帰",
+)
+def test_copy_progress_monitor_cache_is_rebuilt_after_fork(tmp_path):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is False
+
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    process = context.Process(
+        target=_query_copy_progress_after_fork,
+        args=(str(destination), result_queue),
+    )
+    process.start()
+    process.join(15)
+    try:
+        assert process.exitcode == 0
+        result, cache_pid, child_pid, cache_size = result_queue.get(timeout=5)
+    finally:
+        result_queue.close()
+        result_queue.join_thread()
+        process.close()
+
+    assert result is False
+    assert cache_pid == child_pid
+    assert child_pid != os.getpid()
+    assert cache_size == 1
+    assert len(obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE) == 1
+
+
+def test_copy_progress_monitor_cache_is_bounded_and_closes_lru_roots(tmp_path):
+    roots = []
+    first_monitor = None
+    for index in range(obs_bootstrap.OBS_COPY_QUERY_MONITOR_CACHE_MAX_ENTRIES + 1):
+        root = tmp_path / f"obs-portable-{index}"
+        _write_fake_obs(root, f"root-{index}".encode())
+        roots.append(root)
+        assert obs_bootstrap.is_obs_copy_in_progress(root) is False
+        if first_monitor is None:
+            first_monitor = obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE[
+                obs_bootstrap._filesystem_path_key(root)
+            ][1]
+
+    assert len(obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE) == (
+        obs_bootstrap.OBS_COPY_QUERY_MONITOR_CACHE_MAX_ENTRIES
+    )
+    assert (
+        obs_bootstrap._filesystem_path_key(roots[0])
+        not in obs_bootstrap._OBS_COPY_QUERY_MONITOR_CACHE
+    )
+    assert first_monitor is not None
+    assert first_monitor.closed is True
+
+
+def test_copy_progress_query_fails_closed_for_unsafe_scanned_name(
+    monkeypatch,
+    tmp_path,
+):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"clean destination")
+    unsafe = destination / "unsafe-entry"
+    unsafe.write_bytes(b"preserve")
+    real_validate = obs_bootstrap._validate_single_path_component
+
+    def reject_sentinel(name):
+        if name == unsafe.name:
+            raise obs_bootstrap._UnsafeOBSMigrationPathError(
+                "simulated unsafe name"
+            )
+        return real_validate(name)
+
+    monkeypatch.setattr(
+        obs_bootstrap,
+        "_validate_single_path_component",
+        reject_sentinel,
+    )
+
+    assert obs_bootstrap.is_obs_copy_in_progress(destination) is True
+    assert unsafe.read_bytes() == b"preserve"
+
+
+def test_copy_progress_large_tree_operation_and_handle_bounds(
+    monkeypatch,
+    tmp_path,
+    record_property,
+):
+    destination = tmp_path / "obs-portable"
+    _write_fake_obs(destination, b"synthetic obs executable")
+    with obs_bootstrap._OBSDirectoryLease.open_absolute(destination) as root_lease:
+        try:
+            support_probe = obs_bootstrap._OBSRecursiveChangeMonitor.open(root_lease)
+        except obs_bootstrap._OBSRecursiveChangeMonitorUnavailable:
+            pytest.skip("recursive change notification is unavailable")
+        support_probe.close()
+
+    other_file_count = 2999
+    group_count = 50
+    for index in range(other_file_count):
+        path = (
+            destination
+            / "config"
+            / "obs-studio"
+            / "basic"
+            / "profiles"
+            / f"profile-{index % group_count:02d}"
+            / f"scene-{index:05d}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f'{{"index":{index}}}\n', encoding="utf-8")
+
+    paths = tuple(destination.rglob("*"))
+    file_count = sum(path.is_file() for path in paths)
+    directory_count = sum(path.is_dir() for path in paths)
+    maximum_relative_depth = max(
+        len(path.relative_to(destination).parts) for path in paths
+    )
+    assert file_count == 3000
+    assert 3000 <= file_count <= 5000
+    assert maximum_relative_depth == 6
+
+    metrics = {}
+
+    def measure(label, expected):
+        before = _query_tree_snapshot(destination)
+        counters = {"scandir": 0, "open_child_directory": 0}
+        handles_start = _process_handle_count()
+        handles_peak = handles_start
+        real_scandir = obs_bootstrap.os.scandir
+        real_open_child = obs_bootstrap._OBSDirectoryLease.open_child_directory
+
+        def sample_handles():
+            nonlocal handles_peak
+            current = _process_handle_count()
+            if current is not None and (
+                handles_peak is None or current > handles_peak
+            ):
+                handles_peak = current
+
+        def track_scandir(*args, **kwargs):
+            counters["scandir"] += 1
+            iterator = real_scandir(*args, **kwargs)
+            sample_handles()
+            return iterator
+
+        def track_open_child(directory, name, *args, **kwargs):
+            counters["open_child_directory"] += 1
+            child = real_open_child(directory, name, *args, **kwargs)
+            sample_handles()
+            return child
+
+        with monkeypatch.context() as patch:
+            patch.setattr(obs_bootstrap.os, "scandir", track_scandir)
+            patch.setattr(
+                obs_bootstrap._OBSDirectoryLease,
+                "open_child_directory",
+                track_open_child,
+            )
+            started = time.perf_counter()
+            actual = obs_bootstrap.is_obs_copy_in_progress(destination)
+            elapsed = time.perf_counter() - started
+            handles_end = _process_handle_count()
+
+        assert actual is expected
+        assert _query_tree_snapshot(destination) == before
+        peak_growth = (
+            None
+            if handles_start is None or handles_peak is None
+            else handles_peak - handles_start
+        )
+        ending_growth = (
+            None
+            if handles_start is None or handles_end is None
+            else handles_end - handles_start
+        )
+        result = {
+            **counters,
+            "elapsed_seconds": elapsed,
+            "process_handle_peak_growth": peak_growth,
+            "process_handle_ending_growth": ending_growth,
+        }
+        metrics[label] = result
+        if peak_growth is not None:
+            assert peak_growth <= maximum_relative_depth + 8
+        if ending_growth is not None:
+            assert ending_growth <= 2
+        return result
+
+    clean_initial = measure("clean_initial", False)
+    clean_cached = measure("clean_cached", False)
+    assert directory_count + 1 <= clean_initial["scandir"] <= directory_count + 3
+    assert clean_initial["open_child_directory"] <= (
+        directory_count + len(destination.resolve().parts) + 2
+    )
+    assert clean_cached["scandir"] == 0
+    assert clean_cached["open_child_directory"] <= (
+        len(destination.resolve().parts) + 2
+    )
+
+    marker = obs_bootstrap.get_obs_copy_in_progress_marker(destination)
+    marker.write_bytes(b"marker")
+    marker_metrics = measure("marker", True)
+    assert marker_metrics["scandir"] == 0
+    marker.unlink()
+
+    lock_path = obs_bootstrap.get_obs_copy_lock_path(destination)
+    lock = obs_bootstrap._OBSInterProcessLock(lock_path)
+    assert lock.acquire() is True
+    try:
+        live_lock_metrics = measure("live_lock", True)
+    finally:
+        lock.release()
+    assert live_lock_metrics["scandir"] == 0
+    lock_path.unlink()
+
+    obs_bootstrap._clear_obs_copy_query_monitor_cache()
+    nested_target = (
+        destination
+        / "config"
+        / "obs-studio"
+        / "basic"
+        / "profiles"
+        / "profile-49"
+        / "nested-state.json"
+    )
+    nested_temporary = obs_bootstrap._transaction_copy_temporary_path(
+        nested_target,
+        "a" * 32,
+    )
+    nested_temporary.write_bytes(b"orphan")
+    nested_metrics = measure("nested_orphan_temporary", True)
+    assert nested_metrics["scandir"] <= directory_count + 3
+    assert nested_temporary.read_bytes() == b"orphan"
+
+    record_property(
+        "obs_copy_progress_query",
+        json.dumps(
+            {
+                "files": file_count,
+                "directories": directory_count,
+                "maximum_relative_depth": maximum_relative_depth,
+                "states": metrics,
+            },
+            sort_keys=True,
+        ),
+    )
 
 
 def test_copy_progress_query_does_not_recreate_lock_after_probe_race(

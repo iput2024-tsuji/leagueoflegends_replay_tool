@@ -7,6 +7,7 @@ import errno
 import hashlib
 import os
 import stat
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +101,10 @@ class _OBSMigrationLockBusyError(RuntimeError):
     pass
 
 
+class _OBSRecursiveChangeMonitorUnavailable(RuntimeError):
+    """Internal signal that the optional query cache cannot be trusted."""
+
+
 if os.name == "nt":
     _WINDOWS_INVALID_HANDLE = ctypes.c_void_p(-1).value
     _WINDOWS_GENERIC_READ = 0x80000000
@@ -141,6 +146,13 @@ if os.name == "nt":
     _WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
     _WINDOWS_GROUP_SECURITY_INFORMATION = 0x00000002
     _WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
+    _WINDOWS_FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001
+    _WINDOWS_FILE_NOTIFY_CHANGE_DIR_NAME = 0x00000002
+    _WINDOWS_FILE_NOTIFY_CHANGE_ATTRIBUTES = 0x00000004
+    _WINDOWS_FILE_NOTIFY_CHANGE_SECURITY = 0x00000100
+    _WINDOWS_WAIT_OBJECT_0 = 0x00000000
+    _WINDOWS_WAIT_TIMEOUT = 0x00000102
+    _WINDOWS_WAIT_FAILED = 0xFFFFFFFF
 
     class _WindowsUnicodeString(ctypes.Structure):
         _fields_ = [
@@ -270,6 +282,19 @@ if os.name == "nt":
     _WINDOWS_KERNEL32.FlushFileBuffers.restype = wintypes.BOOL
     _WINDOWS_KERNEL32.LocalFree.argtypes = [wintypes.HLOCAL]
     _WINDOWS_KERNEL32.LocalFree.restype = wintypes.HLOCAL
+    _WINDOWS_KERNEL32.FindFirstChangeNotificationW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    _WINDOWS_KERNEL32.FindFirstChangeNotificationW.restype = wintypes.HANDLE
+    _WINDOWS_KERNEL32.FindCloseChangeNotification.argtypes = [wintypes.HANDLE]
+    _WINDOWS_KERNEL32.FindCloseChangeNotification.restype = wintypes.BOOL
+    _WINDOWS_KERNEL32.WaitForSingleObject.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+    ]
+    _WINDOWS_KERNEL32.WaitForSingleObject.restype = wintypes.DWORD
     _WINDOWS_NTDLL.NtCreateFile.argtypes = [
         ctypes.POINTER(wintypes.HANDLE),
         wintypes.DWORD,
@@ -307,6 +332,38 @@ if os.name == "nt":
     _WINDOWS_ADVAPI32.GetSecurityInfo.restype = wintypes.DWORD
     _WINDOWS_ADVAPI32.GetSecurityDescriptorLength.argtypes = [wintypes.LPVOID]
     _WINDOWS_ADVAPI32.GetSecurityDescriptorLength.restype = wintypes.DWORD
+
+
+_LINUX_LIBC: Any | None = None
+if os.name != "nt" and sys.platform.startswith("linux"):
+    try:
+        _LINUX_LIBC = ctypes.CDLL(None, use_errno=True)
+        _LINUX_LIBC.inotify_init1.argtypes = [ctypes.c_int]
+        _LINUX_LIBC.inotify_init1.restype = ctypes.c_int
+        _LINUX_LIBC.inotify_add_watch.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+        ]
+        _LINUX_LIBC.inotify_add_watch.restype = ctypes.c_int
+    except (AttributeError, OSError):
+        _LINUX_LIBC = None
+    _LINUX_IN_ATTRIB = 0x00000004
+    _LINUX_IN_MOVED_FROM = 0x00000040
+    _LINUX_IN_MOVED_TO = 0x00000080
+    _LINUX_IN_CREATE = 0x00000100
+    _LINUX_IN_DELETE = 0x00000200
+    _LINUX_IN_DELETE_SELF = 0x00000400
+    _LINUX_IN_MOVE_SELF = 0x00000800
+    _LINUX_RECURSIVE_CHANGE_MASK = (
+        _LINUX_IN_ATTRIB
+        | _LINUX_IN_MOVED_FROM
+        | _LINUX_IN_MOVED_TO
+        | _LINUX_IN_CREATE
+        | _LINUX_IN_DELETE
+        | _LINUX_IN_DELETE_SELF
+        | _LINUX_IN_MOVE_SELF
+    )
 
 
 def _validate_single_path_component(name: str) -> None:
@@ -1450,6 +1507,183 @@ class _OBSDirectoryLease:
             raise ctypes.WinError(error_code)
         os.fsync(self.native_handle)
         return True
+
+
+class _OBSRecursiveChangeMonitor:
+    """Read-only recursive name-change monitor used to validate clean queries.
+
+    The monitor is only an optimization.  Callers must run a complete safety
+    scan after constructing it and may reuse a clean result only while
+    ``has_changes`` remains false.  Any API error makes the monitor unusable;
+    callers then fall back to the uncached double-inventory scan.
+    """
+
+    def __init__(self, *, kind: str, handle: int) -> None:
+        self._kind = kind
+        self._handle = handle
+        self._closed = False
+
+    @classmethod
+    def open(
+        cls,
+        root: _OBSDirectoryLease,
+    ) -> _OBSRecursiveChangeMonitor:
+        root.validate_lexical_binding()
+        if os.name == "nt":
+            notify_filter = (
+                _WINDOWS_FILE_NOTIFY_CHANGE_FILE_NAME
+                | _WINDOWS_FILE_NOTIFY_CHANGE_DIR_NAME
+                | _WINDOWS_FILE_NOTIFY_CHANGE_ATTRIBUTES
+                | _WINDOWS_FILE_NOTIFY_CHANGE_SECURITY
+            )
+            handle = _WINDOWS_KERNEL32.FindFirstChangeNotificationW(
+                str(root.path),
+                True,
+                notify_filter,
+            )
+            handle_value = int(handle) if handle is not None else 0
+            if handle_value in {0, _WINDOWS_INVALID_HANDLE}:
+                raise _OBSRecursiveChangeMonitorUnavailable(
+                    f"recursive change notificationを開始できません: {root.path}"
+                ) from ctypes.WinError(ctypes.get_last_error())
+            monitor = cls(kind="windows", handle=handle_value)
+        elif sys.platform.startswith("linux") and _LINUX_LIBC is not None:
+            flags = int(getattr(os, "O_NONBLOCK", 0)) | int(
+                getattr(os, "O_CLOEXEC", 0)
+            )
+            descriptor = int(_LINUX_LIBC.inotify_init1(flags))
+            if descriptor < 0:
+                error_number = ctypes.get_errno()
+                raise _OBSRecursiveChangeMonitorUnavailable(
+                    f"inotifyを開始できません: {root.path}"
+                ) from OSError(error_number, os.strerror(error_number))
+            monitor = cls(kind="linux", handle=descriptor)
+            try:
+                monitor.watch_directory(root)
+            except Exception:
+                monitor.close()
+                raise
+        else:
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                f"recursive change notificationに未対応です: {sys.platform}"
+            )
+        try:
+            root.validate_lexical_binding()
+        except Exception:
+            monitor.close()
+            raise
+        return monitor
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def watch_directory(self, directory: _OBSDirectoryLease) -> None:
+        """Watch one already-open directory before enumerating its children."""
+
+        if self._closed:
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                "closed recursive change notificationは再利用できません"
+            )
+        if self._kind == "windows":
+            # FindFirstChangeNotificationW watches the full subtree from the
+            # root, so child registration is intentionally a no-op.
+            return
+        if self._kind != "linux":
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                f"未対応のrecursive change monitorです: {self._kind}"
+            )
+        directory.validate_lexical_binding()
+        descriptor_path = f"/proc/self/fd/{directory.native_handle}"
+        if not Path(descriptor_path).exists():
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                f"open directory handleをinotifyへ登録できません: {directory.path}"
+            )
+        watch_descriptor = int(
+            # _kind="linux" is created only after the libc symbols exist.
+            _LINUX_LIBC.inotify_add_watch(
+                self._handle,
+                os.fsencode(descriptor_path),
+                _LINUX_RECURSIVE_CHANGE_MASK,
+            )
+        )
+        if watch_descriptor < 0:
+            error_number = ctypes.get_errno()
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                f"directoryをinotifyへ登録できません: {directory.path}"
+            ) from OSError(error_number, os.strerror(error_number))
+        directory.validate_lexical_binding()
+
+    def has_changes(self) -> bool:
+        """Return true for every signal, overflow, ignored watch, or removal."""
+
+        if self._closed:
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                "closed recursive change notificationは検査できません"
+            )
+        if self._kind == "windows":
+            result = int(
+                _WINDOWS_KERNEL32.WaitForSingleObject(
+                    wintypes.HANDLE(self._handle),
+                    0,
+                )
+            )
+            if result == _WINDOWS_WAIT_OBJECT_0:
+                # Do not re-arm a signalled monitor.  The cache discards it and
+                # creates a fresh monitor before the next complete scan, which
+                # removes the FindNextChangeNotification race window.
+                return True
+            if result == _WINDOWS_WAIT_TIMEOUT:
+                return False
+            if result == _WINDOWS_WAIT_FAILED:
+                error = ctypes.WinError(ctypes.get_last_error())
+            else:
+                error = OSError(f"unexpected wait result: {result}")
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                "recursive change notificationを検査できません"
+            ) from error
+        if self._kind != "linux":
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                f"未対応のrecursive change monitorです: {self._kind}"
+            )
+        changed = False
+        while True:
+            try:
+                payload = os.read(self._handle, 64 * 1024)
+            except BlockingIOError:
+                break
+            except OSError as exc:
+                raise _OBSRecursiveChangeMonitorUnavailable(
+                    "inotify eventを検査できません"
+                ) from exc
+            if not payload:
+                raise _OBSRecursiveChangeMonitorUnavailable(
+                    "inotify descriptorが予期せずEOFになりました"
+                )
+            # Any event invalidates the cache.  This includes IN_Q_OVERFLOW and
+            # IN_IGNORED, so a lost/removed watch can never validate absence.
+            changed = True
+        return changed
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        handle = self._handle
+        if self._kind == "windows":
+            if not _WINDOWS_KERNEL32.FindCloseChangeNotification(
+                wintypes.HANDLE(handle)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        else:
+            os.close(handle)
+        self._handle = -1
+        self._closed = True
+
+    def __enter__(self) -> _OBSRecursiveChangeMonitor:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
 
 def _posix_mount_id_for_descriptor(descriptor: int, *, path: Path) -> int | None:

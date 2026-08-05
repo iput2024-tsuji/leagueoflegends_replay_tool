@@ -17,6 +17,7 @@ import struct
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import types
 import zipfile
 from collections import Counter
@@ -38,6 +39,7 @@ from scripts.collect_licenses import (
 from scripts.external_runtime_policy import is_user_provided_runtime_path
 from scripts.pyinstaller_runtime_policy import (
     RUNTIME_POLICY_AUDIT_FILENAME,
+    RUNTIME_POLICY_NAME,
     is_root_vcomp_name,
     is_windows_os_runtime_name,
     validate_windows_runtime_policy_audit,
@@ -45,6 +47,10 @@ from scripts.pyinstaller_runtime_policy import (
 from src.license_info import validate_distribution_documents
 
 MANIFEST_RELATIVE_PATH = "licenses/distribution-manifest.json"
+RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH = (
+    "licenses/windows-runtime-policy-attestation.json"
+)
+RUNTIME_POLICY_ATTESTATION_SCHEMA_VERSION = 1
 GENERATED_ROOT_DOCUMENTS = {
     "LICENSE",
     "QT_RELINKING.md",
@@ -89,6 +95,17 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_json_sha256(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -153,6 +170,19 @@ def _component_entries(lock: dict[str, Any]) -> list[dict[str, Any]]:
     entries.extend(lock.get("build_components", []))
     entries.extend(lock.get("installer_components", []))
     return entries
+
+
+def _locked_component_version(lock: dict[str, Any], component_name: str) -> str:
+    matches = [
+        component.get("version")
+        for component in _component_entries(lock)
+        if component.get("component") == component_name
+    ]
+    if len(matches) != 1 or not isinstance(matches[0], str) or not matches[0]:
+        raise ValueError(
+            f"Component lock must contain exactly one version for {component_name}."
+        )
+    return matches[0]
 
 
 def _components_by_distribution(
@@ -2476,6 +2506,9 @@ def _validate_pyinstaller_build(
                 "raw_inventory_sha256": runtime_policy_summary[
                     "raw_inventory_sha256"
                 ],
+                "policy_result_sha256": runtime_policy_summary[
+                    "policy_result_sha256"
+                ],
                 "normalized_raw_inventory_sha256": runtime_policy_summary[
                     "normalized_raw_inventory_sha256"
                 ],
@@ -2764,6 +2797,7 @@ def _allowed_generated_files(
         *GENERATED_ROOT_DOCUMENTS,
         "licenses/components.json",
         "licenses/python-packages.json",
+        RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH,
         *_package_license_paths(package_manifest),
     }
     if package_manifest and isinstance(
@@ -3374,6 +3408,76 @@ def _release_gate_errors(
     return errors
 
 
+def _runtime_policy_attestation_payload(
+    pyinstaller_summary: dict[str, Any],
+) -> dict[str, Any]:
+    runtime_audit = pyinstaller_summary.get("runtime_policy_audit")
+    binding = pyinstaller_summary.get("provenance_binding")
+    if not isinstance(runtime_audit, dict) or not isinstance(binding, dict):
+        raise ValueError(
+            "PyInstaller runtime policy audit binding is unavailable for "
+            "attestation."
+        )
+    payload: dict[str, Any] = {
+        "schema_version": RUNTIME_POLICY_ATTESTATION_SCHEMA_VERSION,
+        "statement": (
+            "This sanitized build attestation binds the PyInstaller runtime "
+            "policy decision to the Analysis and COLLECT inventories. Its file "
+            "SHA256 is included in the finished distribution and can therefore "
+            "be sealed by the later Release asset SHA256."
+        ),
+        "runtime_policy_audit": runtime_audit,
+        "provenance_binding": binding,
+    }
+    payload["payload_sha256"] = _canonical_json_sha256(payload)
+    return payload
+
+
+def _write_json_atomically(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write(encoded)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_name = temporary.name
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name is not None:
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _write_runtime_policy_attestation(
+    distribution_root: Path,
+    pyinstaller_summary: dict[str, Any],
+) -> dict[str, Any]:
+    payload = _runtime_policy_attestation_payload(pyinstaller_summary)
+    path = distribution_root / RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH
+    _write_json_atomically(path, payload)
+    attested = dict(pyinstaller_summary)
+    attested["runtime_policy_attestation"] = {
+        "path": RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH,
+        "size": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "payload_sha256": payload["payload_sha256"],
+    }
+    return attested
+
+
 def _write_distribution_manifest(
     distribution_root: Path,
     component_lock: dict[str, Any],
@@ -3383,6 +3487,10 @@ def _write_distribution_manifest(
     package_manifest: dict[str, Any],
     pyinstaller_summary: dict[str, Any],
 ) -> Path:
+    pyinstaller_summary = _write_runtime_policy_attestation(
+        distribution_root,
+        pyinstaller_summary,
+    )
     toc_by_path = {entry["path"].casefold(): entry for entry in toc_entries}
     files = []
     for collision_key, path in sorted(
@@ -3446,11 +3554,14 @@ def _write_distribution_manifest(
 def _validate_runtime_policy_manifest_binding(
     pyinstaller_summary: dict[str, Any],
     package_manifest: dict[str, Any],
+    component_lock: dict[str, Any],
+    distribution_root: Path,
+    physical: dict[str, Path],
+    manifest_records: list[dict[str, Any]],
+    toc_entries: list[dict[str, str]] | None,
 ) -> list[str]:
     runtime_audit = pyinstaller_summary.get("runtime_policy_audit")
     binding = pyinstaller_summary.get("provenance_binding")
-    if runtime_audit is None and binding is None:
-        return []
     errors: list[str] = []
     if not isinstance(runtime_audit, dict) or not isinstance(binding, dict):
         return [
@@ -3472,6 +3583,21 @@ def _validate_runtime_policy_manifest_binding(
     }
     if set(runtime_audit) != expected_runtime_keys:
         errors.append("Distribution manifest runtime policy structure changed.")
+    if runtime_audit.get("policy") != RUNTIME_POLICY_NAME:
+        errors.append("Distribution manifest runtime policy identifier differs.")
+    try:
+        expected_pyinstaller_version = _locked_component_version(
+            component_lock,
+            "pyinstaller",
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
+        expected_pyinstaller_version = None
+    if runtime_audit.get("pyinstaller_version") != expected_pyinstaller_version:
+        errors.append(
+            "Distribution manifest runtime policy PyInstaller version differs "
+            "from the component lock."
+        )
     artifact = runtime_audit.get("artifact")
     if not isinstance(artifact, dict):
         errors.append("Distribution manifest runtime policy artifact is missing.")
@@ -3685,14 +3811,7 @@ def _validate_runtime_policy_manifest_binding(
             errors.append(
                 "Distribution manifest runtime policy normalized exclusion differs."
             )
-    normalized_digest = hashlib.sha256(
-        json.dumps(
-            raw_records,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    normalized_digest = _canonical_json_sha256(raw_records)
     if runtime_audit.get("normalized_raw_inventory_sha256") != normalized_digest:
         errors.append(
             "Distribution manifest runtime policy normalized raw SHA256 differs."
@@ -3704,6 +3823,7 @@ def _validate_runtime_policy_manifest_binding(
         "runtime_policy_audit_sha256": artifact.get("sha256"),
         "runtime_policy_payload_sha256": artifact.get("payload_sha256"),
         "raw_inventory_sha256": runtime_audit.get("raw_inventory_sha256"),
+        "policy_result_sha256": runtime_audit.get("policy_result_sha256"),
         "normalized_raw_inventory_sha256": runtime_audit.get(
             "normalized_raw_inventory_sha256"
         ),
@@ -3725,6 +3845,156 @@ def _validate_runtime_policy_manifest_binding(
         errors.append(
             "Distribution manifest runtime policy external provenance binding differs."
         )
+
+    manifest_binaries: dict[str, dict[str, Any]] = {}
+    for record in manifest_records:
+        if record.get("toc_type") not in {"BINARY", "EXTENSION"}:
+            continue
+        destination = _safe_relative(record.get("toc_name"))
+        relative = _safe_relative(record.get("path"))
+        if destination is None or relative != f"_internal/{destination}":
+            errors.append(
+                "Distribution manifest retained COLLECT binary path is invalid."
+            )
+            continue
+        key = destination.casefold()
+        if key in manifest_binaries:
+            errors.append(
+                "Distribution manifest retained COLLECT binary destination is "
+                f"duplicated: {destination}"
+            )
+            continue
+        manifest_binaries[key] = record
+
+    retained_records = {
+        str(record.get("destination")).casefold(): record
+        for record in raw_records
+        if isinstance(record, dict)
+        and record.get("decision") == "retained"
+        and _safe_relative(record.get("destination")) is not None
+    }
+    if set(retained_records) != set(manifest_binaries):
+        errors.append(
+            "Distribution manifest retained runtime set differs from COLLECT "
+            "binary records."
+        )
+    for key, record in retained_records.items():
+        manifest_record = manifest_binaries.get(key)
+        if manifest_record is None:
+            continue
+        destination = str(record["destination"])
+        final_path = f"_internal/{destination}"
+        physical_path = physical.get(final_path.casefold())
+        if (
+            manifest_record.get("toc_name") != destination
+            or manifest_record.get("toc_type") != record.get("type")
+            or manifest_record.get("size") != record.get("size")
+            or manifest_record.get("sha256") != record.get("sha256")
+        ):
+            errors.append(
+                "Distribution manifest retained runtime metadata differs from "
+                f"COLLECT: {destination}"
+            )
+        if physical_path is None:
+            errors.append(
+                "Distribution manifest retained runtime is missing from the "
+                f"finished distribution: {destination}"
+            )
+        elif (
+            physical_path.relative_to(distribution_root).as_posix() != final_path
+            or physical_path.stat().st_size != record.get("size")
+            or sha256_file(physical_path) != record.get("sha256")
+        ):
+            errors.append(
+                "Distribution manifest retained runtime differs from the finished "
+                f"distribution: {destination}"
+            )
+
+    for record in raw_records:
+        if not isinstance(record, dict) or record.get("decision") != "excluded":
+            continue
+        destination = _safe_relative(record.get("destination"))
+        if destination is None:
+            continue
+        final_key = f"_internal/{destination}".casefold()
+        if final_key in physical or destination.casefold() in manifest_binaries:
+            errors.append(
+                "Distribution manifest excluded runtime is present in the finished "
+                f"distribution: {destination}"
+            )
+
+    if toc_entries is not None:
+        collect_binaries: dict[str, dict[str, str]] = {}
+        for entry in toc_entries:
+            if entry.get("type") not in {"BINARY", "EXTENSION"}:
+                continue
+            destination = _safe_relative(entry.get("toc_name"))
+            if destination is None:
+                errors.append("PyInstaller COLLECT binary destination is unsafe.")
+                continue
+            key = destination.casefold()
+            if key in collect_binaries:
+                errors.append(
+                    f"PyInstaller COLLECT binary destination is duplicated: {destination}"
+                )
+                continue
+            collect_binaries[key] = entry
+        if set(collect_binaries) != set(retained_records):
+            errors.append(
+                "PyInstaller runtime policy retained set differs from the exact "
+                "COLLECT TOC binary set."
+            )
+        for key, record in retained_records.items():
+            entry = collect_binaries.get(key)
+            if entry is None:
+                continue
+            source = Path(entry["source"])
+            if (
+                entry.get("toc_name") != record.get("destination")
+                or entry.get("type") != record.get("type")
+                or entry.get("path") != f"_internal/{record['destination']}"
+                or not is_safe_regular_file(source)
+                or source.stat().st_size != record.get("size")
+                or sha256_file(source) != record.get("sha256")
+            ):
+                errors.append(
+                    "PyInstaller runtime policy retained metadata differs from "
+                    f"the exact COLLECT TOC: {record.get('destination')}"
+                )
+
+    attestation = pyinstaller_summary.get("runtime_policy_attestation")
+    expected_attestation_keys = {"path", "size", "sha256", "payload_sha256"}
+    if not isinstance(attestation, dict) or set(attestation) != expected_attestation_keys:
+        errors.append(
+            "Distribution manifest runtime policy attestation metadata is missing "
+            "or invalid."
+        )
+    else:
+        attestation_path = distribution_root / RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH
+        expected_payload = _runtime_policy_attestation_payload(pyinstaller_summary)
+        if attestation.get("path") != RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH:
+            errors.append("Distribution manifest runtime policy attestation path differs.")
+        try:
+            actual_payload = _read_json(attestation_path)
+            actual_size = attestation_path.stat().st_size
+            actual_sha256 = sha256_file(attestation_path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            errors.append(f"Cannot verify runtime policy attestation: {exc}")
+        else:
+            if actual_payload != expected_payload:
+                errors.append(
+                    "Distribution runtime policy attestation payload differs from "
+                    "the manifest."
+                )
+            if (
+                attestation.get("size") != actual_size
+                or attestation.get("sha256") != actual_sha256
+                or attestation.get("payload_sha256")
+                != expected_payload["payload_sha256"]
+            ):
+                errors.append(
+                    "Distribution runtime policy attestation identity differs."
+                )
     return errors
 
 
@@ -3781,15 +4051,6 @@ def _validate_existing_distribution_manifest(
     recorded_pyinstaller = payload.get("pyinstaller_build")
     if not isinstance(recorded_pyinstaller, dict):
         errors.append("Distribution manifest complete PyInstaller inventory is missing.")
-    else:
-        errors.extend(
-            _validate_runtime_policy_manifest_binding(
-                recorded_pyinstaller,
-                package_manifest,
-            )
-        )
-        if pyinstaller_summary is not None and recorded_pyinstaller != pyinstaller_summary:
-            errors.append("Distribution manifest PyInstaller inventory does not match.")
 
     records = payload.get("files")
     if not isinstance(records, list):
@@ -3860,6 +4121,28 @@ def _validate_existing_distribution_manifest(
             or record.get("toc_type") != toc_entry["type"]
         ):
             errors.append(f"Manifest TOC metadata differs for: {relative}")
+
+    if isinstance(recorded_pyinstaller, dict):
+        errors.extend(
+            _validate_runtime_policy_manifest_binding(
+                recorded_pyinstaller,
+                package_manifest,
+                component_lock,
+                distribution_root,
+                physical,
+                [record for record in records if isinstance(record, dict)],
+                toc_entries,
+            )
+        )
+        if pyinstaller_summary is not None:
+            expected_pyinstaller = dict(pyinstaller_summary)
+            expected_pyinstaller["runtime_policy_attestation"] = (
+                recorded_pyinstaller.get("runtime_policy_attestation")
+            )
+            if recorded_pyinstaller != expected_pyinstaller:
+                errors.append(
+                    "Distribution manifest PyInstaller inventory does not match."
+                )
 
     for key, path in physical.items():
         if key not in recorded:

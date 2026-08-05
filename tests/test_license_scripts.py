@@ -7,6 +7,7 @@ import marshal
 import os
 import shutil
 import struct
+import subprocess
 import sys
 import sysconfig
 import types
@@ -20,6 +21,7 @@ import pytest
 from scripts import (
     check_license_compliance as compliance,
     collect_licenses as license_collector,
+    installer_content_audit,
     pyinstaller_runtime_policy as runtime_policy,
 )
 from scripts.check_license_compliance import (
@@ -90,6 +92,55 @@ def _verified_stdlib_pyc(
     )
 
 
+def _synthetic_runtime_policy_summary(
+    root: Path,
+    package_manifest: dict[str, object],
+    *,
+    raw_records: list[dict[str, object]] | None = None,
+    collect_toc_sha256: str = "0" * 64,
+) -> dict[str, object]:
+    records = [] if raw_records is None else raw_records
+    normalized_digest = runtime_policy._canonical_json_sha256(records)
+    summary: dict[str, object] = {
+        "toc_files": {
+            "Analysis-00.toc": {"sha256": "1" * 64},
+            "COLLECT-00.toc": {"sha256": collect_toc_sha256},
+        },
+        "runtime_policy_audit": {
+            "artifact": {
+                "filename": runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME,
+                "size": 1,
+                "sha256": "2" * 64,
+                "payload_sha256": "3" * 64,
+            },
+            "policy": runtime_policy.RUNTIME_POLICY_NAME,
+            "pyinstaller_version": "6.18.0",
+            "raw_inventory_sha256": normalized_digest,
+            "policy_result_sha256": normalized_digest,
+            "normalized_raw_inventory_sha256": normalized_digest,
+            "raw_binary_count": len(records),
+            "retained_binary_count": len(records),
+            "excluded_binary_count": 0,
+            "allowed_source_boundaries": [],
+            "excluded_binaries": [],
+            "raw_binaries": records,
+        },
+        "provenance_binding": {
+            "runtime_policy_audit_sha256": "2" * 64,
+            "runtime_policy_payload_sha256": "3" * 64,
+            "raw_inventory_sha256": normalized_digest,
+            "policy_result_sha256": normalized_digest,
+            "normalized_raw_inventory_sha256": normalized_digest,
+            "analysis_toc_sha256": "1" * 64,
+            "collect_toc_sha256": collect_toc_sha256,
+            "build_provenance_sha256": package_manifest.get(
+                "build_provenance_sha256"
+            ),
+        },
+    }
+    return compliance._write_runtime_policy_attestation(root, summary)
+
+
 def _write_existing_inventory(root: Path) -> Path:
     manifest_path = root / compliance.MANIFEST_RELATIVE_PATH
     package_manifest = json.loads(
@@ -114,6 +165,10 @@ def _write_existing_inventory(root: Path) -> Path:
     )
     assert base_errors == []
     assert base_summary is not None
+    pyinstaller_summary = _synthetic_runtime_policy_summary(
+        root,
+        package_manifest,
+    )
     files = []
     for path in root.rglob("*"):
         if path.is_file() and path != manifest_path:
@@ -140,7 +195,7 @@ def _write_existing_inventory(root: Path) -> Path:
                     root / "licenses" / "components.json"
                 ),
                 "pyinstaller_collect_toc_sha256": "0" * 64,
-                "pyinstaller_build": {"test_fixture": True},
+                "pyinstaller_build": pyinstaller_summary,
                 "python_base_library": base_summary,
                 "files": files,
             },
@@ -1355,10 +1410,30 @@ def test_toc_and_dist_are_bidirectionally_inventoried(monkeypatch, tmp_path):
         "_distribution_source_owners",
         lambda _lock: (owners, []),
     )
+    package_manifest = json.loads(
+        (root / "licenses" / "python-packages.json").read_text(encoding="utf-8")
+    )
+    pyinstaller_summary = _synthetic_runtime_policy_summary(
+        root,
+        package_manifest,
+        raw_records=[
+            {
+                "raw_index": 0,
+                "destination": "aiohttp/_demo.pyd",
+                "source": "aiohttp/Lib/site-packages/aiohttp/_demo.pyd",
+                "source_component": "aiohttp",
+                "type": "EXTENSION",
+                "size": native_source.stat().st_size,
+                "sha256": sha256_file(native_source),
+                "decision": "retained",
+            }
+        ],
+        collect_toc_sha256=sha256_file(toc),
+    )
     monkeypatch.setattr(
         compliance,
         "_validate_pyinstaller_build",
-        lambda *_args, **_kwargs: ([], {"test_fixture": True}),
+        lambda *_args, **_kwargs: ([], pyinstaller_summary),
     )
 
     assert validate_distribution(
@@ -1478,6 +1553,43 @@ def test_existing_distribution_manifest_detects_missing_record(tmp_path):
 
     assert any(
         "missing from manifest" in error for error in validate_distribution(root)
+    )
+
+
+def test_current_manifest_requires_runtime_policy_audit_and_binding(tmp_path):
+    root = tmp_path / "distribution"
+    _write_distribution_materials(root)
+    manifest_path = _write_existing_inventory(root)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["pyinstaller_build"].pop("runtime_policy_audit")
+    payload["pyinstaller_build"].pop("provenance_binding")
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    errors = validate_distribution(root)
+
+    assert any("runtime policy audit binding is incomplete" in error for error in errors)
+
+
+def test_installer_audit_rejects_matching_payloads_without_runtime_policy_binding(
+    tmp_path,
+):
+    distribution = tmp_path / "distribution"
+    installed = tmp_path / "installed"
+    _write_distribution_materials(distribution)
+    manifest_path = _write_existing_inventory(distribution)
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["pyinstaller_build"].pop("runtime_policy_audit")
+    payload["pyinstaller_build"].pop("provenance_binding")
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    shutil.copytree(distribution, installed)
+
+    errors = installer_content_audit.audit_installer_payload(
+        distribution,
+        installed,
+    )
+
+    assert any(
+        "runtime policy audit binding is incomplete" in error for error in errors
     )
 
 
@@ -2081,6 +2193,148 @@ def test_windows_runtime_policy_fails_closed_for_unapproved_same_name_source(
         )
 
 
+def test_windows_runtime_policy_source_boundaries_are_unique_and_stable(tmp_path):
+    windows_root = tmp_path / "Windows"
+    universal_sdk = tmp_path / "Kits" / "Universal"
+    windows_sdk = tmp_path / "Kits" / "Windows"
+    distinct = runtime_policy.allowed_windows_runtime_source_boundaries(
+        {
+            "SystemRoot": str(windows_root),
+            "UniversalCRTSdkDir": str(universal_sdk),
+            "WindowsSdkDir": str(windows_sdk),
+        }
+    )
+    assert [name for name, _path in distinct] == [
+        "windows-system32",
+        "windows-sdk-ucrt-redist-universal-crt-sdk",
+        "windows-sdk-ucrt-redist-windows-sdk",
+    ]
+
+    same = runtime_policy.allowed_windows_runtime_source_boundaries(
+        {
+            "SystemRoot": str(windows_root),
+            "UniversalCRTSdkDir": str(universal_sdk),
+            "WindowsSdkDir": str(universal_sdk),
+        }
+    )
+    assert [name for name, _path in same] == [
+        "windows-system32",
+        "windows-sdk-ucrt-redist",
+    ]
+
+    case_variant = runtime_policy.allowed_windows_runtime_source_boundaries(
+        {
+            "SystemRoot": str(windows_root),
+            "UniversalCRTSdkDir": str(universal_sdk),
+            "WindowsSdkDir": str(universal_sdk).upper(),
+        }
+    )
+    assert [name for name, _path in case_variant] == [
+        "windows-system32",
+        "windows-sdk-ucrt-redist",
+    ]
+
+
+def test_windows_runtime_policy_rejects_ambiguous_explicit_boundaries(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    assert runtime_policy._normalized_source_boundaries(
+        [("same", first), ("same", first)]
+    ) == [("same", first.resolve())]
+
+    with pytest.raises(RuntimeError, match="name refers to different paths"):
+        runtime_policy._normalized_source_boundaries(
+            [("same", first), ("same", second)]
+        )
+    with pytest.raises(RuntimeError, match="path has different names"):
+        runtime_policy._normalized_source_boundaries(
+            [("first", first), ("second", first)]
+        )
+    with pytest.raises(RuntimeError, match="Overlapping"):
+        runtime_policy._normalized_source_boundaries(
+            [("parent", first), ("child", first / "nested")]
+        )
+
+
+def test_windows_runtime_policy_rejects_leaf_reparse_source(tmp_path):
+    target = _write_runtime_binary(tmp_path / "target.dll", b"target")
+    link = tmp_path / "linked.dll"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(
+            "Creating a file symlink/reparse point is unavailable on this "
+            f"runner: {exc}"
+        )
+
+    with pytest.raises(RuntimeError, match="regular non-reparse file"):
+        runtime_policy.apply_windows_runtime_policy(
+            [("linked.dll", str(link), "BINARY"), _locked_wheel_vcomp(tmp_path)]
+        )
+
+
+def test_windows_runtime_policy_rejects_parent_reparse_boundary_escape(tmp_path):
+    approved = tmp_path / "approved"
+    approved.mkdir()
+    outside = tmp_path / "outside"
+    source = _write_runtime_binary(outside / "ucrtbase.dll", b"outside")
+    linked_parent = approved / "redirected"
+    try:
+        linked_parent.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        if os.name != "nt" or shutil.which("cmd") is None:
+            pytest.skip(
+                "Creating a directory symlink/reparse point is unavailable on "
+                f"this runner: {exc}"
+            )
+        junction = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(linked_parent), str(outside)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if junction.returncode != 0:
+            pytest.skip(
+                "Creating a parent junction is unavailable on this runner: "
+                f"{junction.stderr.strip() or junction.stdout.strip()}"
+            )
+
+    with pytest.raises(RuntimeError, match="unapproved source"):
+        runtime_policy.apply_windows_runtime_policy(
+            [
+                ("ucrtbase.dll", str(linked_parent / source.name), "BINARY"),
+                _locked_wheel_vcomp(tmp_path),
+            ],
+            source_boundaries=[("approved", approved)],
+        )
+    linked_parent.rmdir()
+
+
+def test_windows_runtime_policy_rejects_source_replacement_while_hashing(
+    monkeypatch,
+    tmp_path,
+):
+    source = _write_runtime_binary(tmp_path / "demo.pyd", b"original")
+    replacement = _write_runtime_binary(
+        tmp_path / "replacement.pyd",
+        b"replacement has a different identity and size",
+    )
+    original_hash = runtime_policy._sha256_file
+
+    def replace_after_hash(path):
+        digest = original_hash(path)
+        if path == source.resolve():
+            os.replace(replacement, source)
+        return digest
+
+    monkeypatch.setattr(runtime_policy, "_sha256_file", replace_after_hash)
+
+    with pytest.raises(RuntimeError, match="changed while hashing"):
+        runtime_policy.apply_windows_runtime_policy(
+            [("demo.pyd", str(source), "EXTENSION"), _locked_wheel_vcomp(tmp_path)]
+        )
+
+
 def test_windows_runtime_policy_audit_detects_source_and_payload_tampering(
     tmp_path,
 ):
@@ -2208,8 +2462,16 @@ def test_private_analysis_contract_fails_on_shape_or_saved_toc_change(tmp_path):
         runtime_policy.apply_windows_runtime_policy_to_analysis(valid)
 
 
-def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance():
+def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance(
+    tmp_path,
+):
     package_manifest = {"build_provenance_sha256": "a" * 64}
+    retained_path = _write_runtime_binary(
+        tmp_path / "_internal" / "sklearn" / ".libs" / "vcomp140.dll",
+        b"locked wheel vcomp",
+    )
+    retained_size = retained_path.stat().st_size
+    retained_sha256 = sha256_file(retained_path)
     artifact = {
         "filename": runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME,
         "size": 123,
@@ -2234,8 +2496,8 @@ def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance():
             "source": "scikit-learn/Lib/site-packages/sklearn/.libs/vcomp140.dll",
             "source_component": "microsoft-vc-runtime",
             "type": "BINARY",
-            "size": 34,
-            "sha256": "1" * 64,
+            "size": retained_size,
+            "sha256": retained_sha256,
             "decision": "retained",
         },
     ]
@@ -2281,6 +2543,7 @@ def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance():
             "runtime_policy_audit_sha256": "b" * 64,
             "runtime_policy_payload_sha256": "c" * 64,
             "raw_inventory_sha256": "d" * 64,
+            "policy_result_sha256": "e" * 64,
             "normalized_raw_inventory_sha256": normalized_digest,
             "analysis_toc_sha256": "2" * 64,
             "collect_toc_sha256": "3" * 64,
@@ -2288,10 +2551,66 @@ def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance():
         },
     }
 
-    assert compliance._validate_runtime_policy_manifest_binding(
-        summary,
-        package_manifest,
-    ) == []
+    summary = compliance._write_runtime_policy_attestation(tmp_path, summary)
+    manifest_records = [
+        {
+            "path": "_internal/sklearn/.libs/vcomp140.dll",
+            "size": retained_size,
+            "sha256": retained_sha256,
+            "component": "microsoft-vc-runtime",
+            "toc_name": "sklearn/.libs/vcomp140.dll",
+            "toc_type": "BINARY",
+        },
+        {
+            "path": compliance.RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH,
+            "size": (
+                tmp_path / compliance.RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH
+            ).stat().st_size,
+            "sha256": sha256_file(
+                tmp_path / compliance.RUNTIME_POLICY_ATTESTATION_RELATIVE_PATH
+            ),
+            "component": "license-materials",
+        },
+    ]
+    physical = compliance._physical_files(tmp_path)
+    collect_entries = [
+        {
+            "toc_name": "sklearn/.libs/vcomp140.dll",
+            "path": "_internal/sklearn/.libs/vcomp140.dll",
+            "source": str(retained_path),
+            "type": "BINARY",
+        }
+    ]
+
+    def validate(candidate):
+        return compliance._validate_runtime_policy_manifest_binding(
+            candidate,
+            package_manifest,
+            _component_lock(),
+            tmp_path,
+            physical,
+            manifest_records,
+            collect_entries,
+        )
+
+    assert validate(summary) == []
+
+    wrong_policy = copy.deepcopy(summary)
+    wrong_policy["runtime_policy_audit"]["policy"] = "allow-all"
+    assert any("policy identifier differs" in error for error in validate(wrong_policy))
+
+    wrong_version = copy.deepcopy(summary)
+    wrong_version["runtime_policy_audit"]["pyinstaller_version"] = "0.0.0"
+    assert any(
+        "PyInstaller version differs" in error for error in validate(wrong_version)
+    )
+
+    unbound_result = copy.deepcopy(summary)
+    unbound_result["provenance_binding"]["policy_result_sha256"] = "0" * 64
+    assert any(
+        "external provenance binding differs" in error
+        for error in validate(unbound_result)
+    )
 
     leaked = copy.deepcopy(summary)
     leaked["runtime_policy_audit"]["excluded_binaries"][0]["source"] = (
@@ -2299,20 +2618,14 @@ def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance():
     )
     assert any(
         "exclusion source is unsafe" in error
-        for error in compliance._validate_runtime_policy_manifest_binding(
-            leaked,
-            package_manifest,
-        )
+        for error in validate(leaked)
     )
 
     unbound = copy.deepcopy(summary)
     unbound["provenance_binding"]["build_provenance_sha256"] = "0" * 64
     assert any(
         "external provenance binding differs" in error
-        for error in compliance._validate_runtime_policy_manifest_binding(
-            unbound,
-            package_manifest,
-        )
+        for error in validate(unbound)
     )
 
     extra_path = copy.deepcopy(summary)
@@ -2321,8 +2634,37 @@ def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance():
     ] = r"C:\runner\venv\sklearn\.libs\vcomp140.dll"
     assert any(
         "normalized raw structure changed" in error
-        for error in compliance._validate_runtime_policy_manifest_binding(
-            extra_path,
-            package_manifest,
-        )
+        for error in validate(extra_path)
+    )
+
+    rewritten = copy.deepcopy(summary)
+    rewritten_raw = rewritten["runtime_policy_audit"]["raw_binaries"]
+    rewritten_raw[1]["sha256"] = "0" * 64
+    rewritten_digest = runtime_policy._canonical_json_sha256(rewritten_raw)
+    rewritten["runtime_policy_audit"][
+        "normalized_raw_inventory_sha256"
+    ] = rewritten_digest
+    rewritten["provenance_binding"][
+        "normalized_raw_inventory_sha256"
+    ] = rewritten_digest
+    rewritten_errors = validate(rewritten)
+    assert any("retained runtime metadata differs" in error for error in rewritten_errors)
+    assert any("attestation payload differs" in error for error in rewritten_errors)
+
+    excluded_path = _write_runtime_binary(
+        tmp_path / "_internal" / "VCOMP140.DLL",
+        b"must not be distributed",
+    )
+    assert excluded_path.is_file()
+    errors_with_excluded = compliance._validate_runtime_policy_manifest_binding(
+        summary,
+        package_manifest,
+        _component_lock(),
+        tmp_path,
+        compliance._physical_files(tmp_path),
+        manifest_records,
+        collect_entries,
+    )
+    assert any(
+        "excluded runtime is present" in error for error in errors_with_excluded
     )

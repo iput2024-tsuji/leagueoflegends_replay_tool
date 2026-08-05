@@ -209,6 +209,56 @@ def _resolved_boundary(name: str, path: Path) -> SourceBoundary:
     return name, path.resolve(strict=False)
 
 
+def _boundary_path_key(path: Path) -> tuple[str, ...]:
+    """Return a Windows-case-insensitive identity for a resolved boundary."""
+
+    return tuple(part.casefold() for part in path.parts)
+
+
+def _normalized_source_boundaries(
+    boundaries: Iterable[SourceBoundary],
+) -> list[SourceBoundary]:
+    """Resolve source boundaries and reject ambiguous names or path scopes."""
+
+    result: list[SourceBoundary] = []
+    names: dict[str, tuple[str, ...]] = {}
+    paths: dict[tuple[str, ...], str] = {}
+    for raw_name, raw_path in boundaries:
+        name, path = _resolved_boundary(raw_name, Path(raw_path))
+        name_key = name.casefold()
+        path_key = _boundary_path_key(path)
+        existing_name_path = names.get(name_key)
+        existing_path_name = paths.get(path_key)
+        if (
+            existing_name_path == path_key
+            and existing_path_name is not None
+            and existing_path_name.casefold() == name_key
+        ):
+            continue
+        if existing_name_path is not None:
+            raise RuntimeError(
+                "Duplicate Windows runtime source boundary name refers to "
+                f"different paths: {name}"
+            )
+        if existing_path_name is not None:
+            raise RuntimeError(
+                "Duplicate Windows runtime source boundary path has different "
+                f"names: {existing_path_name}, {name}"
+            )
+        for other_name, other_path in result:
+            other_key = _boundary_path_key(other_path)
+            shorter_length = min(len(path_key), len(other_key))
+            if path_key[:shorter_length] == other_key[:shorter_length]:
+                raise RuntimeError(
+                    "Overlapping Windows runtime source boundaries are ambiguous: "
+                    f"{other_name}, {name}"
+                )
+        names[name_key] = path_key
+        paths[path_key] = name
+        result.append((name, path))
+    return result
+
+
 def allowed_windows_runtime_source_boundaries(
     environment: Mapping[str, str] | None = None,
 ) -> list[SourceBoundary]:
@@ -221,23 +271,34 @@ def allowed_windows_runtime_source_boundaries(
         candidates.append(
             _resolved_boundary("windows-system32", Path(windows_root) / "System32")
         )
-    sdk_roots = []
-    for key in ("UniversalCRTSdkDir", "WindowsSdkDir"):
+    sdk_roots: list[tuple[str, Path]] = []
+    for key, distinct_name in (
+        (
+            "UniversalCRTSdkDir",
+            "windows-sdk-ucrt-redist-universal-crt-sdk",
+        ),
+        ("WindowsSdkDir", "windows-sdk-ucrt-redist-windows-sdk"),
+    ):
         value = env.get(key)
         if value:
-            sdk_roots.append(Path(value) / "Redist")
-    for sdk_root in sdk_roots:
-        candidates.append(_resolved_boundary("windows-sdk-ucrt-redist", sdk_root))
+            sdk_roots.append((distinct_name, Path(value) / "Redist"))
 
-    result: list[SourceBoundary] = []
-    seen: set[tuple[str, str]] = set()
-    for name, path in candidates:
-        key = (name, os.path.normcase(str(path)).casefold())
-        if key in seen:
+    unique_sdk_roots: list[tuple[str, Path]] = []
+    seen_sdk_paths: set[tuple[str, ...]] = set()
+    for distinct_name, sdk_root in sdk_roots:
+        _unused_name, resolved_root = _resolved_boundary(distinct_name, sdk_root)
+        path_key = _boundary_path_key(resolved_root)
+        if path_key in seen_sdk_paths:
             continue
-        seen.add(key)
-        result.append((name, path))
-    return result
+        seen_sdk_paths.add(path_key)
+        unique_sdk_roots.append((distinct_name, resolved_root))
+    if len(unique_sdk_roots) == 1:
+        _distinct_name, sdk_root = unique_sdk_roots[0]
+        candidates.append(("windows-sdk-ucrt-redist", sdk_root))
+    else:
+        candidates.extend(unique_sdk_roots)
+
+    return _normalized_source_boundaries(candidates)
 
 
 def _relative_to_boundary(
@@ -343,14 +404,11 @@ def apply_windows_runtime_policy(
 ) -> list[PyInstallerBinary]:
     """Remove approved host runtimes and optionally persist the raw inventory."""
 
-    boundaries = [
-        _resolved_boundary(name, Path(path))
-        for name, path in (
-            allowed_windows_runtime_source_boundaries()
-            if source_boundaries is None
-            else source_boundaries
-        )
-    ]
+    boundaries = _normalized_source_boundaries(
+        allowed_windows_runtime_source_boundaries()
+        if source_boundaries is None
+        else source_boundaries
+    )
     retained: list[PyInstallerBinary] = []
     retained_indexes: list[int] = []
     excluded: list[dict[str, Any]] = []

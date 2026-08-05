@@ -558,20 +558,35 @@ def _validated_audit_record(value: object, *, expected_index: int) -> dict[str, 
     }
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("PyInstaller runtime policy raw record structure changed.")
-    if value.get("raw_index") != expected_index:
+    raw_index = value.get("raw_index")
+    if (
+        not isinstance(raw_index, int)
+        or isinstance(raw_index, bool)
+        or raw_index != expected_index
+    ):
         raise ValueError("PyInstaller runtime policy raw indexes are not contiguous.")
     destination = value.get("destination")
     source = value.get("source")
     entry_type = value.get("type")
     if not isinstance(destination, str) or _normalized_destination(destination) != destination:
         raise ValueError("PyInstaller runtime policy destination is invalid.")
-    if not isinstance(source, str) or entry_type not in {"BINARY", "EXTENSION"}:
+    if (
+        not isinstance(source, str)
+        or not isinstance(entry_type, str)
+        or entry_type not in {"BINARY", "EXTENSION"}
+    ):
         raise ValueError("PyInstaller runtime policy source or type is invalid.")
     try:
         _resolved, size, digest = _verified_source(source)
     except RuntimeError as exc:
         raise ValueError(str(exc)) from exc
-    if value.get("size") != size or value.get("sha256") != digest:
+    recorded_size = value.get("size")
+    if (
+        not isinstance(recorded_size, int)
+        or isinstance(recorded_size, bool)
+        or recorded_size != size
+        or value.get("sha256") != digest
+    ):
         raise ValueError(
             f"PyInstaller runtime policy source changed after audit: {destination}"
         )
@@ -587,7 +602,12 @@ def validate_windows_runtime_policy_audit(
     payload = _read_audit(audit_path)
     if set(payload) != _ALLOWED_AUDIT_KEYS:
         raise ValueError("PyInstaller runtime policy audit structure changed.")
-    if payload.get("schema_version") != RUNTIME_POLICY_SCHEMA_VERSION:
+    schema_version = payload.get("schema_version")
+    if (
+        not isinstance(schema_version, int)
+        or isinstance(schema_version, bool)
+        or schema_version != RUNTIME_POLICY_SCHEMA_VERSION
+    ):
         raise ValueError("Unsupported PyInstaller runtime policy audit schema.")
     if payload.get("policy") != RUNTIME_POLICY_NAME:
         raise ValueError("Unexpected PyInstaller runtime policy identifier.")
@@ -634,11 +654,23 @@ def validate_windows_runtime_policy_audit(
     excluded_values = payload.get("excluded_binaries")
     if (
         not isinstance(retained_indexes, list)
-        or not all(isinstance(index, int) for index in retained_indexes)
+        or not all(
+            isinstance(index, int) and not isinstance(index, bool)
+            for index in retained_indexes
+        )
         or retained_indexes != sorted(set(retained_indexes))
         or not isinstance(excluded_values, list)
     ):
         raise ValueError("PyInstaller runtime policy decision sets are invalid.")
+    if any(
+        not isinstance(record, dict)
+        or not isinstance(record.get("raw_index"), int)
+        or isinstance(record.get("raw_index"), bool)
+        or not isinstance(record.get("size"), int)
+        or isinstance(record.get("size"), bool)
+        for record in excluded_values
+    ):
+        raise ValueError("PyInstaller runtime policy exclusions are invalid.")
     expected_excluded: list[dict[str, Any]] = []
     expected_retained: list[int] = []
     for index, (record, source) in enumerate(

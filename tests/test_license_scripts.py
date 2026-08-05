@@ -2406,6 +2406,47 @@ def test_windows_runtime_policy_rejects_partition_and_casefold_duplicates(
         )
 
 
+def test_windows_runtime_policy_audit_rejects_bool_and_unhashable_fields(tmp_path):
+    wheel_vcomp = _locked_wheel_vcomp(tmp_path)
+    first = _write_runtime_binary(tmp_path / "first.dll", b"first")
+    filtered = [wheel_vcomp, ("first.dll", str(first), "BINARY")]
+    audit_path = tmp_path / runtime_policy.RUNTIME_POLICY_AUDIT_FILENAME
+    runtime_policy.apply_windows_runtime_policy(filtered, audit_path=audit_path)
+    original = json.loads(audit_path.read_text(encoding="utf-8"))
+
+    def write_signed(payload):
+        unsigned = dict(payload)
+        unsigned.pop("payload_sha256", None)
+        payload["payload_sha256"] = runtime_policy._canonical_json_sha256(
+            unsigned
+        )
+        audit_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    boolean_raw_index = copy.deepcopy(original)
+    boolean_raw_index["raw_binaries"][0]["raw_index"] = False
+    write_signed(boolean_raw_index)
+    with pytest.raises(ValueError, match="raw indexes are not contiguous"):
+        runtime_policy.validate_windows_runtime_policy_audit(audit_path, filtered)
+
+    boolean_schema = copy.deepcopy(original)
+    boolean_schema["schema_version"] = True
+    write_signed(boolean_schema)
+    with pytest.raises(ValueError, match="Unsupported.*schema"):
+        runtime_policy.validate_windows_runtime_policy_audit(audit_path, filtered)
+
+    boolean_retained_index = copy.deepcopy(original)
+    boolean_retained_index["retained_raw_indexes"][0] = False
+    write_signed(boolean_retained_index)
+    with pytest.raises(ValueError, match="decision sets are invalid"):
+        runtime_policy.validate_windows_runtime_policy_audit(audit_path, filtered)
+
+    unhashable_type = copy.deepcopy(original)
+    unhashable_type["raw_binaries"][0]["type"] = []
+    write_signed(unhashable_type)
+    with pytest.raises(ValueError, match="source or type is invalid"):
+        runtime_policy.validate_windows_runtime_policy_audit(audit_path, filtered)
+
+
 def test_windows_runtime_policy_fails_without_exact_wheel_vcomp(tmp_path):
     demo = _write_runtime_binary(tmp_path / "demo.pyd", b"demo")
     with pytest.raises(RuntimeError, match="exactly one locked scikit-learn"):
@@ -2666,6 +2707,54 @@ def test_runtime_policy_manifest_binds_sanitized_audit_to_external_provenance(
     rewritten_errors = validate(rewritten)
     assert any("retained runtime metadata differs" in error for error in rewritten_errors)
     assert any("attestation payload differs" in error for error in rewritten_errors)
+
+    for invalid_raw_index in ([], True, -1, 99):
+        invalid_index = copy.deepcopy(summary)
+        invalid_index["runtime_policy_audit"]["excluded_binaries"][0][
+            "raw_index"
+        ] = invalid_raw_index
+        assert any(
+            "exclusion raw index is invalid" in error
+            for error in validate(invalid_index)
+        )
+
+    invalid_count = copy.deepcopy(summary)
+    invalid_count["runtime_policy_audit"]["raw_binary_count"] = True
+    assert any("counts are inconsistent" in error for error in validate(invalid_count))
+
+    invalid_raw_record = copy.deepcopy(summary)
+    invalid_raw_record["runtime_policy_audit"]["raw_binaries"][0][
+        "raw_index"
+    ] = False
+    assert any(
+        "normalized raw record is invalid" in error
+        for error in validate(invalid_raw_record)
+    )
+
+    unhashable_metadata = copy.deepcopy(summary)
+    unhashable_metadata["runtime_policy_audit"]["excluded_binaries"][0][
+        "reason"
+    ] = []
+    assert any(
+        "exclusion metadata is invalid" in error
+        for error in validate(unhashable_metadata)
+    )
+
+    invalid_manifest_records = copy.deepcopy(manifest_records)
+    invalid_manifest_records[0]["toc_type"] = []
+    invalid_manifest_errors = compliance._validate_runtime_policy_manifest_binding(
+        summary,
+        package_manifest,
+        _component_lock(),
+        tmp_path,
+        physical,
+        invalid_manifest_records,
+        collect_entries,
+    )
+    assert any(
+        "COLLECT record type is invalid" in error
+        for error in invalid_manifest_errors
+    )
 
     excluded_path = _write_runtime_binary(
         tmp_path / "_internal" / "VCOMP140.DLL",

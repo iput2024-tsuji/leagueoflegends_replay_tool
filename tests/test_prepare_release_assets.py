@@ -278,6 +278,17 @@ def _write_distribution(root: Path) -> None:
     licenses.mkdir()
     (licenses / "components.json").write_text("{}\n", encoding="utf-8")
     (licenses / "distribution-manifest.json").write_text("{}\n", encoding="utf-8")
+    (licenses / "windows-runtime-policy-attestation.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "payload_sha256": "c" * 64,
+                "runtime_policy_audit": {"policy": "windows-runtime-exclusion-v1"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     (licenses / "build-provenance.json").write_text(
         json.dumps(
             {
@@ -434,14 +445,31 @@ def test_create_release_assets_uses_fixed_names_and_hashes(monkeypatch, tmp_path
         }
         assert "runtime_downloads_not_bundled" not in index
         assert archive.read("sources/python-source.tar.gz") == b"python source"
-    with zipfile.ZipFile(output / "LoLReplayTool-license-materials-1.2.3.zip") as archive:
+    license_archive = output / "LoLReplayTool-license-materials-1.2.3.zip"
+    with zipfile.ZipFile(license_archive) as archive:
         assert "QT_RELINKING.md" in archive.namelist()
         assert "licenses/distribution-manifest.json" in archive.namelist()
+        attestation_name = "licenses/windows-runtime-policy-attestation.json"
+        assert attestation_name in archive.namelist()
         license_index = json.loads(archive.read("LICENSE_INDEX.json"))
-        assert {record["path"] for record in license_index["files"]} >= {
+        indexed_files = {record["path"]: record for record in license_index["files"]}
+        assert set(indexed_files) >= {
             "LICENSE",
             "licenses/components.json",
+            attestation_name,
         }
+        attestation = archive.read(attestation_name)
+        assert indexed_files[attestation_name]["size"] == len(attestation)
+        assert indexed_files[attestation_name]["sha256"] == _sha(attestation)
+    checksum_records = {
+        name: digest
+        for digest, name in (
+            line.split("  ", 1) for line in checksums.splitlines()
+        )
+    }
+    assert checksum_records[license_archive.name] == release_assets.sha256_file(
+        license_archive
+    )
 
     verify_release_asset_list(Path(payload["asset_list"]))
 
@@ -2014,6 +2042,24 @@ def test_generated_archive_indexes_detect_member_tampering(monkeypatch, tmp_path
     _replace_zip_member(license_archive, "LICENSE", b"tampered license")
     with pytest.raises(ReleaseAssetError, match="License index mismatch"):
         verify_license_archive(license_archive)
+
+
+def test_runtime_policy_attestation_is_indexed_and_release_hash_sealed(
+    monkeypatch,
+    tmp_path,
+):
+    payload, output = _create_asset_set(tmp_path, monkeypatch)
+    license_archive = output / "LoLReplayTool-license-materials-1.2.3.zip"
+    _replace_zip_member(
+        license_archive,
+        "licenses/windows-runtime-policy-attestation.json",
+        b'{"schema_version": 1, "payload_sha256": "forged"}\n',
+    )
+
+    with pytest.raises(ReleaseAssetError, match="License index mismatch"):
+        verify_license_archive(license_archive)
+    with pytest.raises(ReleaseAssetError, match="SHA256SUMS mismatch"):
+        verify_release_asset_list(Path(payload["asset_list"]))
 
 
 def test_release_source_parts_must_match_checkout_component_lock(

@@ -3606,7 +3606,11 @@ def _validate_runtime_policy_manifest_binding(
         errors.append("Distribution manifest runtime policy artifact structure changed.")
     if artifact.get("filename") != RUNTIME_POLICY_AUDIT_FILENAME:
         errors.append("Distribution manifest runtime policy artifact name differs.")
-    if not isinstance(artifact.get("size"), int) or artifact.get("size", 0) <= 0:
+    if (
+        not isinstance(artifact.get("size"), int)
+        or isinstance(artifact.get("size"), bool)
+        or artifact.get("size", 0) <= 0
+    ):
         errors.append("Distribution manifest runtime policy artifact size is invalid.")
     for field in ("sha256", "payload_sha256"):
         value = artifact.get(field)
@@ -3629,7 +3633,10 @@ def _validate_runtime_policy_manifest_binding(
         runtime_audit.get("retained_binary_count"),
         runtime_audit.get("excluded_binary_count"),
     ]
-    if not all(isinstance(value, int) and value >= 0 for value in counts) or (
+    if not all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in counts
+    ) or (
         counts[0] != counts[1] + counts[2]
     ):
         errors.append("Distribution manifest runtime policy counts are inconsistent.")
@@ -3645,7 +3652,11 @@ def _validate_runtime_policy_manifest_binding(
     if not isinstance(excluded, list):
         errors.append("Distribution manifest runtime policy exclusions are missing.")
         excluded = []
-    elif isinstance(counts[2], int) and len(excluded) != counts[2]:
+    elif (
+        isinstance(counts[2], int)
+        and not isinstance(counts[2], bool)
+        and len(excluded) != counts[2]
+    ):
         errors.append("Distribution manifest runtime policy exclusion count differs.")
     for record in excluded:
         if not isinstance(record, dict):
@@ -3681,14 +3692,24 @@ def _validate_runtime_policy_manifest_binding(
                 "Distribution manifest runtime policy exclusion source is unsafe."
             )
         digest = record.get("sha256")
+        raw_index = record.get("raw_index")
+        entry_type = record.get("type")
+        reason = record.get("reason")
         if (
-            not isinstance(record.get("size"), int)
+            not isinstance(raw_index, int)
+            or isinstance(raw_index, bool)
+            or raw_index < 0
+            or not isinstance(record.get("size"), int)
+            or isinstance(record.get("size"), bool)
             or record.get("size", -1) < 0
             or not isinstance(digest, str)
             or SHA256_PATTERN.fullmatch(digest) is None
-            or record.get("type") != "BINARY"
-            or record.get("reason")
-            not in {"supported-windows-os-runtime", "redundant-root-vcomp"}
+            or entry_type != "BINARY"
+            or not isinstance(reason, str)
+            or reason not in {
+                "supported-windows-os-runtime",
+                "redundant-root-vcomp",
+            }
         ):
             errors.append(
                 "Distribution manifest runtime policy exclusion metadata is invalid."
@@ -3699,7 +3720,11 @@ def _validate_runtime_policy_manifest_binding(
             "Distribution manifest runtime policy normalized raw inventory is missing."
         )
         raw_records = []
-    elif isinstance(counts[0], int) and len(raw_records) != counts[0]:
+    elif (
+        isinstance(counts[0], int)
+        and not isinstance(counts[0], bool)
+        and len(raw_records) != counts[0]
+    ):
         errors.append(
             "Distribution manifest runtime policy normalized raw count differs."
         )
@@ -3707,7 +3732,13 @@ def _validate_runtime_policy_manifest_binding(
     excluded_indexes: set[int] = set()
     retained_indexes: set[int] = set()
     for index, record in enumerate(raw_records):
-        if not isinstance(record, dict) or record.get("raw_index") != index:
+        raw_index = record.get("raw_index") if isinstance(record, dict) else None
+        if (
+            not isinstance(record, dict)
+            or not isinstance(raw_index, int)
+            or isinstance(raw_index, bool)
+            or raw_index != index
+        ):
             errors.append(
                 "Distribution manifest runtime policy normalized raw record is invalid."
             )
@@ -3732,6 +3763,7 @@ def _validate_runtime_policy_manifest_binding(
             )
         destination = _safe_relative(record.get("destination"))
         source = _safe_relative(record.get("source"))
+        entry_type = record.get("type")
         destination_key = destination.casefold() if destination is not None else ""
         if (
             destination is None
@@ -3743,8 +3775,10 @@ def _validate_runtime_policy_manifest_binding(
                 record["source_component"],
             )
             is None
-            or record.get("type") not in {"BINARY", "EXTENSION"}
+            or not isinstance(entry_type, str)
+            or entry_type not in {"BINARY", "EXTENSION"}
             or not isinstance(record.get("size"), int)
+            or isinstance(record.get("size"), bool)
             or record.get("size", -1) < 0
             or not isinstance(record.get("sha256"), str)
             or SHA256_PATTERN.fullmatch(record["sha256"]) is None
@@ -3755,7 +3789,8 @@ def _validate_runtime_policy_manifest_binding(
         seen_destinations.add(destination_key)
         if decision == "excluded":
             excluded_indexes.add(index)
-            if record.get("reason") not in {
+            reason = record.get("reason")
+            if not isinstance(reason, str) or reason not in {
                 "supported-windows-os-runtime",
                 "redundant-root-vcomp",
             }:
@@ -3773,11 +3808,21 @@ def _validate_runtime_policy_manifest_binding(
             errors.append(
                 "Distribution manifest runtime policy normalized decision is invalid."
             )
-    declared_excluded_indexes = {
-        record.get("raw_index")
-        for record in excluded
-        if isinstance(record, dict)
-    }
+    declared_excluded_indexes: set[int] = set()
+    for record in excluded:
+        if not isinstance(record, dict):
+            continue
+        raw_index = record.get("raw_index")
+        if (
+            not isinstance(raw_index, int)
+            or isinstance(raw_index, bool)
+            or not 0 <= raw_index < len(raw_records)
+        ):
+            errors.append(
+                "Distribution manifest runtime policy exclusion raw index is invalid."
+            )
+            continue
+        declared_excluded_indexes.add(raw_index)
     if (
         excluded_indexes != declared_excluded_indexes
         or excluded_indexes & retained_indexes
@@ -3788,14 +3833,19 @@ def _validate_runtime_policy_manifest_binding(
             "partition."
         )
     raw_by_index = {
-        record.get("raw_index"): record
-        for record in raw_records
-        if isinstance(record, dict)
+        index: record
+        for index, record in enumerate(raw_records)
+        if isinstance(record, dict) and record.get("raw_index") == index
     }
     for record in excluded:
         if not isinstance(record, dict):
             continue
-        raw_record = raw_by_index.get(record.get("raw_index"))
+        raw_index = record.get("raw_index")
+        raw_record = (
+            raw_by_index.get(raw_index)
+            if isinstance(raw_index, int) and not isinstance(raw_index, bool)
+            else None
+        )
         if raw_record is None or any(
             raw_record.get(raw_field) != record.get(excluded_field)
             for raw_field, excluded_field in (
@@ -3848,7 +3898,14 @@ def _validate_runtime_policy_manifest_binding(
 
     manifest_binaries: dict[str, dict[str, Any]] = {}
     for record in manifest_records:
-        if record.get("toc_type") not in {"BINARY", "EXTENSION"}:
+        toc_type = record.get("toc_type")
+        if not isinstance(toc_type, str):
+            if toc_type is not None:
+                errors.append(
+                    "Distribution manifest COLLECT record type is invalid."
+                )
+            continue
+        if toc_type not in {"BINARY", "EXTENSION"}:
             continue
         destination = _safe_relative(record.get("toc_name"))
         relative = _safe_relative(record.get("path"))
@@ -3926,7 +3983,11 @@ def _validate_runtime_policy_manifest_binding(
     if toc_entries is not None:
         collect_binaries: dict[str, dict[str, str]] = {}
         for entry in toc_entries:
-            if entry.get("type") not in {"BINARY", "EXTENSION"}:
+            entry_type = entry.get("type")
+            if not isinstance(entry_type, str):
+                errors.append("PyInstaller COLLECT binary type is invalid.")
+                continue
+            if entry_type not in {"BINARY", "EXTENSION"}:
                 continue
             destination = _safe_relative(entry.get("toc_name"))
             if destination is None:

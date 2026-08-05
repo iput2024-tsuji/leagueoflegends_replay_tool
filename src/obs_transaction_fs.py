@@ -7,6 +7,7 @@ import errno
 import hashlib
 import os
 import stat
+import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +89,16 @@ class _OBSPhysicalDirectoryChain:
     last_existing_path: Path
 
 
+@dataclass(frozen=True)
+class _WindowsNotificationVolumeFingerprint:
+    """Physical local volume properties required for a trusted notification."""
+
+    volume_root: str
+    volume_serial: int
+    filesystem_name: str
+    drive_type: int
+
+
 class OBSPathSafetyError(RuntimeError):
     """Raised when an OBS path could escape the managed lexical boundary."""
 
@@ -98,6 +109,10 @@ class _UnsafeOBSMigrationPathError(OBSPathSafetyError):
 
 class _OBSMigrationLockBusyError(RuntimeError):
     pass
+
+
+class _OBSRecursiveChangeMonitorUnavailable(RuntimeError):
+    """Internal signal that the optional query cache cannot be trusted."""
 
 
 if os.name == "nt":
@@ -141,6 +156,17 @@ if os.name == "nt":
     _WINDOWS_OWNER_SECURITY_INFORMATION = 0x00000001
     _WINDOWS_GROUP_SECURITY_INFORMATION = 0x00000002
     _WINDOWS_DACL_SECURITY_INFORMATION = 0x00000004
+    _WINDOWS_FILE_NOTIFY_CHANGE_FILE_NAME = 0x00000001
+    _WINDOWS_FILE_NOTIFY_CHANGE_DIR_NAME = 0x00000002
+    _WINDOWS_FILE_NOTIFY_CHANGE_ATTRIBUTES = 0x00000004
+    _WINDOWS_FILE_NOTIFY_CHANGE_SECURITY = 0x00000100
+    _WINDOWS_WAIT_OBJECT_0 = 0x00000000
+    _WINDOWS_WAIT_TIMEOUT = 0x00000102
+    _WINDOWS_WAIT_FAILED = 0xFFFFFFFF
+    _WINDOWS_DRIVE_FIXED = 3
+    _WINDOWS_FILE_NAME_NORMALIZED = 0x0
+    _WINDOWS_VOLUME_NAME_GUID = 0x1
+    _WINDOWS_TRUSTED_NOTIFICATION_FILESYSTEMS = frozenset({"ntfs", "refs"})
 
     class _WindowsUnicodeString(ctypes.Structure):
         _fields_ = [
@@ -270,6 +296,39 @@ if os.name == "nt":
     _WINDOWS_KERNEL32.FlushFileBuffers.restype = wintypes.BOOL
     _WINDOWS_KERNEL32.LocalFree.argtypes = [wintypes.HLOCAL]
     _WINDOWS_KERNEL32.LocalFree.restype = wintypes.HLOCAL
+    _WINDOWS_KERNEL32.FindFirstChangeNotificationW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    _WINDOWS_KERNEL32.FindFirstChangeNotificationW.restype = wintypes.HANDLE
+    _WINDOWS_KERNEL32.FindCloseChangeNotification.argtypes = [wintypes.HANDLE]
+    _WINDOWS_KERNEL32.FindCloseChangeNotification.restype = wintypes.BOOL
+    _WINDOWS_KERNEL32.WaitForSingleObject.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+    ]
+    _WINDOWS_KERNEL32.WaitForSingleObject.restype = wintypes.DWORD
+    _WINDOWS_KERNEL32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    _WINDOWS_KERNEL32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    _WINDOWS_KERNEL32.GetDriveTypeW.argtypes = [wintypes.LPCWSTR]
+    _WINDOWS_KERNEL32.GetDriveTypeW.restype = wintypes.UINT
+    _WINDOWS_KERNEL32.GetVolumeInformationW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    _WINDOWS_KERNEL32.GetVolumeInformationW.restype = wintypes.BOOL
     _WINDOWS_NTDLL.NtCreateFile.argtypes = [
         ctypes.POINTER(wintypes.HANDLE),
         wintypes.DWORD,
@@ -307,7 +366,6 @@ if os.name == "nt":
     _WINDOWS_ADVAPI32.GetSecurityInfo.restype = wintypes.DWORD
     _WINDOWS_ADVAPI32.GetSecurityDescriptorLength.argtypes = [wintypes.LPVOID]
     _WINDOWS_ADVAPI32.GetSecurityDescriptorLength.restype = wintypes.DWORD
-
 
 def _validate_single_path_component(name: str) -> None:
     unsafe_characters = '<>:"/\\|?*'
@@ -438,6 +496,117 @@ def _windows_handle_details(handle: int) -> tuple[tuple[int, int, int], int, int
     )
     size = (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow)
     return identity, size, int(information.nNumberOfLinks), attributes
+
+
+def _windows_physical_volume_root_for_handle(handle: int, *, path: Path) -> str:
+    """Resolve an open directory to its volume GUID root, never a drive mapping."""
+
+    flags = _WINDOWS_FILE_NAME_NORMALIZED | _WINDOWS_VOLUME_NAME_GUID
+    required = int(
+        _WINDOWS_KERNEL32.GetFinalPathNameByHandleW(
+            wintypes.HANDLE(handle),
+            None,
+            0,
+            flags,
+        )
+    )
+    if required <= 0:
+        raise _OBSRecursiveChangeMonitorUnavailable(
+            f"directoryのphysical volumeを取得できません: {path}"
+        ) from ctypes.WinError(ctypes.get_last_error())
+    while True:
+        buffer = ctypes.create_unicode_buffer(required + 1)
+        written = int(
+            _WINDOWS_KERNEL32.GetFinalPathNameByHandleW(
+                wintypes.HANDLE(handle),
+                buffer,
+                len(buffer),
+                flags,
+            )
+        )
+        if written <= 0:
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                f"directoryのphysical volumeを取得できません: {path}"
+            ) from ctypes.WinError(ctypes.get_last_error())
+        if written < len(buffer):
+            final_path = buffer.value
+            break
+        required = written
+    marker = "}\\"
+    marker_index = final_path.find(marker)
+    expected_prefix = "\\\\?\\Volume{"
+    if (
+        not final_path.casefold().startswith(expected_prefix.casefold())
+        or marker_index < len(expected_prefix)
+    ):
+        raise _OBSRecursiveChangeMonitorUnavailable(
+            f"local volume GUIDへ解決できないdirectoryです: {path}"
+        )
+    return final_path[: marker_index + len(marker)]
+
+
+def _windows_volume_details(volume_root: str) -> tuple[int, int, str]:
+    """Return drive type, serial, and filesystem name for one volume GUID."""
+
+    drive_type = int(_WINDOWS_KERNEL32.GetDriveTypeW(volume_root))
+    volume_serial = wintypes.DWORD()
+    maximum_component_length = wintypes.DWORD()
+    filesystem_flags = wintypes.DWORD()
+    filesystem_name = ctypes.create_unicode_buffer(64)
+    if not _WINDOWS_KERNEL32.GetVolumeInformationW(
+        volume_root,
+        None,
+        0,
+        ctypes.byref(volume_serial),
+        ctypes.byref(maximum_component_length),
+        ctypes.byref(filesystem_flags),
+        filesystem_name,
+        len(filesystem_name),
+    ):
+        raise _OBSRecursiveChangeMonitorUnavailable(
+            f"volume情報を取得できません: {volume_root}"
+        ) from ctypes.WinError(ctypes.get_last_error())
+    return drive_type, int(volume_serial.value), filesystem_name.value
+
+
+def _windows_notification_volume_fingerprint_for_volume_root(
+    volume_root: str,
+) -> _WindowsNotificationVolumeFingerprint:
+    drive_type, volume_serial, filesystem_name = _windows_volume_details(volume_root)
+    if drive_type != _WINDOWS_DRIVE_FIXED:
+        raise _OBSRecursiveChangeMonitorUnavailable(
+            "remoteまたは固定local volumeではchange notificationを信頼できません: "
+            f"{volume_root} (drive type {drive_type})"
+        )
+    if filesystem_name.casefold() not in _WINDOWS_TRUSTED_NOTIFICATION_FILESYSTEMS:
+        raise _OBSRecursiveChangeMonitorUnavailable(
+            "未対応filesystemではchange notificationを信頼できません: "
+            f"{volume_root} ({filesystem_name or 'unknown'})"
+        )
+    return _WindowsNotificationVolumeFingerprint(
+        volume_root=volume_root.casefold(),
+        volume_serial=volume_serial,
+        filesystem_name=filesystem_name.casefold(),
+        drive_type=drive_type,
+    )
+
+
+def _windows_notification_volume_fingerprint_for_root(
+    root: _OBSDirectoryLease,
+) -> _WindowsNotificationVolumeFingerprint:
+    volume_root = _windows_physical_volume_root_for_handle(
+        root.native_handle,
+        path=root.path,
+    )
+    fingerprint = _windows_notification_volume_fingerprint_for_volume_root(
+        volume_root
+    )
+    if fingerprint.volume_serial != root.identity[0]:
+        raise _OBSRecursiveChangeMonitorUnavailable(
+            "directory handleとvolume情報のidentityが一致しません: "
+            f"{root.path}"
+        )
+    return fingerprint
 
 
 def _windows_filetime_value(value: Any) -> int:
@@ -1450,6 +1619,165 @@ class _OBSDirectoryLease:
             raise ctypes.WinError(error_code)
         os.fsync(self.native_handle)
         return True
+
+
+class _OBSRecursiveChangeMonitor:
+    """Read-only recursive name-change monitor used to validate clean queries.
+
+    The monitor is only an optimization.  Callers must run a complete safety
+    scan after constructing it and may reuse a clean result only while
+    ``has_changes`` remains false.  Any API error makes the monitor unusable;
+    callers then fall back to the uncached double-inventory scan.
+    """
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        handle: int,
+        windows_volume: _WindowsNotificationVolumeFingerprint | None = None,
+    ) -> None:
+        self._kind = kind
+        self._handle = handle
+        self._windows_volume = windows_volume
+        self._closed = False
+
+    @classmethod
+    def open(
+        cls,
+        root: _OBSDirectoryLease,
+    ) -> _OBSRecursiveChangeMonitor:
+        root.validate_lexical_binding()
+        if os.name == "nt":
+            volume_fingerprint = (
+                _windows_notification_volume_fingerprint_for_root(root)
+            )
+            notify_filter = (
+                _WINDOWS_FILE_NOTIFY_CHANGE_FILE_NAME
+                | _WINDOWS_FILE_NOTIFY_CHANGE_DIR_NAME
+                | _WINDOWS_FILE_NOTIFY_CHANGE_ATTRIBUTES
+                | _WINDOWS_FILE_NOTIFY_CHANGE_SECURITY
+            )
+            handle = _WINDOWS_KERNEL32.FindFirstChangeNotificationW(
+                str(root.path),
+                True,
+                notify_filter,
+            )
+            handle_value = int(handle) if handle is not None else 0
+            if handle_value in {0, _WINDOWS_INVALID_HANDLE}:
+                raise _OBSRecursiveChangeMonitorUnavailable(
+                    f"recursive change notificationを開始できません: {root.path}"
+                ) from ctypes.WinError(ctypes.get_last_error())
+            monitor = cls(
+                kind="windows",
+                handle=handle_value,
+                windows_volume=volume_fingerprint,
+            )
+        elif sys.platform.startswith("linux"):
+            # inotify does not report remote changes and cannot guarantee that
+            # a mount/bind mount appearing below an existing watch is seen.
+            # False negatives are more harmful than the extra inventory, so
+            # Linux deliberately uses the uncached double-scan path.
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                "Linuxではmount topologyを含む再帰通知を保証できません"
+            )
+        else:
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                f"recursive change notificationに未対応です: {sys.platform}"
+            )
+        try:
+            root.validate_lexical_binding()
+        except Exception:
+            monitor.close()
+            raise
+        return monitor
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def watch_directory(self, directory: _OBSDirectoryLease) -> None:
+        """Watch one already-open directory before enumerating its children."""
+
+        if self._closed:
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                "closed recursive change notificationは再利用できません"
+            )
+        if self._kind == "windows":
+            # FindFirstChangeNotificationW watches the full subtree from the
+            # root, so child registration is intentionally a no-op.
+            return
+        raise _OBSRecursiveChangeMonitorUnavailable(
+            f"未対応のrecursive change monitorです: {self._kind}"
+        )
+
+    def has_changes(self) -> bool:
+        """Return true for every signal, overflow, ignored watch, or removal."""
+
+        if self._closed:
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                "closed recursive change notificationは検査できません"
+            )
+        if self._kind == "windows":
+            expected_volume = self._windows_volume
+            if expected_volume is None:
+                raise _OBSRecursiveChangeMonitorUnavailable(
+                    "change notificationのvolume identityがありません"
+                )
+            current_volume = (
+                _windows_notification_volume_fingerprint_for_volume_root(
+                    expected_volume.volume_root
+                )
+            )
+            if current_volume != expected_volume:
+                raise _OBSRecursiveChangeMonitorUnavailable(
+                    "change notification開始後にvolume topologyが変化しました"
+                )
+            result = int(
+                _WINDOWS_KERNEL32.WaitForSingleObject(
+                    wintypes.HANDLE(self._handle),
+                    0,
+                )
+            )
+            if result == _WINDOWS_WAIT_OBJECT_0:
+                # Do not re-arm a signalled monitor.  The cache discards it and
+                # creates a fresh monitor before the next complete scan, which
+                # removes the FindNextChangeNotification race window.
+                return True
+            if result == _WINDOWS_WAIT_TIMEOUT:
+                return False
+            if result == _WINDOWS_WAIT_FAILED:
+                error = ctypes.WinError(ctypes.get_last_error())
+            else:
+                error = OSError(f"unexpected wait result: {result}")
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                "recursive change notificationを検査できません"
+            ) from error
+        raise _OBSRecursiveChangeMonitorUnavailable(
+            f"未対応のrecursive change monitorです: {self._kind}"
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        handle = self._handle
+        if self._kind == "windows":
+            if not _WINDOWS_KERNEL32.FindCloseChangeNotification(
+                wintypes.HANDLE(handle)
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        else:
+            raise _OBSRecursiveChangeMonitorUnavailable(
+                f"未対応のrecursive change monitorです: {self._kind}"
+            )
+        self._handle = -1
+        self._closed = True
+
+    def __enter__(self) -> _OBSRecursiveChangeMonitor:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
 
 def _posix_mount_id_for_descriptor(descriptor: int, *, path: Path) -> int | None:

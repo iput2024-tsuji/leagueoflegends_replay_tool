@@ -83,6 +83,123 @@ def test_posix_handle_relative_capability_requires_rename(monkeypatch):
     assert obs_transaction_fs._supports_posix_handle_relative_migration() is False
 
 
+def test_recursive_change_monitor_observes_nested_names_without_blocking_changes(
+    tmp_path,
+):
+    root = tmp_path / "tree"
+    nested = root / "nested"
+    nested.mkdir(parents=True)
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(root) as root_lease:
+        try:
+            monitor = obs_transaction_fs._OBSRecursiveChangeMonitor.open(root_lease)
+        except obs_transaction_fs._OBSRecursiveChangeMonitorUnavailable:
+            pytest.skip("recursive change notification is unavailable")
+        try:
+            with root_lease.open_child_directory(nested.name) as nested_lease:
+                monitor.watch_directory(nested_lease)
+            assert monitor.has_changes() is False
+
+            temporary = nested / "payload.tmp"
+            published = nested / "payload.bin"
+            temporary.write_bytes(b"payload")
+            temporary.replace(published)
+            published.unlink()
+
+            assert monitor.has_changes() is True
+        finally:
+            monitor.close()
+
+    renamed = tmp_path / "renamed-tree"
+    root.rename(renamed)
+    assert renamed.is_dir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume trust boundaryの回帰")
+@pytest.mark.parametrize(
+    ("drive_type", "filesystem_name"),
+    (
+        (4, "NTFS"),
+        (3, "unsupported-fs"),
+    ),
+    ids=("remote-volume", "unsupported-filesystem"),
+)
+def test_recursive_change_monitor_rejects_untrusted_windows_volume(
+    monkeypatch,
+    tmp_path,
+    drive_type,
+    filesystem_name,
+):
+    fake_volume_root = "\\\\?\\Volume{test-volume}\\"
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(tmp_path) as root_lease:
+        monkeypatch.setattr(
+            obs_transaction_fs,
+            "_windows_physical_volume_root_for_handle",
+            lambda _handle, *, path: fake_volume_root,
+        )
+        monkeypatch.setattr(
+            obs_transaction_fs,
+            "_windows_volume_details",
+            lambda _volume_root: (
+                drive_type,
+                root_lease.identity[0],
+                filesystem_name,
+            ),
+        )
+
+        with pytest.raises(
+            obs_transaction_fs._OBSRecursiveChangeMonitorUnavailable,
+            match="remote|固定local|未対応filesystem",
+        ):
+            obs_transaction_fs._OBSRecursiveChangeMonitor.open(root_lease)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows volume topologyの回帰")
+def test_recursive_change_monitor_rejects_changed_windows_volume_topology(
+    monkeypatch,
+    tmp_path,
+):
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(tmp_path) as root_lease:
+        monitor = obs_transaction_fs._OBSRecursiveChangeMonitor.open(root_lease)
+        try:
+            original = monitor._windows_volume
+            assert original is not None
+            changed_filesystem = (
+                "refs" if original.filesystem_name != "refs" else "ntfs"
+            )
+            changed = obs_transaction_fs._WindowsNotificationVolumeFingerprint(
+                volume_root=original.volume_root,
+                volume_serial=original.volume_serial,
+                filesystem_name=changed_filesystem,
+                drive_type=original.drive_type,
+            )
+            monkeypatch.setattr(
+                obs_transaction_fs,
+                "_windows_notification_volume_fingerprint_for_volume_root",
+                lambda _volume_root: changed,
+            )
+
+            with pytest.raises(
+                obs_transaction_fs._OBSRecursiveChangeMonitorUnavailable,
+                match="volume topology",
+            ):
+                monitor.has_changes()
+        finally:
+            monitor.close()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Linux notification cache無効化の回帰",
+)
+def test_recursive_change_monitor_is_unavailable_on_linux(tmp_path):
+    with obs_transaction_fs._OBSDirectoryLease.open_absolute(tmp_path) as root_lease:
+        with pytest.raises(
+            obs_transaction_fs._OBSRecursiveChangeMonitorUnavailable,
+            match="mount topology",
+        ):
+            obs_transaction_fs._OBSRecursiveChangeMonitor.open(root_lease)
+
+
 @pytest.mark.skipif(
     not _POSIX_MOUNT_ID_AVAILABLE,
     reason="Linux /proc mount identityのFD close回帰",

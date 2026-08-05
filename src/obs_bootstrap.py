@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import configparser
 import hashlib
 import io
@@ -7,8 +8,10 @@ import json
 import logging
 import os
 import stat
+import threading
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import Callable, Iterable
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
@@ -78,6 +81,10 @@ _windows_mark_open_file_for_deletion = _transaction_fs._windows_mark_open_file_f
 _is_reparse_point = _transaction_fs._is_reparse_point
 _validate_existing_entry = _transaction_fs._validate_existing_entry
 _OBSDirectoryLease = _transaction_fs._OBSDirectoryLease
+_OBSRecursiveChangeMonitor = _transaction_fs._OBSRecursiveChangeMonitor
+_OBSRecursiveChangeMonitorUnavailable = (
+    _transaction_fs._OBSRecursiveChangeMonitorUnavailable
+)
 _snapshot_open_entry_metadata = _transaction_fs._snapshot_open_entry_metadata
 _physical_directory_chain = _transaction_fs._physical_directory_chain
 _validate_distinct_physical_directory_trees = (
@@ -267,6 +274,125 @@ _ACTIVE_OBS_SETTINGS_TRANSACTION_TARGETS: ContextVar[frozenset[str] | None] = Co
     "active_obs_settings_transaction_targets",
     default=None,
 )
+OBS_COPY_QUERY_MONITOR_CACHE_MAX_ENTRIES = 4
+_OBS_COPY_QUERY_MONITOR_CACHE: OrderedDict[
+    str,
+    tuple[tuple[int, int, int], _OBSRecursiveChangeMonitor],
+] = OrderedDict()
+_OBS_COPY_QUERY_MONITOR_CACHE_LOCK = threading.RLock()
+_OBS_COPY_QUERY_MONITOR_CACHE_PID = os.getpid()
+
+
+def _close_obs_copy_query_monitor(monitor: _OBSRecursiveChangeMonitor) -> None:
+    try:
+        monitor.close()
+    except Exception:
+        # A failed close must not turn a read-only status query into a false
+        # negative.  The cache has already stopped trusting this monitor and
+        # the OS reclaims any unreleased handle when the process exits.
+        pass
+
+
+def _clear_obs_copy_query_monitor_cache() -> None:
+    """Close all process-local change monitors without touching the tree."""
+
+    global _OBS_COPY_QUERY_MONITOR_CACHE_PID
+    with _OBS_COPY_QUERY_MONITOR_CACHE_LOCK:
+        entries = tuple(_OBS_COPY_QUERY_MONITOR_CACHE.values())
+        _OBS_COPY_QUERY_MONITOR_CACHE.clear()
+        _OBS_COPY_QUERY_MONITOR_CACHE_PID = os.getpid()
+    for _identity, monitor in entries:
+        _close_obs_copy_query_monitor(monitor)
+
+
+def _reset_obs_copy_query_monitor_cache_after_fork() -> None:
+    global _OBS_COPY_QUERY_MONITOR_CACHE_PID
+    with _OBS_COPY_QUERY_MONITOR_CACHE_LOCK:
+        current_pid = os.getpid()
+        if current_pid == _OBS_COPY_QUERY_MONITOR_CACHE_PID:
+            return
+        entries = tuple(_OBS_COPY_QUERY_MONITOR_CACHE.values())
+        _OBS_COPY_QUERY_MONITOR_CACHE.clear()
+        _OBS_COPY_QUERY_MONITOR_CACHE_PID = current_pid
+    for _identity, monitor in entries:
+        _close_obs_copy_query_monitor(monitor)
+
+
+def _reset_obs_copy_query_monitor_cache_in_forked_child() -> None:
+    """Replace a possibly inherited locked RLock before the child queries."""
+
+    global _OBS_COPY_QUERY_MONITOR_CACHE_LOCK
+    global _OBS_COPY_QUERY_MONITOR_CACHE_PID
+    entries = tuple(_OBS_COPY_QUERY_MONITOR_CACHE.values())
+    _OBS_COPY_QUERY_MONITOR_CACHE.clear()
+    _OBS_COPY_QUERY_MONITOR_CACHE_LOCK = threading.RLock()
+    _OBS_COPY_QUERY_MONITOR_CACHE_PID = os.getpid()
+    for _identity, monitor in entries:
+        _close_obs_copy_query_monitor(monitor)
+
+
+def _discard_obs_copy_query_monitor_cache_entry(key: str) -> None:
+    with _OBS_COPY_QUERY_MONITOR_CACHE_LOCK:
+        entry = _OBS_COPY_QUERY_MONITOR_CACHE.pop(key, None)
+    if entry is not None:
+        _identity, monitor = entry
+        _close_obs_copy_query_monitor(monitor)
+
+
+def _cached_obs_copy_query_monitor(
+    directory: _OBSDirectoryLease,
+) -> _OBSRecursiveChangeMonitor | None:
+    """Return a still-clean monitor for the exact physical root."""
+
+    with _OBS_COPY_QUERY_MONITOR_CACHE_LOCK:
+        _reset_obs_copy_query_monitor_cache_after_fork()
+        key = _filesystem_path_key(directory.path)
+        entry = _OBS_COPY_QUERY_MONITOR_CACHE.get(key)
+        if entry is None:
+            return None
+        identity, monitor = entry
+        if identity != directory.identity:
+            _discard_obs_copy_query_monitor_cache_entry(key)
+            return None
+        try:
+            changed = monitor.has_changes()
+        except _OBSRecursiveChangeMonitorUnavailable:
+            _discard_obs_copy_query_monitor_cache_entry(key)
+            return None
+        if changed:
+            _discard_obs_copy_query_monitor_cache_entry(key)
+            return None
+        _OBS_COPY_QUERY_MONITOR_CACHE.move_to_end(key)
+        return monitor
+
+
+def _store_obs_copy_query_monitor(
+    directory: _OBSDirectoryLease,
+    monitor: _OBSRecursiveChangeMonitor,
+) -> None:
+    with _OBS_COPY_QUERY_MONITOR_CACHE_LOCK:
+        key = _filesystem_path_key(directory.path)
+        previous = _OBS_COPY_QUERY_MONITOR_CACHE.pop(key, None)
+        if previous is not None:
+            _previous_identity, previous_monitor = previous
+            if previous_monitor is not monitor:
+                _close_obs_copy_query_monitor(previous_monitor)
+        _OBS_COPY_QUERY_MONITOR_CACHE[key] = (directory.identity, monitor)
+        while (
+            len(_OBS_COPY_QUERY_MONITOR_CACHE)
+            > OBS_COPY_QUERY_MONITOR_CACHE_MAX_ENTRIES
+        ):
+            _old_key, (_old_identity, old_monitor) = (
+                _OBS_COPY_QUERY_MONITOR_CACHE.popitem(last=False)
+            )
+            _close_obs_copy_query_monitor(old_monitor)
+
+
+atexit.register(_clear_obs_copy_query_monitor_cache)
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=_reset_obs_copy_query_monitor_cache_in_forked_child
+    )
 
 
 class OBSMigrationError(RuntimeError):
@@ -1235,38 +1361,114 @@ def is_obs_copy_in_progress(base_dir: str | Path) -> bool:
             return False
 
         def scan_without_lock() -> bool:
-            if (
-                destination_probe.relative_file_identity_or_none(marker.name)
-                is not None
-                or destination_probe.relative_file_identity_or_none(lock_path.name)
-                is not None
-            ):
-                return True
-            if (
-                destination_probe.relative_file_identity_or_none(settings_marker.name)
-                is not None
-            ):
-                return False
-            root_temporaries = _root_transaction_temporaries(base_path)
-            if (
-                len(root_temporaries) == 1
-                and root_temporaries[0].kind == OBS_TRANSACTION_TEMP_WRITE
-                and _filesystem_name_key(root_temporaries[0].target_name)
-                == _filesystem_name_key(settings_marker.name)
-            ):
-                return False
-            has_temporary = _has_transaction_temporary_name_under_lease(
-                destination_probe
-            )
-            return (
-                destination_probe.relative_file_identity_or_none(marker.name)
-                is not None
-                or destination_probe.relative_file_identity_or_none(lock_path.name)
-                is not None
-                or (
-                    has_temporary
+            def copy_control_exists() -> bool:
+                return (
+                    destination_probe.relative_file_identity_or_none(marker.name)
+                    is not None
+                    or destination_probe.relative_file_identity_or_none(
+                        lock_path.name
+                    )
+                    is not None
                 )
-            )
+
+            def settings_marker_exists() -> bool:
+                return (
+                    destination_probe.relative_file_identity_or_none(
+                        settings_marker.name
+                    )
+                    is not None
+                )
+
+            def only_settings_prejournal_temporary() -> bool:
+                root_temporaries = _root_transaction_temporaries(
+                    base_path,
+                    directory_lease=destination_probe,
+                )
+                return (
+                    len(root_temporaries) == 1
+                    and root_temporaries[0].kind == OBS_TRANSACTION_TEMP_WRITE
+                    and _filesystem_name_key(root_temporaries[0].target_name)
+                    == _filesystem_name_key(settings_marker.name)
+                )
+
+            def full_tree_scan() -> bool:
+                def legacy_full_tree_scan() -> bool:
+                    has_temporary = _has_transaction_temporary_name_under_lease(
+                        destination_probe
+                    )
+                    return has_temporary or copy_control_exists()
+
+                monitor: _OBSRecursiveChangeMonitor | None
+                try:
+                    monitor = _OBSRecursiveChangeMonitor.open(destination_probe)
+                except _OBSRecursiveChangeMonitorUnavailable:
+                    monitor = None
+                if monitor is None:
+                    return legacy_full_tree_scan()
+                try:
+                    try:
+                        has_temporary = _has_transaction_temporary_name_under_lease(
+                            destination_probe,
+                            change_monitor=monitor,
+                        )
+                    except _OBSRecursiveChangeMonitorUnavailable:
+                        _close_obs_copy_query_monitor(monitor)
+                        monitor = None
+                        return legacy_full_tree_scan()
+                    if has_temporary:
+                        return True
+                    try:
+                        changed = monitor.has_changes()
+                    except _OBSRecursiveChangeMonitorUnavailable:
+                        _close_obs_copy_query_monitor(monitor)
+                        monitor = None
+                        return legacy_full_tree_scan()
+                    if changed:
+                        # The one-pass inventory is valid only if the monitor
+                        # stayed quiet from before the first directory scan.
+                        return True
+                    if copy_control_exists():
+                        return True
+                    if settings_marker_exists():
+                        return False
+                    try:
+                        changed = monitor.has_changes()
+                    except _OBSRecursiveChangeMonitorUnavailable:
+                        _close_obs_copy_query_monitor(monitor)
+                        monitor = None
+                        return legacy_full_tree_scan()
+                    if changed:
+                        return True
+                    _store_obs_copy_query_monitor(destination_probe, monitor)
+                    monitor = None
+                    return False
+                finally:
+                    if monitor is not None:
+                        _close_obs_copy_query_monitor(monitor)
+
+            if copy_control_exists():
+                return True
+            if settings_marker_exists():
+                return False
+            with _OBS_COPY_QUERY_MONITOR_CACHE_LOCK:
+                cached_monitor = _cached_obs_copy_query_monitor(destination_probe)
+                if cached_monitor is not None:
+                    if copy_control_exists():
+                        return True
+                    if settings_marker_exists():
+                        return False
+                    try:
+                        changed = cached_monitor.has_changes()
+                    except _OBSRecursiveChangeMonitorUnavailable:
+                        changed = True
+                    if not changed:
+                        return False
+                    _discard_obs_copy_query_monitor_cache_entry(
+                        _filesystem_path_key(destination_probe.path)
+                    )
+                if only_settings_prejournal_temporary():
+                    return copy_control_exists()
+                return full_tree_scan()
 
         if destination_probe.relative_file_identity_or_none(marker.name) is not None:
             return True
@@ -4561,8 +4763,21 @@ def _is_obs_process_lease_temporary_name(
 
 def _has_transaction_temporary_name_under_lease(
     directory: _OBSDirectoryLease,
+    *,
+    change_monitor: _OBSRecursiveChangeMonitor | None = None,
 ) -> bool:
     """Inspect transaction names without opening files before an OS lock exists."""
+
+    def directory_identity_matches(
+        opened_identity: tuple[int, int, int],
+        scanned_identity: tuple[int, int, int],
+    ) -> bool:
+        if os.name == "nt":
+            return (
+                opened_identity[1] == scanned_identity[1]
+                and opened_identity[2] == scanned_identity[2]
+            )
+        return opened_identity == scanned_identity
 
     def list_children(
         current: _OBSDirectoryLease,
@@ -4594,27 +4809,26 @@ def _has_transaction_temporary_name_under_lease(
                         raise _UnsafeOBSMigrationPathError(
                             f"reparse pointは利用できません: {child_path}"
                         )
+                    scanned_identity = _file_identity(child_stat)
                     if stat.S_ISDIR(child_stat.st_mode):
-                        with current.open_child_directory(entry.name) as child_directory:
-                            child_identity = child_directory.identity
-                            scanned_identity = _file_identity(child_stat)
-                            identity_matches = (
-                                child_identity == scanned_identity
-                                if os.name != "nt"
-                                else (
-                                    int(child_stat.st_ino) == child_identity[1]
-                                    and stat.S_IFMT(child_stat.st_mode)
-                                    == child_identity[2]
-                                )
-                            )
-                        if not identity_matches:
-                            raise _UnsafeOBSMigrationPathError(
-                                f"列挙中にdirectory identityが変化しました: {child_path}"
-                            )
+                        child_identity = scanned_identity
+                        if change_monitor is None:
+                            with current.open_child_directory(
+                                entry.name
+                            ) as child_directory:
+                                child_identity = child_directory.identity
+                                if not directory_identity_matches(
+                                    child_identity,
+                                    scanned_identity,
+                                ):
+                                    raise _UnsafeOBSMigrationPathError(
+                                        "列挙中にdirectory identityが変化しました: "
+                                        f"{child_path}"
+                                    )
                         kind = "directory"
                     elif stat.S_ISREG(child_stat.st_mode):
                         kind = "file"
-                        child_identity = _file_identity(child_stat)
+                        child_identity = scanned_identity
                     else:
                         raise _UnsafeOBSMigrationPathError(
                             f"特殊entryは利用できません: {child_path}"
@@ -4627,8 +4841,9 @@ def _has_transaction_temporary_name_under_lease(
         return tuple(sorted(children, key=lambda child: (child[0].casefold(), child[0])))
 
     def visit(current: _OBSDirectoryLease) -> bool:
+        if change_monitor is not None:
+            change_monitor.watch_directory(current)
         children_before = list_children(current)
-        found = False
         for name, kind, expected_identity in children_before:
             child_path = current.path / name
             parsed = _parse_transaction_temporary(child_path)
@@ -4637,19 +4852,23 @@ def _has_transaction_temporary_name_under_lease(
                     raise _UnsafeOBSMigrationPathError(
                         f"transaction一時pathが通常fileではありません: {child_path}"
                     )
-                found = True
+                return True
             elif kind == "directory":
                 with current.open_child_directory(name) as child_directory:
-                    if child_directory.identity != expected_identity:
+                    if not directory_identity_matches(
+                        child_directory.identity,
+                        expected_identity,
+                    ):
                         raise _UnsafeOBSMigrationPathError(
                             f"列挙後にdirectory identityが変化しました: {child_path}"
                         )
-                    found = visit(child_directory) or found
-        if list_children(current) != children_before:
+                    if visit(child_directory):
+                        return True
+        if change_monitor is None and list_children(current) != children_before:
             raise _UnsafeOBSMigrationPathError(
                 f"走査中にdirectory entryが変化しました: {current.path}"
             )
-        return found
+        return False
 
     return visit(directory)
 

@@ -69,3 +69,45 @@ addressed together with its reason; do not silently ignore review comments.
 - Do not use bot identities for ordinary developer commits when a maintainer is
   responsible for the change. Repository history must describe what changed,
   not which supporting tool was used.
+
+## Complexity control
+
+Ponytail and similar minimalism aids are advisory complexity controls. They
+do not override repository requirements or authorize removal of existing
+safeguards.
+
+- Use Ponytail `lite` by default in this repository.
+- Ponytail `full` may be used only for a small and explicitly scoped
+  implementation.
+- Do not use Ponytail `ultra` unless the maintainer explicitly requests it
+  for a specific task.
+- Do not run a whole-repository Ponytail audit unless the maintainer
+  explicitly requests it.
+- Ponytail review is an additional over-engineering review. It does not
+  replace correctness, security, performance, compatibility, licensing,
+  Release, or manual review.
+- `CONTRIBUTING.md` and the relevant manual test checklist override
+  Ponytail's preference for the smallest possible test.
+- Do not remove or weaken validation, process-identity checks, transaction
+  recovery, data-loss prevention, installer isolation, license checks,
+  Release gates, or compatibility behavior merely to reduce code or file
+  count.
+- Do not simplify code that manages OBS processes, user recordings,
+  application settings, credentials, installer cleanup, or external runtime
+  boundaries without an explicitly scoped requirement and appropriate
+  regression tests.
+- Do not create follow-up Issues automatically. Report at most three
+  candidates, ranked by user impact, likelihood, and reproducibility. The
+  maintainer decides whether they become Issues.
+- Prefer observed user-flow failures over speculative hardening.
+- Before introducing an abstraction, require either two real implementations
+  or an explicitly approved migration requirement.
+- Prefer the smallest correct change after tracing the complete affected
+  flow. A small diff in the wrong layer is not an acceptable simplification.
+- The current product priority is one complete real League of Legends
+  recording and replay flow, not minimizing the repository's total line
+  count.
+- Passing a Ponytail review or automated tests does not prove that real LoL,
+  OBS, mpv, FFmpeg, Windows installer, or uninstall flows work.
+- If the Ponytail plugin is unavailable or disabled, the rules in this
+  section still apply as repository instructions.

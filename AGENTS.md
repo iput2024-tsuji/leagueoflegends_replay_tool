@@ -9,7 +9,8 @@ Follow `CONTRIBUTING.md` for all development and GitHub operations.
 - Use one branch for one Issue-sized purpose. Split unrelated changes into
   separate Issues and branches.
 - Record the related Issue in the Pull Request. If work reveals additional
-  scope, create or identify another Issue instead of expanding the branch.
+  scope, do not expand the branch. Identify an existing Issue or report the
+  scope to the maintainer; create a new Issue only with maintainer approval.
 - Before opening a Pull Request, run Ruff and pytest as documented in
   `CONTRIBUTING.md` unless the change is documentation-only. Record skipped
   checks and their reasons in the Pull Request.
@@ -31,7 +32,7 @@ Classify review feedback before responding:
   violations of repository rules. Resolve before merge.
 - `Should`: maintainability, clarity, resilience, or useful test improvements.
   Resolve before merge when practical; otherwise document why it is deferred
-  and link or create a follow-up Issue.
+  and link an existing follow-up Issue or report it for maintainer triage.
 - `Nit`: optional wording, style, or preference with no material behavioral
   effect. Apply when useful; declining it only requires a brief reason.
 
@@ -69,3 +70,49 @@ addressed together with its reason; do not silently ignore review comments.
 - Do not use bot identities for ordinary developer commits when a maintainer is
   responsible for the change. Repository history must describe what changed,
   not which supporting tool was used.
+
+## Complexity control
+
+Ponytail and similar minimalism aids are advisory complexity controls. They
+do not override repository requirements or authorize removal of existing
+safeguards.
+
+- Use Ponytail `lite` by default in this repository.
+- Ponytail `full` may be used only for a small and explicitly scoped
+  implementation.
+- Do not use Ponytail `ultra` unless the maintainer explicitly requests it
+  for a specific task.
+- Do not run a whole-repository Ponytail audit unless the maintainer
+  explicitly requests it.
+- Ponytail review is an additional over-engineering review. It does not
+  replace correctness, security, performance, compatibility, licensing,
+  Release, or manual review.
+- `CONTRIBUTING.md` and the relevant manual test checklist override
+  Ponytail's preference for the smallest possible test.
+- Do not remove or weaken validation, process-identity checks, transaction
+  recovery, data-loss prevention, installer isolation, license checks,
+  Release gates, or compatibility behavior merely to reduce code or file
+  count.
+- Do not simplify code that manages OBS processes, user recordings,
+  application settings, credentials, installer cleanup, or external runtime
+  boundaries without an explicitly scoped requirement and appropriate
+  regression tests.
+- Do not create follow-up Issues without maintainer approval. Link an existing
+  Issue when available; otherwise report the candidate for maintainer triage.
+- When prioritizing work outside the `Must` category, prefer observed
+  user-flow failures over speculative hardening. Findings involving
+  correctness, security, data loss, compatibility, required tests, licensing,
+  or Release blockers remain `Must` even if they have not yet appeared in a
+  user report.
+- Before introducing an abstraction, require either two concrete production
+  implementations, a documented external-boundary or testability need, or
+  explicit maintainer approval.
+- Prefer the smallest correct change after tracing the complete affected
+  flow. A small diff in the wrong layer is not an acceptable simplification.
+- The current product priority is one complete real League of Legends
+  recording and replay flow, not minimizing the repository's total line
+  count.
+- Passing a Ponytail review or automated tests does not prove that real LoL,
+  OBS, mpv, FFmpeg, Windows installer, or uninstall flows work.
+- If the Ponytail plugin is unavailable or disabled, the rules in this
+  section still apply as repository instructions.

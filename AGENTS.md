@@ -99,9 +99,11 @@ safeguards.
   regression tests.
 - Do not create follow-up Issues without maintainer approval. Link an existing
   Issue when available; otherwise report the candidate for maintainer triage.
-- When choosing discretionary work, prefer observed user-flow failures over
-  speculative hardening. Required correctness, security, licensing, and
-  Release gates remain mandatory.
+- When prioritizing work outside the `Must` category, prefer observed
+  user-flow failures over speculative hardening. Findings involving
+  correctness, security, data loss, compatibility, required tests, licensing,
+  or Release blockers remain `Must` even if they have not yet appeared in a
+  user report.
 - Before introducing an abstraction, require either two concrete production
   implementations, a documented external-boundary or testability need, or
   explicit maintainer approval.

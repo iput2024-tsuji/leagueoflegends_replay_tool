@@ -9,7 +9,8 @@ Follow `CONTRIBUTING.md` for all development and GitHub operations.
 - Use one branch for one Issue-sized purpose. Split unrelated changes into
   separate Issues and branches.
 - Record the related Issue in the Pull Request. If work reveals additional
-  scope, create or identify another Issue instead of expanding the branch.
+  scope, do not expand the branch. Identify an existing Issue or report the
+  scope to the maintainer; create a new Issue only with maintainer approval.
 - Before opening a Pull Request, run Ruff and pytest as documented in
   `CONTRIBUTING.md` unless the change is documentation-only. Record skipped
   checks and their reasons in the Pull Request.
@@ -31,7 +32,7 @@ Classify review feedback before responding:
   violations of repository rules. Resolve before merge.
 - `Should`: maintainability, clarity, resilience, or useful test improvements.
   Resolve before merge when practical; otherwise document why it is deferred
-  and link or create a follow-up Issue.
+  and link an existing follow-up Issue or report it for maintainer triage.
 - `Nit`: optional wording, style, or preference with no material behavioral
   effect. Apply when useful; declining it only requires a brief reason.
 
@@ -96,12 +97,14 @@ safeguards.
   application settings, credentials, installer cleanup, or external runtime
   boundaries without an explicitly scoped requirement and appropriate
   regression tests.
-- Do not create follow-up Issues automatically. Report at most three
-  candidates, ranked by user impact, likelihood, and reproducibility. The
-  maintainer decides whether they become Issues.
-- Prefer observed user-flow failures over speculative hardening.
-- Before introducing an abstraction, require either two real implementations
-  or an explicitly approved migration requirement.
+- Do not create follow-up Issues without maintainer approval. Link an existing
+  Issue when available; otherwise report the candidate for maintainer triage.
+- When choosing discretionary work, prefer observed user-flow failures over
+  speculative hardening. Required correctness, security, licensing, and
+  Release gates remain mandatory.
+- Before introducing an abstraction, require either two concrete production
+  implementations, a documented external-boundary or testability need, or
+  explicit maintainer approval.
 - Prefer the smallest correct change after tracing the complete affected
   flow. A small diff in the wrong layer is not an acceptable simplification.
 - The current product priority is one complete real League of Legends

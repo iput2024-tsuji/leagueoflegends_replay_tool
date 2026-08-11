@@ -712,10 +712,7 @@ class _OBSProcessLeaseTransaction:
 class _OBSStartAdmissionGuard:
     managed_pin: _OBSExecutableIdentityPin
     candidate_pins: tuple[_OBSExecutableIdentityPin, ...]
-
-    @property
-    def launch_path(self) -> Path:
-        return self.managed_pin.launch_path
+    launch_path: Path
 
     def revalidate(self) -> None:
         self.managed_pin.revalidate()
@@ -729,7 +726,6 @@ class OBSProcessManager:
     def __init__(self, obs_dir: str | Path, logger: logging.Logger | None = None) -> None:
         self.obs_dir = Path(obs_dir).resolve()
         self.obs_exe = (self.obs_dir / "bin" / "64bit" / "obs64.exe").resolve()
-        self.working_dir = self.obs_exe.parent
         self.logger = logger or LOGGER
         self.lease_path = self.obs_dir / OBS_PROCESS_LEASE_FILE_NAME
         self.lease_lock_path = self.obs_dir / OBS_PROCESS_LEASE_LOCK_NAME
@@ -2552,8 +2548,13 @@ class OBSProcessManager:
 
         with ExitStack() as stack:
             try:
+                managed_launch_path = self.obs_exe
+                if not _is_absolute_obs_process_path(managed_launch_path):
+                    raise OBSProcessQueryError(
+                        "OBS start managed executable path is not absolute"
+                    )
                 managed_pin = stack.enter_context(
-                    _pin_obs_executable_identity(self.obs_exe)
+                    _pin_obs_executable_identity(managed_launch_path)
                 )
                 candidate_pins: list[_OBSExecutableIdentityPin] = []
                 managed_processes: list[OBSProcessInfo] = []
@@ -2563,7 +2564,10 @@ class OBSProcessManager:
                         raise OBSProcessQueryError(
                             "OBS start admission process path is missing"
                         )
-                    if _obs_process_paths_equal(executable_path, self.obs_exe):
+                    if _obs_process_paths_equal(
+                        executable_path,
+                        managed_launch_path,
+                    ):
                         managed_processes.append(process)
                         continue
                     candidate_pin = stack.enter_context(
@@ -2589,6 +2593,7 @@ class OBSProcessManager:
                 guard = _OBSStartAdmissionGuard(
                     managed_pin=managed_pin,
                     candidate_pins=tuple(candidate_pins),
+                    launch_path=managed_launch_path,
                 )
                 self._revalidate_obs_start_guard_locked(
                     transaction,

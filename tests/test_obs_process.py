@@ -640,8 +640,8 @@ def test_start_obs_physical_identity_denial_fails_closed_before_popen_or_signal(
     )
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Windows volume GUID起動pathの実APIテスト")
-def test_start_obs_uses_pinned_volume_guid_command_cwd_and_lease_proof(
+@pytest.mark.skipif(os.name != "nt", reason="Windows CreateProcess起動pathの実APIテスト")
+def test_start_obs_uses_normal_absolute_command_while_preserving_volume_guid_proof(
     monkeypatch,
     tmp_path,
 ):
@@ -686,14 +686,34 @@ def test_start_obs_uses_pinned_volume_guid_command_cwd_and_lease_proof(
 
     assert len(popen_calls) == 1
     command, kwargs = popen_calls[0]
-    assert command[0] == str(launch_path)
-    assert kwargs["cwd"] == str(launch_path.parent)
+    assert command[0] == str(manager.obs_exe)
+    assert kwargs["cwd"] == str(manager.obs_exe.parent)
     with obs_process_module._pin_obs_executable_identity(Path(command[0])) as pin:
         assert pin.physical_identity == expected_physical_identity
     lease = manager.read_process_lease()
     assert lease is not None
     assert lease.executable_path == manager.obs_exe
     assert process._lol_replay_obs_process_lease == lease
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows CreateProcess互換性の実APIテスト")
+def test_windows_normal_absolute_path_starts_helper_while_identity_is_pinned():
+    helper_path = Path(sys.executable).resolve()
+
+    with obs_process_module._pin_obs_executable_identity(helper_path) as pin:
+        pin.revalidate()
+        assert str(pin.launch_path).casefold().startswith("\\\\?\\volume{")
+        assert helper_path.is_absolute()
+        assert not str(helper_path).casefold().startswith("\\\\?\\volume{")
+        subprocess.run(
+            [str(helper_path), "-c", "import sys; sys.exit(0)"],
+            cwd=str(helper_path.parent),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows volume GUID owned pathの実APIテスト")

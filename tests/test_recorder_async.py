@@ -946,6 +946,8 @@ def test_record_until_end_stops_when_game_process_disappears_after_live_client_f
     )
     recorder.recording_started = True
     recorder.wait_with_stop_async = AsyncMock(return_value=True)
+    messages = []
+    recorder.log = messages.append
 
     outcome = run(recorder.record_until_end_async())
 
@@ -954,9 +956,71 @@ def test_record_until_end_stops_when_game_process_disappears_after_live_client_f
     assert recorder.match_metadata["result_source"] == "unavailable"
     assert recorder.game_result is None
     assert recorder.winning_team is None
+    assert any("勝敗を取得できませんでした" in message for message in messages)
     assert riot_client.get_all_game_data_result.await_count == 3
     assert game_process_checker.call_count == 3
     riot_client.get_event_data.assert_not_awaited()
+    riot_client.get_post_game_result.assert_awaited_once()
+
+
+def test_ensure_post_game_result_uses_cached_live_result_without_failure_warning():
+    tmp_path = runtime_dir("cached_live_result")
+    riot_client = Mock()
+    riot_client.get_post_game_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE)
+    )
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path),
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder.last_game_data = {"gameData": {"gameResult": "Loss"}}
+    messages = []
+    recorder.log = messages.append
+
+    run(
+        recorder.ensure_post_game_result_async(
+            recordtest.RecordingEndDecision(True, recordtest.RecordingEndReason.GAME_END_EVENT)
+        )
+    )
+    payload = recorder.build_session_payload()
+
+    assert recorder.game_result == "Loss"
+    assert payload["game_result"] == "Loss"
+    assert payload["match"]["result_source"] == "live_client_game_data"
+    assert not any("勝敗を取得できませんでした" in message for message in messages)
+    riot_client.get_post_game_result.assert_awaited_once()
+
+
+def test_ensure_post_game_result_keeps_game_end_result_without_failure_warning():
+    tmp_path = runtime_dir("game_end_result_without_winning_team")
+    riot_client = Mock()
+    riot_client.get_post_game_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE)
+    )
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path),
+        obs_client=FakeOBSClient(),
+        riot_api_client=riot_client,
+        auto_setup=False,
+    )
+    recorder.last_game_data = {"gameData": {"gameResult": "Loss"}}
+    recorder.update_result_from_events([{"EventName": "GameEnd", "Result": "Lose", "WinningTeam": None}])
+    messages = []
+    recorder.log = messages.append
+
+    run(
+        recorder.ensure_post_game_result_async(
+            recordtest.RecordingEndDecision(True, recordtest.RecordingEndReason.GAME_END_EVENT)
+        )
+    )
+    payload = recorder.build_session_payload()
+
+    assert payload["game_result"] == "Loss"
+    assert payload["winning_team"] is None
+    assert payload["match"]["result_source"] == "live_client_game_end"
+    assert not any("勝敗を取得できませんでした" in message for message in messages)
     riot_client.get_post_game_result.assert_awaited_once()
 
 

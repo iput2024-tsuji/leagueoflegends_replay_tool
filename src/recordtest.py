@@ -3823,6 +3823,30 @@ class LoLAutoRecorder(RecordingSessionManager):
             return DEFAULT_POST_GAME_RESULT_WAIT_SEC
         return 0.0
 
+    def _apply_result_from_last_game_data(self) -> bool:
+        if not self.last_game_data or (self.game_result is not None and self.winning_team is not None):
+            return False
+        game_data = self.last_game_data.get("gameData", {})
+        if not isinstance(game_data, dict):
+            return False
+
+        result_value = game_data.get("gameResult") or game_data.get("result")
+        winning_team = game_data.get("winningTeam") or game_data.get("winning_team")
+        changed = False
+        if self.game_result is None:
+            game_result = normalize_game_result_value(result_value) or result_value
+            if game_result:
+                self.game_result = game_result
+                changed = True
+        if self.winning_team is None:
+            normalized_winning_team = normalize_lcu_team(winning_team) or winning_team
+            if normalized_winning_team:
+                self.winning_team = normalized_winning_team
+                changed = True
+        if changed:
+            self.match_metadata["result_source"] = "live_client_game_data"
+        return changed
+
     async def ensure_post_game_result_async(self, decision: RecordingEndDecision) -> None:
         if self.game_result and self.winning_team:
             return
@@ -3842,6 +3866,9 @@ class LoLAutoRecorder(RecordingSessionManager):
                 if await self._poll_post_game_result_once_async():
                     return
 
+        self._apply_result_from_last_game_data()
+        if self.game_result or self.winning_team:
+            return
         self.match_metadata.setdefault("result_source", "unavailable")
         self.log("⚠️ 勝敗を取得できませんでした。録画保存を優先します。")
 
@@ -4367,17 +4394,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         if self.output_file is None:
             self.output_file = build_output_path(self.config)
 
-        if self.last_game_data and (self.game_result is None or self.winning_team is None):
-            game_data = self.last_game_data.get("gameData", {})
-            if isinstance(game_data, dict):
-                result_value = game_data.get("gameResult") or game_data.get("result")
-                winning_team = game_data.get("winningTeam") or game_data.get("winning_team")
-                if self.game_result is None:
-                    self.game_result = normalize_game_result_value(result_value) or result_value
-                if self.winning_team is None:
-                    self.winning_team = normalize_lcu_team(winning_team) or winning_team
-                if self.game_result or self.winning_team:
-                    self.match_metadata["result_source"] = "live_client_game_data"
+        self._apply_result_from_last_game_data()
 
         if self.game_start_detection_source:
             self.match_metadata["game_start_detection_source"] = self.game_start_detection_source

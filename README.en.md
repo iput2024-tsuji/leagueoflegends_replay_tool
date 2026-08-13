@@ -83,7 +83,9 @@ Recording monitoring runs in a `RecorderWorker` separate from the GUI thread. Th
 The main responsibilities are separated as follows:
 
 - `obs_websocket_client.py` / `OBSClient`: OBS WebSocket communication and OBS control
-- `RiotAPIClient`: Riot local API requests and response parsing
+- `riot_api.py` / `RiotAPIClient`: Live Client API and LCU requests, response parsing, and poll-state classification
+- `recorder_config.py` / `AppConfig`: structured recording settings, loading, and user-data path resolution
+- `storage_policy.py`: storage limits, app-owned recording checks, and safe deletion when the limit is exceeded
 - `RecordingSessionManager` / `LoLAutoRecorder`: recording workflow orchestration
 - `controllers.py`: settings, audio, analytics, and recording controllers
 - `app.py`: PyQt6 views and user interaction
@@ -122,14 +124,17 @@ Maintainer-authored commits and Pull Requests are managed in Japanese. English I
 
 ```text
 src/
-  app.py                 # PyQt6 GUI and RecorderWorker
-  recordtest.py          # Recording workflow and compatibility facade for existing imports
+  app.py                  # PyQt6 GUI and RecorderWorker
+  recordtest.py           # Recording state transitions, session integration, and compatibility facade
+  recorder_config.py      # Structured recording settings, loading, and path resolution
+  riot_api.py             # Live Client API / LCU client and poll-state classification
+  storage_policy.py       # Storage limits and safe deletion of app-owned recordings
   obs_websocket_client.py # OBS WebSocket client and request/response handling
-  recording_library.py   # Safe recording and metadata deletion
-  player.py              # mpv replay player
-  analytics.py           # Data analysis and tactical rules
-  controllers.py         # UI/backend controller layer
-  app_paths.py           # Runtime path resolution
+  recording_library.py    # Safe recording and metadata deletion
+  player.py               # mpv replay player
+  analytics.py            # Data analysis and tactical rules
+  controllers.py          # UI/backend controller layer
+  app_paths.py            # Runtime path resolution
 config/
   setting.sample.json
 recordings/

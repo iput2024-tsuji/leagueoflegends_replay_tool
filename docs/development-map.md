@@ -10,7 +10,10 @@ LoL Replay Toolの変更箇所を判断するための開発者向け地図で�
 | `src/app.py` | PyQt6画面、画面遷移、`RecorderWorker`、設定UI | UIスレッドを止めないこと、ワーカー終了、手動GUI確認 |
 | `src/controllers.py` | UIから設定・録画・分析処理を呼ぶ境界 | UIと外部依存を直接結合しないこと |
 | `src/recording_supervisor.py` | 監視、録画、終了、保存、通知をつなぐアプリケーションフロー | 正常終了、部分保存、中断、次試合監視 |
-| `src/recordtest.py` | `LoLAutoRecorder`、Live Client/LCU連携、録画処理、既存import互換facade | 非同期状態遷移、外部API失敗、既存テストのモック境界 |
+| `src/recordtest.py` | `RecordingSessionManager`、`LoLAutoRecorder`、録画状態遷移とセッション統合、既存import互換facade | 非同期状態遷移、外部API失敗、既存テストのモック境界 |
+| `src/recorder_config.py` | `AppConfig`、設定値の構造化と読み込み、ユーザーデータ配下のパス解決 | 既定値、相対・絶対パス、開発版と配布版の保存先 |
+| `src/riot_api.py` | `RiotAPIClient`、Live Client API／LCUの非同期取得、レスポンス解析、poll状態の区別 | 未起動、404、認証失敗、タイムアウト、一時障害と試合外の区別 |
+| `src/storage_policy.py` | 容量上限、アプリ所有の動画・クリップ判定、上限超過時の安全な削除 | 設定済みの保存先以外を削除しないこと、保持対象、壊れたJSON、削除失敗 |
 | `src/obs_websocket_client.py` | `ObsWebSocketClient`、OBS接続、request/response、シーン・入力・録画・音声制御 | 認証、タイムアウト、再試行、`recordtest`のimport・monkeypatch互換性 |
 | `src/obs_runtime.py` | OBSプロセス所有権とRecorder生成 | 管理対象OBSだけを制御・終了すること |
 | `src/obs_process.py` | OBS起動、プロセス探索、ログ診断、終了 | Windows実機、既存OBSとの衝突、プロセス取り違え |

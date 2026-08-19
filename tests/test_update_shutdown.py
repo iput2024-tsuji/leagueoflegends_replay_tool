@@ -41,6 +41,24 @@ def test_update_obs_gate_fails_when_unowned_managed_obs_remains(monkeypatch):
         app_module._stop_owned_obs_for_update()
 
 
+def test_update_request_during_startup_setup_is_blocked_immediately(monkeypatch):
+    guard = SimpleNamespace(
+        consume_update_shutdown_request=Mock(return_value=True),
+    )
+    window = SimpleNamespace(
+        _instance_guard=guard,
+        _closing=False,
+        _startup_setup_active=True,
+        _notify_installer_shutdown_blocked=Mock(),
+        _handle_update_shutdown_request=Mock(),
+    )
+
+    MainWindow._poll_update_shutdown_request(window)
+
+    window._notify_installer_shutdown_blocked.assert_called_once_with()
+    window._handle_update_shutdown_request.assert_not_called()
+
+
 def test_recorder_worker_rejects_update_after_recording_transition():
     supervisor = SimpleNamespace(reserve_update_shutdown=Mock(return_value=False))
     worker = SimpleNamespace(

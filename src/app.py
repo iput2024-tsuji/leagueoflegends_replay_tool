@@ -1631,6 +1631,7 @@ class MainWindow(QMainWindow):
         self._update_shutdown_completed = False
         self._update_shutdown_timer = None
         self._last_recorder_shutdown_failed = False
+        self._startup_setup_active = False
         self.setWindowTitle("LoL Replay Tool")
         self.resize(1200, 720)
         icon = get_app_icon()
@@ -1666,15 +1667,27 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.settings_page)
 
         self.stack.setCurrentWidget(self.home_page)
-        setup_ok = self.run_startup_setup()
-        self._recorder_autostart_enabled = setup_ok
-        if setup_ok:
-            self.start_background_recorder()
+        if self._instance_guard is None:
+            self._finish_startup_setup()
         else:
-            self.home_page.set_recorder_status(
-                "⚪ セットアップ未完了",
-                color_hex="#cfcfcf",
-            )
+            QTimer.singleShot(0, self._finish_startup_setup)
+
+    def _finish_startup_setup(self) -> None:
+        if self._closing:
+            return
+        self._startup_setup_active = True
+        try:
+            setup_ok = self.run_startup_setup()
+            self._recorder_autostart_enabled = setup_ok
+            if setup_ok:
+                self.start_background_recorder()
+            else:
+                self.home_page.set_recorder_status(
+                    "⚪ セットアップ未完了",
+                    color_hex="#cfcfcf",
+                )
+        finally:
+            self._startup_setup_active = False
 
     def init_menu_bar(self) -> None:
         help_menu = self.menuBar().addMenu("ヘルプ")
@@ -1742,6 +1755,9 @@ class MainWindow(QMainWindow):
             self._notify_installer_shutdown_blocked()
             return
         if requested:
+            if self._startup_setup_active:
+                self._notify_installer_shutdown_blocked()
+                return
             self._handle_update_shutdown_request()
 
     def _handle_update_shutdown_request(self) -> None:

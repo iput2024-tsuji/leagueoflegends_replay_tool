@@ -2170,7 +2170,12 @@ def main() -> None:
         window.show()
         app.exec()
     finally:
-        if window is not None and window._update_shutdown_completed:
+        update_shutdown_completed = (
+            window is not None and window._update_shutdown_completed
+        )
+        # Keep the handles open until process teardown so the installer cannot
+        # reach its file-in-use check while this executable is still exiting.
+        if update_shutdown_completed:
             try:
                 if not instance_guard.signal_update_shutdown_complete():
                     recordtest.LOGGER.error("Failed to signal completed update shutdown")
@@ -2179,7 +2184,8 @@ def main() -> None:
                     "Failed to signal completed update shutdown",
                     exc_info=True,
                 )
-        instance_guard.release()
+        else:
+            instance_guard.release()
 
 
 if __name__ == "__main__":

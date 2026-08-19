@@ -204,3 +204,44 @@ def test_update_shutdown_keeps_failed_recorder_for_fail_closed_result():
     assert MainWindow.stop_background_recorder(window) is False
     assert window.bg_recorder_worker is worker
     window.worker_registry.unregister.assert_not_called()
+
+
+@pytest.mark.parametrize("update_shutdown_completed", [False, True])
+def test_main_keeps_instance_handles_until_update_process_teardown(
+    monkeypatch, update_shutdown_completed
+):
+    class FakeApplication:
+        def __init__(self, _argv):
+            pass
+
+        def setWindowIcon(self, _icon):
+            pass
+
+        def setStyleSheet(self, _stylesheet):
+            pass
+
+        def exec(self):
+            return 0
+
+    guard = SimpleNamespace(
+        acquire=Mock(return_value=True),
+        release=Mock(),
+        signal_update_shutdown_complete=Mock(return_value=True),
+    )
+    window = SimpleNamespace(
+        _update_shutdown_completed=update_shutdown_completed,
+        show=Mock(),
+    )
+    monkeypatch.setattr(app_module, "QApplication", FakeApplication)
+    monkeypatch.setattr(app_module, "SingleInstanceGuard", lambda: guard)
+    monkeypatch.setattr(app_module, "MainWindow", lambda instance_guard: window)
+    monkeypatch.setattr(app_module, "get_app_icon", lambda: None)
+
+    app_module.main()
+
+    if update_shutdown_completed:
+        guard.signal_update_shutdown_complete.assert_called_once_with()
+        guard.release.assert_not_called()
+    else:
+        guard.signal_update_shutdown_complete.assert_not_called()
+        guard.release.assert_called_once_with()

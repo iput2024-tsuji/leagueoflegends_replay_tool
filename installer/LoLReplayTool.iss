@@ -64,6 +64,34 @@ Filename: "{app}\{#AppExeName}"; Description: "{#AppName} を起動"; Flags: now
 Filename: "{localappdata}\LoLReplayTool\bin"; Description: "mpv DLL の配置フォルダーを開く"; Flags: shellexec postinstall skipifsilent unchecked; Check: not IsContentAuditMode
 
 [Code]
+const
+  SynchronizeAccess = $00100000;
+  EventModifyState = $0002;
+  ErrorFileNotFound = 2;
+  WaitObject0 = 0;
+  WaitTimeout = 258;
+  UpdateShutdownPollCount = 120;
+  UpdateShutdownPollIntervalMs = 250;
+  AppMutexName = 'Local\LoLReplayTool.SingleInstance';
+  UpdateShutdownEventName = 'Local\LoLReplayTool.UpdateShutdown';
+  UpdateShutdownBlockedEventName = 'Local\LoLReplayTool.UpdateShutdownBlocked';
+  UpdateShutdownCompleteEventName = 'Local\LoLReplayTool.UpdateShutdownComplete';
+
+function OpenMutex(DesiredAccess: LongWord; InheritHandle: BOOL;
+  const Name: String): THandle;
+  external 'OpenMutexW@kernel32.dll stdcall';
+function OpenEvent(DesiredAccess: LongWord; InheritHandle: BOOL;
+  const Name: String): THandle;
+  external 'OpenEventW@kernel32.dll stdcall';
+function SetEvent(EventHandle: THandle): BOOL;
+  external 'SetEvent@kernel32.dll stdcall';
+function ResetEvent(EventHandle: THandle): BOOL;
+  external 'ResetEvent@kernel32.dll stdcall';
+function WaitForSingleObject(Handle: THandle; Milliseconds: LongWord): LongWord;
+  external 'WaitForSingleObject@kernel32.dll stdcall';
+function CloseHandle(Handle: THandle): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
+
 var
   MpvInfoPage: TOutputMsgWizardPage;
   DeleteManagedDataOnUninstall: Boolean;
@@ -72,6 +100,171 @@ var
 function IsContentAuditMode: Boolean;
 begin
   Result := ExpandConstant('{param:contentaudit|}') = '1';
+end;
+
+function QueryApplicationRunning(var QueryFailed: Boolean): Boolean;
+var
+  MutexHandle: THandle;
+  LastError: LongWord;
+begin
+  QueryFailed := False;
+  MutexHandle := OpenMutex(SynchronizeAccess, False, AppMutexName);
+  if MutexHandle <> 0 then
+  begin
+    Result := True;
+    if not CloseHandle(MutexHandle) then
+      QueryFailed := True;
+    Exit;
+  end;
+
+  LastError := DLLGetLastError;
+  if LastError = ErrorFileNotFound then
+    Result := False
+  else
+  begin
+    QueryFailed := True;
+    Result := False;
+  end;
+end;
+
+function RequestSafeUpdateShutdown: String;
+var
+  RequestHandle: THandle;
+  BlockedHandle: THandle;
+  CompleteHandle: THandle;
+  QueryFailed: Boolean;
+  ApplicationRunning: Boolean;
+  WaitResult: LongWord;
+  CompleteWaitResult: LongWord;
+  ShutdownCompleted: Boolean;
+  HandleCloseFailed: Boolean;
+  Attempt: Integer;
+begin
+  Result := '';
+  ApplicationRunning := QueryApplicationRunning(QueryFailed);
+  if QueryFailed then
+  begin
+    Result := 'LoL Replay Tool の実行状態を安全に確認できませんでした。' +
+      'アプリとOBSを手動で終了してから更新を再試行してください。';
+    Exit;
+  end;
+  if not ApplicationRunning then
+    Exit;
+
+  RequestHandle := 0;
+  BlockedHandle := 0;
+  CompleteHandle := 0;
+  HandleCloseFailed := False;
+  try
+    RequestHandle := OpenEvent(EventModifyState, False,
+      UpdateShutdownEventName);
+    BlockedHandle := OpenEvent(SynchronizeAccess or EventModifyState, False,
+      UpdateShutdownBlockedEventName);
+    CompleteHandle := OpenEvent(SynchronizeAccess or EventModifyState, False,
+      UpdateShutdownCompleteEventName);
+    if (RequestHandle = 0) or (BlockedHandle = 0) or (CompleteHandle = 0) then
+    begin
+      Result := '起動中のLoL Replay Toolは更新用の安全終了に対応していません。' +
+        'タスクトレイの「終了」からアプリを終了し、更新を再試行してください。';
+      Exit;
+    end;
+
+    if not ResetEvent(BlockedHandle) then
+    begin
+      Result := '更新用の安全終了状態を初期化できませんでした。' +
+        'アプリとOBSを手動で終了してから更新を再試行してください。';
+      Exit;
+    end;
+    if not ResetEvent(CompleteHandle) then
+    begin
+      Result := '更新用の安全終了完了状態を初期化できませんでした。' +
+        'アプリとOBSを手動で終了してから更新を再試行してください。';
+      Exit;
+    end;
+    if not SetEvent(RequestHandle) then
+    begin
+      Result := 'LoL Replay Toolへ安全終了を要求できませんでした。' +
+        'タスクトレイの「終了」からアプリを終了し、更新を再試行してください。';
+      Exit;
+    end;
+
+    ShutdownCompleted := False;
+    for Attempt := 1 to UpdateShutdownPollCount do
+    begin
+      WaitResult := WaitForSingleObject(BlockedHandle, 0);
+      if WaitResult = WaitObject0 then
+      begin
+        Result := 'LoL Replay Toolは録画中か、安全終了を完了できませんでした。' +
+          'アプリに表示された案内を確認し、録画中の場合は試合終了後に更新を再試行してください。';
+        Exit;
+      end;
+      if (WaitResult <> WaitTimeout) then
+      begin
+        Result := 'LoL Replay Toolの安全終了結果を確認できませんでした。' +
+          'アプリとOBSを手動で終了してから更新を再試行してください。';
+        Exit;
+      end;
+
+      CompleteWaitResult := WaitForSingleObject(CompleteHandle, 0);
+      if CompleteWaitResult = WaitObject0 then
+        ShutdownCompleted := True
+      else if CompleteWaitResult <> WaitTimeout then
+      begin
+        Result := 'LoL Replay Toolの安全終了完了通知を確認できませんでした。' +
+          'アプリとOBSを手動で終了してから更新を再試行してください。';
+        Exit;
+      end;
+
+      ApplicationRunning := QueryApplicationRunning(QueryFailed);
+      if QueryFailed then
+      begin
+        Result := 'LoL Replay Toolの終了状態を安全に確認できませんでした。' +
+          'アプリとOBSを手動で終了してから更新を再試行してください。';
+        Exit;
+      end;
+      if not ApplicationRunning then
+      begin
+        if not ShutdownCompleted then
+        begin
+          CompleteWaitResult := WaitForSingleObject(CompleteHandle, 0);
+          ShutdownCompleted := CompleteWaitResult = WaitObject0;
+        end;
+        if ShutdownCompleted then
+          Exit;
+        Result := 'LoL Replay Toolが安全終了完了前に終了したため、更新を中止しました。' +
+          '管理対象OBSを手動で終了し、アプリを起動し直してから更新を再試行してください。';
+        Exit;
+      end;
+      Sleep(UpdateShutdownPollIntervalMs);
+    end;
+
+    Result := 'LoL Replay Toolの安全終了が時間内に完了しませんでした。' +
+      'アプリとOBSの状態を確認し、タスクトレイの「終了」から終了してから更新を再試行してください。';
+  finally
+    if CompleteHandle <> 0 then
+      if not CloseHandle(CompleteHandle) then
+        HandleCloseFailed := True;
+    if BlockedHandle <> 0 then
+      if not CloseHandle(BlockedHandle) then
+        HandleCloseFailed := True;
+    if RequestHandle <> 0 then
+      if not CloseHandle(RequestHandle) then
+        HandleCloseFailed := True;
+    if HandleCloseFailed and (Result = '') then
+      Result := '更新用の安全終了handleを解放できなかったため、更新を中止しました。' +
+        'アプリとOBSを手動で終了してから更新を再試行してください。';
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  if IsContentAuditMode then
+  begin
+    Result := '';
+    Exit;
+  end;
+
+  Result := RequestSafeUpdateShutdown;
 end;
 
 procedure InitializeWizard;

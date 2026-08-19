@@ -12,6 +12,7 @@ class FakeRecorder:
     def __init__(self, *args, **kwargs):
         self.open_called = 0
         self.shutdown_called = 0
+        self.shutdown_allow_force = []
         self.disconnect_called = 0
         self.finalize_called = 0
         self.fail_finalize = False
@@ -24,8 +25,9 @@ class FakeRecorder:
         if self.open_error is not None:
             raise self.open_error
 
-    def shutdown_obs(self):
+    def shutdown_obs(self, allow_force=True):
         self.shutdown_called += 1
+        self.shutdown_allow_force.append(allow_force)
         if self.shutdown_error is not None:
             raise self.shutdown_error
 
@@ -55,6 +57,37 @@ def test_runtime_closes_owned_obs_process_with_shutdown(monkeypatch):
     assert recorder.finalize_called == 1
     assert recorder.shutdown_called == 1
     assert recorder.disconnect_called == 0
+    assert recorder.shutdown_allow_force == [True]
+
+
+def test_runtime_close_propagates_graceful_only_to_popen_owned_recorder():
+    recorder = FakeRecorder()
+    runtime = RecorderRuntime(recorder=recorder, owns_process=True)
+
+    runtime.close(allow_force=False)
+
+    assert recorder.shutdown_allow_force == [False]
+
+
+def test_runtime_close_propagates_graceful_only_to_existing_owned_manager():
+    recorder = FakeRecorder()
+    calls = []
+
+    class Manager:
+        def kill_stale_owned_processes(self, **kwargs):
+            calls.append(kwargs)
+
+    runtime = RecorderRuntime(
+        recorder=recorder,
+        owns_process=True,
+        owns_existing_process=True,
+        process_manager=Manager(),
+    )
+
+    runtime.close(allow_force=False)
+
+    assert recorder.disconnect_called == 1
+    assert calls == [{"allow_force": False}]
 
 
 def test_runtime_closes_borrowed_obs_connection_with_disconnect(monkeypatch):

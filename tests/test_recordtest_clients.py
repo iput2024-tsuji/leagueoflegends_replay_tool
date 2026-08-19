@@ -3687,6 +3687,30 @@ def _read_obs_profile_ini(path):
     return parser
 
 
+def test_lol_auto_recorder_shutdown_obs_propagates_graceful_only_and_closes(
+):
+    calls = []
+
+    class FakeOBSClient:
+        obs_process = None
+
+        def shutdown(self, allow_force=True):
+            calls.append(allow_force)
+
+    recorder = recordtest.LoLAutoRecorder(
+        config=recordtest.AppConfig.from_dict({}),
+        obs_client=FakeOBSClient(),
+        auto_setup=False,
+    )
+    recorder.opened = True
+
+    recorder.shutdown_obs(allow_force=False)
+
+    assert calls == [False]
+    assert recorder.opened is False
+    assert recorder._status_handler is None
+
+
 def _fake_launch_config(root, recording_encoder="auto"):
     return recordtest.AppConfig.from_dict(
         {

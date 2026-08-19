@@ -92,7 +92,7 @@ class OBSClient(ABC):
         pass
 
     @abstractmethod
-    def shutdown(self) -> None:
+    def shutdown(self, allow_force: bool = True) -> None:
         pass
 
 
@@ -865,15 +865,22 @@ class ObsWebSocketClient(OBSClient):
             details["simple_file_output.settings_error"] = f"{type(exc).__name__}: {exc}"
         return details
 
-    def shutdown(self) -> None:
+    def shutdown(self, allow_force: bool = True) -> None:
         termination_error: BaseException | None = None
         if self.obs_process is not None:
             self.log("🧹 OBSを終了しています...")
             try:
-                _compat("OBSProcessManager")(
+                process_manager = _compat("OBSProcessManager")(
                     self.config.obs.obs_dir,
                     logger=self.logger,
-                ).terminate_process(self.obs_process)
+                )
+                if allow_force:
+                    process_manager.terminate_process(self.obs_process)
+                else:
+                    process_manager.terminate_process(
+                        self.obs_process,
+                        allow_force=False,
+                    )
                 self.obs_process = None
             except BaseException as exc:
                 termination_error = exc

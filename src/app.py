@@ -91,6 +91,21 @@ AUDIO_CONTROLLER = AudioSettingsController(CONFIG_CONTROLLER)
 ANALYTICS_CONTROLLER = AnalyticsController(CONFIG_CONTROLLER)
 
 
+def _stop_owned_obs_for_update() -> None:
+    manager = recordtest.OBSProcessManager(
+        recordtest.MANAGED_PORTABLE_OBS_DIR,
+        logger=recordtest.LOGGER,
+    )
+    with recordtest.OBS_OPERATION_LOCK:
+        manager.kill_stale_owned_processes(allow_force=False)
+        remaining = manager.query_managed_processes_strict()
+    if remaining:
+        raise recordtest.RecorderError(
+            "管理対象OBSが実行中ですが、停止を認可できる所有情報がありません。"
+            "OBSを手動で終了してから更新を再試行してください。"
+        )
+
+
 def apply_auto_defaults(
     data: dict[str, Any] | None, force_obs_detect: bool = False
 ) -> tuple[dict[str, Any], bool, list[str]]:
@@ -145,11 +160,14 @@ class RecorderWorker(QThread):
         self.supervisor = None
         self.loop = None
         self.stop_event = None
+        self._update_shutdown_requested = False
 
     def run(self) -> None:
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.stop_event = asyncio.Event()
+        if self.stop_flag:
+            self.stop_event.set()
         try:
             self.loop.run_until_complete(self.run_async())
         except recordtest.RecorderError as e:
@@ -179,6 +197,8 @@ class RecorderWorker(QThread):
             status_cb=self.status.emit,
             notification_cb=self.notification.emit,
         )
+        if self._update_shutdown_requested:
+            self.supervisor.reserve_update_shutdown()
         await self.supervisor.run(self.stop_event)
 
     def stop(self) -> None:
@@ -194,6 +214,17 @@ class RecorderWorker(QThread):
             self.stop_event.set()
         if self.supervisor:
             self.supervisor.request_stop()
+
+    def request_update_shutdown(self) -> bool:
+        supervisor = self.supervisor
+        if supervisor is not None and not supervisor.reserve_update_shutdown():
+            return False
+        self._update_shutdown_requested = True
+        self.stop()
+        return True
+
+    def update_shutdown_failed(self) -> bool:
+        return bool(self.supervisor and self.supervisor.shutdown_error is not None)
 
 
 class AnalyticsWorker(QThread):
@@ -1582,7 +1613,7 @@ class SettingsPage(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, instance_guard: SingleInstanceGuard | None = None) -> None:
         super().__init__()
         self.bg_recorder_worker = None
         self.worker_registry = WorkerRegistry()
@@ -1594,6 +1625,12 @@ class MainWindow(QMainWindow):
         self._recorder_autostart_enabled = False
         self._shutdown_attempts = 0
         self._shutdown_max_attempts = 3
+        self._update_shutdown_max_attempts = 1
+        self._instance_guard = instance_guard
+        self._update_shutdown_requested = False
+        self._update_shutdown_completed = False
+        self._update_shutdown_timer = None
+        self._last_recorder_shutdown_failed = False
         self.setWindowTitle("LoL Replay Tool")
         self.resize(1200, 720)
         icon = get_app_icon()
@@ -1601,6 +1638,11 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(icon)
         self.init_menu_bar()
         self.init_tray_icon()
+
+        if self._instance_guard is not None:
+            self._update_shutdown_timer = QTimer(self)
+            self._update_shutdown_timer.timeout.connect(self._poll_update_shutdown_request)
+            self._update_shutdown_timer.start(250)
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -1688,6 +1730,82 @@ class MainWindow(QMainWindow):
     def exit_from_tray(self) -> None:
         self._is_quitting = True
         self.close()
+
+    def _poll_update_shutdown_request(self) -> None:
+        guard = self._instance_guard
+        if guard is None or self._closing:
+            return
+        try:
+            requested = guard.consume_update_shutdown_request()
+        except Exception:
+            recordtest.LOGGER.error("Failed to poll the update shutdown event", exc_info=True)
+            self._notify_installer_shutdown_blocked()
+            return
+        if requested:
+            self._handle_update_shutdown_request()
+
+    def _handle_update_shutdown_request(self) -> None:
+        if self._last_recorder_shutdown_failed:
+            self._notify_installer_shutdown_blocked()
+            self.show()
+            self.showNormal()
+            QMessageBox.warning(
+                self,
+                "更新を開始できません",
+                "管理対象OBSの安全な終了状態を確認できません。アプリとOBSを手動で終了してから"
+                "更新を再試行してください。",
+            )
+            return
+        worker = self.bg_recorder_worker
+        if worker is not None and worker.isRunning():
+            try:
+                shutdown_allowed = worker.request_update_shutdown()
+            except Exception:
+                recordtest.LOGGER.error("Failed to reserve update shutdown", exc_info=True)
+                shutdown_allowed = False
+            if not shutdown_allowed:
+                self._notify_installer_shutdown_blocked()
+                self.restore_from_tray()
+                QMessageBox.warning(
+                    self,
+                    "更新を開始できません",
+                    "試合を録画中のため更新できません。試合終了後に更新を再試行してください。",
+                )
+                return
+
+        self._update_shutdown_requested = True
+        self._update_shutdown_completed = False
+        self._is_quitting = True
+        self.close()
+
+    def _notify_installer_shutdown_blocked(self) -> None:
+        guard = self._instance_guard
+        if guard is None:
+            return
+        try:
+            if not guard.signal_update_shutdown_blocked():
+                recordtest.LOGGER.error("Failed to signal the blocked update shutdown event")
+        except Exception:
+            recordtest.LOGGER.error("Failed to signal the blocked update shutdown event", exc_info=True)
+
+    def _abort_update_shutdown(self) -> None:
+        self._notify_installer_shutdown_blocked()
+        self._update_shutdown_requested = False
+        self._update_shutdown_completed = False
+        self._is_quitting = False
+        self._closing = False
+        self._shutdown_attempts = 0
+        self.show()
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        QMessageBox.warning(
+            self,
+            "更新のための終了に失敗しました",
+            "安全な終了を完了できなかったため、更新を中止しました。\n"
+            "アプリと管理対象OBSの状態を確認し、タスクトレイの「終了」から終了してから"
+            "更新を再試行してください。",
+        )
 
     def should_minimize_to_tray(self) -> bool:
         if self._is_quitting:
@@ -1824,6 +1942,12 @@ class MainWindow(QMainWindow):
     def start_background_recorder(self) -> None:
         if self.bg_recorder_worker and self.bg_recorder_worker.isRunning():
             return
+        if self._last_recorder_shutdown_failed:
+            self.home_page.set_recorder_status(
+                "⚠️ OBS終了状態を確認できません",
+                color_hex="#ffb74d",
+            )
+            return
 
         self.bg_recorder_worker = self.worker_registry.register(RecorderWorker(), cancel_method="stop")
         self.bg_recorder_worker.status.connect(self.on_bg_recorder_status)
@@ -1836,8 +1960,13 @@ class MainWindow(QMainWindow):
     def stop_background_recorder(self, wait_ms: int = 5000, force: bool = False) -> bool:
         worker = self.bg_recorder_worker
         if not worker:
-            return True
+            return not (
+                self._update_shutdown_requested
+                and self._last_recorder_shutdown_failed
+            )
         if not worker.isRunning():
+            if self._update_shutdown_requested and worker.update_shutdown_failed():
+                return False
             self.worker_registry.unregister(worker)
             self.bg_recorder_worker = None
             return True
@@ -1848,6 +1977,8 @@ class MainWindow(QMainWindow):
                 "⚠️ 停止待機中",
                 color_hex="#ffb74d",
             )
+            return False
+        if self._update_shutdown_requested and worker.update_shutdown_failed():
             return False
         self.worker_registry.unregister(worker)
         self.bg_recorder_worker = None
@@ -1882,6 +2013,9 @@ class MainWindow(QMainWindow):
         self.notification_service.notify(event, title, message)
 
     def on_bg_recorder_finished(self) -> None:
+        worker = self.bg_recorder_worker
+        if worker and worker.update_shutdown_failed():
+            self._last_recorder_shutdown_failed = True
         if self._closing:
             self.home_page.set_recorder_status("⚪ 停止", color_hex="#cfcfcf")
             return
@@ -1910,13 +2044,32 @@ class MainWindow(QMainWindow):
         self._closing = True
         player_stopped = self._stop_player()
         self._shutdown_attempts += 1
-        force_shutdown = self._shutdown_attempts > self._shutdown_max_attempts
+        force_shutdown = (
+            not self._update_shutdown_requested
+            and self._shutdown_attempts > self._shutdown_max_attempts
+        )
         workers_stopped = self._stop_all_background_work(force=force_shutdown) and player_stopped
         if not workers_stopped:
             self.home_page.set_recorder_status(
                 "⚠️ 停止待機中",
                 color_hex="#ffb74d",
             )
+            recorder_shutdown_failed = bool(
+                self._last_recorder_shutdown_failed
+                or (
+                    self.bg_recorder_worker
+                    and self.bg_recorder_worker.update_shutdown_failed()
+                )
+            )
+            if self._update_shutdown_requested and (
+                recorder_shutdown_failed
+                or self._shutdown_attempts > self._update_shutdown_max_attempts
+            ):
+                if recorder_shutdown_failed:
+                    self._last_recorder_shutdown_failed = True
+                event.ignore()
+                self._abort_update_shutdown()
+                return
             if force_shutdown:
                 reply = QMessageBox.warning(
                     self,
@@ -1934,11 +2087,24 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 QTimer.singleShot(1000, self.close)
                 return
+        if self._update_shutdown_requested:
+            try:
+                _stop_owned_obs_for_update()
+            except BaseException:
+                recordtest.LOGGER.error(
+                    "Managed OBS update shutdown verification failed",
+                    exc_info=True,
+                )
+                self._last_recorder_shutdown_failed = True
+                event.ignore()
+                self._abort_update_shutdown()
+                return
         if self._tray_icon:
             try:
                 self._tray_icon.hide()
             except Exception:
                 pass
+        self._update_shutdown_completed = self._update_shutdown_requested
         event.accept()
         super().closeEvent(event)
         app = QApplication.instance()
@@ -1949,6 +2115,7 @@ class MainWindow(QMainWindow):
 def main() -> None:
     app = QApplication([])
     instance_guard = SingleInstanceGuard()
+    window = None
     if not instance_guard.acquire():
         QMessageBox.information(None, "LoL Replay Tool", "LoL Replay Tool は既に起動しています。")
         return
@@ -1983,10 +2150,19 @@ def main() -> None:
             QSlider::groove:horizontal { height: 6px; background: #3a3a3a; }
             QSlider::handle:horizontal { background: #e0e0e0; width: 12px; margin: -4px 0; border-radius: 6px; }
         """)
-        window = MainWindow()
+        window = MainWindow(instance_guard=instance_guard)
         window.show()
         app.exec()
     finally:
+        if window is not None and window._update_shutdown_completed:
+            try:
+                if not instance_guard.signal_update_shutdown_complete():
+                    recordtest.LOGGER.error("Failed to signal completed update shutdown")
+            except Exception:
+                recordtest.LOGGER.error(
+                    "Failed to signal completed update shutdown",
+                    exc_info=True,
+                )
         instance_guard.release()
 
 

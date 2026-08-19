@@ -149,6 +149,40 @@ def test_absent_lease_in_existing_root_does_not_create_persistent_lock(tmp_path)
     assert not manager.lease_lock_path.exists()
 
 
+def test_query_managed_processes_strict_keeps_unmanaged_obs(monkeypatch, tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    manager.obs_exe.parent.mkdir(parents=True)
+    manager.obs_exe.touch()
+    unmanaged_exe = tmp_path / "obs-studio" / "bin" / "64bit" / "obs64.exe"
+    unmanaged_exe.parent.mkdir(parents=True)
+    unmanaged_exe.touch()
+    managed = _identity(manager, pid=101)
+    unmanaged = _identity(manager, pid=202, executable_path=unmanaged_exe)
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: _snapshot(managed, unmanaged),
+    )
+
+    assert manager.query_managed_processes_strict() == (managed,)
+
+
+def test_query_managed_processes_strict_rejects_incomplete_identity(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    incomplete = OBSProcessInfo(pid=101, executable_path=None, creation_time=10.0)
+    monkeypatch.setattr(
+        manager,
+        "query_obs_processes_strict",
+        lambda: _snapshot(incomplete),
+    )
+
+    with pytest.raises(OBSProcessQueryError, match="executable path"):
+        manager.query_managed_processes_strict()
+
+
 def test_absent_lease_probe_reports_root_appearance_with_recovery_paths(
     monkeypatch,
     tmp_path,
@@ -3390,6 +3424,83 @@ def _install_owned_windows_harness(
         lambda handle: events.append(("close", handle)),
     )
     return events
+
+
+def test_owned_windows_graceful_only_timeout_never_forces_and_keeps_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    target = _identity(manager)
+    _write_v2_lease(manager, target)
+    lease_before = manager.lease_path.read_bytes()
+    events = _install_owned_windows_harness(
+        monkeypatch,
+        manager,
+        target,
+        [_snapshot(target), _snapshot(target), _snapshot(target), _snapshot(target)],
+        [False, False, False, False, False, False],
+    )
+
+    with pytest.raises(OBSProcessQueryError, match="survived graceful"):
+        manager.kill_stale_owned_processes(timeout_sec=0, allow_force=False)
+
+    assert not any(event[0] == "force" for event in events)
+    assert manager.lease_path.read_bytes() == lease_before
+
+
+def test_owned_nonhandle_graceful_only_timeout_never_forces_and_keeps_lease(
+    monkeypatch,
+    tmp_path,
+):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    target = _identity(manager)
+    _write_v2_lease(manager, target)
+    lease_before = manager.lease_path.read_bytes()
+    snapshots = iter([_snapshot(target), _snapshot(target), _snapshot(target)])
+    signals = []
+    monkeypatch.setattr(manager, "_uses_windows_process_identity_handles", lambda: False)
+    monkeypatch.setattr(manager, "query_obs_processes_strict", lambda: next(snapshots))
+    monkeypatch.setattr(
+        manager,
+        "_terminate_pid",
+        lambda pid, force: signals.append((pid, force)) or True,
+    )
+
+    with pytest.raises(OBSProcessQueryError, match="survived graceful"):
+        manager.kill_stale_owned_processes(timeout_sec=0, allow_force=False)
+
+    assert signals == [(target.pid, False)]
+    assert manager.lease_path.read_bytes() == lease_before
+
+
+def test_popen_graceful_only_timeout_never_kills_and_keeps_lease(monkeypatch, tmp_path):
+    manager = OBSProcessManager(tmp_path / "obs-portable")
+    identity = _identity(manager)
+
+    class StubbornPopen:
+        pid = identity.pid
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout):
+            raise subprocess.TimeoutExpired("obs", timeout)
+
+        def kill(self):
+            pytest.fail("graceful-only cleanup must not call kill")
+
+    process = StubbornPopen()
+    monkeypatch.setattr(manager, "query_popen_process_identity", lambda candidate: identity)
+    manager.write_process_lease(process)
+
+    with pytest.raises(OBSProcessTerminationError, match="graceful termination timeout"):
+        manager.terminate_process(process, timeout_sec=0, allow_force=False)
+
+    assert manager.lease_path.exists()
 
 
 @pytest.mark.parametrize(

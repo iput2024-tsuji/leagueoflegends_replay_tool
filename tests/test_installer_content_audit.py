@@ -335,6 +335,47 @@ def test_inno_structure_requires_initialize_wizard_guard_before_side_effects(
     assert any("exit before side effects" in error for error in errors)
 
 
+def test_inno_structure_requires_prepare_to_install_guard_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    source = (REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss").read_text(
+        encoding="utf-8"
+    )
+    original = (
+        "function PrepareToInstall(var NeedsRestart: Boolean): String;\n"
+        "begin\n"
+        "  if IsContentAuditMode then"
+    )
+    replacement = (
+        "function PrepareToInstall(var NeedsRestart: Boolean): String;\n"
+        "begin\n"
+        "  Sleep(1);\n"
+        "  if IsContentAuditMode then"
+    )
+    assert original in source
+    candidate = tmp_path / "late-prepare-to-install-guard.iss"
+    candidate.write_text(source.replace(original, replacement, 1), encoding="utf-8")
+
+    errors = audit.validate_inno_audit_guards(candidate)
+
+    assert any("PrepareToInstall must exit before side effects" in error for error in errors)
+
+
+def test_inno_update_shutdown_protocol_is_fail_closed_and_never_targets_obs_by_name():
+    source = (REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss").read_text(
+        encoding="utf-8"
+    )
+
+    assert "Result := RequestSafeUpdateShutdown;" in source
+    assert "Local\\LoLReplayTool.UpdateShutdown" in source
+    assert "Local\\LoLReplayTool.UpdateShutdownBlocked" in source
+    assert "Local\\LoLReplayTool.UpdateShutdownComplete" in source
+    assert "LoLReplayTool.SingleInstance" in source
+    assert "試合終了後に更新を再試行" in source
+    assert "taskkill" not in source.casefold()
+    assert "obs64" not in source.casefold()
+
+
 @pytest.mark.parametrize(
     ("original", "replacement", "expected"),
     [

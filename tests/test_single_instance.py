@@ -70,6 +70,28 @@ def test_single_instance_guard_rolls_back_when_named_event_exists(monkeypatch):
     assert guard._windows_handle is None
 
 
+def test_single_instance_guard_rolls_back_when_named_event_access_fails(monkeypatch):
+    root = runtime_dir("single_instance_event_access_denied")
+    mutex = object()
+    request = object()
+    released = []
+
+    def create_event(name):
+        if name == single_instance.UPDATE_SHUTDOWN_REQUEST:
+            return request
+        raise OSError("access denied")
+
+    monkeypatch.setattr(single_instance.os, "name", "nt")
+    monkeypatch.setattr(single_instance, "_create_windows_mutex", lambda name: mutex)
+    monkeypatch.setattr(single_instance, "_create_windows_event", create_event)
+    monkeypatch.setattr(single_instance, "_close_windows_handle", released.append)
+    guard = single_instance.SingleInstanceGuard(lock_path=root / "instance.lock")
+
+    assert guard.acquire() is False
+    assert released == [request, mutex]
+    assert guard._windows_handle is None
+
+
 def test_single_instance_release_closes_all_handles_after_one_close_failure(
     monkeypatch,
 ):

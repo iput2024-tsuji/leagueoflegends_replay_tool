@@ -372,6 +372,8 @@ def test_inno_update_shutdown_protocol_is_fail_closed_and_never_targets_obs_by_n
     assert "Local\\LoLReplayTool.UpdateShutdownComplete" in source
     assert "LoLReplayTool.SingleInstance" in source
     assert "試合終了後に更新を再試行" in source
+    assert "if not ShutdownCompleted then" in source
+    assert "if ShutdownCompleted then" in source
     assert "taskkill" not in source.casefold()
     assert "obs64" not in source.casefold()
 

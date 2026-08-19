@@ -262,6 +262,10 @@ OBS, the standalone `ffmpeg.exe`, mpv DLLs, configuration, and recordings are
 not copied into the application distribution directory. The FFmpeg DLL used by
 the bundled `opencv-python` wheel and its notices are included.
 
+`assets/app/app.ico` and `assets/app/app.png` are canonical assets tracked in
+Git. The build does not regenerate them from a font; the ICO is used for the
+executable and window icon.
+
 ## Installer
 
 Install Inno Setup 6 and run:

@@ -141,6 +141,7 @@ class _FakeWin32Function:
 
 
 def test_update_shutdown_event_methods_are_nonblocking_and_signal(monkeypatch):
+    lock_path = runtime_dir("single_instance_event_signal") / "instance.lock"
     request_handle = object()
     blocked_handle = object()
     complete_handle = object()
@@ -149,7 +150,7 @@ def test_update_shutdown_event_methods_are_nonblocking_and_signal(monkeypatch):
     kernel.SetEvent = _FakeWin32Function(1)
     monkeypatch.setattr(single_instance.os, "name", "nt")
     monkeypatch.setattr(single_instance.ctypes, "WinDLL", lambda *args, **kwargs: kernel, raising=False)
-    guard = single_instance.SingleInstanceGuard()
+    guard = single_instance.SingleInstanceGuard(lock_path=lock_path)
     guard._update_shutdown_request_handle = request_handle
     guard._update_shutdown_blocked_handle = blocked_handle
     guard._update_shutdown_complete_handle = complete_handle

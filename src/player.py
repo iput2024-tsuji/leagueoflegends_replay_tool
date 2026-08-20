@@ -1941,12 +1941,15 @@ class PlayerWidget(QWidget):
             self.current_video_path = video_path
             self.duration = 0.0
             self.sync_game_time = data.get("sync_game_time", 0.0)
+            match = data.get("match") if isinstance(data.get("match"), dict) else {}
+            sync_unavailable = match.get("sync_time_source") == "unavailable"
             self.events = data.get("events", []) or []
             self.events_all = data.get("events_all", []) or []
             self.ban_pick = data.get("ban_pick") if isinstance(data.get("ban_pick"), dict) else {}
             self.my_name = data.get("summoner_name", "Unknown")
             self.my_name_short = normalize_summoner_name(self.my_name)
             self.offset = None
+            self.update_offset_label()
             self.clip_start = None
             self.clip_end = None
             self.update_clip_label()
@@ -1963,6 +1966,12 @@ class PlayerWidget(QWidget):
             self.video_frame.setFocus()
 
             self.update_video_fps()
+            if sync_unavailable:
+                self.info_label.setText("⚠️ 自動同期できません\nイベントを選び、動画を合わせて現在位置で同期してください。")
+                self.event_list.setEnabled(True)
+                self.player.pause = False
+                self.play_btn.setText("Pause")
+                return True
             if not self.start_sync_worker():
                 message = "同期解析を開始できませんでした。リプレイを開き直してください。"
                 LOGGER.warning("Replay sync worker could not be started")
@@ -2011,8 +2020,8 @@ class PlayerWidget(QWidget):
         sync_offset = calculate_sync_offset(found_time, self.sync_game_time)
         normalized_found_time = _finite_number(found_time)
         if normalized_found_time is None or normalized_found_time < 0 or sync_offset is None:
-            self.info_label.setText("⚠️ No Marker Found\nOffset: 0s")
-            self.offset = 0
+            self.info_label.setText("⚠️ No Marker Found\n手動で同期してください。")
+            self.offset = None
         else:
             self.offset = sync_offset
             self.info_label.setText(f"✅ Synced\nOffset: {self.offset:.2f}s")

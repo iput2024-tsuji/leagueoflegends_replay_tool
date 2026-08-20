@@ -67,6 +67,12 @@ def config_for(tmp_path, **overrides):
     return recordtest.AppConfig.from_dict(data)
 
 
+def test_live_game_time_accepts_only_finite_nonnegative_numbers():
+    assert recordtest.LoLAutoRecorder._live_game_time({"gameData": {"gameTime": 0}}) == 0.0
+    for value in (True, float("inf"), float("-inf"), float("nan"), -1):
+        assert recordtest.LoLAutoRecorder._live_game_time({"gameData": {"gameTime": value}}) is None
+
+
 def test_wait_for_game_start_retries_after_timeout_without_real_sleep():
     tmp_path = runtime_dir("retry")
     config = config_for(tmp_path)
@@ -410,18 +416,35 @@ def test_start_recording_waits_until_obs_reports_active():
     assert obs_client.is_recording_active.call_count == 2
 
 
-def test_start_recording_estimates_sync_time_when_live_client_game_time_is_stale():
-    tmp_path = runtime_dir("recording_sync_estimated_from_anchor")
+@pytest.mark.parametrize(
+    "stale_game_times",
+    [
+        pytest.param([], id="no-loading"),
+        pytest.param([0.02, 0.02], id="short-loading"),
+        pytest.param([0.02] * 40, id="long-loading"),
+    ],
+)
+def test_start_recording_waits_until_live_client_game_time_advances(stale_game_times):
+    tmp_path = runtime_dir("recording_sync_waits_for_game_clock")
     config = config_for(tmp_path)
     obs_client = FakeOBSClient()
     riot_client = Mock()
     riot_client.get_active_player_name = AsyncMock(return_value="Tester#JP1")
     riot_client.get_event_data = AsyncMock(return_value={"Events": []})
     riot_client.get_all_game_data_result = AsyncMock(
-        return_value=recordtest.RiotPollResult(
-            recordtest.RiotPollStatus.IN_GAME,
-            payload={"gameData": {"gameTime": 0.02}, "allPlayers": []},
-        )
+        side_effect=[
+            *[
+                recordtest.RiotPollResult(
+                    recordtest.RiotPollStatus.IN_GAME,
+                    payload={"gameData": {"gameTime": game_time}, "allPlayers": []},
+                )
+                for game_time in stale_game_times
+            ],
+            recordtest.RiotPollResult(
+                recordtest.RiotPollStatus.IN_GAME,
+                payload={"gameData": {"gameTime": 0.62}, "allPlayers": []},
+            ),
+        ]
     )
 
     recorder = recordtest.LoLAutoRecorder(
@@ -438,17 +461,116 @@ def test_start_recording_estimates_sync_time_when_live_client_game_time_is_stale
             live_data={"gameData": {"gameTime": 0.02}, "allPlayers": []},
             game_time=0.02,
         )
-        recorder.game_start_anchor_monotonic -= 6.0
         await recorder.start_recording_async()
 
     run(scenario())
 
     assert recorder.recording_started is True
-    assert recorder.sync_game_time >= 5.5
-    assert recorder.sync_time_source == "estimated_from_start_anchor"
+    assert recorder.sync_game_time == 0.62
+    assert recorder.sync_time_source == "live_client"
     assert recorder.match_metadata["game_start_detection_source"] == "live_client"
-    assert recorder.match_metadata["sync_time_source"] == "estimated_from_start_anchor"
+    assert recorder.match_metadata["sync_time_source"] == "live_client"
+    assert obs_client.set_sync_marker_enabled.call_args_list[0].args == (True, 1)
+    assert obs_client.set_sync_marker_enabled.call_args_list[1].args == (False, 1)
+    assert riot_client.get_all_game_data_result.await_count == len(stale_game_times) + 1
     riot_client.get_event_data.assert_not_awaited()
+
+
+def test_live_client_sync_timeout_skips_marker(monkeypatch):
+    tmp_path = runtime_dir("recording_sync_timeout")
+    config = config_for(tmp_path)
+    obs_client = FakeOBSClient()
+    riot_client = Mock()
+    riot_client.get_all_game_data_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME,
+            payload={"gameData": {"gameTime": 0.02}, "allPlayers": []},
+        )
+    )
+    recorder = recordtest.LoLAutoRecorder(config=config, obs_client=obs_client, riot_api_client=riot_client, auto_setup=False)
+    recorder.game_start_detection_source = "live_client"
+    recorder.game_start_anchor_game_time = 0.02
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+    monkeypatch.setattr(recordtest, "DEFAULT_SYNC_GAME_TIME_TIMEOUT_SEC", 0.0)
+
+    run(recorder.start_recording_async())
+
+    assert recorder.recording_started is True
+    assert recorder.sync_game_time == 0.0
+    assert recorder.sync_time_source == "unavailable"
+    obs_client.set_sync_marker_enabled.assert_not_called()
+
+
+def test_live_client_sync_temporary_failure_can_recover():
+    tmp_path = runtime_dir("recording_sync_temporary_failure")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_all_game_data_result = AsyncMock(
+        side_effect=[
+            recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE),
+            recordtest.RiotPollResult(
+                recordtest.RiotPollStatus.IN_GAME,
+                payload={"gameData": {"gameTime": 0.7}, "allPlayers": []},
+            ),
+        ]
+    )
+    recorder = recordtest.LoLAutoRecorder(config=config, obs_client=FakeOBSClient(), riot_api_client=riot_client, auto_setup=False)
+    recorder.game_start_detection_source = "live_client"
+    recorder.game_start_anchor_game_time = 0.02
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+
+    assert run(recorder.resolve_sync_game_time_async(event_time=None)) == (0.7, "live_client")
+
+
+def test_live_client_sync_ignores_rewind_and_invalid_values_until_clock_advances():
+    tmp_path = runtime_dir("recording_sync_rewind")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_all_game_data_result = AsyncMock(
+        side_effect=[
+            *[
+                recordtest.RiotPollResult(
+                    recordtest.RiotPollStatus.IN_GAME,
+                    payload={"gameData": {"gameTime": game_time}, "allPlayers": []},
+                )
+                for game_time in (0.01, float("nan"), -1.0)
+            ],
+            recordtest.RiotPollResult(
+                recordtest.RiotPollStatus.IN_GAME,
+                payload={"gameData": {"gameTime": 0.7}, "allPlayers": []},
+            ),
+        ]
+    )
+    recorder = recordtest.LoLAutoRecorder(config=config, obs_client=FakeOBSClient(), riot_api_client=riot_client, auto_setup=False)
+    recorder.game_start_detection_source = "live_client"
+    recorder.game_start_anchor_game_time = 0.02
+    recorder.wait_with_stop_async = AsyncMock(return_value=True)
+
+    assert run(recorder.resolve_sync_game_time_async(event_time=None)) == (0.7, "live_client")
+    assert riot_client.get_all_game_data_result.await_count == 4
+
+
+def test_live_client_sync_stop_returns_unavailable():
+    tmp_path = runtime_dir("recording_sync_stop")
+    config = config_for(tmp_path)
+    riot_client = Mock()
+    riot_client.get_all_game_data_result = AsyncMock(
+        return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME,
+            payload={"gameData": {"gameTime": 0.02}, "allPlayers": []},
+        )
+    )
+    recorder = recordtest.LoLAutoRecorder(config=config, obs_client=FakeOBSClient(), riot_api_client=riot_client, auto_setup=False)
+    recorder.game_start_detection_source = "live_client"
+    recorder.game_start_anchor_game_time = 0.02
+
+    async def stop_after_poll(*_args, **_kwargs):
+        recorder.request_stop()
+        return False
+
+    recorder.wait_with_stop_async = AsyncMock(side_effect=stop_after_poll)
+
+    assert run(recorder.resolve_sync_game_time_async(event_time=None)) == (0.0, "unavailable")
 
 
 def test_start_recording_prefers_current_live_client_sync_time_when_it_is_fresh():
@@ -479,7 +601,6 @@ def test_start_recording_prefers_current_live_client_sync_time_when_it_is_fresh(
             live_data={"gameData": {"gameTime": 0.02}, "allPlayers": []},
             game_time=0.02,
         )
-        recorder.game_start_anchor_monotonic -= 6.0
         await recorder.start_recording_async()
 
     run(scenario())
@@ -518,6 +639,22 @@ def test_start_recording_uses_game_start_event_for_lcu_only_start():
     assert recorder.sync_game_time == 0.0
     assert recorder.sync_time_source == "game_start_event"
     assert recorder.match_metadata["sync_time_source"] == "game_start_event"
+    assert obs_client.set_sync_marker_enabled.call_args_list[0].args == (True, 1)
+
+
+@pytest.mark.parametrize("event_time", [True, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_lcu_sync_rejects_invalid_game_start_event_time(event_time):
+    tmp_path = runtime_dir("recording_sync_invalid_lcu_event")
+    config = config_for(tmp_path)
+    recorder = recordtest.LoLAutoRecorder(
+        config=config,
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.game_start_detection_source = "lcu"
+
+    assert run(recorder.resolve_sync_game_time_async(event_time=event_time)) == (0.0, "unavailable")
 
 
 def test_start_recording_continues_when_game_start_event_is_unavailable():
@@ -545,6 +682,7 @@ def test_start_recording_continues_when_game_start_event_is_unavailable():
     assert recorder.sync_game_time == 0.0
     assert recorder.sync_time_source == "unavailable"
     assert recorder.match_metadata["sync_time_source"] == "unavailable"
+    obs_client.set_sync_marker_enabled.assert_not_called()
 
 
 def test_game_start_event_wait_uses_short_default_timeout():

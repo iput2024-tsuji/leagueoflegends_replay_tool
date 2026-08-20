@@ -81,6 +81,17 @@ def test_calculate_sync_offset_rejects_non_finite_or_non_numeric_values():
     assert calculate_sync_offset(True, 12.5) is None
 
 
+@pytest.mark.parametrize("loading_seconds", [0.0, 2.0, 18.0], ids=["none", "short", "long"])
+def test_game_clock_marker_keeps_event_seek_aligned_across_loading_times(loading_seconds):
+    marker_game_time = 0.62
+    marker_video_time = loading_seconds + marker_game_time
+
+    sync_offset = calculate_sync_offset(marker_video_time, marker_game_time)
+
+    assert sync_offset == pytest.approx(loading_seconds)
+    assert calculate_event_seek_position(63.0, sync_offset, None) == pytest.approx(loading_seconds + 58.0)
+
+
 def test_event_list_omits_invalid_event_times(qtbot):
     widget = PlayerWidget(auto_open=False)
     qtbot.addWidget(widget)
@@ -178,10 +189,12 @@ def test_loading_new_replay_clears_previous_duration_before_event_seek(qtbot, mo
     monkeypatch.setattr(widget, "cancel_sync_worker", lambda timeout_ms=1000: True)
     monkeypatch.setattr(widget, "init_mpv", lambda: True)
     monkeypatch.setattr(widget, "update_video_fps", lambda: None)
-    monkeypatch.setattr(widget, "start_sync_worker", lambda: True)
+    start_sync_worker = Mock(return_value=True)
+    monkeypatch.setattr(widget, "start_sync_worker", start_sync_worker)
 
     assert widget.load_data(tmp_path / "next.json") is True
     assert widget.duration == 0.0
+    start_sync_worker.assert_called_once_with()
 
     widget.offset = 0.0
     item = QListWidgetItem()
@@ -189,6 +202,50 @@ def test_loading_new_replay_clears_previous_duration_before_event_seek(qtbot, mo
     widget.on_event_clicked(item)
 
     player.seek.assert_called_once_with(95.0, reference="absolute", precision="exact")
+    widget.player = None
+
+
+def test_loading_sync_unavailable_replay_skips_auto_sync_and_keeps_manual_sync(qtbot, monkeypatch, tmp_path):
+    widget = PlayerWidget(auto_open=False)
+    qtbot.addWidget(widget)
+    player = SimpleNamespace(play=Mock(), seek=Mock(), pause=True, time_pos=45.0)
+    widget.player = player
+    video_path = tmp_path / "unavailable.mp4"
+    monkeypatch.setattr(
+        player_module,
+        "load_session_payload",
+        lambda _path: {
+            "sync_game_time": 0.0,
+            "match": {"sync_time_source": "unavailable"},
+            "events": [],
+            "events_all": [],
+            "ban_pick": {},
+            "summoner_name": "Tester",
+        },
+    )
+    monkeypatch.setattr(player_module, "resolve_video_path", lambda *_args: video_path)
+    monkeypatch.setattr(widget, "cancel_sync_worker", lambda timeout_ms=1000: True)
+    monkeypatch.setattr(widget, "init_mpv", lambda: True)
+    monkeypatch.setattr(widget, "update_video_fps", lambda: None)
+    start_sync_worker = Mock(return_value=True)
+    monkeypatch.setattr(widget, "start_sync_worker", start_sync_worker)
+
+    assert widget.load_data(tmp_path / "unavailable.json") is True
+
+    start_sync_worker.assert_not_called()
+    assert widget.offset is None
+    assert widget.offset_label.text() == "Offset: --"
+    assert widget.info_label.text() == "⚠️ 自動同期できません\nイベントを選び、動画を合わせて現在位置で同期してください。"
+    assert widget.event_list.isEnabled() is True
+    assert player.pause is False
+
+    item = QListWidgetItem()
+    item.setData(Qt.ItemDataRole.UserRole, 30.0)
+    widget.event_list.addItem(item)
+    widget.event_list.setCurrentItem(item)
+    widget.sync_to_current_position()
+
+    assert widget.offset == 15.0
     widget.player = None
 
 
@@ -274,9 +331,9 @@ def test_active_sync_completion_fails_closed_for_invalid_found_time(qtbot, found
     widget.on_sync_finished(worker, generation=7, found_time=found_time)
 
     assert widget.worker is None
-    assert widget.offset == 0
-    assert widget.info_label.text() == "⚠️ No Marker Found\nOffset: 0s"
-    assert widget.offset_label.text() == "Offset: +0.00s"
+    assert widget.offset is None
+    assert widget.info_label.text() == "⚠️ No Marker Found\n手動で同期してください。"
+    assert widget.offset_label.text() == "Offset: --"
     assert widget.event_list.isEnabled() is True
     assert widget.player.pause is False
     assert widget.play_btn.text() == "Pause"
@@ -292,9 +349,9 @@ def test_active_sync_completion_fails_closed_for_invalid_sync_game_time(qtbot, s
     widget.on_sync_finished(worker, generation=7, found_time=18.0)
 
     assert widget.worker is None
-    assert widget.offset == 0
-    assert widget.info_label.text() == "⚠️ No Marker Found\nOffset: 0s"
-    assert widget.offset_label.text() == "Offset: +0.00s"
+    assert widget.offset is None
+    assert widget.info_label.text() == "⚠️ No Marker Found\n手動で同期してください。"
+    assert widget.offset_label.text() == "Offset: --"
     assert widget.event_list.isEnabled() is True
     assert widget.player.pause is False
     assert widget.play_btn.text() == "Pause"

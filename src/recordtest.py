@@ -5,6 +5,7 @@ import configparser
 import io
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -283,7 +284,9 @@ DEFAULT_GAMEFLOW_INACTIVE_GRACE_SEC = 10.0
 DEFAULT_GAME_PROCESS_MISSING_GRACE_SEC = 10.0
 DEFAULT_POST_GAME_RESULT_WAIT_SEC = 12.0
 DEFAULT_POST_GAME_RESULT_POLL_SEC = 1.0
-DEFAULT_SYNC_STALE_GAME_TIME_TOLERANCE_SEC = 1.0
+DEFAULT_SYNC_GAME_TIME_ADVANCE_SEC = 0.5
+DEFAULT_SYNC_GAME_TIME_POLL_SEC = 0.5
+DEFAULT_SYNC_GAME_TIME_TIMEOUT_SEC = 120.0
 LOL_GAME_PROCESS_NAME = "League of Legends.exe"
 MIN_RECORDING_FREE_SPACE_BYTES = 64 * 1024 * 1024
 LCU_GAMEFLOW_START_PHASES = frozenset({"gamestart", "inprogress", "reconnect"})
@@ -3387,7 +3390,6 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.match_metadata: dict[str, Any] = {}
         self.game_start_detection_source: str | None = None
         self.game_start_anchor_game_time: float | None = None
-        self.game_start_anchor_monotonic: float | None = None
         self.sync_time_source: str | None = None
         self.champ_select_tracker = ChampSelectTracker()
         self.game_result = None
@@ -3880,11 +3882,13 @@ class LoLAutoRecorder(RecordingSessionManager):
         if not isinstance(game_data, dict):
             return None
         raw_value = _first_mapping_value(game_data, "gameTime", "game_time")
+        if isinstance(raw_value, bool):
+            return None
         try:
             game_time = float(raw_value)
         except (TypeError, ValueError):
             return None
-        return game_time if game_time >= 0 else None
+        return game_time if math.isfinite(game_time) and game_time >= 0 else None
 
     async def _mark_game_started(
         self,
@@ -3893,13 +3897,11 @@ class LoLAutoRecorder(RecordingSessionManager):
         live_data: dict[str, Any] | None = None,
         game_time: float | None = None,
     ) -> bool:
-        loop = asyncio.get_running_loop()
         self.game_start_detection_source = source
         self.match_metadata["game_start_detection_source"] = source
         if source == "live_client":
             anchor_game_time = float(game_time or 0.0)
             self.game_start_anchor_game_time = anchor_game_time
-            self.game_start_anchor_monotonic = loop.time()
             self.match_metadata["game_start_game_time"] = anchor_game_time
             self.log(f"🔥 試合開始検知！ Live Client GameTime: {anchor_game_time:.2f}s")
         else:
@@ -4005,41 +4007,44 @@ class LoLAutoRecorder(RecordingSessionManager):
         return (
             self.game_start_detection_source == "live_client"
             and self.game_start_anchor_game_time is not None
-            and self.game_start_anchor_monotonic is not None
         )
-
-    def _estimated_game_time_from_start_anchor(self, marker_monotonic: float) -> float | None:
-        if self.game_start_anchor_game_time is None or self.game_start_anchor_monotonic is None:
-            return None
-        elapsed = max(0.0, float(marker_monotonic) - float(self.game_start_anchor_monotonic))
-        return max(0.0, float(self.game_start_anchor_game_time) + elapsed)
 
     async def resolve_sync_game_time_async(
         self,
         *,
         event_time: float | None,
-        marker_monotonic: float,
     ) -> tuple[float, str]:
-        if self.game_start_detection_source == "lcu" and event_time is not None:
-            return float(event_time), "game_start_event"
+        if self.game_start_detection_source == "lcu":
+            if isinstance(event_time, bool):
+                return 0.0, "unavailable"
+            try:
+                normalized_event_time = float(event_time)
+            except (TypeError, ValueError):
+                return 0.0, "unavailable"
+            if math.isfinite(normalized_event_time) and normalized_event_time >= 0:
+                return normalized_event_time, "game_start_event"
+            return 0.0, "unavailable"
 
-        result = await self.poll_all_game_data()
-        live_game_time = self._live_game_time(result.payload)
-        estimated_game_time = self._estimated_game_time_from_start_anchor(marker_monotonic)
+        if self.game_start_detection_source != "live_client" or self.game_start_anchor_game_time is None:
+            return 0.0, "unavailable"
 
-        if live_game_time is not None:
+        initial_game_time = float(self.game_start_anchor_game_time)
+        deadline = asyncio.get_running_loop().time() + DEFAULT_SYNC_GAME_TIME_TIMEOUT_SEC
+        while True:
+            if self.should_stop():
+                return 0.0, "unavailable"
+            result = await self.poll_all_game_data()
+            live_game_time = self._live_game_time(result.payload)
             if (
-                estimated_game_time is not None
-                and live_game_time + DEFAULT_SYNC_STALE_GAME_TIME_TOLERANCE_SEC < estimated_game_time
+                result.status == RiotPollStatus.IN_GAME
+                and live_game_time is not None
+                and live_game_time >= initial_game_time + DEFAULT_SYNC_GAME_TIME_ADVANCE_SEC
             ):
-                return estimated_game_time, "estimated_from_start_anchor"
-            return float(live_game_time), "live_client"
-
-        if estimated_game_time is not None:
-            return estimated_game_time, "estimated_from_start_anchor"
-        if event_time is not None:
-            return float(event_time), "game_start_event"
-        return 0.0, "unavailable"
+                return float(live_game_time), "live_client"
+            if asyncio.get_running_loop().time() >= deadline:
+                return 0.0, "unavailable"
+            if not await self.wait_with_stop_async(DEFAULT_SYNC_GAME_TIME_POLL_SEC):
+                return 0.0, "unavailable"
 
     async def start_recording_async(self) -> None:
         """録画開始 -> 同期マーカー"""
@@ -4099,23 +4104,27 @@ class LoLAutoRecorder(RecordingSessionManager):
                 self.session_phase = RecordingPhase.CANCELLED
                 return
 
-        marker_monotonic = asyncio.get_running_loop().time()
-        self.log("⚡ 同期シグナル送信 (Marker ON)")
-        self.obs_client.set_sync_marker_enabled(True, item_id)
-
         sync_time, sync_source = await self.resolve_sync_game_time_async(
             event_time=event_time,
-            marker_monotonic=marker_monotonic,
         )
-
         self.sync_game_time = sync_time
         self.sync_time_source = sync_source
         self.match_metadata["sync_time_source"] = sync_source
         self.log(f"📝 同期ログ記録: {sync_time:.4f}s ({sync_source})")
+        if sync_source == "unavailable":
+            self.log("⚠️ 同期可能なゲーム時間を確認できないため、マーカーなしで録画を継続します。")
+            return
 
-        await self.wait_with_stop_async(0.5)
-        self.obs_client.set_sync_marker_enabled(False, item_id)
-        self.log("✅ シグナル消灯。録画継続中。")
+        marker_enabled = False
+        try:
+            self.log("⚡ 同期シグナル送信 (Marker ON)")
+            marker_enabled = True
+            self.obs_client.set_sync_marker_enabled(True, item_id)
+            await self.wait_with_stop_async(0.5)
+        finally:
+            if marker_enabled:
+                self.obs_client.set_sync_marker_enabled(False, item_id)
+                self.log("✅ シグナル消灯。録画継続中。")
 
     def _prepare_recording_output_for_start(self) -> None:
         preparer = getattr(self.obs_client, "prepare_recording_start", None)

@@ -104,7 +104,9 @@ LoL の振り返りは、動画を見返すだけでは「何が勝敗に効い�
 主な分離方針:
 
 - `obs_websocket_client.py` / `OBSClient`: OBS WebSocket 通信と OBS 制御のみを担当
-- `RiotAPIClient`: LCU API からのデータ取得とパースのみを担当
+- `riot_api.py` / `RiotAPIClient`: Live Client API と LCU からのデータ取得、レスポンスのパース、poll 状態の区別を担当
+- `recorder_config.py` / `AppConfig`: 録画設定の構造化、読み込み、ユーザーデータ配下のパス解決を担当
+- `storage_policy.py`: 容量上限、アプリ所有の録画判定、上限超過時の安全な削除を担当
 - `RecordingSessionManager` / `LoLAutoRecorder`: 録画ワークフローをオーケストレーション
 - `controllers.py`: UI から呼び出される設定、音声、分析、録画のコントローラー層
 - `app.py`: PyQt6 の画面表示とユーザー操作に集中
@@ -168,14 +170,17 @@ pytest tests
 
 ```text
 src/
-  app.py             # PyQt6 GUI、画面遷移、タスクトレイ、RecorderWorker
-  recordtest.py      # 録画ワークフローと既存 import の互換 facade
+  app.py                  # PyQt6 GUI、画面遷移、タスクトレイ、RecorderWorker
+  recordtest.py           # 録画状態遷移、セッション統合、既存 import の互換 facade
+  recorder_config.py      # 録画設定の構造化、読み込み、パス解決
+  riot_api.py             # Live Client API / LCU クライアントと poll 状態の区別
+  storage_policy.py       # 容量上限とアプリ所有録画の安全な削除
   obs_websocket_client.py # OBS WebSocket クライアントと request/response 処理
-  recording_library.py # 録画、JSON、関連クリップの安全な削除
-  player.py          # mpv ベースのリプレイプレーヤー
-  analytics.py       # JSON 分析、特徴量生成、決定木インサイト抽出
-  controllers.py     # UI とバックエンド処理を分離するコントローラー層
-  app_paths.py       # 実行環境ごとのパス解決
+  recording_library.py    # 録画、JSON、関連クリップの安全な削除
+  player.py               # mpv ベースのリプレイプレーヤー
+  analytics.py            # JSON 分析、特徴量生成、決定木インサイト抽出
+  controllers.py          # UI とバックエンド処理を分離するコントローラー層
+  app_paths.py            # 実行環境ごとのパス解決
 config/
   setting.sample.json
 recordings/

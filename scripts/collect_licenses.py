@@ -358,6 +358,7 @@ def collect_distribution_licenses(
     binary_archive: dict[str, Any] | None = None,
     verified_binary_components: set[str] | None = None,
     seen_targets: dict[str, Path] | None = None,
+    locked_license_materials: list[dict[str, Any]] | None = None,
 ) -> dict[str, object]:
     distribution = metadata.distribution(distribution_name)
     canonical_name = distribution.metadata.get("Name") or distribution_name
@@ -388,6 +389,30 @@ def collect_distribution_licenses(
         copied_files.append(relative_target)
         if is_substantive_license_file(relative):
             substantive_files.append(relative_target)
+
+    repository_materials: list[dict[str, Any]] = []
+    for material in locked_license_materials or []:
+        if not isinstance(material, dict):
+            raise RuntimeError("Locked license material is invalid.")
+        source = material.get("source")
+        if source is None:
+            continue
+        if source != "repository":
+            raise RuntimeError(f"Unsupported license material source: {source}")
+        repository_materials.append(material)
+    if repository_materials:
+        repository_files, _repository_hashes = copy_repository_license_materials(
+            repository_materials,
+            destination_root.parent,
+            seen_targets=seen,
+            required_prefix=package_dir.relative_to(destination_root.parent),
+        )
+        copied_files.extend(repository_files)
+        substantive_files.extend(
+            relative
+            for relative in repository_files
+            if is_substantive_license_file(Path(relative))
+        )
 
     if not substantive_files:
         raise RuntimeError(
@@ -498,6 +523,58 @@ def collect_python_runtime_license(
     }
 
 
+def copy_repository_license_materials(
+    materials: list[dict[str, Any]],
+    destination: Path,
+    *,
+    seen_targets: dict[str, Path],
+    required_prefix: Path | None = None,
+) -> tuple[list[str], dict[str, str]]:
+    """Copy repository-locked license materials after verifying their hashes."""
+
+    copied: list[str] = []
+    hashes: dict[str, str] = {}
+    for material in materials:
+        if not isinstance(material, dict):
+            raise RuntimeError("Repository license material is invalid.")
+        relative = safe_relative_path(str(material.get("path", "")))
+        if not relative.parts or relative.parts[0] != "licenses":
+            raise RuntimeError(
+                "Repository license material must be under licenses/: "
+                f"{relative.as_posix()}"
+            )
+        manifest_relative = Path(*relative.parts[1:])
+        if not manifest_relative.parts:
+            raise RuntimeError("Repository license material path is empty.")
+        if required_prefix is not None and not manifest_relative.is_relative_to(
+            required_prefix
+        ):
+            raise RuntimeError(
+                "Repository license material is outside the component directory: "
+                f"{relative.as_posix()}"
+            )
+        source = REPO_ROOT / relative
+        if not is_meaningful_license_file(source):
+            raise RuntimeError(
+                f"Repository license material is missing: {relative.as_posix()}"
+            )
+        actual_hash = sha256_file(source)
+        expected_hash = material.get("sha256")
+        if actual_hash != expected_hash:
+            raise RuntimeError(
+                "Repository license material differs from lock: "
+                f"{relative.as_posix()}"
+            )
+        target = destination / manifest_relative
+        _reserve_target(target, seen_targets)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        relative_text = manifest_relative.as_posix()
+        copied.append(relative_text)
+        hashes[relative_text] = actual_hash
+    return copied, hashes
+
+
 def collect_installer_component_license(
     component: dict[str, Any],
     destination: Path,
@@ -511,39 +588,11 @@ def collect_installer_component_license(
         raise RuntimeError(
             f"Installer component has no license materials: {component.get('component')}"
         )
-    copied: list[str] = []
-    hashes: dict[str, str] = {}
-    for material in materials:
-        if not isinstance(material, dict):
-            raise RuntimeError("Installer component license material is invalid.")
-        relative = safe_relative_path(str(material.get("path", "")))
-        if not relative.parts or relative.parts[0] != "licenses":
-            raise RuntimeError(
-                "Installer component license material must be under licenses/: "
-                f"{relative.as_posix()}"
-            )
-        manifest_relative = Path(*relative.parts[1:])
-        if not manifest_relative.parts:
-            raise RuntimeError("Installer component license material path is empty.")
-        source = REPO_ROOT / relative
-        if not is_meaningful_license_file(source):
-            raise RuntimeError(
-                f"Installer component license material is missing: {relative.as_posix()}"
-            )
-        actual_hash = sha256_file(source)
-        expected_hash = material.get("sha256")
-        if actual_hash != expected_hash:
-            raise RuntimeError(
-                "Installer component license material differs from lock: "
-                f"{relative.as_posix()}"
-            )
-        target = destination / manifest_relative
-        _reserve_target(target, seen_targets)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, target)
-        relative_text = manifest_relative.as_posix()
-        copied.append(relative_text)
-        hashes[relative_text] = actual_hash
+    copied, hashes = copy_repository_license_materials(
+        materials,
+        destination,
+        seen_targets=seen_targets,
+    )
     return {
         "component": str(component["component"]),
         "name": str(component["component"]),
@@ -1106,6 +1155,7 @@ def collect_licenses(
                 binary_archive=component.get("binary_archive"),
                 verified_binary_components=verified_binary_components,
                 seen_targets=seen_targets,
+                locked_license_materials=component.get("license_materials"),
             )
         )
     for build_component in component_lock.get("build_components", []):
@@ -1121,6 +1171,7 @@ def collect_licenses(
                 binary_archive=locked_component.get("binary_archive"),
                 verified_binary_components=verified_binary_components,
                 seen_targets=seen_targets,
+                locked_license_materials=locked_component.get("license_materials"),
             )
         )
     for installer_component in component_lock.get("installer_components", []):

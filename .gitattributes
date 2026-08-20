@@ -1,1 +1,2 @@
 licenses/inno-setup/LICENSE.txt text eol=lf
+licenses/python-packages/PyQt6-Qt6/qt-6.10.2/** -text -whitespace

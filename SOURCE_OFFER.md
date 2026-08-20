@@ -74,27 +74,40 @@ sealed build provenanceへ記録します。このarchiveは番号付き第三�
 `licenses/inno-setup/LICENSE.txt`で配布します。
 
 The current lock includes verified candidates for LoL Replay Tool, Python,
-PyQt6, obsws-python, OpenCV and the FFmpeg codec library in opencv-python.
-It does not yet prove complete source coverage for every runtime wheel.
-In particular, the Qt 6.10.2 official archive is an upstream reference: the
-patches, configure options and build scripts used for the PyQt6-Qt6 Windows
-wheel have not been verified, so it is not asserted to be that wheel's exact
-Corresponding Source. The same fail-closed treatment applies to the wheel's
-Qt plugin third-party notices and bundled Mesa `opengl32sw.dll`. Microsoft
-Visual C++ runtime files are classified separately; their redistribution and
-source-exception basis requires recorded specialist evidence. These gaps
-deliberately keep the Release gate closed.
-Package-specific license texts are copied under `licenses/python-packages/`.
+PyQt6, obsws-python, OpenCV and the FFmpeg codec library in opencv-python. It
+does not yet prove complete source coverage for every runtime wheel. The 20 Qt
+6.10.2 artifacts shipped by this application are byte-identical to members of
+the official `qtbase`, `qtsvg` and `qtimageformats` MSVC 2022 archives. Their
+official module SBOMs identify the build configuration and source revisions,
+and their substantive source inventories match the three locked official
+submodule source archives. The referenced third-party license texts are also
+packaged. The PyQt6-Qt6 wheel publisher's complete repackaging provenance is
+still unverified and remains a Release gate. The unused Mesa `opengl32sw.dll`
+is excluded from the application distribution. Microsoft Visual C++ runtime
+files are classified separately; their remaining source, redistribution or
+exception evidence must be completed independently.
+The NumPy and SciPy records pin the exact MacPython `openblas-libs` tags,
+OpenBLAS commit, Windows workflow and applied patch, but not the complete
+Rtools/GCC/Strawberry toolchain manifests or publisher artifact chains; those
+records therefore remain Release gates.
+Package-specific license texts and the Qt SBOMs are copied under
+`licenses/python-packages/`.
 
 現在のlockには、LoL Replay Tool、Python、PyQt6、obsws-python、OpenCV、
 opencv-python内FFmpeg codec libraryについて検証済みの候補を記録していますが、
-すべてのruntime wheelのsource coverageは未確認です。特にQt 6.10.2公式archiveは
-上流参考sourceであり、PyQt6-Qt6 Windows wheelで使われたpatch、configure
-option、build scriptを確認できていないため、当該wheelのexact Corresponding
-Sourceとは断定しません。Qt pluginの第三者通知とwheel同梱Mesa
-`opengl32sw.dll`にも同じfail-closed方針を適用します。Microsoft Visual C++
-runtimeは別componentとして分類し、再配布とsource例外の根拠を専門家の証拠付きで
-記録する必要があります。これらの不足が残る間はRelease gateを閉じたままにします。
+すべてのruntime wheelのsource coverageはまだ完了していません。このアプリが
+同梱する20個のQt 6.10.2成果物は、公式`qtbase`、`qtsvg`、`qtimageformats`の
+MSVC 2022 archive memberとbyte単位で一致します。公式module SBOMからbuild設定と
+source revisionを確認し、実質的なsource inventoryを固定した3つの公式submodule
+source archiveと照合し、参照される第三者ライセンス本文も同梱します。
+PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceは未確認のため、
+Release gateとして残します。未使用のMesa `opengl32sw.dll`はアプリ配布物から
+除外します。Microsoft Visual C++ runtimeは別componentとして分類し、残るsource、
+再配布、例外根拠を個別に完了する必要があります。
+NumPyとSciPyについては、MacPython `openblas-libs`のexact tag、OpenBLAS commit、
+Windows workflow、適用patchを固定しましたが、Rtools/GCC/Strawberry toolchainの
+完全なmanifestと公開wheelまでのartifact chainは未確認のため、Release gateを
+維持します。
 
 If a listed source asset becomes unavailable, request the matching source
 through the project's Issue tracker. Maintainers must provide an equivalent

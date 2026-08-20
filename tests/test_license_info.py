@@ -111,11 +111,16 @@ def test_local_document_symlink_is_not_opened_or_accepted(tmp_path):
 def test_installer_uses_plain_text_third_party_notice():
     installer_script = Path("installer/LoLReplayTool.iss").read_text(encoding="utf-8")
     notice_path = Path("installer/THIRD_PARTY_NOTICES.txt")
+    notice = notice_path.read_text(encoding="utf-8")
 
     assert "InfoBeforeFile=THIRD_PARTY_NOTICES.txt" in installer_script
     assert "InfoBeforeFile=..\\THIRD_PARTY_NOTICES.md" not in installer_script
     assert notice_path.is_file()
-    assert "GPL-3.0-only" in notice_path.read_text(encoding="utf-8")
+    assert "GPL-3.0-only" in notice
+    assert "Microsoft Visual C++ runtime、Mesa software OpenGL" not in notice
+    assert "Microsoft Visual C++ runtime files, and Mesa software OpenGL" not in notice
+    assert "opengl32sw.dllはpackaging policyで除外され" in notice
+    assert "opengl32sw.dll supplied by the Qt\nwheel is removed" in notice
 
 
 def test_installer_removes_managed_download_license_materials():

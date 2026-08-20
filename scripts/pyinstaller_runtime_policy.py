@@ -12,6 +12,11 @@ _WINDOWS_OS_RUNTIME_NAME = re.compile(
     re.IGNORECASE,
 )
 _SCIKIT_LEARN_VCOMP_NAME = "sklearn/.libs/vcomp140.dll"
+_UNUSED_QT_RUNTIME_NAMES = {
+    "pyqt6/qt6/bin/opengl32sw.dll",
+    "pyqt6/qt6/bin/qt6pdf.dll",
+    "pyqt6/qt6/plugins/imageformats/qpdf.dll",
+}
 
 
 def is_windows_os_runtime_name(toc_name: str) -> bool:
@@ -36,7 +41,7 @@ def is_root_vcomp_name(toc_name: str) -> bool:
 def apply_windows_runtime_policy(
     binaries: Iterable[PyInstallerBinary],
 ) -> list[PyInstallerBinary]:
-    """Remove host OS runtimes while retaining wheel-owned nested libraries."""
+    """Remove host OS runtimes and unused Qt runtime artifacts."""
 
     retained: list[PyInstallerBinary] = []
     scikit_learn_vcomp_count = 0
@@ -53,9 +58,13 @@ def apply_windows_runtime_policy(
             raise RuntimeError(
                 f"PyInstaller emitted an unexpected binary type: {entry_type}"
             )
-        if is_windows_os_runtime_name(toc_name) or is_root_vcomp_name(toc_name):
-            continue
         normalized_name = toc_name.replace("\\", "/")
+        if (
+            is_windows_os_runtime_name(toc_name)
+            or is_root_vcomp_name(toc_name)
+            or normalized_name.casefold() in _UNUSED_QT_RUNTIME_NAMES
+        ):
+            continue
         if normalized_name.casefold() == _SCIKIT_LEARN_VCOMP_NAME:
             if entry_type != "BINARY":
                 raise RuntimeError(

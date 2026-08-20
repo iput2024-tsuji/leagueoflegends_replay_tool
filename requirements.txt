@@ -15,7 +15,6 @@ obsws-python==1.8.0
 opencv-python==4.13.0.90
 packaging==26.0
 pandas==3.0.2
-Pillow==12.1.1
 propcache==0.4.1
 PyQt6==6.10.2
 PyQt6-Qt6==6.10.2

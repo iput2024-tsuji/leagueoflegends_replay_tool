@@ -938,6 +938,17 @@ def _tracked_git_source_record(source: Path) -> dict[str, Any]:
     }
 
 
+def _application_icon_source_records() -> list[dict[str, Any]]:
+    repository_root = Path(__file__).resolve().parents[1]
+    return [
+        {
+            "kind": "git-blob",
+            **_tracked_git_source_record(repository_root / relative),
+        }
+        for relative in ("assets/app/app.ico", "assets/app/app.png")
+    ]
+
+
 def _stdlib_source_records(
     package_manifest: dict[str, Any],
 ) -> dict[str, dict[str, Any]]:
@@ -1007,18 +1018,6 @@ def _module_source_component(
         }
     repository_root = Path(__file__).resolve().parents[1]
     if _is_relative_to(source, repository_root):
-        relative = source.resolve().relative_to(repository_root.resolve()).as_posix()
-        if relative in {"assets/app/app.ico", "assets/app/app.png"}:
-            recipe = _tracked_git_source_record(repository_root / "scripts" / "make_icon.py")
-            if not is_safe_regular_file(source):
-                raise ValueError(f"Generated application asset is unsafe: {relative}")
-            return "lol-replay-tool", {
-                "kind": "declared-generated-asset",
-                "path": relative,
-                "size": source.stat().st_size,
-                "sha256": sha256_file(source),
-                "recipe": recipe,
-            }
         return "lol-replay-tool", {
             "kind": "git-blob",
             **_tracked_git_source_record(source),
@@ -1940,6 +1939,7 @@ def _validate_pyinstaller_build(
         if parsed["analysis"][3] != expected_hook_paths:
             raise ValueError("PyInstaller Analysis hook paths differ from locked wheels.")
         repository_root = Path(__file__).resolve().parents[1]
+        application_icon_assets = _application_icon_source_records()
         expected_input_datas = {
             (
                 "assets\\app\\app.ico",
@@ -2303,6 +2303,7 @@ def _validate_pyinstaller_build(
             "carchive_layout": carchive_layout,
             "pyz_layout": pyz_layout,
             "pe_bootloader": pe_summary,
+            "application_icon_assets": application_icon_assets,
             "collect_entry_count": len(parsed["collect_entries"]),
             "carchive_member_count": len(carchive.toc),
             "pyz_module_count": len(pyz_reader.toc),

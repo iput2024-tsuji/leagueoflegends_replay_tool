@@ -219,4 +219,8 @@ obs-portable/
 recordings/
 logs/
 config/setting.json
-assets/
+assets/*
+!assets/app/
+assets/app/*
+!assets/app/app.ico
+!assets/app/app.png

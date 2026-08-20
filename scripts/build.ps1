@@ -55,11 +55,9 @@ function Assert-BuildProvenance {
 
 Assert-BuildProvenance
 
-$makeIconScript = "scripts\make_icon.py"
-if (Test-Path $makeIconScript) {
-  & $selectedPython $makeIconScript
-  if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+foreach ($iconAsset in @("assets\app\app.ico", "assets\app\app.png")) {
+  if (-not (Test-Path -LiteralPath $iconAsset -PathType Leaf)) {
+    throw "固定アプリアイコンassetが見つかりません: $iconAsset"
   }
 }
 

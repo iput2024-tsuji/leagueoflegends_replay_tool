@@ -55,7 +55,9 @@ class RecorderRuntime:
     owns_existing_process: bool = False
     process_manager: Any | None = None
 
-    def close(self, finalize_session: bool = False) -> None:
+    def close(
+        self, finalize_session: bool = False, *, allow_force: bool = True
+    ) -> None:
         primary_error: BaseException | None = None
         try:
             if finalize_session:
@@ -67,9 +69,12 @@ class RecorderRuntime:
         try:
             with recordtest.OBS_OPERATION_LOCK:
                 if self.owns_existing_process:
-                    self._close_existing_owned_process()
+                    self._close_existing_owned_process(allow_force=allow_force)
                 elif self.owns_process:
-                    self.recorder.shutdown_obs()
+                    if allow_force:
+                        self.recorder.shutdown_obs()
+                    else:
+                        self.recorder.shutdown_obs(allow_force=False)
                 else:
                     self.recorder.disconnect_obs()
         except BaseException as exc:
@@ -89,7 +94,7 @@ class RecorderRuntime:
         if cleanup_error is not None:
             raise cleanup_error
 
-    def _close_existing_owned_process(self) -> None:
+    def _close_existing_owned_process(self, *, allow_force: bool = True) -> None:
         failures: list[BaseException] = []
         selected_error: BaseException | None = None
 
@@ -121,7 +126,10 @@ class RecorderRuntime:
             )
         else:
             try:
-                self.process_manager.kill_stale_owned_processes()
+                if allow_force:
+                    self.process_manager.kill_stale_owned_processes()
+                else:
+                    self.process_manager.kill_stale_owned_processes(allow_force=False)
             except BaseException as exc:
                 record_failure(
                     exc,
@@ -151,7 +159,6 @@ class RecorderRuntime:
             for failure in failures:
                 add_note(f"{type(failure).__name__}: {failure}")
         raise error from failures[0]
-
 
 class OBSRuntimeManager:
     """OBSプロセス所有権とRecorder起動を一箇所で扱う。"""

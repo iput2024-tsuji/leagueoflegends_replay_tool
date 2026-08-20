@@ -554,7 +554,7 @@ class RecordingSessionManager(ABC):
         pass
 
     @abstractmethod
-    def shutdown_obs(self) -> None:
+    def shutdown_obs(self, allow_force: bool = True) -> None:
         pass
 
     @abstractmethod
@@ -4366,9 +4366,12 @@ class LoLAutoRecorder(RecordingSessionManager):
             self.session_outcome = RecordingOutcome.FAILED_PARTIAL
             self.failure_reason = f"OBS録画停止に失敗しました: {e}"
 
-    def shutdown_obs(self) -> None:
+    def shutdown_obs(self, allow_force: bool = True) -> None:
         try:
-            self.obs_client.shutdown()
+            if allow_force:
+                self.obs_client.shutdown()
+            else:
+                self.obs_client.shutdown(allow_force=False)
         finally:
             self.opened = False
             if self._status_handler:

@@ -138,6 +138,79 @@ async def run_supervisor(supervisor):
     await supervisor.run(asyncio.Event())
 
 
+def test_update_shutdown_reservation_wins_before_recording_transition():
+    class ReservingRecorder(FakeRecorder):
+        async def wait_for_game_start_async(self):
+            self.calls.append("wait_for_game_start_async")
+            assert supervisor.reserve_update_shutdown() is True
+            return True
+
+    class UpdateRuntime(FakeRuntime):
+        def close(self, finalize_session=False, allow_force=True):
+            self.close_calls.append((finalize_session, allow_force))
+            self.recorder.calls.append("runtime_close")
+
+    recorder = ReservingRecorder()
+    recording_controller = FakeRecordingController(recorder)
+    recording_controller.runtime = UpdateRuntime(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+    )
+
+    run(run_supervisor(supervisor))
+
+    assert "start_recording_async" not in recorder.calls
+    assert recording_controller.runtime.close_calls == [(False, False)]
+    assert supervisor.shutdown_error is None
+
+
+def test_update_shutdown_reservation_loses_after_recording_transition():
+    reservation_results = []
+
+    class RecordingRecorder(FakeRecorder):
+        async def start_recording_async(self):
+            reservation_results.append(supervisor.reserve_update_shutdown())
+            await super().start_recording_async()
+
+    recorder = RecordingRecorder()
+    recording_controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+    )
+
+    run(run_supervisor(supervisor))
+
+    assert reservation_results == [False]
+    assert recording_controller.runtime.close_calls == [False]
+
+
+def test_update_shutdown_records_owned_obs_cleanup_failure():
+    cleanup_error = RuntimeError("owned OBS did not exit gracefully")
+
+    class FailingUpdateRuntime(FakeRuntime):
+        def close(self, finalize_session=False, allow_force=True):
+            self.close_calls.append((finalize_session, allow_force))
+            raise cleanup_error
+
+    recorder = FakeRecorder()
+    recording_controller = FakeRecordingController(recorder)
+    recording_controller.runtime = FailingUpdateRuntime(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+    )
+    assert supervisor.reserve_update_shutdown() is True
+
+    with pytest.raises(RuntimeError) as captured:
+        run(run_supervisor(supervisor))
+
+    assert captured.value is cleanup_error
+    assert supervisor.shutdown_error is cleanup_error
+    assert recording_controller.runtime.close_calls == [(False, False)]
+
+
 def test_recording_supervisor_runs_one_session_and_cleans_up():
     statuses = []
     notifications = []

@@ -1555,6 +1555,23 @@ class OBSProcessManager:
     def has_managed_process(self) -> bool:
         return bool(self.managed_processes())
 
+    def query_managed_processes_strict(self) -> tuple[OBSProcessInfo, ...]:
+        """Return managed OBS identities without hiding query or path failures."""
+
+        snapshot = self.query_obs_processes_strict()
+        processes = validate_obs_process_query_snapshot(
+            snapshot,
+            label="managed OBS verification",
+        )
+        return tuple(
+            process
+            for process in processes
+            if self._is_managed_process_strict(
+                process,
+                label="managed OBS verification",
+            )
+        )
+
     def unmanaged_processes(self) -> list[OBSProcessInfo]:
         return [process for process in self.list_obs_processes() if not self.is_managed_process(process)]
 
@@ -1919,7 +1936,9 @@ class OBSProcessManager:
                     close_error,
                 )
 
-    def kill_stale_owned_processes(self, timeout_sec: float = 3.0) -> list[int]:
+    def kill_stale_owned_processes(
+        self, timeout_sec: float = 3.0, *, allow_force: bool = True
+    ) -> list[int]:
         """Stop only the exact v2 identity recorded by this application's lease."""
 
         with self._process_lease_transaction() as transaction:
@@ -1928,6 +1947,7 @@ class OBSProcessManager:
             return self._kill_stale_owned_processes_locked(
                 transaction,
                 timeout_sec=timeout_sec,
+                allow_force=allow_force,
             )
 
     def _kill_stale_owned_processes_locked(
@@ -1935,6 +1955,7 @@ class OBSProcessManager:
         transaction: _OBSProcessLeaseTransaction,
         *,
         timeout_sec: float,
+        allow_force: bool,
     ) -> list[int]:
         lease_snapshot = self._open_process_lease_snapshot_locked(transaction)
         if lease_snapshot is None:
@@ -1967,6 +1988,7 @@ class OBSProcessManager:
         result = self.terminate_owned_process_strict(
             process,
             timeout_sec=timeout_sec,
+            allow_force=allow_force,
             validate_authorization=validate_authorization,
         )
         validate_authorization()
@@ -1983,6 +2005,7 @@ class OBSProcessManager:
         timeout_sec: float = 3.0,
         poll_interval: float = 0.1,
         validate_authorization: Callable[[], None] | None = None,
+        allow_force: bool = True,
     ) -> OBSStrictTerminationResult:
         """Stop one fixed owned identity while leaving unrelated OBS untouched."""
 
@@ -2007,12 +2030,14 @@ class OBSProcessManager:
                 timeout_sec=timeout_sec,
                 poll_interval=poll_interval,
                 validate_authorization=validate_authorization,
+                allow_force=allow_force,
             )
         return self._terminate_owned_process_without_handle(
             expected,
             timeout_sec=timeout_sec,
             poll_interval=poll_interval,
             validate_authorization=validate_authorization,
+            allow_force=allow_force,
         )
 
     def _query_owned_target_strict(
@@ -2042,6 +2067,7 @@ class OBSProcessManager:
         timeout_sec: float,
         poll_interval: float,
         validate_authorization: Callable[[], None] | None,
+        allow_force: bool,
     ) -> OBSStrictTerminationResult:
         """Test fallback; Windows production uses the handle-bound implementation."""
 
@@ -2083,6 +2109,10 @@ class OBSProcessManager:
             if time.monotonic() < deadline:
                 time.sleep(max(0.01, poll_interval))
                 continue
+            if not allow_force:
+                raise OBSProcessQueryError(
+                    "Owned OBS survived graceful termination"
+                )
             if force_sent:
                 raise OBSProcessQueryError(
                     "Owned OBS survived strict forced termination"
@@ -2119,6 +2149,7 @@ class OBSProcessManager:
         timeout_sec: float,
         poll_interval: float,
         validate_authorization: Callable[[], None] | None,
+        allow_force: bool,
     ) -> OBSStrictTerminationResult:
         """Bind graceful verification and forced termination to one held handle."""
 
@@ -2251,6 +2282,10 @@ class OBSProcessManager:
                 if time.monotonic() < deadline:
                     time.sleep(max(0.01, poll_interval))
                     continue
+                if not allow_force:
+                    raise OBSProcessQueryError(
+                        "Owned OBS survived graceful termination"
+                    )
                 if force_sent:
                     raise OBSProcessQueryError(
                         "Owned OBS survived handle-bound forced termination"
@@ -2890,6 +2925,8 @@ class OBSProcessManager:
         self,
         process: subprocess.Popen[Any] | None,
         timeout_sec: float = 3.0,
+        *,
+        allow_force: bool = True,
     ) -> None:
         """Stop exactly one Popen-owned process and prove its handle exited.
 
@@ -2911,6 +2948,7 @@ class OBSProcessManager:
                 self._terminate_popen_process(
                     process,
                     timeout_sec=timeout_sec,
+                    allow_force=allow_force,
                     require_bound_lease=True,
                     transaction=transaction,
                     lease_snapshot=lease_snapshot,
@@ -2952,6 +2990,7 @@ class OBSProcessManager:
         require_bound_lease: bool,
         transaction: _OBSProcessLeaseTransaction | None,
         lease_snapshot: _OBSProcessLeaseFileSnapshot | None,
+        allow_force: bool = True,
     ) -> None:
         """Shared handle-only termination primitive for leased and new Popen."""
 
@@ -3093,6 +3132,19 @@ class OBSProcessManager:
             )
             if exited is None and graceful_wait_succeeded:
                 exited = True
+
+        if not allow_force and exited is not True:
+            failures.append(
+                (
+                    "graceful termination timeout",
+                    RuntimeError("OBS process survived graceful termination"),
+                )
+            )
+            self._raise_popen_termination_error(
+                pid=pid,
+                exited=exited,
+                failures=failures,
+            )
 
         force_wait_succeeded = False
         if exited is not True:

@@ -327,7 +327,7 @@ SHA256、component分類を記録する技術的なinventoryです。適用さ�
 - `opencv-python`が動画入出力に使用するFFmpeg DLLと、その通知文はビルド成果物に含まれます
 - チャンピオンアイコンはビルド成果物へコピーされません
 - 配布版の可変データは `dist\LoLReplayTool` ではなく `%LOCALAPPDATA%\LoLReplayTool` に作成されます
-- `assets/app/app.ico` が存在する場合、exe アイコンとウィンドウアイコンに反映されます
+- `assets/app/app.ico` と `assets/app/app.png` はGitで追跡する原本assetです。ビルド時にfontから再生成せず、ICOをexeアイコンとウィンドウアイコンへ使用します
 
 ## インストーラー
 

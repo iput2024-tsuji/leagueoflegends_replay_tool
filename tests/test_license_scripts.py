@@ -63,6 +63,52 @@ def _stdlib_source_record(relative: str = "linecache.py") -> dict[str, object]:
     }
 
 
+def test_application_icon_assets_are_fixed_git_blobs():
+    expected = {
+        "assets/app/app.ico": {
+            "size": 8983,
+            "sha256": "9578dc9ad3303cb9d0c308b0cda492bd9b1ef29e3dbcbd2d7c3f9c8c02b94458",
+        },
+        "assets/app/app.png": {
+            "size": 4635,
+            "sha256": "52d5720615e9989abffe505b365645c09841070ef601dd6cd4f1c7cf3ede317d",
+        },
+    }
+
+    records = compliance._application_icon_source_records()
+
+    assert {record["path"] for record in records} == set(expected)
+    for record in records:
+        assert record["kind"] == "git-blob"
+        assert record["size"] == expected[record["path"]]["size"]
+        assert record["sha256"] == expected[record["path"]]["sha256"]
+        assert "recipe" not in record
+
+
+def test_application_icon_originals_have_matching_pixels_and_expected_sizes():
+    from PIL import Image
+
+    root = Path(__file__).resolve().parents[1] / "assets" / "app"
+    with Image.open(root / "app.ico") as icon, Image.open(root / "app.png") as png:
+        assert icon.info["sizes"] == {
+            (16, 16),
+            (32, 32),
+            (48, 48),
+            (256, 256),
+        }
+        assert png.size == (256, 256)
+        assert icon.convert("RGBA").tobytes() == png.convert("RGBA").tobytes()
+
+
+def test_build_uses_fixed_icon_assets_without_regeneration():
+    script = Path("scripts/build.ps1").read_text(encoding="utf-8")
+
+    assert not Path("scripts/make_icon.py").exists()
+    assert "make_icon.py" not in script
+    assert '"assets\\app\\app.ico"' in script
+    assert '"assets\\app\\app.png"' in script
+
+
 def _verified_stdlib_pyc(
     source_record: dict[str, object],
     *,

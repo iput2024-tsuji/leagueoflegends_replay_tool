@@ -18,40 +18,59 @@ LoL Replay Toolは`GPL-3.0-only`で提供され、プロジェクトのライセ
 | --- | --- | --- |
 | Python and its bundled OpenSSL runtime | Runtime, TLS and cryptography | Python Software Foundation License 2.0; Python's third-party license page contains notices for bundled components |
 | PyQt6 | GUI bindings | GPL-3.0-only for the free edition used by this project |
-| Qt 6 | GUI libraries and plugins | Module-specific LGPL-3.0, GPL-2.0/GPL-3.0 or other applicable terms |
+| Qt 6 | GUI libraries and plugins | LGPL-3.0-only for this distribution; official module SBOMs and the license texts for the shipped dependency closure are included |
 | obsws-python | OBS WebSocket client | GPL-3.0-only |
 | python-mpv | Python binding loaded at runtime | GPL-2.0-or-later; a separately supplied libmpv build has its own build-dependent terms |
 | opencv-python / OpenCV | Image and video processing | MIT packaging code; Apache-2.0 OpenCV code; bundled third-party notices also apply |
 | OpenCV FFmpeg DLL | Video I/O used by OpenCV | LGPL-2.1-or-later for the locked build, with the notices shipped for that wheel |
 | NumPy, pandas, SciPy, scikit-learn | Numerical and analytics libraries | Primarily BSD-3-Clause, with component-specific bundled notices |
-| OpenBLAS and other numerical binaries | Numerical runtime used by wheels | Component-specific permissive licenses included with the wheels |
+| OpenBLAS and other numerical binaries | Numerical runtime used by wheels | OpenBLAS and LAPACK use BSD-style terms; statically linked GCC runtime portions are covered by GPL-3.0-or-later with GCC Runtime Library Exception 3.1, with the full notices included in the wheels |
 | Microsoft Visual C++ runtime files | Native runtime used by CPython, Qt and numerical wheels | Microsoft Visual C++ Redistributable terms; redistribution/source-exception evidence remains a Release gate |
-| Mesa `opengl32sw.dll` in the Qt wheel | Software OpenGL fallback | MIT and bundled component licenses; exact source/build provenance remains a Release gate |
 | aiohttp, Requests and supporting packages | Network clients | Component-specific permissive licenses included with the packages |
 | PyInstaller bootloader | Executable packaging bootloader | GPL-2.0-or-later with the PyInstaller bootloader exception |
 | Inno Setup 6.7.3 | Setup/Uninstall stubs and LZMA decompression code embedded in the public installer; LZMA compression tools are build-only inputs | Inno Setup License; the pinned license text is copied with the distribution materials |
 
 The exact locked component versions and artifact patterns, plus source URLs and
-hashes where verified, are recorded in `licenses/components.json`. Missing
-runtime source archives, unverified wheel-vendored native sources, the
-unverified PyQt6-Qt6 wheel build provenance and Qt plugin notices, Mesa
-provenance, and Microsoft runtime exception evidence are Release gates. The generated
-`licenses/distribution-manifest.json` records relative paths, hashes and
-component classifications observed in the completed build. It is a technical
-inventory, not a controlling legal record. Copied package license texts are
-under `licenses/python-packages/`. The pinned Inno Setup license is copied to
+hashes where verified, are recorded in `licenses/components.json`. The 20 Qt
+artifacts shipped by this application are byte-identical to members of the
+official Qt 6.10.2 archives. Their official module SBOMs, corresponding
+submodule source archives and referenced license texts are locked. The
+PyQt6-Qt6 wheel publisher's complete repackaging provenance remains a Release
+gate, as do the Microsoft runtime records and any other gate
+listed in the component lock. The generated `licenses/distribution-manifest.json`
+records relative paths, hashes and component classifications observed in the
+completed build. It is a technical inventory, not a controlling legal record.
+Copied package license texts and the Qt SBOMs are under
+`licenses/python-packages/`. The pinned Inno Setup license is copied to
 `licenses/inno-setup/LICENSE.txt`.
 
+The unused Mesa software OpenGL fallback `opengl32sw.dll` supplied by the Qt
+wheel is removed by the packaging policy and is not distributed.
+
+For NumPy and SciPy, the locked records pin the exact MacPython
+`openblas-libs` tags, OpenBLAS commit, Windows workflow and applied patch. The
+exact Rtools/GCC/Strawberry toolchain manifests and the publisher artifact
+chains are not verified, so both records remain Release gates.
+
 正確なcomponentバージョンと成果物pattern、および検証できたsource URL/hashは
-`licenses/components.json`に記録します。runtime source archiveの欠落、
-wheel同梱native source、PyQt6-Qt6 wheelのbuild provenanceとQt plugin通知、
-Mesaのprovenance、Microsoft runtime例外根拠の未確認は
-公開を止めるRelease gateです。生成される
-`licenses/distribution-manifest.json`は、完成したビルドで確認した相対path、
-hash、component分類の技術的なinventoryであり、法的に支配的な記録では
-ありません。パッケージから収集したライセンス本文は
-`licenses/python-packages/`、固定したInno Setupのライセンス本文は
-`licenses/inno-setup/LICENSE.txt`にあります。
+`licenses/components.json`に記録します。このアプリが同梱する20個のQt成果物は
+公式Qt 6.10.2 archiveのmemberとbyte単位で一致し、公式module SBOM、対応する
+submodule source archive、参照されるライセンス本文を固定しています。
+PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceはRelease gateとして
+残し、Microsoft runtime、およびcomponent lockに列挙した
+その他のgateも公開前に解消します。生成される
+`licenses/distribution-manifest.json`は、完成したbuildで確認した相対path、hash、
+component分類の技術的なinventoryであり、法的に支配的な記録ではありません。
+パッケージのライセンス本文とQt SBOMは`licenses/python-packages/`、固定した
+Inno Setupのライセンス本文は`licenses/inno-setup/LICENSE.txt`にあります。
+
+Qt wheelが提供する未使用のMesa software OpenGL fallback `opengl32sw.dll`は
+packaging policyで除外し、配布しません。
+
+NumPyとSciPyについては、MacPython `openblas-libs`のexact tag、OpenBLAS commit、
+Windows workflow、適用patchを固定しました。Rtools/GCC/Strawberry toolchainの
+正確なmanifestと公開wheelまでのartifact chainは未確認のため、両componentの
+Release gateを維持します。
 
 Inno Setup 6.7.3 contributes the Setup/Uninstall stubs and LZMA decompression
 code embedded in the public installer; these are not files in the installed

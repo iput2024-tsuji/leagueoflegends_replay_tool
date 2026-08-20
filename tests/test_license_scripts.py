@@ -5,6 +5,7 @@ import importlib.util
 import json
 import marshal
 import os
+import re
 import shutil
 import struct
 import sys
@@ -107,6 +108,337 @@ def test_build_uses_fixed_icon_assets_without_regeneration():
     assert "make_icon.py" not in script
     assert '"assets\\app\\app.ico"' in script
     assert '"assets\\app\\app.png"' in script
+
+
+def test_pillow_is_dev_only_and_excluded_from_pyinstaller():
+    from scripts.prepare_release_assets import release_gate_errors
+
+    runtime_pins = parse_requirement_pins(Path("requirements.txt"))
+    development_pins = parse_requirement_pins(Path("requirements-dev.txt"))
+    lock = _component_lock()
+
+    assert "pillow" not in runtime_pins
+    assert development_pins["pillow"] == ("Pillow", "12.1.1")
+    assert not any(
+        component.get("component") == "pillow"
+        for component in lock["runtime_components"]
+    )
+    pillow = next(
+        component
+        for component in lock["build_components"]
+        if component.get("component") == "pillow"
+    )
+    assert pillow["packaged_in_distribution"] is False
+    assert pillow["corresponding_source_required"] is False
+    assert pillow.get("release_legal_review_required") is not True
+    assert pillow["artifact_patterns"] == []
+    assert not any(
+        error.startswith("pillow:") for error in release_gate_errors(lock)
+    )
+
+    spec = Path("LoLReplayTool.spec").read_text(encoding="utf-8")
+    assert 'excludes=["PIL"]' in spec
+
+
+def test_setuptools_vendored_runtime_has_exact_source_and_license_inventory():
+    from scripts.prepare_release_assets import release_gate_errors
+
+    lock = _component_lock()
+    component = next(
+        item
+        for item in lock["build_components"]
+        if item.get("component") == "setuptools-vendored-runtime"
+    )
+    distribution = metadata.distribution("setuptools")
+    records = []
+    prefix = "setuptools/_vendor/"
+    for file_entry in distribution.files or ():
+        installed_path = str(file_entry).replace("\\", "/")
+        if not installed_path.startswith(prefix):
+            continue
+        relative = installed_path.removeprefix(prefix)
+        if (
+            "/__pycache__/" in f"/{relative}"
+            or relative.endswith(".pyc")
+        ):
+            continue
+        source = Path(distribution.locate_file(file_entry))
+        if not source.is_file():
+            continue
+        records.append(
+            {
+                "path": relative,
+                "size": source.stat().st_size,
+                "sha256": sha256_file(source),
+            }
+        )
+    records.sort(key=lambda item: item["path"].casefold())
+    inventory = component["vendored_source_inventory"]
+    encoded = json.dumps(
+        records,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+    assert component["vendored_source_coverage_verified"] is True
+    assert len(records) == inventory["file_count"] == 180
+    assert hashlib.sha256(encoded).hexdigest() == inventory["sha256"]
+    assert len(component["license_materials"]) == 17
+    license_prefix = "licenses/python-packages/setuptools/"
+    for material in component["license_materials"]:
+        assert material["path"].startswith(license_prefix)
+        source = Path(
+            distribution.locate_file(material["path"].removeprefix(license_prefix))
+        )
+        assert sha256_file(source) == material["sha256"]
+    assert not any(
+        error.startswith("setuptools-vendored-runtime:")
+        for error in release_gate_errors(lock)
+    )
+
+
+def test_unused_mesa_software_opengl_is_not_a_release_component():
+    from scripts.prepare_release_assets import release_gate_errors
+
+    lock = _component_lock()
+    assert not any(
+        component.get("component") == "mesa-opengl32sw"
+        for component in lock["runtime_components"]
+    )
+    assert not any(
+        error.startswith("mesa-opengl32sw:") for error in release_gate_errors(lock)
+    )
+
+
+def test_opencv_ippicv_provenance_is_locked_without_legal_exception():
+    import cv2
+
+    from scripts.prepare_release_assets import release_gate_errors
+
+    lock = _component_lock()
+    component = next(
+        item
+        for item in lock["runtime_components"]
+        if item.get("component") == "opencv-python"
+    )
+    evidence = component["wheel_build_evidence"]
+    vendored = component["vendored_binary_input"]
+    build_information = cv2.getBuildInformation()
+
+    assert f"Version control:               {evidence['opencv_source_revision']}" in (
+        build_information
+    )
+    assert f"Intel IPP:                   {evidence['intel_ipp']}" in build_information
+    assert f"Intel IPP IW:                {evidence['intel_ipp_iw']}" in (
+        build_information
+    )
+    assert vendored["archive"] == {
+        "filename": "ippicv_2022.2.0_win_intel64_20250730_general.zip",
+        "url": (
+            "https://raw.githubusercontent.com/opencv/opencv_3rdparty/"
+            "c934a2a15a6df020446ac3dfa07e3acf72b63a8f/ippicv/"
+            "ippicv_2022.2.0_win_intel64_20250730_general.zip"
+        ),
+        "md5": "7c0973976ab0716bc33f03a76a50017f",
+        "sha256": (
+            "56c7bada1067982afd5dd43636f8a9b5a5b80447ec452b754252168cde9d8be8"
+        ),
+        "size": 29247105,
+    }
+    assert len(vendored["archive_license_materials"]) == 3
+    assert vendored["source_exception_reviewed"] is False
+    assert component["release_legal_review_required"] is True
+    assert any(
+        error.startswith("opencv-python:") for error in release_gate_errors(lock)
+    )
+
+
+def test_qt_official_sboms_have_notices_for_shipped_dependency_closure():
+    from scripts.prepare_release_assets import release_gate_errors
+
+    lock = _component_lock()
+    component = next(
+        item
+        for item in lock["runtime_components"]
+        if item.get("component") == "qt"
+    )
+    repository_materials = [
+        material
+        for material in component["license_materials"]
+        if material.get("source") == "repository"
+    ]
+    material_paths = {material["path"] for material in repository_materials}
+    license_ids = {
+        Path(path).stem
+        for path in material_paths
+        if "/LICENSES/" in path
+    }
+
+    assert component["source_status"] == "verified_corresponding_source"
+    assert component["native_source_coverage_verified"] is True
+    assert component["qt_plugin_third_party_notices_verified"] is True
+    assert component["wheel_build_provenance_verified"] is False
+    repackaging = component["wheel_repackaging_tool_reference"]
+    assert repackaging["reference_version"] == "1.19.1"
+    assert repackaging["reference_commit"] == (
+        "6ad7e58870362dbfd50c0e3bd95f9915cb30c42b"
+    )
+    assert repackaging["qt_source_build_supported"] is False
+    assert repackaging["published_wheel_build_relationship_verified"] is False
+    assert len(repository_materials) == 30
+    assert len(component["verified_runtime_artifacts"]) == 20
+    assert {module["module"] for module in component["qt_upstream_modules"]} == {
+        "qtbase",
+        "qtimageformats",
+        "qtsvg",
+    }
+
+    artifacts_by_module: dict[str, list[dict[str, object]]] = {}
+    for artifact in component["verified_runtime_artifacts"]:
+        artifacts_by_module.setdefault(str(artifact["module"]), []).append(artifact)
+    ignored_expression_tokens = {"AND", "NOASSERTION", "OR", "WITH"}
+    for module in component["qt_upstream_modules"]:
+        spdx_path = Path(module["spdx_material"])
+        assert spdx_path.as_posix() in material_paths
+        spdx = json.loads(spdx_path.read_text(encoding="utf-8"))
+        packages = {package["SPDXID"]: package for package in spdx["packages"]}
+        dependencies: dict[str, list[str]] = {}
+        for relationship in spdx["relationships"]:
+            if relationship["relationshipType"] != "DEPENDS_ON":
+                continue
+            related = relationship["relatedSpdxElement"]
+            if related.startswith("DocumentRef-"):
+                continue
+            dependencies.setdefault(relationship["spdxElementId"], []).append(
+                related
+            )
+
+        pending = [
+            str(artifact["spdx_package"])
+            for artifact in artifacts_by_module[str(module["module"])]
+        ]
+        closure: set[str] = set()
+        while pending:
+            package_id = pending.pop()
+            if package_id in closure:
+                continue
+            assert package_id in packages
+            closure.add(package_id)
+            pending.extend(dependencies.get(package_id, []))
+
+        required_license_ids: set[str] = set()
+        for package_id in closure:
+            expression = str(packages[package_id].get("licenseConcluded", ""))
+            required_license_ids.update(
+                token
+                for token in re.findall(r"[A-Za-z][A-Za-z0-9.-]*", expression)
+                if token not in ignored_expression_tokens
+            )
+        assert required_license_ids <= license_ids
+
+    for material in repository_materials:
+        source = Path(material["path"])
+        assert source.is_file()
+        assert sha256_file(source) == material["sha256"]
+
+    qt_errors = [
+        error
+        for error in release_gate_errors(lock)
+        if error.startswith("qt:")
+    ]
+    assert not any("source_status" in error for error in qt_errors)
+    assert not any("native_source_coverage_verified" in error for error in qt_errors)
+    assert not any("third-party notices" in error for error in qt_errors)
+    assert any("wheel_build_provenance_verified" in error for error in qt_errors)
+
+
+def test_qt_windows_runtime_artifacts_match_official_archive_lock():
+    if os.name != "nt":
+        pytest.skip("Qt runtime artifact lock is for the Windows release wheel")
+
+    component = next(
+        item
+        for item in _component_lock()["runtime_components"]
+        if item.get("component") == "qt"
+    )
+    distribution = metadata.distribution("PyQt6-Qt6")
+
+    for artifact in component["verified_runtime_artifacts"]:
+        wheel_relative = str(artifact["path"]).removeprefix("_internal/")
+        source = Path(distribution.locate_file(wheel_relative))
+        assert source.stat().st_size == artifact["size"]
+        assert sha256_file(source) == artifact["sha256"]
+    assert not any(
+        "pdf" in str(artifact["path"]).casefold()
+        for artifact in component["verified_runtime_artifacts"]
+    )
+
+
+def test_numpy_and_scipy_openblas_windows_build_evidence_matches_wheels():
+    if os.name != "nt":
+        pytest.skip("OpenBLAS runtime artifact locks are for Windows wheels")
+
+    lock = _component_lock()
+    components = {
+        component["component"]: component
+        for component in lock["runtime_components"]
+        if component.get("component") in {"numpy", "scipy"}
+    }
+    for component_name in ("numpy", "scipy"):
+        component = components[component_name]
+        evidence = component["openblas_windows_build_evidence"]
+        artifact = evidence["runtime_artifact"]
+        distribution = metadata.distribution(component["distribution"])
+        source = Path(distribution.locate_file(artifact["path"]))
+        license_relative = component["license_materials"][0]["path"].removeprefix(
+            f"licenses/python-packages/{component['distribution']}/"
+        )
+        license_path = Path(
+            distribution.locate_file(license_relative)
+        )
+
+        assert evidence["openblas_submodule_commit"] == (
+            "b5456c1b41ea88d4e0041778aa8ec09ee2a111a0"
+        )
+        assert evidence["rtools_chocolatey_version"] == "4.0.0.20220206"
+        assert evidence["wheel_notice_covers_gcc_runtime_exception"] is True
+        assert evidence["toolchain_manifest_verified"] is False
+        assert evidence["publisher_artifact_chain_verified"] is False
+        assert source.stat().st_size == artifact["size"]
+        assert sha256_file(source) == artifact["sha256"]
+        license_text = license_path.read_text(encoding="utf-8")
+        assert "Name: GCC runtime library" in license_text
+        assert "GCC Runtime Library Exception" in license_text
+
+def test_qt_repository_notices_are_merged_into_package_manifest(tmp_path):
+    if os.name != "nt":
+        pytest.skip("Packaged Qt notice fixture uses the Windows release wheel")
+
+    component = next(
+        item
+        for item in _component_lock()["runtime_components"]
+        if item.get("component") == "qt"
+    )
+    manifest = license_collector.collect_distribution_licenses(
+        component["distribution"],
+        tmp_path / "licenses" / "python-packages",
+        expected_version=component["version"],
+        expected_license=component["license"],
+        component=component["component"],
+        locked_license_materials=component["license_materials"],
+    )
+    expected_repository_paths = {
+        material["path"].removeprefix("licenses/")
+        for material in component["license_materials"]
+        if material.get("source") == "repository"
+    }
+
+    assert expected_repository_paths <= set(manifest["license_files"])
+    for relative in expected_repository_paths:
+        assert manifest["license_file_sha256"][relative] == sha256_file(
+            Path("licenses") / relative
+        )
 
 
 def _verified_stdlib_pyc(
@@ -302,6 +634,90 @@ def test_collect_distribution_licenses_checks_version_and_is_idempotent(
             "demo",
             destination,
             expected_version="2.0",
+        )
+
+
+def test_collect_distribution_merges_locked_repository_license_materials(
+    monkeypatch,
+    tmp_path,
+):
+    metadata_license = tmp_path / "installed" / "demo.dist-info" / "LICENSE"
+    metadata_license.parent.mkdir(parents=True)
+    metadata_license.write_text(
+        "Permission is granted to use, copy, modify, and distribute this "
+        "software. THE SOFTWARE IS PROVIDED AS IS WITHOUT WARRANTY.\n",
+        encoding="utf-8",
+    )
+
+    class FakeDistribution:
+        metadata = {"Name": "demo", "License-Expression": "MIT"}
+        version = "1.0"
+        files = [Path("demo.dist-info/LICENSE")]
+
+        @staticmethod
+        def locate_file(relative_path):
+            return tmp_path / "installed" / relative_path
+
+    repository_root = tmp_path / "repository"
+    repository_notice = (
+        repository_root
+        / "licenses"
+        / "python-packages"
+        / "demo"
+        / "upstream"
+        / "NOTICE.txt"
+    )
+    repository_notice.parent.mkdir(parents=True)
+    repository_notice.write_text(
+        "Third-party notice with copyright, redistribution terms, and warranty "
+        "disclaimer.\n",
+        encoding="utf-8",
+    )
+    material = {
+        "path": "licenses/python-packages/demo/upstream/NOTICE.txt",
+        "sha256": sha256_file(repository_notice),
+        "source": "repository",
+    }
+    monkeypatch.setattr(
+        license_collector.metadata,
+        "distribution",
+        lambda _distribution_name: FakeDistribution(),
+    )
+    monkeypatch.setattr(license_collector, "REPO_ROOT", repository_root)
+    destination = tmp_path / "distribution" / "licenses" / "python-packages"
+
+    manifest = license_collector.collect_distribution_licenses(
+        "demo",
+        destination,
+        expected_version="1.0",
+        expected_license="MIT",
+        locked_license_materials=[material],
+    )
+
+    relative_notice = "python-packages/demo/upstream/NOTICE.txt"
+    assert relative_notice in manifest["license_files"]
+    assert manifest["license_file_sha256"][relative_notice] == material["sha256"]
+    assert (
+        destination.parent / "python-packages" / "demo" / "upstream" / "NOTICE.txt"
+    ).read_bytes() == repository_notice.read_bytes()
+
+    bad_material = {**material, "sha256": "0" * 64}
+    with pytest.raises(RuntimeError, match="differs from lock"):
+        license_collector.collect_distribution_licenses(
+            "demo",
+            tmp_path / "bad-hash" / "licenses" / "python-packages",
+            locked_license_materials=[bad_material],
+        )
+
+    outside_material = {
+        **material,
+        "path": "licenses/python-packages/other/NOTICE.txt",
+    }
+    with pytest.raises(RuntimeError, match="outside the component directory"):
+        license_collector.collect_distribution_licenses(
+            "demo",
+            tmp_path / "bad-scope" / "licenses" / "python-packages",
+            locked_license_materials=[outside_material],
         )
 
 
@@ -516,7 +932,7 @@ def _write_minimal_pyinstaller_tocs(tmp_path: Path) -> dict[str, Path]:
         ["mpv"],
         [],
         {},
-        [],
+        ["PIL", "__main__"],
         [],
         False,
         {},
@@ -1714,12 +2130,6 @@ def test_installer_build_self_check_has_an_explicit_timeout():
             "numpy",
             "microsoft-vc-runtime",
         ),
-        (
-            "_internal/PyQt6/Qt6/bin/opengl32sw.dll",
-            "opengl32sw.dll",
-            "qt",
-            "mesa-opengl32sw",
-        ),
     ],
 )
 def test_native_runtime_overrides_wheel_owner(
@@ -1947,11 +2357,9 @@ def test_base_library_runtime_read_error_fails_closed(monkeypatch, tmp_path):
     assert any("Cannot inspect base_library.zip" in error for error in errors)
 
 
-def test_native_runtime_override_requires_owner_and_final_path(tmp_path):
+def test_microsoft_runtime_override_requires_owner_and_final_path(tmp_path):
     msvc = tmp_path / "VCRUNTIME140.dll"
-    mesa = tmp_path / "opengl32sw.dll"
     msvc.write_bytes(b"msvc")
-    mesa.write_bytes(b"mesa")
 
     assert (
         compliance._classify_toc_entry(
@@ -1965,20 +2373,6 @@ def test_native_runtime_override_requires_owner_and_final_path(tmp_path):
         )
         is None
     )
-    assert (
-        compliance._classify_toc_entry(
-            {
-                "path": "_internal/PyQt6/Qt6/bin/opengl32sw.dll",
-                "source": str(mesa),
-                "toc_name": mesa.name,
-                "type": "BINARY",
-            },
-            {compliance._path_key(mesa): "numpy"},
-        )
-        is None
-    )
-
-
 def test_system_vcomp_is_not_accepted_as_a_redistributable_source(
     monkeypatch,
     tmp_path,
@@ -2023,6 +2417,21 @@ def test_windows_runtime_policy_excludes_host_runtime_and_retains_wheel_vcomp(
         (
             r"sklearn\.libs\vcomp140.dll",
             str(wheel_vcomp),
+            "BINARY",
+        ),
+        (
+            r"PyQt6\Qt6\bin\opengl32sw.dll",
+            str(tmp_path / "opengl32sw.dll"),
+            "BINARY",
+        ),
+        (
+            r"PyQt6\Qt6\bin\Qt6Pdf.dll",
+            str(tmp_path / "Qt6Pdf.dll"),
+            "BINARY",
+        ),
+        (
+            r"PyQt6\Qt6\plugins\imageformats\qpdf.dll",
+            str(tmp_path / "qpdf.dll"),
             "BINARY",
         ),
         ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION"),

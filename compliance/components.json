@@ -510,8 +510,79 @@
         {
           "path": "licenses/python-packages/setuptools/setuptools-81.0.0.dist-info/licenses/LICENSE",
           "sha256": "86da0f01aeae46348a3c3d465195dc1ceccde79f79e87769a64b8da04b2a4741"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/autocommand-2.2.2.dist-info/LICENSE",
+          "sha256": "ade78d04982d69972d444a8e14a94f87a2334dd3855cc80348ea8e240aa0df2d"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/backports.tarfile-1.2.0.dist-info/LICENSE",
+          "sha256": "86da0f01aeae46348a3c3d465195dc1ceccde79f79e87769a64b8da04b2a4741"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/importlib_metadata-8.7.1.dist-info/licenses/LICENSE",
+          "sha256": "458502e12d97bbf64438606a20044aa85eb05fb0a8a807bb35dbec253fd1fc04"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/jaraco_context-6.1.0.dist-info/licenses/LICENSE",
+          "sha256": "9755a18519666e5f0f4cae3daad3d7012bcae48a600b31237d75e9fe134e6683"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/jaraco_functools-4.4.0.dist-info/licenses/LICENSE",
+          "sha256": "5a57cb4db85e2a2dd88c290628908add57e3451449e0a9a71fdfb38776fd759d"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/jaraco.text-4.0.0.dist-info/LICENSE",
+          "sha256": "86da0f01aeae46348a3c3d465195dc1ceccde79f79e87769a64b8da04b2a4741"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/more_itertools-10.8.0.dist-info/licenses/LICENSE",
+          "sha256": "09f1c8c9e941af3e584d59641ea9b87d83c0cb0fd007eb5ef391a7e2643c1a46"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/packaging-26.0.dist-info/licenses/LICENSE",
+          "sha256": "cad1ef5bd340d73e074ba614d26f7deaca5c7940c3d8c34852e65c4909686c48"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/packaging-26.0.dist-info/licenses/LICENSE.APACHE",
+          "sha256": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/packaging-26.0.dist-info/licenses/LICENSE.BSD",
+          "sha256": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/platformdirs-4.4.0.dist-info/licenses/LICENSE",
+          "sha256": "29e0fd62e929850e86eb28c3fdccf0cefdf4fa94879011cffb3d0d4bed6d4db6"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/tomli-2.4.0.dist-info/licenses/LICENSE",
+          "sha256": "b80816b0d530b8accb4c2211783790984a6e3b61922c2b5ee92f3372ab2742fe"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/wheel-0.46.3.dist-info/licenses/LICENSE.txt",
+          "sha256": "30c23618679108f3e8ea1d2a658c7ca417bdfc891c98ef1a89fa4ff0c9828654"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/_vendor/zipp-3.23.0.dist-info/licenses/LICENSE",
+          "sha256": "5a57cb4db85e2a2dd88c290628908add57e3451449e0a9a71fdfb38776fd759d"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/config/_validate_pyproject/NOTICE",
+          "sha256": "5d300dbfa643138b013b75ac9caeee591f951b8b0ee24288c34ccd926c4780c8"
+        },
+        {
+          "path": "licenses/python-packages/setuptools/setuptools/config/NOTICE",
+          "sha256": "2dddf08818297a3b89d43d95ff659d8da85741108c9136dfa3a4d856c0623bd8"
         }
       ],
+      "vendored_source_coverage_verified": true,
+      "vendored_source_inventory": {
+        "path": "setuptools/_vendor",
+        "file_count": 180,
+        "sha256": "89c0b067d7099850edb3ca43778b9887956e1326f678ac6a27d6f20461d3215a",
+        "comparison": "All wheel vendored files are byte-identical to the locked sdist; the sdist additionally contains ruff.toml."
+      },
       "binary_archive": {
         "filename": "setuptools-81.0.0-py3-none-any.whl",
         "url": "https://files.pythonhosted.org/packages/e1/e3/c164c88b2e5ce7b24d667b9bd83589cf4f3520d97cad01534cd3c4f55fdb/setuptools-81.0.0-py3-none-any.whl",
@@ -524,6 +595,37 @@
           "url": "https://files.pythonhosted.org/packages/0d/1c/73e719955c59b8e424d015ab450f51c0af856ae46ea2da83eba51cc88de1/setuptools-81.0.0.tar.gz",
           "sha256": "487b53915f52501f0a79ccfd0c02c165ffe06631443a886740b91af4b7a5845a",
           "size": 1198299
+        }
+      ]
+    },
+    {
+      "component": "pillow",
+      "distribution": "Pillow",
+      "version": "12.1.1",
+      "license": "MIT-CMU AND bundled component licenses",
+      "artifact_patterns": [],
+      "packaged_in_distribution": false,
+      "corresponding_source_required": false,
+      "source_status": "incomplete_corresponding_source",
+      "license_materials": [
+        {
+          "path": "licenses/python-packages/pillow/pillow-12.1.1.dist-info/licenses/LICENSE",
+          "sha256": "926df5f888a7337fd4126a435202edf2847312be81a167df91a6d70cfa3f2ed3"
+        }
+      ],
+      "binary_archive": {
+        "filename": "pillow-12.1.1-cp314-cp314-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/40/72/4c245f7d1044b67affc7f134a09ea619d4895333d35322b775b928180044/pillow-12.1.1-cp314-cp314-win_amd64.whl",
+        "sha256": "50480dcd74fa63b8e78235957d302d98d98d82ccbfac4c7e12108ba9ecbdba15",
+        "size": 7176748
+      },
+      "native_source_coverage_verified": false,
+      "source_archives": [
+        {
+          "filename": "pillow-12.1.1.tar.gz",
+          "url": "https://files.pythonhosted.org/packages/1f/42/5c74462b4fd957fcd7b13b04fb3205ff8349236ea74c7c375766d6c82288/pillow-12.1.1.tar.gz",
+          "sha256": "9ad8fa5937ab05218e2b6a4cff30295ad35afd2f83ac592e68c0d871bb0fdbc4",
+          "size": 46980264
         }
       ]
     },
@@ -1002,26 +1104,6 @@
       "release_gate_reason": "Microsoft Visual C++ runtimeの再配布条件、正確なversion別の出所、system libraryまたは対応ソース例外の適用根拠を専門家が確認し、証拠を記録するまで公開しない。"
     },
     {
-      "component": "mesa-opengl32sw",
-      "version": "PyQt6-Qt6 6.10.2 bundled opengl32sw.dll; exact Mesa revision unknown",
-      "license": "MIT and bundled component licenses",
-      "artifact_patterns": [
-        "_internal/PyQt6/Qt6/bin/opengl32sw.dll"
-      ],
-      "source_status": "unverified_vendored_native_source",
-      "build_provenance_verified": false,
-      "license_materials_exception": {
-        "reason": "Exact Mesa revision and corresponding notice are not yet established",
-        "review_completed": false,
-        "evidence": "",
-        "scope": "PyQt6-Qt6 opengl32sw.dll",
-        "reviewer": "",
-        "date": ""
-      },
-      "release_legal_review_required": true,
-      "release_gate_reason": "PyQt6-Qt6 wheel内opengl32sw.dllのexact Mesa revision、対応ソース、patch、build provenanceを確認できていないため公開しない。"
-    },
-    {
       "component": "aiohappyeyeballs",
       "distribution": "aiohappyeyeballs",
       "version": "2.6.1",
@@ -1383,9 +1465,36 @@
         "sha256": "7d5d7999df434a038d75a748275cd6c0094b0ecdb0837342b332a82defc4dc4d",
         "size": 12438590
       },
+      "wheel_build_compilers": {
+        "c": "MSVC 19.44.35222",
+        "cxx": "MSVC 19.44.35222"
+      },
+      "openblas_windows_build_evidence": {
+        "source_archive_filename": "openblas-libs-v0.3.30.0.7.tar.gz",
+        "repository_commit": "2f333bd4a797eb3fbf1aff77668318ff126d351b",
+        "openblas_submodule_commit": "b5456c1b41ea88d4e0041778aa8ec09ee2a111a0",
+        "workflow_path": ".github/workflows/windows.yml",
+        "workflow_sha256": "ab992275316067c1cece2b96efb0ca9b0e1de1724a82f3601126c3439601e879",
+        "build_script_path": "tools/build_openblas.sh",
+        "rtools_chocolatey_version": "4.0.0.20220206",
+        "applied_windows_patch": {
+          "path": "patches-windows/openblas-make-libs.patch",
+          "sha256": "4bf4799ec503921a203d2ab1e925b819ce58d55e5bb9b859aa44da4e39a7e6ba"
+        },
+        "interface": "ILP64",
+        "delvewheel_version": "1.11.2",
+        "wheel_notice_covers_gcc_runtime_exception": true,
+        "toolchain_manifest_verified": false,
+        "publisher_artifact_chain_verified": false,
+        "runtime_artifact": {
+          "path": "numpy.libs/libscipy_openblas64_-9e3e5a4229c1ca39f10dc82bba9e2b2b.dll",
+          "size": 20403712,
+          "sha256": "9e3e5a4229c1ca39f10dc82bba9e2b2bf48037790932566f37aff1a7ccf3588f"
+        }
+      },
       "native_source_coverage_verified": false,
       "release_legal_review_required": true,
-      "release_gate_reason": "NumPy本体とOpenBLASのexact source/build recipeは確認済みだが、Windows wheelのOpenBLASにstatic linkされたGCC/Rtools toolchain source、patch、build provenanceを完全には確認できていないため公開しない。",
+      "release_gate_reason": "NumPy本体のMSVC build情報とOpenBLASのexact tag、submodule、Windows workflow、適用patch、Rtools指定は固定済みだが、MacPython CI run、Rtools installer hashとGCC toolchain manifest、生成物からNumPy wheelまでのartifact chainを確認できていないため公開しない。",
       "source_archives": [
         {
           "filename": "numpy-2.4.1.tar.gz",
@@ -1455,9 +1564,41 @@
         "sha256": "526bde4c33a86808a751e2bb57bf4921beb49794621810971926c472897f6433",
         "size": 40211706
       },
+      "wheel_build_evidence": {
+        "opencv_source_revision": "4.13.0-1-gb4c5ec4042",
+        "intel_ipp": "2022.2.0 [2022.2.0]",
+        "intel_ipp_iw": "sources (2022.2.0)"
+      },
+      "vendored_binary_input": {
+        "component": "Intel IPP ICV",
+        "version": "2022.2.0",
+        "archive": {
+          "filename": "ippicv_2022.2.0_win_intel64_20250730_general.zip",
+          "url": "https://raw.githubusercontent.com/opencv/opencv_3rdparty/c934a2a15a6df020446ac3dfa07e3acf72b63a8f/ippicv/ippicv_2022.2.0_win_intel64_20250730_general.zip",
+          "md5": "7c0973976ab0716bc33f03a76a50017f",
+          "sha256": "56c7bada1067982afd5dd43636f8a9b5a5b80447ec452b754252168cde9d8be8",
+          "size": 29247105
+        },
+        "archive_license_materials": [
+          {
+            "path": "ippicv_win/EULA.rtf",
+            "sha256": "37f11c79f36fb5e1b00aca31c1234a7435c2929d83e181ee802a349ca8571749"
+          },
+          {
+            "path": "ippicv_win/support.txt",
+            "sha256": "b65d6663771b4ec4af82c5064543ddc8d1cb4e1510c72a29a29ca5da4d517851"
+          },
+          {
+            "path": "ippicv_win/third-party-programs.txt",
+            "sha256": "a0a246b67784450f7a1b99b244d00cbdb8c001aa9b13755ababf4a218431703c"
+          }
+        ],
+        "wheel_notice_path": "licenses/python-packages/opencv-python/cv2/LICENSE-3RD-PARTY.txt",
+        "source_exception_reviewed": false
+      },
       "native_source_coverage_verified": false,
       "release_legal_review_required": true,
-      "release_gate_reason": "OpenCV/opencv-pythonと多くの同梱sourceは固定済みだが、cv2.pydに含まれるIntel IPPICV 2022.2.0等のprebuilt proprietary binaryについて承認済みsource例外と証拠がないため公開しない。",
+      "release_gate_reason": "OpenCV/opencv-python、IPPICV archive、wheel build表示、Intel noticeは固定済みだが、cv2.pydにstatic linkされたprebuilt proprietary binaryについてGPLv3と両立する承認済みsource例外がないため公開しない。",
       "source_archives": [
         {
           "filename": "opencv-python-6cb94ce.tar.gz",
@@ -1581,40 +1722,6 @@
       ]
     },
     {
-      "component": "pillow",
-      "distribution": "Pillow",
-      "version": "12.1.1",
-      "license": "MIT-CMU AND bundled component licenses",
-      "source_status": "incomplete_corresponding_source",
-      "license_materials": [
-        {
-          "path": "licenses/python-packages/pillow/pillow-12.1.1.dist-info/licenses/LICENSE",
-          "sha256": "926df5f888a7337fd4126a435202edf2847312be81a167df91a6d70cfa3f2ed3"
-        }
-      ],
-      "artifact_patterns": [
-        "_internal/PIL/**/*.pyd",
-        "_internal/PIL/**/*.dll"
-      ],
-      "binary_archive": {
-        "filename": "pillow-12.1.1-cp314-cp314-win_amd64.whl",
-        "url": "https://files.pythonhosted.org/packages/40/72/4c245f7d1044b67affc7f134a09ea619d4895333d35322b775b928180044/pillow-12.1.1-cp314-cp314-win_amd64.whl",
-        "sha256": "50480dcd74fa63b8e78235957d302d98d98d82ccbfac4c7e12108ba9ecbdba15",
-        "size": 7176748
-      },
-      "native_source_coverage_verified": false,
-      "release_legal_review_required": true,
-      "release_gate_reason": "Pillow sdistのWindows build定義は確認済みだが、mutable mirrorとlibavif nested dependenciesを含むactual wheelのexact dependency archive bytesとbuild provenanceを確認できていないため公開しない。",
-      "source_archives": [
-        {
-          "filename": "pillow-12.1.1.tar.gz",
-          "url": "https://files.pythonhosted.org/packages/1f/42/5c74462b4fd957fcd7b13b04fb3205ff8349236ea74c7c375766d6c82288/pillow-12.1.1.tar.gz",
-          "sha256": "9ad8fa5937ab05218e2b6a4cff30295ad35afd2f83ac592e68c0d871bb0fdbc4",
-          "size": 46980264
-        }
-      ]
-    },
-    {
       "component": "propcache",
       "distribution": "propcache",
       "version": "0.4.1",
@@ -1681,6 +1788,156 @@
         {
           "path": "licenses/python-packages/PyQt6-Qt6/pyqt6_qt6-6.10.2.dist-info/LICENSE",
           "sha256": "6c671e2912ec69c0832f32066c0313cee5fdc3bbcbce237822e89f3da58edd4e"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/README.md",
+          "sha256": "0687dcf43498bc86119e591b544e326654150ae930b7c26e19bbe77d06476961",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/qtbase-6.10.2.spdx.json",
+          "sha256": "49a96273143388adf81829d2a5150f0e9679f2c12e651a4b83e29dbc764a87be",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/qtimageformats-6.10.2.spdx.json",
+          "sha256": "4a8fbd46fdd4dd43647beade687dd26d56d8f20509ab6f9c7a7eeb6f10eccb02",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/qtsvg-6.10.2.spdx.json",
+          "sha256": "7aa49ecca62638cc25b31f6d87fc89e0b2a53731ebaa2a72f0b5bef00407a615",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/Apache-2.0.txt",
+          "sha256": "e3ba223bb1423f0aad8c3dfce0fe3148db48926d41e6fbc3afbbf5ff9e1c89cb",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/BSD-2-Clause.txt",
+          "sha256": "8fda146749ca071ac9cdce2e24d25444676ea48d1f9dccc2b7c15c054b717db8",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/BSD-3-Clause.txt",
+          "sha256": "9f0490f18656c6f2435bd14f603ef0c96434d1825615363dce43abb42ed1dcce",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/CC0-1.0.txt",
+          "sha256": "a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/FTL.txt",
+          "sha256": "08c135755dd589039470f1fdbb400daaabaaa50d0b366d19cebff4d22986baa1",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/GPL-2.0-only.txt",
+          "sha256": "8177f97513213526df2cf6184d8ff986c675afb514d4e68a404010521b880643",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/GPL-3.0-only.txt",
+          "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/HPND-sell-variant.txt",
+          "sha256": "3a946598a9f674d44df764279ca0b85b5d6faba08f3bc75d8e0fcf6cd729a9bd",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/HPND.txt",
+          "sha256": "67ac968431270291f5e9cd3ed76705e1169f57082ee102093b2543b28cef63cf",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/IJG.txt",
+          "sha256": "1cb448f5e2e6d3aca60943f4eee1a04675628dc0266a074a42bc1560ebc28d61",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/Imlib2.txt",
+          "sha256": "8846f2baba1a7f4c36f7ca19a923a000d8a21afa37cf0fe006f6ce88a6058a89",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/LGPL-3.0-only.txt",
+          "sha256": "da7eabb7bafdf7d3ae5e9f223aa5bdc1eece45ac569dc21b3b037520b4464768",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/libpng-2.0.txt",
+          "sha256": "7317e078e2d3b5d7ba5a6159e650945153262b44b76f6700f8e9edb261c5143e",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/Libpng.txt",
+          "sha256": "58fe669792f9b4e0740bf75ecfe90b5326128bb2ce7e27e1c342abd9db4d8ea6",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/libtiff.txt",
+          "sha256": "fbd6fed7938541d2c809c0826225fc85e551fdbfa8732b10f0c87e0847acafd7",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/LicenseRef-BSD-3-Clause-with-PCRE2-Binary-Like-Packages-Exception.txt",
+          "sha256": "0526625fcc746a42d3f19a0ab357d3dc8479fdbe3bfd168825498f50215c7a63",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/LicenseRef-ICC-License.txt",
+          "sha256": "9e34ff47b3a44814e183342e7e198d127a6740e29d20e8381fba7688dafc79dd",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/LicenseRef-Lcs-Telegraphics.txt",
+          "sha256": "c10225ebbd5191bfdd761b0d7752c785f2453ab665d6c454473fb12d254668aa",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/LicenseRef-Qt-Commercial.txt",
+          "sha256": "9b1f50aae6267f9d5e0ceb6775ee86450262c25ec7c0573e151fe5d3f18a4700",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/LicenseRef-SHA1-Public-Domain.txt",
+          "sha256": "65d86b8ec6b1cd8b8f6e64fd8710274ba00d6a3c520e00dfdcd1c3d2071f3305",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/MIT-open-group.txt",
+          "sha256": "c55d2ab72d8a4f9e9cd8fbd1379268e575e8cfa16874affa5899b75a6d754514",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/MIT.txt",
+          "sha256": "d040359701c01996a017d5c515678929cd1b0625e64cb86db44025fbb6cdf1fc",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/MPL-2.0.txt",
+          "sha256": "3f3d9e0024b1921b067d6f7f88deb4a60cbe7a78e76c64e3f1d7fc3b779b9d04",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/Unicode-3.0.txt",
+          "sha256": "80bb6294022d8764adb36a9d65ebb6bd94efb1865918a71e31e6c247607d7634",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/X11.txt",
+          "sha256": "e2936c6509784b4f0ec27bac74182393866fad9422b29a70e085ff14aba87193",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/LICENSES/Zlib.txt",
+          "sha256": "d7e3139972874dc8abdbbfce27ec1e6f942b28279dd7d27453630a8b4610e080",
+          "source": "repository"
         }
       ],
       "artifact_patterns": [
@@ -1693,19 +1950,125 @@
         "sha256": "c4b7f7d66cc58bddf1bc1ca28dfcf7a45f58cfcb11d81d13a0510409dd4957ac",
         "size": 78433821
       },
-      "source_status": "upstream_reference_not_verified_corresponding_source",
+      "wheel_repackaging_tool_reference": {
+        "project": "PyQt-builder",
+        "reference_version": "1.19.1",
+        "reference_commit": "6ad7e58870362dbfd50c0e3bd95f9915cb30c42b",
+        "entry_point": "pyqt-qt-wheel = pyqtbuild.bundle.qt_wheel_main:main",
+        "source_url": "https://github.com/Python-PyQt/PyQt-builder/blob/6ad7e58870362dbfd50c0e3bd95f9915cb30c42b/pyqtbuild/bundle/qt_wheel.py",
+        "input_model": "existing local Qt installation selected with --qt-dir",
+        "qt_source_build_supported": false,
+        "published_wheel_build_relationship_verified": false
+      },
+      "source_status": "verified_corresponding_source",
       "wheel_build_provenance_verified": false,
-      "qt_plugin_third_party_notices_verified": false,
-      "native_source_coverage_verified": false,
+      "qt_plugin_third_party_notices_verified": true,
+      "native_source_coverage_verified": true,
       "release_legal_review_required": true,
-      "release_gate_reason": "PyQt6-Qt6 Windows wheelのpatch、configure option、build scriptを含む完全なbuild provenanceを確認できていないため、Qt公式archiveを当該wheelのexact Corresponding Sourceとは断定しない。",
+      "release_gate_reason": "同梱する20個のQt成果物は公式Qt 6.10.2 archiveとbyte単位で一致し、対応sourceと通知本文も固定したが、PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceは確認できていない。",
       "source_archives": [
         {
-          "filename": "qt-everywhere-src-6.10.2.tar.xz",
-          "url": "https://download.qt.io/official_releases/qt/6.10/6.10.2/single/qt-everywhere-src-6.10.2.tar.xz",
-          "sha256": "c3df0f0e421130cc52ed81cb712358804471ce9bd2a41d97828f9f5b1bf7fed2",
-          "size": 1315359412
+          "filename": "qtbase-everywhere-src-6.10.2.tar.xz",
+          "url": "https://download.qt.io/official_releases/qt/6.10/6.10.2/submodules/qtbase-everywhere-src-6.10.2.tar.xz",
+          "sha256": "aeb78d29291a2b5fd53cb55950f8f5065b4978c25fb1d77f627d695ab9adf21e",
+          "size": 50374380
+        },
+        {
+          "filename": "qtsvg-everywhere-src-6.10.2.tar.xz",
+          "url": "https://download.qt.io/official_releases/qt/6.10/6.10.2/submodules/qtsvg-everywhere-src-6.10.2.tar.xz",
+          "sha256": "f07ff80f38caf235187200345392ca7479445ddf49a36c3694cd52a735dad6e1",
+          "size": 2614740
+        },
+        {
+          "filename": "qtimageformats-everywhere-src-6.10.2.tar.xz",
+          "url": "https://download.qt.io/official_releases/qt/6.10/6.10.2/submodules/qtimageformats-everywhere-src-6.10.2.tar.xz",
+          "sha256": "8b8f9c718638081e7b3c000e7f31910140b1202a98e98df5d1b496fe6f639d67",
+          "size": 2032388
         }
+      ],
+      "qt_upstream_modules": [
+        {
+          "module": "qtbase",
+          "source_revision": "000d6c62f7880bb8d3054724e8da0b8ae244130e",
+          "compiler": "MSVC 19.39.33520.0",
+          "binary_archive": {
+            "filename": "6.10.2-0-202601261212qtbase-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z",
+            "url": "https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_6102/qt6_6102/qt.qt6.6102.win64_msvc2022_64/6.10.2-0-202601261212qtbase-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z",
+            "sha1": "5d89fd111a57ebdabe4e2122d747ae891f5d98c3",
+            "sha256": "c4cedcc54d2036ab20b193db113cf324d90f390647f831a522952cc9b158f38b",
+            "size": 42287623
+          },
+          "spdx_material": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/qtbase-6.10.2.spdx.json",
+          "source_inventory_verification": {
+            "records": 22713,
+            "byte_exact": 7149,
+            "crlf_normalized": 15162,
+            "metadata_only_excluded": 401,
+            "tag_record_verified": true
+          }
+        },
+        {
+          "module": "qtsvg",
+          "source_revision": "b925029db51aff0b17a48f5939cb83c27932d0cb",
+          "compiler": "MSVC 19.39.33520.0",
+          "binary_archive": {
+            "filename": "6.10.2-0-202601261212qtsvg-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z",
+            "url": "https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_6102/qt6_6102/qt.qt6.6102.win64_msvc2022_64/6.10.2-0-202601261212qtsvg-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z",
+            "sha1": "94765e05e1bf4b9c545002888c5917edcd15ed9e",
+            "sha256": "2c85364c1464100b583c36f071c6fca9fa36e1951a1f82ff26bf0a151de26e6c",
+            "size": 667569
+          },
+          "spdx_material": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/qtsvg-6.10.2.spdx.json",
+          "source_inventory_verification": {
+            "records": 634,
+            "byte_exact": 85,
+            "crlf_normalized": 538,
+            "metadata_only_excluded": 10,
+            "tag_record_verified": true
+          }
+        },
+        {
+          "module": "qtimageformats",
+          "source_revision": "076fb82c55321e42beeae62d9e3ca8c4bb71439c",
+          "compiler": "MSVC 19.39.33520.0",
+          "binary_archive": {
+            "filename": "6.10.2-0-202601261212qtimageformats-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z",
+            "url": "https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_6102/qt6_6102/qt.qt6.6102.addons.qtimageformats.win64_msvc2022_64/6.10.2-0-202601261212qtimageformats-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z",
+            "sha1": "56fe96e0c99f16796d8f9626a142f6745599c9d0",
+            "sha256": "726cb7ef71f140e736af04c75665af059c3b5490334f06ba91506efba9e51272",
+            "size": 821720
+          },
+          "spdx_material": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/qtimageformats-6.10.2.spdx.json",
+          "source_inventory_verification": {
+            "records": 551,
+            "byte_exact": 138,
+            "crlf_normalized": 413,
+            "metadata_only_excluded": 0,
+            "tag_record_verified": true
+          }
+        }
+      ],
+      "verified_runtime_artifacts": [
+        {"path": "_internal/PyQt6/Qt6/bin/Qt6Core.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-module-Core", "archive_member": "bin/Qt6Core.dll", "size": 10242360, "sha256": "b98eea394a95563879b614dbd4432ce074b0fceeb154c3bae252f4e7a9376a40"},
+        {"path": "_internal/PyQt6/Qt6/bin/Qt6Gui.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-module-Gui", "archive_member": "bin/Qt6Gui.dll", "size": 9494840, "sha256": "28ca8b9e7d3d1c4e3cfafd6fe63877a05cf10202a240134a11f98384f01c9e37"},
+        {"path": "_internal/PyQt6/Qt6/bin/Qt6Network.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-module-Network", "archive_member": "bin/Qt6Network.dll", "size": 1766712, "sha256": "905e1ce3947fadaad566b6deffe345daf7f6efbc57207ea7fcdbfa77669e3de6"},
+        {"path": "_internal/PyQt6/Qt6/bin/Qt6Svg.dll", "module": "qtsvg", "spdx_package": "SPDXRef-Package-qtsvg-qt-module-Svg", "archive_member": "bin/Qt6Svg.dll", "size": 632120, "sha256": "982a589e52680d7b525da0031eba783d3bbd77e6611cdea5cd276a2b9213f4c9"},
+        {"path": "_internal/PyQt6/Qt6/bin/Qt6Widgets.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-module-Widgets", "archive_member": "bin/Qt6Widgets.dll", "size": 6576952, "sha256": "f383fb6b3f6996efe23327ff607e7298fc47ee76e8b8ef8a65f8d2e0a91707e4"},
+        {"path": "_internal/PyQt6/Qt6/plugins/generic/qtuiotouchplugin.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-plugin-QTuioTouchPlugin", "archive_member": "plugins/generic/qtuiotouchplugin.dll", "size": 102712, "sha256": "bf4efd69f22ad7b3f3bb79979e9fdef4182ef782e7ab2c4b80e6656bbe33e363"},
+        {"path": "_internal/PyQt6/Qt6/plugins/iconengines/qsvgicon.dll", "module": "qtsvg", "spdx_package": "SPDXRef-Package-qtsvg-qt-plugin-QSvgIconPlugin", "archive_member": "plugins/iconengines/qsvgicon.dll", "size": 71480, "sha256": "6221fed44f0f560a864312553c6918a536b8e2f04c7cb4e8ee5ba9445338aa96"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qgif.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-plugin-QGifPlugin", "archive_member": "plugins/imageformats/qgif.dll", "size": 47928, "sha256": "4fe24916a961587173c846055a34735b904900fb75716de4fa458c203da3e7ef"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qicns.dll", "module": "qtimageformats", "spdx_package": "SPDXRef-Package-qtimageformats-qt-plugin-QICNSPlugin", "archive_member": "plugins/imageformats/qicns.dll", "size": 56120, "sha256": "fcf2c00c959cdc7af7f7ac51e2f1158f37a76c166367bf30c4edc4e0657a835c"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qico.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-plugin-QICOPlugin", "archive_member": "plugins/imageformats/qico.dll", "size": 45880, "sha256": "0d79934047e06591b74201d826af72f6ab595f5df4705ad7f0c234c0e2cf3a32"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qjpeg.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-plugin-QJpegPlugin", "archive_member": "plugins/imageformats/qjpeg.dll", "size": 577848, "sha256": "004f456d513a6bfc58320652c326a023fa8fea905d26b642a561f7081442aff0"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qsvg.dll", "module": "qtsvg", "spdx_package": "SPDXRef-Package-qtsvg-qt-plugin-QSvgPlugin", "archive_member": "plugins/imageformats/qsvg.dll", "size": 39224, "sha256": "b34f721be6e1a451a2eea3c146b0808091577143587d9e6bc689fe8214ff47d7"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qtga.dll", "module": "qtimageformats", "spdx_package": "SPDXRef-Package-qtimageformats-qt-plugin-QTgaPlugin", "archive_member": "plugins/imageformats/qtga.dll", "size": 38200, "sha256": "c11ac719c2d7c50a4c2924ef4d439772176e00723e96f04d50d4a70163a9abda"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qtiff.dll", "module": "qtimageformats", "spdx_package": "SPDXRef-Package-qtimageformats-qt-plugin-QTiffPlugin", "archive_member": "plugins/imageformats/qtiff.dll", "size": 441656, "sha256": "498e9259b9ec69a7f9a77e4ff796b9d2afcaa2e4c7c0a382b401f0b1c07718de"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qwbmp.dll", "module": "qtimageformats", "spdx_package": "SPDXRef-Package-qtimageformats-qt-plugin-QWbmpPlugin", "archive_member": "plugins/imageformats/qwbmp.dll", "size": 36664, "sha256": "e3a1be02183ebd3c136a4554b34689cbb9ee6699278efda6944e9faf9c02f4e3"},
+        {"path": "_internal/PyQt6/Qt6/plugins/imageformats/qwebp.dll", "module": "qtimageformats", "spdx_package": "SPDXRef-Package-qtimageformats-qt-plugin-QWebpPlugin", "archive_member": "plugins/imageformats/qwebp.dll", "size": 562488, "sha256": "3fb2f8be5b82dada607ac9133a5139c770bd210145ea2ded90e69953b21a8d4d"},
+        {"path": "_internal/PyQt6/Qt6/plugins/platforms/qminimal.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-plugin-QMinimalIntegrationPlugin", "archive_member": "plugins/platforms/qminimal.dll", "size": 61752, "sha256": "dcff6be588488da37b817c2eb37fc679c056ef587a25520ab1a7700af2161850"},
+        {"path": "_internal/PyQt6/Qt6/plugins/platforms/qoffscreen.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-plugin-QOffscreenIntegrationPlugin", "archive_member": "plugins/platforms/qoffscreen.dll", "size": 113976, "sha256": "c8b67c7a233bc1c727f3f8fe1bcd4f4e36f61a5e5b7dbee0913920e178523470"},
+        {"path": "_internal/PyQt6/Qt6/plugins/platforms/qwindows.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-plugin-QWindowsIntegrationPlugin", "archive_member": "plugins/platforms/qwindows.dll", "size": 997688, "sha256": "540211565db496024246cb8a44437212e6b967f3ee7b899e888f41cc556bf041"},
+        {"path": "_internal/PyQt6/Qt6/plugins/styles/qmodernwindowsstyle.dll", "module": "qtbase", "spdx_package": "SPDXRef-Package-qtbase-qt-plugin-QModernWindowsStylePlugin", "archive_member": "plugins/styles/qmodernwindowsstyle.dll", "size": 220984, "sha256": "f9ddcd6f6319be76ec8ea1b95e6829cdc0f9600242b6bdd07babb0185e9762ab"}
       ]
     },
     {
@@ -1875,9 +2238,37 @@
         "sha256": "3877ac408e14da24a6196de0ddcace62092bfc12a83823e92e49e40747e52c19",
         "size": 37290984
       },
+      "wheel_build_compilers": {
+        "c": "GCC 10.3.0 (Strawberry toolchain)",
+        "cxx": "GCC 10.3.0 (Strawberry toolchain)",
+        "fortran": "GFortran 10.3.0 (Strawberry toolchain)"
+      },
+      "openblas_windows_build_evidence": {
+        "source_archive_filename": "openblas-libs-v0.3.30.0.8.tar.gz",
+        "repository_commit": "cc349923c809273389f49e582da3174e7a7b8ac4",
+        "openblas_submodule_commit": "b5456c1b41ea88d4e0041778aa8ec09ee2a111a0",
+        "workflow_path": ".github/workflows/windows.yml",
+        "workflow_sha256": "42f34e60f8879e36a9bb0231b1d9736b1517bca829b6526e0108013b642a2289",
+        "build_script_path": "tools/build_openblas.sh",
+        "rtools_chocolatey_version": "4.0.0.20220206",
+        "applied_windows_patch": {
+          "path": "patches-windows/openblas-make-libs.patch",
+          "sha256": "4bf4799ec503921a203d2ab1e925b819ce58d55e5bb9b859aa44da4e39a7e6ba"
+        },
+        "interface": "LP64",
+        "delvewheel_version": "1.12.0",
+        "wheel_notice_covers_gcc_runtime_exception": true,
+        "toolchain_manifest_verified": false,
+        "publisher_artifact_chain_verified": false,
+        "runtime_artifact": {
+          "path": "scipy.libs/libscipy_openblas-64eda39e79589aedb16f58e5547eb599.dll",
+          "size": 20260864,
+          "sha256": "64eda39e79589aedb16f58e5547eb599f0b5855505d56b9d40022e2eee354a0b"
+        }
+      },
       "native_source_coverage_verified": false,
       "release_legal_review_required": true,
-      "release_gate_reason": "SciPy/OpenBLASのexact sourceとbuild recipeは固定済みだが、Windows wheelのOpenBLASにstatic linkされたGCC/Rtools toolchain source、patch、build provenanceを完全には確認できていないため公開しない。",
+      "release_gate_reason": "SciPy wheelのGCC 10.3.0 build情報とOpenBLASのexact tag、submodule、Windows workflow、適用patch、Rtools指定は固定済みだが、SciPyのStrawberry toolchainとOpenBLASのRtools/GCC toolchain manifest、MacPython CI run、生成物からSciPy wheelまでのartifact chainを確認できていないため公開しない。",
       "source_archives": [
         {
           "filename": "scipy-1.17.1.tar.gz",

@@ -591,7 +591,7 @@ def _parse_pyinstaller_tocs(collect_path: Path) -> dict[str, Any]:
         or analysis[10] != []
     ):
         raise ValueError("PyInstaller Analysis application inputs differ from the spec.")
-    if analysis[4:10] != ({}, [], [], False, {}, 0):
+    if analysis[4:10] != ({}, ["PIL", "__main__"], [], False, {}, 0):
         raise ValueError("PyInstaller Analysis build options differ from the spec.")
     scripts = _typed_toc_entries(
         analysis[13], label="Analysis scripts", allowed_types={"PYSOURCE"}
@@ -2423,13 +2423,6 @@ def _classify_toc_entry(
             "microsoft-vc-runtime-python"
             if python_core is not None
             else "microsoft-vc-runtime"
-        )
-    if source_lower == "opengl32sw.dll":
-        return (
-            "mesa-opengl32sw"
-            if owner == "qt"
-            and final_lower == "_internal/pyqt6/qt6/bin/opengl32sw.dll"
-            else None
         )
     python_dependency_owners = {
         "_bz2.pyd": "python-bzip2",

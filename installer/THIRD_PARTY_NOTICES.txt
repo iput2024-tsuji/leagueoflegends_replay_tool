@@ -6,9 +6,13 @@ GPL version 3 の全文は、この画面の前に表示されるライセンス
 
 本アプリケーションには、Python、PyQt6、Qt、obsws-python、
 opencv-python、OpenCV FFmpeg、NumPy、pandas、SciPy、
-scikit-learn、Microsoft Visual C++ runtime、Mesa software OpenGL
-などの第三者コンポーネントが含まれます。
+scikit-learn、Microsoft Visual C++ runtimeなどの第三者コンポーネントが
+含まれます。
 各コンポーネントには、それぞれのライセンス条件が適用されます。
+
+Qt wheelに含まれる未使用のMesa software OpenGL fallback
+opengl32sw.dllはpackaging policyで除外され、このインストーラーには
+含まれません。
 
 このインストーラーは Inno Setup 6.7.3 で作成され、Setup/Uninstall stubと
 LZMA展開コードを内蔵します。compiler、LZMA圧縮component、その他のbuild
@@ -48,8 +52,11 @@ text appears before this page and is installed as LICENSE.
 
 The application contains third-party components including Python, PyQt6, Qt,
 obsws-python, opencv-python, the OpenCV FFmpeg DLL, NumPy, pandas, SciPy,
-scikit-learn, Microsoft Visual C++ runtime files, and Mesa software OpenGL.
+scikit-learn, and Microsoft Visual C++ runtime files.
 Each component remains subject to its own license terms.
+
+The unused Mesa software OpenGL fallback opengl32sw.dll supplied by the Qt
+wheel is removed by the packaging policy and is not included in this installer.
 
 This installer is built with Inno Setup 6.7.3 and embeds its Setup/Uninstall
 stubs and LZMA decompression code. The compiler, LZMA compression components,

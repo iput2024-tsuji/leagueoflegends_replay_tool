@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -36,6 +37,10 @@ class RecordingSupervisor:
         self.session_completed = False
         self.session_should_finalize = False
         self.session_finalize_attempted = False
+        self.shutdown_error: BaseException | None = None
+        self._recording_state_lock = threading.Lock()
+        self._recording_active = False
+        self._update_shutdown_reserved = False
 
     async def run(self, stop_event: asyncio.Event) -> None:
         self.stop_event = stop_event
@@ -68,58 +73,64 @@ class RecordingSupervisor:
                 started = await self.recorder.wait_for_game_start_async()
                 if not started or stop_event.is_set():
                     break
+                if not self._begin_recording():
+                    break
                 try:
-                    await self.recorder.start_recording_async()
-                    self._notify(
-                        NotificationEvent.RECORDING_STARTED,
-                        "録画を開始しました",
-                        "League of Legendsの録画を開始しました。",
-                    )
-                    if stop_event.is_set():
-                        self._finalize_aborted("stop requested after recording started")
-                        break
-                    outcome = await self.recorder.record_until_end_async()
-                except Exception as e:
-                    should_continue = not stop_event.is_set()
-                    if self._has_session_data():
-                        self._mark_failed_partial(e)
-                        result = self._finalize_current_session(RecordingOutcome.FAILED_PARTIAL, e)
-                        if self._finalize_success(result):
-                            self._emit("⚠️ 録画セッションを部分保存しました。")
-                        else:
-                            self._emit(f"⚠️ 部分保存に失敗しました: {self._finalize_error(result)}")
-                            should_continue = False
-                    self._notify(
-                        NotificationEvent.RECORDING_FAILED,
-                        "録画に失敗しました",
-                        self._notification_error_message(e),
-                    )
-                    if should_continue:
-                        self._defer_current_game_after_failure()
-                        self._emit("⚠️ 録画エラーが発生したため、この試合中の再試行を停止します。")
-                        await self._wait_for_post_game_notification_window()
+                    try:
+                        await self.recorder.start_recording_async()
+                        self._notify(
+                            NotificationEvent.RECORDING_STARTED,
+                            "録画を開始しました",
+                            "League of Legendsの録画を開始しました。",
+                        )
                         if stop_event.is_set():
+                            self._finalize_aborted("stop requested after recording started")
                             break
-                        self._emit("⚠️ 録画エラー後も次の試合監視を継続します。")
-                        continue
-                    break
-                if outcome != RecordingOutcome.COMPLETED:
-                    if self._has_session_data():
-                        self._finalize_aborted("recording was cancelled")
-                    else:
-                        self._emit("⏹️ 録画セッションを中断しました。")
-                    break
-                self.session_completed = True
-                result = self._finalize_current_session(RecordingOutcome.COMPLETED)
-                if not self._finalize_success(result):
-                    self._emit(f"⚠️ セッション保存に失敗しました: {self._finalize_error(result)}")
-                    self._notify(
-                        NotificationEvent.RECORDING_FAILED,
-                        "録画の保存に失敗しました",
-                        f"録画セッションを保存できませんでした: {self._finalize_error(result)}",
-                    )
-                    break
-                self._emit("✅ 試合記録完了。次の試合を待機します。")
+                        outcome = await self.recorder.record_until_end_async()
+                    except Exception as e:
+                        should_continue = not stop_event.is_set()
+                        if self._has_session_data():
+                            self._mark_failed_partial(e)
+                            result = self._finalize_current_session(RecordingOutcome.FAILED_PARTIAL, e)
+                            if self._finalize_success(result):
+                                self._emit("⚠️ 録画セッションを部分保存しました。")
+                            else:
+                                self._emit(f"⚠️ 部分保存に失敗しました: {self._finalize_error(result)}")
+                                should_continue = False
+                        self._notify(
+                            NotificationEvent.RECORDING_FAILED,
+                            "録画に失敗しました",
+                            self._notification_error_message(e),
+                        )
+                        if should_continue:
+                            self._defer_current_game_after_failure()
+                            self._emit("⚠️ 録画エラーが発生したため、この試合中の再試行を停止します。")
+                            self._finish_recording()
+                            await self._wait_for_post_game_notification_window()
+                            if stop_event.is_set():
+                                break
+                            self._emit("⚠️ 録画エラー後も次の試合監視を継続します。")
+                            continue
+                        break
+                    if outcome != RecordingOutcome.COMPLETED:
+                        if self._has_session_data():
+                            self._finalize_aborted("recording was cancelled")
+                        else:
+                            self._emit("⏹️ 録画セッションを中断しました。")
+                        break
+                    self.session_completed = True
+                    result = self._finalize_current_session(RecordingOutcome.COMPLETED)
+                    if not self._finalize_success(result):
+                        self._emit(f"⚠️ セッション保存に失敗しました: {self._finalize_error(result)}")
+                        self._notify(
+                            NotificationEvent.RECORDING_FAILED,
+                            "録画の保存に失敗しました",
+                            f"録画セッションを保存できませんでした: {self._finalize_error(result)}",
+                        )
+                        break
+                    self._emit("✅ 試合記録完了。次の試合を待機します。")
+                finally:
+                    self._finish_recording()
                 await self._wait_for_post_game_notification_window()
                 self._notify(
                     NotificationEvent.RECORDING_COMPLETED,
@@ -157,6 +168,26 @@ class RecordingSupervisor:
             self.stop_event.set()
         if self.recorder is not None:
             self.recorder.request_stop()
+
+    def reserve_update_shutdown(self) -> bool:
+        """Reserve shutdown unless a recording transition already owns the session."""
+
+        with self._recording_state_lock:
+            if self._recording_active:
+                return False
+            self._update_shutdown_reserved = True
+            return True
+
+    def _begin_recording(self) -> bool:
+        with self._recording_state_lock:
+            if self._update_shutdown_reserved:
+                return False
+            self._recording_active = True
+            return True
+
+    def _finish_recording(self) -> None:
+        with self._recording_state_lock:
+            self._recording_active = False
 
     def shutdown(self) -> None:
         recorder = self.recorder
@@ -202,9 +233,15 @@ class RecordingSupervisor:
 
             try:
                 if runtime is not None:
-                    runtime.close(finalize_session=False)
+                    if self._update_shutdown_reserved:
+                        runtime.close(finalize_session=False, allow_force=False)
+                    else:
+                        runtime.close(finalize_session=False)
                 elif recorder is not None:
-                    recorder.shutdown_obs()
+                    if self._update_shutdown_reserved:
+                        recorder.shutdown_obs(allow_force=False)
+                    else:
+                        recorder.shutdown_obs()
             except BaseException as cleanup_error:
                 owner_cleanup_context = (
                     "録画監視終了時の所有OBS cleanupにも失敗しました。"
@@ -233,6 +270,7 @@ class RecordingSupervisor:
             self.runtime = None
             self.recorder = None
 
+        self.shutdown_error = selected_error
         if selected_error is not None:
             raise selected_error
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- During an in-place update, the installer now requests a safe shutdown from an app running in the system tray and waits for recording monitoring, settings work, and the managed OBS instance to stop normally before replacing files. If a match is being recorded, shutdown state cannot be verified, or normal shutdown times out, the update stops without force-quitting the app or OBS.
+
 ## [0.5.2] - 2026-06-27
 
 ### Fixed

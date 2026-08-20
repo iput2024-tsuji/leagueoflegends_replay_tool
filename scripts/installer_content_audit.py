@@ -49,18 +49,37 @@ INNO_INITIALIZE_WIZARD_GUARD = re.compile(
     r"Exit\s*;",
     re.IGNORECASE | re.DOTALL,
 )
+INNO_PREPARE_TO_INSTALL_GUARD = re.compile(
+    r"function\s+PrepareToInstall\s*\(\s*var\s+NeedsRestart\s*:\s*Boolean\s*\)\s*"
+    r":\s*String\s*;\s*"
+    r"begin\s*"
+    r"if\s+IsContentAuditMode(?:\(\))?\s+then\s*"
+    r"begin\s*"
+    r"Result\s*:=\s*;\s*"
+    r"Exit\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
 INNO_CODE_DECLARATION = re.compile(
     r"\b(?:function|procedure)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
     re.IGNORECASE,
 )
 INNO_ALLOWED_CODE_DECLARATIONS = (
+    "closehandle",
     "curuninstallstepchanged",
     "deletemanagedrecordings",
     "deletemanageduserdata",
     "initializeuninstall",
     "initializewizard",
     "iscontentauditmode",
+    "openevent",
+    "openmutex",
+    "preparetoinstall",
+    "queryapplicationrunning",
+    "requestsafeupdateshutdown",
+    "resetevent",
+    "setevent",
     "showuninstalloptions",
+    "waitforsingleobject",
 )
 INNO_SIDE_EFFECT_SECTIONS = frozenset(
     {
@@ -321,6 +340,22 @@ def _validate_inno_code(source: str) -> list[str]:
     ):
         errors.append(
             "Inno InitializeWizard must exit before side effects in content-audit mode."
+        )
+    prepare_to_install_declarations = [
+        match
+        for match in declaration_matches
+        if match.group(1).casefold() == "preparetoinstall"
+    ]
+    if (
+        len(prepare_to_install_declarations) != 1
+        or INNO_PREPARE_TO_INSTALL_GUARD.match(
+            structural_code,
+            prepare_to_install_declarations[0].start(),
+        )
+        is None
+    ):
+        errors.append(
+            "Inno PrepareToInstall must exit before side effects in content-audit mode."
         )
     return errors
 

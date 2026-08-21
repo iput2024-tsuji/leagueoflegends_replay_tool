@@ -100,7 +100,8 @@
     "license_materials": [
       {
         "path": "licenses/python-packages/Python/LICENSE.txt",
-        "sha256": "935cf13e19f8c31b497d20b05d73623431a226b230c3599bc30fa3348979bc68"
+        "sha256": "935cf13e19f8c31b497d20b05d73623431a226b230c3599bc30fa3348979bc68",
+        "shared": true
       }
     ],
     "artifact_patterns": [
@@ -1052,7 +1053,32 @@
         "_internal/VCRUNTIME140_1.dll"
       ],
       "corresponding_source_required": false,
-      "build_provenance_verified": false,
+      "build_provenance_verified": true,
+      "verified_runtime_artifacts": [
+        {
+          "path": "_internal/VCRUNTIME140.dll",
+          "archive_member": "vcruntime140.dll",
+          "size": 120400,
+          "sha256": "052ad6a20d375957e82aa6a3c441ea548d89be0981516ca7eb306e063d5027f4",
+          "file_version": "14.42.34438.0",
+          "source_component": "python"
+        },
+        {
+          "path": "_internal/VCRUNTIME140_1.dll",
+          "archive_member": "vcruntime140_1.dll",
+          "size": 49776,
+          "sha256": "6a99bc0128e0c7d6cbbf615fcc26909565e17d4ca3451b97f8987f9c6acbc6c8",
+          "file_version": "14.42.34438.0",
+          "source_component": "python"
+        }
+      ],
+      "license_materials": [
+        {
+          "path": "licenses/python-packages/Python/LICENSE.txt",
+          "sha256": "935cf13e19f8c31b497d20b05d73623431a226b230c3599bc30fa3348979bc68",
+          "shared": true
+        }
+      ],
       "source_exception": {
         "kind": "proprietary-runtime-redistribution",
         "review_completed": false,
@@ -1083,7 +1109,81 @@
         "_internal/**/vcomp140*.dll"
       ],
       "corresponding_source_required": false,
-      "build_provenance_verified": false,
+      "build_provenance_verified": true,
+      "verified_runtime_artifacts": [
+        {
+          "path": "_internal/numpy.libs/msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll",
+          "wheel_member": "numpy.libs/msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll",
+          "size": 575056,
+          "sha256": "a4c2229bdc2a2a630acdc095b4d86008e5c3e3bc7773174354f3da4f5beb9cde",
+          "file_version": "14.40.33810.0",
+          "source_component": "numpy",
+          "distribution": "numpy"
+        },
+        {
+          "path": "_internal/PyQt6/Qt6/bin/MSVCP140_1.dll",
+          "wheel_member": "PyQt6/Qt6/bin/MSVCP140_1.dll",
+          "size": 31728,
+          "sha256": "446c48c1224c289bd3080087fe15d6759416d64f4136addf30086abd5415d83f",
+          "file_version": "14.26.28720.3",
+          "source_component": "qt",
+          "distribution": "PyQt6-Qt6"
+        },
+        {
+          "path": "_internal/PyQt6/Qt6/bin/MSVCP140_2.dll",
+          "wheel_member": "PyQt6/Qt6/bin/MSVCP140_2.dll",
+          "size": 193520,
+          "sha256": "24b47c966b6e4a65b3e4df866d347d3427e9bd709be550c38224427eb5e143d3",
+          "file_version": "14.26.28720.3",
+          "source_component": "qt",
+          "distribution": "PyQt6-Qt6"
+        },
+        {
+          "path": "_internal/PyQt6/Qt6/bin/MSVCP140.dll",
+          "wheel_member": "PyQt6/Qt6/bin/MSVCP140.dll",
+          "size": 590112,
+          "sha256": "88f55d86b50b0a7e55e71ad2d8f7552146ba26e927230daf2e26ad3a971973c5",
+          "file_version": "14.26.28720.3",
+          "source_component": "qt",
+          "distribution": "PyQt6-Qt6"
+        },
+        {
+          "path": "_internal/PyQt6/Qt6/bin/VCRUNTIME140_1.dll",
+          "wheel_member": "PyQt6/Qt6/bin/VCRUNTIME140_1.dll",
+          "size": 44528,
+          "sha256": "1f0f5f2ce671e0f68cf96176721df0e5e6f527c8ca9cfa98aa875b5a3816d460",
+          "file_version": "14.26.28720.3",
+          "source_component": "qt",
+          "distribution": "PyQt6-Qt6"
+        },
+        {
+          "path": "_internal/PyQt6/Qt6/bin/VCRUNTIME140.dll",
+          "wheel_member": "PyQt6/Qt6/bin/VCRUNTIME140.dll",
+          "size": 101872,
+          "sha256": "5e197a086b6a7711baa09afe4ea7c68f0e777b2ff33f1df25a21f375b7d9693a",
+          "file_version": "14.26.28720.3",
+          "source_component": "qt",
+          "distribution": "PyQt6-Qt6"
+        },
+        {
+          "path": "_internal/sklearn/.libs/msvcp140.dll",
+          "wheel_member": "sklearn/.libs/msvcp140.dll",
+          "size": 557728,
+          "sha256": "0f885b509a685d2bbfa652fed26b5fb31d88fbdab0a978c641d1c7b8aa460aa9",
+          "file_version": "14.44.35211.0",
+          "source_component": "scikit-learn",
+          "distribution": "scikit-learn"
+        },
+        {
+          "path": "_internal/sklearn/.libs/vcomp140.dll",
+          "wheel_member": "sklearn/.libs/vcomp140.dll",
+          "size": 193152,
+          "sha256": "55aba23cdcd6484fbb06f4155b8ca75adfce7a881f10afd0c49457165e677164",
+          "file_version": "14.44.35211.0",
+          "source_component": "scikit-learn",
+          "distribution": "scikit-learn"
+        }
+      ],
       "source_exception": {
         "kind": "proprietary-runtime-redistribution",
         "review_completed": false,

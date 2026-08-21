@@ -45,6 +45,28 @@ def _component_lock():
     )
 
 
+def _windows_file_version(path: Path) -> str:
+    import pefile
+
+    pe = pefile.PE(str(path), fast_load=False)
+    try:
+        pe.parse_data_directories(
+            directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]]
+        )
+        fixed = pe.VS_FIXEDFILEINFO[0]
+        return ".".join(
+            str(value)
+            for value in (
+                fixed.FileVersionMS >> 16,
+                fixed.FileVersionMS & 0xFFFF,
+                fixed.FileVersionLS >> 16,
+                fixed.FileVersionLS & 0xFFFF,
+            )
+        )
+    finally:
+        pe.close()
+
+
 def _write_distribution_materials(root: Path) -> None:
     if os.name != "nt":
         pytest.skip("Packaged license fixture requires the Windows release runtime")
@@ -373,6 +395,116 @@ def test_qt_windows_runtime_artifacts_match_official_archive_lock():
         "pdf" in str(artifact["path"]).casefold()
         for artifact in component["verified_runtime_artifacts"]
     )
+
+
+def test_microsoft_python_runtime_artifacts_match_release_profile():
+    if os.name != "nt":
+        pytest.skip("Microsoft runtime artifact locks are Windows-specific")
+
+    lock = _component_lock()
+    python_component = next(
+        component
+        for component in lock["runtime_components"]
+        if component.get("component") == "microsoft-vc-runtime-python"
+    )
+    assert python_component["build_provenance_verified"] is True
+    assert python_component["license_materials"] == [
+        {
+            "path": "licenses/python-packages/Python/LICENSE.txt",
+            "sha256": "935cf13e19f8c31b497d20b05d73623431a226b230c3599bc30fa3348979bc68",
+            "shared": True,
+        }
+    ]
+    assert python_component["source_exception"]["review_completed"] is False
+    assert python_component["license_materials_exception"]["review_completed"] is False
+    assert python_component["release_legal_review_required"] is True
+
+    release_version = lock["python"]["release_version"]
+    profile = lock["python"]["windows_native_runtime_profiles"][release_version]
+    inventory = {
+        artifact["path"]: artifact
+        for artifact in profile["core_native_inventory"]["artifacts"]
+    }
+    assert len(python_component["verified_runtime_artifacts"]) == 2
+    prefix = Path(sys.base_prefix)
+    for artifact in python_component["verified_runtime_artifacts"]:
+        assert artifact["source_component"] == "python"
+        assert Path(artifact["path"]).name.casefold() == Path(
+            artifact["archive_member"]
+        ).name.casefold()
+        expected = inventory[artifact["archive_member"]]
+        assert artifact["size"] == expected["size"]
+        assert artifact["sha256"] == expected["sha256"]
+    if sys.version.split()[0] != release_version:
+        pytest.skip(f"release runtime file check requires CPython {release_version}")
+    for artifact in python_component["verified_runtime_artifacts"]:
+        source = prefix / Path(*artifact["archive_member"].split("/"))
+        assert source.stat().st_size == artifact["size"]
+        assert sha256_file(source) == artifact["sha256"]
+        assert _windows_file_version(source) == artifact["file_version"]
+
+
+def test_microsoft_wheel_runtime_artifacts_match_locked_distributions():
+    if os.name != "nt":
+        pytest.skip("Microsoft runtime artifact locks are Windows-specific")
+
+    lock = _component_lock()
+    wheel_component = next(
+        component
+        for component in lock["runtime_components"]
+        if component.get("component") == "microsoft-vc-runtime"
+    )
+    assert wheel_component["build_provenance_verified"] is True
+    assert wheel_component["source_exception"]["review_completed"] is False
+    assert wheel_component["license_materials_exception"]["review_completed"] is False
+    assert wheel_component["release_legal_review_required"] is True
+    distributions = {
+        "numpy": "numpy",
+        "PyQt6-Qt6": "qt",
+        "scikit-learn": "scikit-learn",
+    }
+    expected_wheels = {
+        "numpy": (
+            "numpy-2.4.1-cp314-cp314-win_amd64.whl",
+            "7d5d7999df434a038d75a748275cd6c0094b0ecdb0837342b332a82defc4dc4d",
+            12438590,
+        ),
+        "PyQt6-Qt6": (
+            "pyqt6_qt6-6.10.2-py3-none-win_amd64.whl",
+            "c4b7f7d66cc58bddf1bc1ca28dfcf7a45f58cfcb11d81d13a0510409dd4957ac",
+            78433821,
+        ),
+        "scikit-learn": (
+            "scikit_learn-1.8.0-cp314-cp314-win_amd64.whl",
+            "56079a99c20d230e873ea40753102102734c5953366972a71d5cb39a32bc40c6",
+            8096518,
+        ),
+    }
+    assert len(wheel_component["verified_runtime_artifacts"]) == 8
+    for artifact in wheel_component["verified_runtime_artifacts"]:
+        distribution_name = artifact["distribution"]
+        source_component = distributions[distribution_name]
+        assert artifact["source_component"] == source_component
+        assert artifact["path"].casefold() == (
+            f"_internal/{artifact['wheel_member']}".casefold()
+        )
+        source_component_lock = next(
+            component
+            for component in lock["runtime_components"]
+            if component.get("component") == source_component
+        )
+        archive = source_component_lock["binary_archive"]
+        assert (
+            archive["filename"],
+            archive["sha256"],
+            archive["size"],
+        ) == expected_wheels[distribution_name]
+        distribution = metadata.distribution(distribution_name)
+        assert distribution.version == source_component_lock["version"]
+        source = Path(distribution.locate_file(artifact["wheel_member"]))
+        assert source.stat().st_size == artifact["size"]
+        assert sha256_file(source) == artifact["sha256"]
+        assert _windows_file_version(source) == artifact["file_version"]
 
 
 def test_numpy_and_scipy_openblas_windows_build_evidence_matches_wheels():

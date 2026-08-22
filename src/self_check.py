@@ -46,6 +46,17 @@ def run_self_check() -> dict[str, Any]:
             fatal=True,
         )
 
+    try:
+        _add_check(checks, "native_modules", True, _native_runtime_summary())
+    except Exception as e:
+        _add_check(
+            checks,
+            "native_modules",
+            False,
+            f"{type(e).__name__}: {e}",
+            fatal=True,
+        )
+
     config_data: dict[str, Any] = {}
     app_config = None
     try:
@@ -161,6 +172,40 @@ def _add_check(
             "fatal": bool(fatal),
             "message": message,
         }
+    )
+
+
+def _native_runtime_summary() -> str:
+    import cv2
+    import numpy as np
+    import pandas as pd
+    import sklearn
+    from PyQt6 import QtCore
+    from sklearn.tree import DecisionTreeClassifier
+
+    fft_real = tuple(float(value.real) for value in np.fft.fft([1.0, 2.0, 3.0, 4.0]))
+    if fft_real != (10.0, -2.0, -2.0, -2.0):
+        raise RuntimeError(f"NumPy FFT returned an unexpected result: {fft_real}")
+
+    rolling = pd.Series([1.0, 2.0, 3.0]).rolling(2).mean().tolist()
+    if rolling[1:] != [1.5, 2.5]:
+        raise RuntimeError(f"pandas rolling returned an unexpected result: {rolling}")
+
+    model = DecisionTreeClassifier(random_state=0).fit([[0.0], [1.0]], [0, 1])
+    prediction = int(model.predict([[1.0]])[0])
+    if prediction != 1:
+        raise RuntimeError(
+            f"scikit-learn prediction returned an unexpected result: {prediction}"
+        )
+
+    gray = cv2.cvtColor(np.zeros((2, 2, 3), dtype=np.uint8), cv2.COLOR_BGR2GRAY)
+    if gray.shape != (2, 2):
+        raise RuntimeError(f"OpenCV conversion returned an unexpected shape: {gray.shape}")
+
+    return (
+        f"PyQt6/Qt {QtCore.qVersion()}; NumPy {np.__version__}; "
+        f"pandas {pd.__version__}; scikit-learn {sklearn.__version__}; "
+        f"OpenCV {cv2.__version__}"
     )
 
 

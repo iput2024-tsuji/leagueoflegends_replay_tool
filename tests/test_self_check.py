@@ -32,9 +32,20 @@ def test_self_check_passes_with_missing_optional_binaries(monkeypatch, tmp_path)
     assert report["ok"] is True
     statuses = {check["name"]: check["status"] for check in report["checks"]}
     assert statuses["analytics_runtime"] == "ok"
+    assert statuses["native_modules"] == "ok"
     assert statuses["config"] == "ok"
     assert statuses["recording_dirs"] == "ok"
     assert statuses["mpv_dll"] == "warning"
+
+
+def test_native_runtime_summary_exercises_locked_native_modules():
+    summary = self_check._native_runtime_summary()
+
+    assert "PyQt6/Qt 6.10.2" in summary
+    assert "NumPy 2.4.1" in summary
+    assert "pandas 3.0.2" in summary
+    assert "scikit-learn 1.8.0" in summary
+    assert "OpenCV 4.13.0" in summary
 
 
 def test_self_check_cli_reconfigures_cp1252_streams_to_utf8(monkeypatch):

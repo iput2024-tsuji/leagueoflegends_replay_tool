@@ -21,6 +21,33 @@ Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 Import-Module NetSecurity -ErrorAction Stop
 Import-Module NetTCPIP -ErrorAction Stop
 
+function Get-Sha256 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [IO.File]::Open(
+    [IO.Path]::GetFullPath($Path),
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::Read,
+    [IO.FileShare]::Read
+  )
+  try {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+      return ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace(
+        "-",
+        ""
+      ).ToLowerInvariant()
+    } finally {
+      $algorithm.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 function Get-ExternalRuntimeState {
   $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
     [Microsoft.Win32.RegistryHive]::LocalMachine,
@@ -95,7 +122,7 @@ function Get-SystemRuntimeDlls {
         sha256 = if ($null -eq $file) {
           $null
         } else {
-          (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+          Get-Sha256 -Path $path
         }
       }
     }
@@ -127,7 +154,7 @@ function Get-SystemRuntimeInventory {
           hashed_name = $_.Name -match '^(?:concrt|msvcp|vcomp|vcruntime)140-[0-9a-f]{8,}\.dll$'
           version = $_.VersionInfo.FileVersion
           size = $_.Length
-          sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          sha256 = Get-Sha256 -Path $_.FullName
           signature_status = [string]$signature.Status
           signer_subject = if ($null -eq $signature.SignerCertificate) {
             $null
@@ -557,7 +584,7 @@ function Assert-FileHash {
   if ($ExpectedSha256 -cnotmatch '^[0-9a-f]{64}$') {
     throw "$Label の固定SHA256が不正です。"
   }
-  $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+  $actual = Get-Sha256 -Path $Path
   if ($actual -cne $ExpectedSha256) {
     throw "$Label のSHA256が一致しません。expected=$ExpectedSha256 actual=$actual"
   }

@@ -21,8 +21,15 @@ ISO_BUILD_SCRIPT = Path("scripts/build_windows_vm_lab_iso.ps1").resolve()
 
 @pytest.fixture
 def external_temp() -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix="lol-vm-lab-test-") as directory:
-        yield Path(directory)
+    runner_temp = os.environ.get("RUNNER_TEMP")
+    parent = runner_temp if runner_temp and Path(runner_temp).is_dir() else None
+    with tempfile.TemporaryDirectory(
+        prefix="lol-vm-lab-test-",
+        dir=parent,
+    ) as directory:
+        path = Path(directory).resolve()
+        assert not path.is_relative_to(Path.cwd().resolve())
+        yield path
 
 
 def _config(external_temp: Path, **overrides: object) -> tuple[Path, dict[str, object]]:

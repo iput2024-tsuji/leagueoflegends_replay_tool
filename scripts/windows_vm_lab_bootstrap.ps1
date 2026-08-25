@@ -20,6 +20,33 @@ Import-Module NetConnection -ErrorAction Stop
 Import-Module NetSecurity -ErrorAction Stop
 Import-Module NetTCPIP -ErrorAction Stop
 
+function Get-Sha256 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [IO.File]::Open(
+    [IO.Path]::GetFullPath($Path),
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::Read,
+    [IO.FileShare]::Read
+  )
+  try {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+      return ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace(
+        "-",
+        ""
+      ).ToLowerInvariant()
+    } finally {
+      $algorithm.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 function Assert-Administrator {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -445,7 +472,7 @@ $marker = [ordered]@{
   vmware_tools_present = $false
   default_routes = $defaultRoutes
   winrm_firewall = $firewallEvidence
-  bootstrap_sha256 = (Get-FileHash -LiteralPath $MyInvocation.MyCommand.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+  bootstrap_sha256 = Get-Sha256 -Path $MyInvocation.MyCommand.Path
 }
 $marker | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $markerPath -Encoding utf8
 

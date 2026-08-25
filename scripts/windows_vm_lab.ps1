@@ -13,7 +13,6 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
-Import-Module Microsoft.WSMan.Management -ErrorAction Stop
 
 $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $repositoryRoot = Split-Path -Parent $scriptDirectory
@@ -22,6 +21,33 @@ $bootstrapScript = Join-Path $scriptDirectory "windows_vm_lab_bootstrap.ps1"
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $fixedVmName = "LoLReplayTool-VC-Runtime-Lab"
 $captureValue = "capture"
+
+function Get-Sha256 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [IO.File]::Open(
+    [IO.Path]::GetFullPath($Path),
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::Read,
+    [IO.FileShare]::Read
+  )
+  try {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+      return ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace(
+        "-",
+        ""
+      ).ToLowerInvariant()
+    } finally {
+      $algorithm.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
 
 function Get-AbsolutePath {
   param(
@@ -366,7 +392,7 @@ function Read-LabConfig {
   return [pscustomobject][ordered]@{
     schema_version = 2
     config_path = $resolvedConfigPath
-    config_sha256 = (Get-FileHash -LiteralPath $resolvedConfigPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    config_sha256 = Get-Sha256 -Path $resolvedConfigPath
     vmrun_path = $vmrunPath
     vmx_path = $vmxPath
     vm_encryption_credential_path = $vmCredentialPath
@@ -495,9 +521,7 @@ function Get-VmDefinition {
     throw "対象VMは専用directory/name '$fixedVmName' に固定してください。"
   }
   $values = Get-VmwareKeyValueFile -Path $vmxPath
-  $vmxFileSha256 = (
-    Get-FileHash -LiteralPath $vmxPath -Algorithm SHA256
-  ).Hash.ToLowerInvariant()
+  $vmxFileSha256 = Get-Sha256 -Path $vmxPath
   $displayName = Get-VmwareValue -Values $values -Key "displayName"
   if ($displayName -cne $fixedVmName) {
     throw "VMX displayNameが専用lab名と一致しません。"
@@ -784,7 +808,7 @@ function Get-VmdkFileSet {
     $files += [pscustomobject][ordered]@{
       relative_path = $relativePath
       size = $file.Length
-      sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+      sha256 = Get-Sha256 -Path $file.FullName
     }
 
     if ($file.Length -le 4MB) {
@@ -816,9 +840,7 @@ function Get-SnapshotDefinition {
 
   $vmsdPath = [IO.Path]::ChangeExtension($Config.vmx_path, ".vmsd")
   $values = Get-VmwareKeyValueFile -Path $vmsdPath
-  $vmsdFileSha256 = (
-    Get-FileHash -LiteralPath $vmsdPath -Algorithm SHA256
-  ).Hash.ToLowerInvariant()
+  $vmsdFileSha256 = Get-Sha256 -Path $vmsdPath
   $matches = @(
     foreach ($key in @($values.Keys)) {
       if (
@@ -854,7 +876,7 @@ function Get-SnapshotDefinition {
   }
   Assert-NoReparsePointInPath -Path $vmsnPath -Label "snapshot state file"
   $vmsn = Get-Item -LiteralPath $vmsnPath
-  $vmsnHash = (Get-FileHash -LiteralPath $vmsnPath -Algorithm SHA256).Hash.ToLowerInvariant()
+  $vmsnHash = Get-Sha256 -Path $vmsnPath
   $numDisksValue = Get-VmwareValue -Values $values -Key "${prefix}numDisks"
   $numDisks = 0
   if (-not [int]::TryParse($numDisksValue, [ref]$numDisks) -or $numDisks -ne 1) {
@@ -974,7 +996,7 @@ function Get-FileReadiness {
   $isoExists = Test-Path -LiteralPath $Config.payload_iso_path -PathType Leaf
   $isoActualHash = if ($isoExists) {
     Assert-NoReparsePointInPath -Path $Config.payload_iso_path -Label "payload ISO"
-    (Get-FileHash -LiteralPath $Config.payload_iso_path -Algorithm SHA256).Hash.ToLowerInvariant()
+    Get-Sha256 -Path $Config.payload_iso_path
   } else {
     $null
   }
@@ -1001,7 +1023,7 @@ function Get-FileReadiness {
     guest_script_exists = Test-Path -LiteralPath $guestScript -PathType Leaf
     bootstrap_script_exists = $bootstrapExists
     bootstrap_script_sha256 = if ($bootstrapExists) {
-      (Get-FileHash -LiteralPath $bootstrapScript -Algorithm SHA256).Hash.ToLowerInvariant()
+      Get-Sha256 -Path $bootstrapScript
     } else {
       $null
     }
@@ -1166,6 +1188,7 @@ function Get-Snapshots {
 
 function Get-TrustedHosts {
   try {
+    Import-Module Microsoft.WSMan.Management -ErrorAction Stop
     $item = Get-Item -LiteralPath WSMan:\localhost\Client\TrustedHosts -ErrorAction Stop
     return @(
       ([string]$item.Value).Split(",", [StringSplitOptions]::RemoveEmptyEntries) |
@@ -1274,6 +1297,7 @@ function Open-LabSession {
     [int]$TimeoutSeconds = 60
   )
 
+  Import-Module Microsoft.WSMan.Management -ErrorAction Stop
   $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
   $lastError = "WinRM endpoint did not respond"
   do {
@@ -1318,7 +1342,7 @@ function Invoke-GuestAction {
         $Config.app_sha256,
         $Config.environment_b_script_relative_path,
         $Config.environment_b_script_sha256,
-        (Get-FileHash -LiteralPath $bootstrapScript -Algorithm SHA256).Hash.ToLowerInvariant(),
+        (Get-Sha256 -Path $bootstrapScript),
         180
       ) `
       -ErrorAction Stop
@@ -1386,9 +1410,7 @@ function Assert-EnvironmentA {
     $Inspection.bootstrap.guest_address -cne $Config.guest_address -or
     $Inspection.bootstrap.host_address -cne $Config.host_address -or
     $Inspection.bootstrap.computer_name -cne $Inspection.computer_name -or
-    $Inspection.bootstrap.bootstrap_sha256 -cne (
-      Get-FileHash -LiteralPath $bootstrapScript -Algorithm SHA256
-    ).Hash.ToLowerInvariant() -or
+    $Inspection.bootstrap.bootstrap_sha256 -cne (Get-Sha256 -Path $bootstrapScript) -or
     $Inspection.bootstrap.vmware_tools_present
   ) {
     throw "Environment Aのbootstrap markerが固定lab構成と一致しません。"
@@ -1597,12 +1619,8 @@ function Invoke-LabRun {
     vm_definition_fingerprint_sha256 = $Config.vm_definition_fingerprint_sha256
     snapshot_uid = $Config.snapshot_uid
     snapshot_fingerprint_sha256 = $Config.snapshot_fingerprint_sha256
-    guest_script_sha256 = (
-      Get-FileHash -LiteralPath $guestScript -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
-    bootstrap_script_sha256 = (
-      Get-FileHash -LiteralPath $bootstrapScript -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
+    guest_script_sha256 = Get-Sha256 -Path $guestScript
+    bootstrap_script_sha256 = Get-Sha256 -Path $bootstrapScript
     vmx_path = $Config.vmx_path
     evidence_directory = $runDirectory
     risk_acceptance = [ordered]@{
@@ -1776,7 +1794,7 @@ function Invoke-LabRun {
           [ordered]@{
             name = $_.Name
             size = $_.Length
-            sha256 = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            sha256 = Get-Sha256 -Path $_.FullName
           }
         }
     )

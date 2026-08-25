@@ -25,6 +25,33 @@ $requiredPaths = @(
   "evidence\external-vc-runtime-wheel-provenance.json"
 )
 
+function Get-Sha256 {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [IO.File]::Open(
+    [IO.Path]::GetFullPath($Path),
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::Read,
+    [IO.FileShare]::Read
+  )
+  try {
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+      return ([BitConverter]::ToString($algorithm.ComputeHash($stream))).Replace(
+        "-",
+        ""
+      ).ToLowerInvariant()
+    } finally {
+      $algorithm.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 function Test-PathWithin {
   param(
     [Parameter(Mandatory = $true)]
@@ -155,7 +182,7 @@ try {
       [ordered]@{
         path = $relativePath.Replace("\", "/")
         size = $file.Length
-        sha256 = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+        sha256 = Get-Sha256 -Path $file.FullName
       }
     }
   )
@@ -208,7 +235,7 @@ $iso = Get-Item -LiteralPath $resolvedOutput
 [ordered]@{
   path = $iso.FullName
   size = $iso.Length
-  sha256 = (Get-FileHash -LiteralPath $iso.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+  sha256 = Get-Sha256 -Path $iso.FullName
   volume_label = "LOL_VC_PR134"
   payload_commit = $PayloadCommit
 } | ConvertTo-Json -Compress

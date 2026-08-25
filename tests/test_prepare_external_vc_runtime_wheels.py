@@ -241,6 +241,20 @@ def test_after_validation_rejects_app_local_runtime() -> None:
         target._validate_after(inventory, manifest)
 
 
+def test_run_rejects_non_release_python(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(target.sys, "version_info", (3, 14, 7))
+
+    with pytest.raises(target.WheelError, match="requires Python 3.14.6, got 3.14.7"):
+        target.run(
+            tmp_path / "input",
+            tmp_path / "output",
+            tmp_path / "components.json",
+            tmp_path / "tools",
+        )
+
+    assert not (tmp_path / "output").exists()
+
+
 def test_run_leaves_no_partial_output_on_failure(monkeypatch, tmp_path) -> None:
     input_dir = tmp_path / "input"
     input_dir.mkdir()

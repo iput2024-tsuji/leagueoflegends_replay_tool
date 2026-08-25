@@ -21,6 +21,7 @@ from scripts import pe_runtime_audit
 
 HASHED_RUNTIME = "msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll"
 PROVENANCE_NAME = "external-vc-runtime-wheel-provenance.json"
+REQUIRED_PYTHON = (3, 14, 6)
 
 EXPECTED: dict[str, dict[str, Any]] = {
     "numpy-2.4.1-cp314-cp314-win_amd64.whl": {
@@ -616,6 +617,10 @@ def transform_wheel(
 
 
 def run(input_dir: Path, output_dir: Path, lock: Path, tool_dir: Path) -> None:
+    if sys.version_info[:3] != REQUIRED_PYTHON:
+        required = ".".join(map(str, REQUIRED_PYTHON))
+        actual = ".".join(map(str, sys.version_info[:3]))
+        raise WheelError(f"requires Python {required}, got {actual}")
     if output_dir.exists():
         raise WheelError(f"output directory already exists: {output_dir}")
     wheels = validate_inputs(input_dir, lock)

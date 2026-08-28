@@ -20,6 +20,7 @@ $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 Import-Module NetSecurity -ErrorAction Stop
 Import-Module NetTCPIP -ErrorAction Stop
+Import-Module ScheduledTasks -ErrorAction SilentlyContinue
 
 function Get-Sha256 {
   param(
@@ -166,56 +167,84 @@ function Get-SystemRuntimeInventory {
   )
 }
 
-function Get-DefaultRouteState {
+function Get-Clr0400Evidence {
+  $names = @("msvcp140_clr0400.dll", "vcruntime140_clr0400.dll", "vcruntime140_1_clr0400.dll")
+  $system32 = Join-Path $env:WINDIR "System32"
+  $fsutil = Join-Path $system32 "fsutil.exe"
+  $sfcPath = Join-Path $system32 "sfc.exe"
+  $records = @(
+    foreach ($name in $names) {
+      $path = Join-Path $system32 $name
+      $file = if (Test-Path -LiteralPath $path -PathType Leaf) { Get-Item -LiteralPath $path } else { $null }
+      $signature = if ($null -eq $file) { $null } else { Get-AuthenticodeSignature -LiteralPath $path }
+      $links = if ($null -eq $file) { @() } else { @(& $fsutil hardlink list $path 2>&1 | ForEach-Object { [string]$_ }) }
+      $linkExit = if ($null -eq $file) { 1 } else { $LASTEXITCODE }
+      $sfc = if ($null -eq $file) { @() } else { @(& $sfcPath /verifyfile=$path 2>&1 | ForEach-Object { [string]$_ }) }
+      $sfcExit = if ($null -eq $file) { 1 } else { $LASTEXITCODE }
+      $linkText = $links -join "`n"
+      [ordered]@{
+        name = $name; present = $null -ne $file
+        version = if ($null -eq $file) { $null } else { $file.VersionInfo.FileVersion }
+        size = if ($null -eq $file) { $null } else { $file.Length }
+        sha256 = if ($null -eq $file) { $null } else { Get-Sha256 -Path $path }
+        signature_status = if ($null -eq $signature) { $null } else { [string]$signature.Status }
+        signer_subject = if ($null -eq $signature -or $null -eq $signature.SignerCertificate) { $null } else { $signature.SignerCertificate.Subject }
+        original_filename = if ($null -eq $file) { $null } else { $file.VersionInfo.OriginalFilename }
+        hardlinks = $links; hardlink_exit_code = $linkExit
+        hardlinks_valid = ($null -ne $file -and $linkExit -eq 0 -and $linkText -match '(?im)\\Windows\\System32\\' + [regex]::Escape($name) + '\s*$' -and $linkText -match '(?im)\\WinSxS\\amd64_netfx4-[^\\]+\\' + [regex]::Escape($name) + '\s*$')
+        sfc_output = $sfc; sfc_exit_code = $sfcExit
+        valid = ($null -ne $file -and [string]$signature.Status -ceq "Valid" -and $signature.SignerCertificate.Subject -match '(^|,\s*)O=Microsoft Corporation(,|$)' -and $file.VersionInfo.OriginalFilename -ieq $name -and $linkExit -eq 0 -and $linkText -match '(?im)\\Windows\\System32\\' + [regex]::Escape($name) + '\s*$' -and $linkText -match '(?im)\\WinSxS\\amd64_netfx4-[^\\]+\\' + [regex]::Escape($name) + '\s*$' -and $sfcExit -eq 0)
+      }
+    }
+  )
+  return [ordered]@{ expected_names = $names; observed_names = @($records | Where-Object { $_.present } | ForEach-Object { $_.name }); exact_set = (@($records | Where-Object { $_.present }).Count -eq $names.Count); files = $records; valid = (@($records | Where-Object { -not $_.valid }).Count -eq 0 -and @($records | Where-Object { $_.present }).Count -eq $names.Count) }
+}
+
+function Test-Clr0400EvidencePolicy {
+  param([Parameter(Mandatory = $true)][psobject]$Evidence)
+  $expected = @("msvcp140_clr0400.dll", "vcruntime140_clr0400.dll", "vcruntime140_1_clr0400.dll")
+  if (-not $Evidence.valid -or -not $Evidence.exact_set) { return $false }
+  return $null -eq (Compare-Object -ReferenceObject $expected -DifferenceObject @($Evidence.observed_names) -CaseSensitive)
+}
+
+function Get-ActiveDefaultIpv4Routes {
   try {
-    $routes = @(
+    return @(
       Get-NetRoute `
         -AddressFamily IPv4 `
-        -DestinationPrefix "0.0.0.0/0" `
         -PolicyStore ActiveStore `
         -ErrorAction Stop |
-        Sort-Object InterfaceIndex, RouteMetric |
-        ForEach-Object {
-          [ordered]@{
-            interface_index = $_.InterfaceIndex
-            interface_alias = $_.InterfaceAlias
-            next_hop = $_.NextHop
-            route_metric = $_.RouteMetric
-            state = [string]$_.State
-          }
-        }
+        Where-Object { [string]$_.DestinationPrefix -ceq "0.0.0.0/0" }
     )
-    return [ordered]@{
-      source = "route-table"
-      routes = $routes
-      error = $null
-    }
   } catch {
-    $fallback = @(
-      [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
-        Where-Object {
-          $_.OperationalStatus -eq [Net.NetworkInformation.OperationalStatus]::Up
-        } |
-        ForEach-Object {
-          $networkInterface = $_
-          $networkInterface.GetIPProperties().GatewayAddresses |
-            Where-Object {
-              $_.Address.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
-              $_.Address.ToString() -ne "0.0.0.0"
-            } |
-            ForEach-Object {
-              [ordered]@{
-                interface_alias = $networkInterface.Name
-                next_hop = $_.Address.ToString()
-              }
-            }
-        }
-    )
-    return [ordered]@{
-      source = "gateway-fallback"
-      routes = $fallback
-      error = $_.Exception.Message
+    if (
+      [string]$_.CategoryInfo.Category -ceq "ObjectNotFound" -and
+      [string]$_.FullyQualifiedErrorId -ceq "CmdletizationQuery_NotFound,Get-NetRoute"
+    ) {
+      return @()
     }
+    throw
+  }
+}
+
+function Get-DefaultRouteState {
+  $routes = @(
+    Get-ActiveDefaultIpv4Routes |
+      Sort-Object InterfaceIndex, RouteMetric |
+      ForEach-Object {
+        [ordered]@{
+          interface_index = $_.InterfaceIndex
+          interface_alias = $_.InterfaceAlias
+          next_hop = $_.NextHop
+          route_metric = $_.RouteMetric
+          state = [string]$_.State
+        }
+      }
+  )
+  return [ordered]@{
+    source = "route-table"
+    routes = $routes
+    error = $null
   }
 }
 
@@ -500,9 +529,81 @@ function Get-Inspection {
   }
   $script:bootstrapMarker = $bootstrapMarker
   $routeState = Get-DefaultRouteState
+  $startupTask = $null
+  try {
+    $taskMatches = @(
+      Get-ScheduledTask `
+        -TaskName "LoLReplayTool-VM-Lab-NetworkRepair" `
+        -TaskPath "\" `
+        -ErrorAction Stop
+    )
+    if ($taskMatches.Count -ne 1) {
+      throw "startup network repair taskがroot task pathにexact matchで1件ではありません。"
+    }
+    $task = $taskMatches[0]
+    $taskInfo = $null
+    try {
+      $info = Get-ScheduledTaskInfo `
+        -TaskName $task.TaskName `
+        -TaskPath $task.TaskPath `
+        -ErrorAction Stop
+      $taskInfo = [ordered]@{ last_task_result = $info.LastTaskResult; last_run_time = $info.LastRunTime.ToString("o") }
+    } catch { $taskInfo = $null }
+    $taskActions = @($task.Actions)
+    $taskAction = if ($taskActions.Count -eq 1) {
+      [ordered]@{
+        execute = [string]$taskActions[0].Execute
+        arguments = [string]$taskActions[0].Arguments
+      }
+    } else {
+      $null
+    }
+    $taskScriptPath = $null
+    if ($null -ne $taskAction) {
+      $fileArguments = [regex]::Matches(
+        $taskAction.arguments,
+        '(?:^|\s)-File\s+"([^"]+)"(?:\s|$)',
+        [Text.RegularExpressions.RegexOptions]::CultureInvariant
+      )
+      if ($fileArguments.Count -eq 1) {
+        $taskScriptPath = $fileArguments[0].Groups[1].Value
+      }
+    }
+    $expectedTaskScriptPath = Join-Path $env:ProgramData "LoLReplayToolVMLab\windows_vm_lab_bootstrap.ps1"
+    $markerTaskScriptPath = if ($null -ne $bootstrapMarker) {
+      [string]$bootstrapMarker.startup_task.script_path
+    } else {
+      $null
+    }
+    $taskScriptExists = (
+      -not [string]::IsNullOrWhiteSpace($taskScriptPath) -and
+      (Test-Path -LiteralPath $taskScriptPath -PathType Leaf)
+    )
+    $startupTask = [ordered]@{
+      present = $true
+      name = $task.TaskName
+      task_path = $task.TaskPath
+      principal = [string]$task.Principal.UserId
+      logon_type = [string]$task.Principal.LogonType
+      run_level = [string]$task.Principal.RunLevel
+      enabled = [string]$task.Settings.Enabled
+      triggers = @($task.Triggers | ForEach-Object { $_.CimClass.CimClassName })
+      action_count = $taskActions.Count
+      action = $taskAction
+      info = $taskInfo
+      script_path_source = "task-action"
+      script_path = $taskScriptPath
+      script_path_matches_expected = ($taskScriptPath -ceq $expectedTaskScriptPath)
+      marker_script_path_matches_action = ($markerTaskScriptPath -ceq $taskScriptPath)
+      script_exists = $taskScriptExists
+      script_sha256 = if ($taskScriptExists) { Get-Sha256 -Path $taskScriptPath } else { $null }
+    }
+  } catch {
+    $startupTask = [ordered]@{ present = $false; error = $_.Exception.Message }
+  }
 
   return [ordered]@{
-    schema_version = 1
+    schema_version = 3
     action = "Inspect"
     captured_at_utc = [DateTime]::UtcNow.ToString("o")
     computer_name = $env:COMPUTERNAME
@@ -516,6 +617,7 @@ function Get-Inspection {
     payload = Get-PayloadInspection
     system_runtime_dlls = Get-SystemRuntimeDlls
     system_runtime_inventory = Get-SystemRuntimeInventory
+    clr0400_evidence = Get-Clr0400Evidence
     bootstrap = $bootstrapMarker
     vmware_tools = [ordered]@{
       present = ($null -ne $toolsService -or (Test-Path -LiteralPath $toolsExecutable -PathType Leaf))
@@ -527,6 +629,11 @@ function Get-Inspection {
     default_routes = $routeState.routes
     default_route_error = $routeState.error
     winrm_firewall = Get-WinRmFirewallEvidence
+    startup_task = $startupTask
+    startup_repair = if ($null -ne $bootstrapMarker) {
+      $repairPath = Join-Path $env:ProgramData "LoLReplayToolVMLab\startup-repair.json"
+      if (Test-Path -LiteralPath $repairPath -PathType Leaf) { Get-Content -LiteralPath $repairPath -Raw -Encoding utf8 | ConvertFrom-Json -ErrorAction Stop } else { $null }
+    } else { $null }
   }
 }
 
@@ -677,7 +784,21 @@ function Invoke-PackagedSelfCheck {
   if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
     Remove-Item -LiteralPath $resultPath -Force
   }
-  $validationOutput = @(& $environmentBScript *>&1 | ForEach-Object { [string]$_ })
+  $windowsPowerShell = Join-Path `
+    $env:WINDIR `
+    "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $validationOutput = @(
+    & $windowsPowerShell `
+      -NoProfile `
+      -NonInteractive `
+      -ExecutionPolicy Bypass `
+      -File $environmentBScript *>&1 |
+      ForEach-Object { [string]$_ }
+  )
+  $validationExitCode = $LASTEXITCODE
+  if ($validationExitCode -ne 0) {
+    throw "Environment B validationが失敗しました: exit=$validationExitCode"
+  }
   if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
     throw "Environment B validation resultが生成されませんでした。"
   }
@@ -695,6 +816,7 @@ function Invoke-PackagedSelfCheck {
     app_sha256 = $appHash
     environment_b_script_sha256 = $environmentBScriptHash
     runtime = $runtime
+    validation_exit_code = $validationExitCode
     output = $validationOutput
     validation = $validationResult
   }

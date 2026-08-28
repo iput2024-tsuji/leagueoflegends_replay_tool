@@ -15,6 +15,7 @@ Import-Module Microsoft.PowerShell.Utility -ErrorAction Stop
 $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $bootstrapCmd = Join-Path $scriptDirectory "windows_vm_lab_bootstrap.cmd"
 $bootstrapScript = Join-Path $scriptDirectory "windows_vm_lab_bootstrap.ps1"
+$selfCheckRunner = Join-Path $scriptDirectory "run_packaged_self_check.ps1"
 $requiredPaths = @(
   "vc_redist.x64.exe",
   "LoLReplayTool-external-build\LoLReplayTool.exe",
@@ -132,9 +133,9 @@ foreach ($required in $requiredPaths) {
     throw "Required source kit file does not exist: $required"
   }
 }
-foreach ($tracked in @($bootstrapCmd, $bootstrapScript)) {
+foreach ($tracked in @($bootstrapCmd, $bootstrapScript, $selfCheckRunner)) {
   if (-not (Test-Path -LiteralPath $tracked -PathType Leaf)) {
-    throw "Tracked bootstrap file does not exist: $tracked"
+    throw "Tracked VM lab file does not exist: $tracked"
   }
 }
 Assert-RegularTree -Root $source
@@ -172,6 +173,29 @@ try {
   Copy-Item -LiteralPath $bootstrapScript -Destination (
     Join-Path $staging "windows_vm_lab_bootstrap.ps1"
   ) -Force
+  Copy-Item -LiteralPath $selfCheckRunner -Destination (
+    Join-Path $staging "run_packaged_self_check.ps1"
+  ) -Force
+
+  # Windows PowerShell 5.1 treats a BOM-less script as the active ANSI code
+  # page. The clean guest uses powershell.exe, so normalize every directly
+  # executed payload script to deterministic UTF-8 with BOM.
+  $utf8WithBom = [Text.UTF8Encoding]::new($true)
+  foreach ($relativePath in @(
+    "02-test-environment-b.ps1",
+    "run_packaged_self_check.ps1",
+    "windows_vm_lab_bootstrap.ps1"
+  )) {
+    $scriptPath = Join-Path $staging $relativePath
+    # A source kit extracted from read-only media can retain the ReadOnly bit.
+    # Only the disposable staging copy is made writable for normalization.
+    $scriptItem = Get-Item -LiteralPath $scriptPath -ErrorAction Stop
+    if ($scriptItem.IsReadOnly) {
+      $scriptItem.IsReadOnly = $false
+    }
+    $scriptText = [IO.File]::ReadAllText($scriptPath, [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($scriptPath, $scriptText, $utf8WithBom)
+  }
 
   $manifestFiles = @(
     foreach ($relativePath in @(
@@ -192,10 +216,18 @@ try {
     payload_commit = $PayloadCommit
     files = $manifestFiles
   }
+  $mediaManifestPath = Join-Path $staging "vm-lab-media-manifest.json"
+  if (Test-Path -LiteralPath $mediaManifestPath -PathType Leaf) {
+    $oldManifest = Get-Item -LiteralPath $mediaManifestPath -ErrorAction Stop
+    if ($oldManifest.IsReadOnly) {
+      $oldManifest.IsReadOnly = $false
+    }
+    Remove-Item -LiteralPath $mediaManifestPath -Force -ErrorAction Stop
+  }
   $mediaManifest |
     ConvertTo-Json -Depth 6 |
     Set-Content `
-      -LiteralPath (Join-Path $staging "vm-lab-media-manifest.json") `
+      -LiteralPath $mediaManifestPath `
       -Encoding utf8
 
   $image = New-Object -ComObject IMAPI2FS.MsftFileSystemImage

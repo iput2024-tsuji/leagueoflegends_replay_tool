@@ -14,7 +14,7 @@ CI、Release工程には接続しません。
 - Runtimeをdownloadしません。Runtime DLLや`vc_redist.x64.exe`を製品へ同梱しません。
 - snapshot restore、Runtime導入、VM passwordのprocess argument露出は、3個すべての
   明示switchがない限り実行しません。
-- VM停止はsoft requestだけです。失敗してもhard power offへfallbackしません。
+- VM停止は確立済みWinRMからのguest shutdown requestだけです。失敗してもhard power offへfallbackしません。
 - credential、VM、ISO、test evidenceはrepository外へ置きます。
 - 実LoL録画はこのlabの対象外です。
 
@@ -27,7 +27,7 @@ CI、Release工程には接続しません。
 | `Capture` | なし | VMX/VMSDからUUID、MAC、暗号化方式、A0 fingerprintを取得 |
 | `Plan` | なし | config、固定hash、実行順、禁止事項をJSONで表示 |
 | `Doctor` | なし | VM identity、snapshot、credential、host-only、TrustedHostsをread-only確認 |
-| `Run` | あり | A0復元、Environment A、Runtime導入、Environment B、self-check、soft shutdown |
+| `Run` | あり | A0復元、Environment A、Runtime導入、Environment B、self-check、guest shutdown |
 
 `Run`は次の順序を固定し、途中をskipできません。
 
@@ -37,15 +37,16 @@ CI、Release工程には接続しません。
 3. A0へ復元して、powered-off snapshotであることを確認
 4. VMを`nogui`で起動
 5. WinRMでEnvironment Aを検査
-6. Runtime未導入、対象System32 DLLなし、VMware Toolsなし、default routeなしを確認
+6. Runtime未導入、canonical/hashed VC++ Runtime DLLなし、VMware Toolsなし、default routeなしを確認
 7. ISO内のMicrosoft署名済みRuntime installerを固定SHA256で検査して導入
 8. Runtime versionと必要なSystem32 DLLを確認
 9. ISO内の既存Environment B検査を実行し、全package hashとpackaged self-checkを確認
-10. JSON evidenceをホストへ保存してsoft shutdownを要求
+10. JSON evidenceをホストへ保存してguest shutdownを要求
 
 ## 固定test ISO
 
-既存のIssue #133 test kitへ、このbranchで管理するbootstrapだけを一時stagingしてISOを作成します。
+既存のIssue #133 test kitへ、このbranchで管理するbootstrapとpackaged self-check runnerを
+一時stagingしてISOを作成します。
 元のtest kitは変更せず、出力ISOはrepository外へ新規作成します。
 
 ```powershell
@@ -55,7 +56,9 @@ CI、Release工程には接続しません。
 ```
 
 builderは必要なapp、Runtime installer、Environment B script、package manifest、PE audit、wheel
-provenanceが揃うことを確認し、tracked bootstrapを追加します。ISO内には主要fileのsize/SHA256を持つ
+provenanceが揃うことを確認し、tracked bootstrapとrunnerを追加します。stockのWindows PowerShell
+5.1がguest scriptをcode page依存で誤読しないよう、直接実行する`.ps1`はUTF-8 BOM付きへ正規化します。
+ISO内には主要fileのsize/SHA256を持つ
 `vm-lab-media-manifest.json`も入ります。出力されたISOのSHA256だけをlocal configへ固定します。
 このISOはlocal test inputであり、アプリ、installer、Release assetではありません。
 
@@ -79,16 +82,31 @@ provenanceが揃うことを確認し、tracked bootstrapを追加します。IS
 9. 固定test ISOを接続し、起動時にも接続する設定にします。
 10. ISO内の`00-Bootstrap-VM-Lab.cmd`を右クリックし、管理者として実行します。
 11. bootstrap成功後にWindowsを通常shutdownします。
-12. Registry64のx64 Runtimeが未導入で、`concrt140*`、`msvcp140*`、`vcomp140*`、
-    `vcruntime140*`に一致するSystem32 DLLが0件であること、VMware Toolsがないことを確認します。
-    Windows標準由来の例外も、根拠を固定するまでは許可しません。
+12. Registry64のx64 Runtimeが未導入で、canonical 7名（`concrt140.dll`、`msvcp140.dll`、
+    `msvcp140_1.dll`、`msvcp140_2.dll`、`vcomp140.dll`、`vcruntime140.dll`、
+    `vcruntime140_1.dll`）、hashed名、その他のpattern一致名がないことを確認します。
+    ただし正確な3名（`msvcp140_clr0400.dll`、`vcruntime140_clr0400.dll`、
+    `vcruntime140_1_clr0400.dll`）がすべて存在する場合は、各ファイルについて
+    Microsoft署名、OriginalFilename、System32/`WinSxS\amd64_netfx4-*` hardlink、
+    `sfc /verifyfile` exit 0を確認した証拠が揃った場合だけWindows/.NET componentとして許可します。
+    欠損、追加、署名・hardlink・SFC不成立はfail closedです。
 13. powered-off root snapshot `A0-runtime-absent`を1個だけ作成します。
 14. configのidentity値を一度`capture`にして`Capture`を実行し、返された
     `replacement_values`をconfigへ固定します。その後、`Plan`を実行します。
 
 bootstrapはguestを`192.168.20.10/24`、hostを`192.168.20.1`として設定し、default routeを
-除去します。既存のWinRM service/TCP 5985 inbound ruleを無効化したうえで、firewallをhost
-address、guest address、interface、Private profile、TCP 5985へ限定した1規則だけにします。
+除去します。`ActiveStore`全体を監査し、変更可能な`PersistentStore`のWinRM service/TCP 5985
+inbound ruleだけをName指定で無効化したうえで、firewallをhost address、guest address、
+interface、Private profile、TCP 5985へ限定した1規則だけにします。
+同時にbootstrapの固定hash copyを`ProgramData\LoLReplayToolVMLab`へ保存し、
+`SYSTEM`・ServiceAccount・Highest・AtStartupの固定Scheduled Taskを登録します。起動時はEthernet0の
+準備、固定IP、default route不存在、他physical NIC不存在をbounded retryで確認してから
+Private profileへ戻します。taskの有効状態、action、principal、唯一のBootTrigger、script hash、
+終了コード、実行時刻はmarkerおよび`Inspect`で検証します。task script pathはmarkerから転記せず、
+登録済みactionの`-File`引数から逆算して固定ProgramData path・実file hash・markerと照合します。
+規則metadataは変更前に全件検証します。cmdletの途中失敗ではmarkerを作らず停止し、すでに処理した
+local規則だけが無効のまま残る場合があります。原因解消後は同じbootstrapを再実行でき、最終判定は
+再度`ActiveStore`全体に対して行います。
 local administratorをWinRMで使用するため`LocalAccountTokenFilterPolicy=1`をtest VM内だけで
 設定します。このVMをhost-only以外へ接続してはいけません。
 
@@ -165,9 +183,12 @@ configもrepository外へ置きます。passwordそのものをJSONへ書いて�
 ```
 
 `capture`は`Capture`だけで許可されます。`replacement_values`を転記していないconfigは、`Plan`、
-`Doctor`、`Run`で拒否されます。VMX file全体のSHA256に加え、起動中に変わり得る値を除いた
-hardware/security/disk構成をsemantic fingerprintとして固定します。snapshot fingerprintはVMSD内の
-A0 metadata、VMSN、および参照VMDK chainのpath、size、SHA256を固定します。
+`Doctor`、`Run`で拒否されます。VMX file全体のSHA256は取得時点の証拠として記録します。
+実行gateでは、snapshot復元時にVMwareが更新する`encryption.data`、電源状態、作業用delta disk名だけを
+除いた全VMX key/valueをsemantic fingerprintとして固定します。作業用delta diskは名前を固定せず、
+parent CIDと`parentFileNameHint`を辿って固定A0 snapshot diskへ到達することを毎回検査します。
+snapshot fingerprintはVMSD内のA0 metadata、VMSN、および参照VMDK chainのpath、size、SHA256を
+固定します。
 
 ## 実行
 
@@ -211,12 +232,27 @@ evidenceへ出力しません。
 - VM暗号化passwordを`vmrun`で検証できない
 - VMX UUID/MAC/encryption/vTPM/NIC/ISO/isolationまたはsnapshot UID/fingerprintが一致しない
 - VMX、VMSD、VMSN、VMDK chain、payload ISOのpathにreparse pointがある
-- VMware Tools、default route、既存Runtime、対象System32 DLLをEnvironment Aで検出する
+- VMware Tools、default route、既存Runtime、canonical/hashed/unknownなSystem32 DLLをEnvironment Aで検出する
+- CLR0400の3ファイルについて、Microsoft署名・OriginalFilename・System32/WinSxS hardlink・SFC exit 0の全証拠を確認できない
 - ISO、Runtime installer、app、Environment B scriptのhashが変わる
 - Microsoft署名を確認できない
 - Runtime installが0または3010以外で終了する
 - 3010により再起動が必要になる
 - WinRM firewallの有効規則を固定scopeの1件へ限定できない
-- WinRM、Environment B検査、packaged self-check、soft shutdown後のpowered-off確認が失敗する
+- WinRM、Environment B検査、packaged self-check、guest OS shutdown後のpowered-off確認が失敗する
+
+Runのcleanupは確立済みWinRM sessionから`shutdown.exe /s /t 0`（強制なし）を要求し、
+sessionを閉じてから最大60秒pollします。session未確立時は`vmrun stop`を呼ばず、VMを起動中の
+まま`manual_shutdown_required`として証拠化して失敗します。WinRM transport切断時はrequest送信を
+`unknown`として記録し、最終VM stateを別に記録します。VMware Toolsは前提にしません。
 
 3010では勝手にguestを再起動せず、evidenceを保存して管理者判断へ戻します。
+
+CLR0400の検査定義はMicrosoftのVC++ Redistributable DLL命名資料、`fsutil hardlink`、
+`sfc /verifyfile`、PowerShell署名検査の仕様に基づきます。
+
+- <https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files?view=msvc-170>
+- <https://learn.microsoft.com/en-us/cpp/windows/determining-which-dlls-to-redistribute?view=msvc-170>
+- <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/fsutil-hardlink>
+- <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/sfc>
+- <https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/get-authenticodesignature>

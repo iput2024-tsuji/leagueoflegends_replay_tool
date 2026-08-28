@@ -2240,8 +2240,12 @@ def test_installer_build_self_check_has_an_explicit_timeout():
     assert "catch [System.Management.Automation.MethodException]" in runner
     assert "$Process.Kill()" in runner
     assert "& taskkill" not in runner
-    assert "-RedirectStandardOutput" in runner
-    assert "-RedirectStandardError" in runner
+    assert "Start-Process" not in runner
+    assert "$startInfo.RedirectStandardOutput = $true" in runner
+    assert "$startInfo.RedirectStandardError = $true" in runner
+    assert "$process.StandardOutput.ReadToEndAsync()" in runner
+    assert "$process.StandardError.ReadToEndAsync()" in runner
+    assert "WaitAll($readTasks, $TimeoutMilliseconds)" in runner
     assert "Remove-Item -LiteralPath $selfCheckDir -Recurse -Force" in runner
     assert "finally" in runner
     assert "-Wait `" not in runner

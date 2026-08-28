@@ -505,12 +505,116 @@ function Test-TrueVmwareValue {
   return $null -ne $Value -and $Value.Equals("true", [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-VmdkDescriptorHeader {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path
+  )
+
+  $stream = [IO.File]::Open(
+    [IO.Path]::GetFullPath($Path),
+    [IO.FileMode]::Open,
+    [IO.FileAccess]::Read,
+    [IO.FileShare]::Read
+  )
+  try {
+    $buffer = [byte[]]::new([int][Math]::Min($stream.Length, 1MB))
+    $offset = 0
+    while ($offset -lt $buffer.Length) {
+      $read = $stream.Read($buffer, $offset, $buffer.Length - $offset)
+      if ($read -eq 0) {
+        break
+      }
+      $offset += $read
+    }
+  } finally {
+    $stream.Dispose()
+  }
+  $descriptor = [Text.Encoding]::ASCII.GetString($buffer, 0, $offset)
+  $cidMatches = @([regex]::Matches($descriptor, '(?im)^\s*CID\s*=\s*([0-9a-f]{8})\s*$'))
+  $parentCidMatches = @(
+    [regex]::Matches($descriptor, '(?im)^\s*parentCID\s*=\s*([0-9a-f]{8})\s*$')
+  )
+  $parentMatches = @(
+    [regex]::Matches(
+      $descriptor,
+      '(?im)^\s*parentFileNameHint\s*=\s*"([^"]+\.vmdk)"\s*$'
+    )
+  )
+  if ($cidMatches.Count -ne 1 -or $parentCidMatches.Count -ne 1) {
+    throw "VMDK descriptorのCID/parentCIDを一意に解釈できません: $Path"
+  }
+  if ($parentMatches.Count -gt 1) {
+    throw "VMDK descriptorのparentFileNameHintが重複しています: $Path"
+  }
+  return [pscustomobject][ordered]@{
+    cid = $cidMatches[0].Groups[1].Value.ToLowerInvariant()
+    parent_cid = $parentCidMatches[0].Groups[1].Value.ToLowerInvariant()
+    parent_file_name = if ($parentMatches.Count -eq 1) {
+      $parentMatches[0].Groups[1].Value
+    } else {
+      $null
+    }
+  }
+}
+
+function Assert-ActiveDiskDescendsFromSnapshot {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$ActiveDiskPath,
+    [Parameter(Mandatory = $true)]
+    [string]$SnapshotDiskPath,
+    [Parameter(Mandatory = $true)]
+    [string]$VmDirectory
+  )
+
+  $snapshotPath = [IO.Path]::GetFullPath($SnapshotDiskPath)
+  $currentPath = [IO.Path]::GetFullPath($ActiveDiskPath)
+  $seen = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase
+  )
+  while (-not $currentPath.Equals($snapshotPath, [StringComparison]::OrdinalIgnoreCase)) {
+    if ($seen.Count -ge 64 -or -not $seen.Add($currentPath)) {
+      throw "VMX active disk chainに循環または過剰な深さがあります。"
+    }
+    if (
+      -not (Test-PathWithin -Path $currentPath -Root $VmDirectory) -or
+      -not (Test-Path -LiteralPath $currentPath -PathType Leaf)
+    ) {
+      throw "VMX active disk chainが専用VM directory内に見つかりません: $currentPath"
+    }
+    Assert-NoReparsePointInPath -Path $currentPath -Label "VMX active disk chain"
+    $descriptor = Get-VmdkDescriptorHeader -Path $currentPath
+    if (
+      $descriptor.parent_cid -ceq "ffffffff" -or
+      [string]::IsNullOrWhiteSpace($descriptor.parent_file_name)
+    ) {
+      throw "VMX active disk chainが固定snapshot diskへ到達しません: $currentPath"
+    }
+    Assert-RelativePayloadPath `
+      -Path $descriptor.parent_file_name `
+      -Label "VMDK parentFileNameHint"
+    $parentPath = [IO.Path]::GetFullPath((Join-Path $VmDirectory $descriptor.parent_file_name))
+    if (
+      -not (Test-PathWithin -Path $parentPath -Root $VmDirectory) -or
+      -not (Test-Path -LiteralPath $parentPath -PathType Leaf)
+    ) {
+      throw "VMDK parentが専用VM directory内に見つかりません: $parentPath"
+    }
+    Assert-NoReparsePointInPath -Path $parentPath -Label "VMDK parent"
+    $parentDescriptor = Get-VmdkDescriptorHeader -Path $parentPath
+    if ($descriptor.parent_cid -cne $parentDescriptor.cid) {
+      throw "VMX active disk chainのparent CIDが一致しません: $currentPath"
+    }
+    $currentPath = $parentPath
+  }
+}
+
 function Get-VmDefinition {
   param(
     [Parameter(Mandatory = $true)]
     [psobject]$Config,
-    [switch]$ValidateExpected,
-    [switch]$IgnoreRawVmxHash
+    [switch]$ValidateExpected
   )
 
   $vmxPath = [IO.Path]::GetFullPath($Config.vmx_path)
@@ -542,6 +646,14 @@ function Get-VmDefinition {
   }
   if (-not (Test-TrueVmwareValue (Get-VmwareValue -Values $values -Key "vtpm.present"))) {
     throw "VMXにvTPMが存在しません。"
+  }
+  $encryptionData = Get-VmwareValue -Values $values -Key "encryption.data"
+  $encryptionKeySafe = Get-VmwareValue -Values $values -Key "encryption.keySafe"
+  if (
+    [string]::IsNullOrWhiteSpace($encryptionData) -or
+    [string]::IsNullOrWhiteSpace($encryptionKeySafe)
+  ) {
+    throw "VMX encryption metadataがありません。"
   }
 
   $nicIndexes = @(
@@ -710,42 +822,34 @@ function Get-VmDefinition {
     throw "VMX active virtual diskが専用VM directory内に見つかりません。"
   }
   Assert-NoReparsePointInPath -Path $activeDiskPath -Label "VMX active virtual disk"
-  $usbLines = @(
-    $values.Keys |
-      Where-Object { $_ -match '^(?:usb|ehci|usb_xhci)\.' } |
-      Sort-Object |
-      ForEach-Object { "$($_.ToLowerInvariant())=$($values[$_])" }
+  $volatileKeys = [Collections.Generic.HashSet[string]]::new(
+    [StringComparer]::OrdinalIgnoreCase
   )
-
+  foreach ($key in @(
+    "$diskDevice.fileName",
+    "cleanShutdown",
+    "encryption.data",
+    "softPowerOff",
+    "vm.genid",
+    "vm.genidX",
+    "vm.lastPowerRequestTimestamp"
+  )) {
+    $volatileKeys.Add($key) | Out-Null
+  }
+  $stableKeys = [Collections.Generic.List[string]]::new()
+  foreach ($key in @($values.Keys)) {
+    if (-not $volatileKeys.Contains($key)) {
+      $stableKeys.Add($key)
+    }
+  }
+  $stableKeys.Sort([StringComparer]::OrdinalIgnoreCase)
   $fingerprintLines = @(
-    "display_name=$displayName",
-    "uuid=$uuid",
-    "encryption_type=$encryptionType",
-    "vtpm_present=true",
-    "nic=$nic",
-    "nic_connection_type=$connectionType",
-    "nic_vnet=$($vnet.ToLowerInvariant())",
-    "nic_start_connected=true",
-    "mac_source=$($macSource.ToLowerInvariant())",
-    "mac=$mac",
-    "cd=$($cd.ToLowerInvariant())",
-    "cd_iso=$($mountedIso.ToLowerInvariant())",
-    "cd_start_connected=true",
-    "copy_disabled=true",
-    "paste_disabled=true",
-    "dnd_disabled=true",
-    "hgfs_disabled=$(if ($null -eq $hgfsDisabled) { 'absent' } else { 'true' })",
-    "shared_folder_max_num=0",
-    "guest_os=$guestOs",
-    "firmware=$firmware",
-    "secure_boot=true",
-    "memory_mb=$memoryMb",
-    "processor_count=$processorCount",
-    "virtual_hardware_version=$virtualHardwareVersion",
-    "disk_device=$($diskDevice.ToLowerInvariant())",
-    "disk_controller=$($controller.ToLowerInvariant())",
-    "active_disk=$($activeDiskRelativePath.ToLowerInvariant())",
-    $usbLines
+    foreach ($key in $stableKeys) {
+      "$($key.ToLowerInvariant())=$($values[$key])"
+    }
+    "active_disk_node=$($diskDevice.ToLowerInvariant())"
+    "active_disk_chain=<validated-snapshot-descendant>"
+    "encryption.data=<present>"
   )
   $fingerprint = Get-StringSha256 -Value (($fingerprintLines -join "`n") + "`n")
   if ($ValidateExpected) {
@@ -753,8 +857,7 @@ function Get-VmDefinition {
       $uuid -cne $Config.expected_vm_uuid -or
       $encryptionType -cne $Config.expected_vm_encryption_type -or
       $mac -cne $Config.expected_guest_mac -or
-      $fingerprint -cne $Config.vm_definition_fingerprint_sha256 -or
-      (-not $IgnoreRawVmxHash -and $vmxFileSha256 -cne $Config.vmx_file_sha256)
+      $fingerprint -cne $Config.vm_definition_fingerprint_sha256
     ) {
       throw "VMX identity/fingerprintがconfigの固定値と一致しません。"
     }
@@ -942,14 +1045,12 @@ function Get-LabDefinition {
   param(
     [Parameter(Mandatory = $true)]
     [psobject]$Config,
-    [switch]$ValidateExpected,
-    [switch]$IgnoreRawVmxHash
+    [switch]$ValidateExpected
   )
 
   $vm = Get-VmDefinition `
     -Config $Config `
-    -ValidateExpected:$ValidateExpected `
-    -IgnoreRawVmxHash:$IgnoreRawVmxHash
+    -ValidateExpected:$ValidateExpected
   $snapshot = Get-SnapshotDefinition -Config $Config -ValidateExpected:$ValidateExpected
   if (
     @($snapshot.disks).Count -ne 1 -or
@@ -957,6 +1058,10 @@ function Get-LabDefinition {
   ) {
     throw "VMX active diskとEnvironment A snapshot disk nodeが一致しません。"
   }
+  Assert-ActiveDiskDescendsFromSnapshot `
+    -ActiveDiskPath $vm.active_disk_path `
+    -SnapshotDiskPath $snapshot.disks[0].primary_path `
+    -VmDirectory (Split-Path -Parent $Config.vmx_path)
   return [pscustomobject][ordered]@{
     vm = $vm
     snapshot = $snapshot
@@ -1054,7 +1159,7 @@ function Get-LabPlan {
       "verify Environment B Runtime version",
       "run the fixed packaged self-check with isolated data",
       "write JSON evidence",
-      "request soft VM shutdown"
+    "request guest OS shutdown"
     )
     forbidden = @(
       "VMware Tools guest control",
@@ -1354,8 +1459,9 @@ function Invoke-GuestAction {
     throw "guest action '$GuestAction' が有効なJSONを返しませんでした: $json"
   }
   $capturedAt = [DateTimeOffset]::MinValue
+  $expectedGuestSchema = if ($GuestAction -ceq "Inspect") { 3 } else { 1 }
   if (
-    $result.schema_version -ne 1 -or
+    $result.schema_version -ne $expectedGuestSchema -or
     $result.action -cne $GuestAction -or
     [string]::IsNullOrWhiteSpace([string]$result.computer_name) -or
     -not [DateTimeOffset]::TryParse(
@@ -1380,6 +1486,20 @@ function Write-EvidenceJson {
   [IO.File]::WriteAllText($Path, $json + "`n", $utf8NoBom)
 }
 
+function Test-Clr0400EvidencePolicy {
+  param([Parameter(Mandatory = $true)][psobject]$Evidence)
+  $expected = @("msvcp140_clr0400.dll", "vcruntime140_clr0400.dll", "vcruntime140_1_clr0400.dll")
+  if (-not $Evidence.valid -or -not $Evidence.exact_set) { return $false }
+  return $null -eq (Compare-Object -ReferenceObject $expected -DifferenceObject @($Evidence.observed_names) -CaseSensitive)
+}
+
+function Get-StableClr0400Evidence {
+  param([Parameter(Mandatory = $true)][psobject]$Evidence)
+  return @($Evidence.files | ForEach-Object {
+    [ordered]@{ name = $_.name; version = $_.version; size = $_.size; sha256 = $_.sha256; signature_status = $_.signature_status; signer_subject = $_.signer_subject; original_filename = $_.original_filename; hardlinks = @($_.hardlinks | Sort-Object); hardlink_exit_code = $_.hardlink_exit_code; hardlinks_valid = $_.hardlinks_valid; sfc_exit_code = $_.sfc_exit_code; valid = $_.valid }
+  })
+}
+
 function Assert-EnvironmentA {
   param(
     [Parameter(Mandatory = $true)]
@@ -1387,6 +1507,10 @@ function Assert-EnvironmentA {
     [Parameter(Mandatory = $true)]
     [psobject]$Inspection
   )
+
+  if ($null -eq $Inspection.bootstrap -or $Inspection.bootstrap.schema_version -ne 3) {
+    throw "Environment Aのbootstrap marker schemaが不正です。"
+  }
 
   if ($Inspection.runtime.installed) {
     throw "Environment Aにx64 Visual C++ Redistributableが導入済みです。"
@@ -1401,12 +1525,22 @@ function Assert-EnvironmentA {
   if (@($Inspection.system_runtime_dlls | Where-Object { $_.present }).Count -ne 0) {
     throw "Environment AのSystem32に対象VC++ Runtime DLLがあります。"
   }
-  if (@($Inspection.system_runtime_inventory).Count -ne 0) {
+  $clrNames = @("msvcp140_clr0400.dll", "vcruntime140_clr0400.dll", "vcruntime140_1_clr0400.dll")
+  $unexpectedRuntimeDlls = @($Inspection.system_runtime_inventory | Where-Object { $_.name -notin $clrNames })
+  if ($unexpectedRuntimeDlls.Count -ne 0) {
     throw "Environment AのSystem32にVC++ Runtime名のDLLがあります。"
+  }
+  $clrEvidence = $Inspection.clr0400_evidence
+  if ($null -eq $clrEvidence -or -not (Test-Clr0400EvidencePolicy -Evidence $clrEvidence) -or
+      $null -eq $Inspection.bootstrap.clr0400_evidence -or
+      -not (Test-Clr0400EvidencePolicy -Evidence $Inspection.bootstrap.clr0400_evidence) -or
+      (Get-StableClr0400Evidence -Evidence $Inspection.bootstrap.clr0400_evidence | ConvertTo-Json -Depth 20) -cne
+      (Get-StableClr0400Evidence -Evidence $clrEvidence | ConvertTo-Json -Depth 20)) {
+    throw "Environment AのCLR0400 Windows/.NET component証拠が不成立またはbootstrap markerと不一致です。"
   }
   if (
     $null -eq $Inspection.bootstrap -or
-    $Inspection.bootstrap.schema_version -ne 2 -or
+    $Inspection.bootstrap.schema_version -ne 3 -or
     $Inspection.bootstrap.guest_address -cne $Config.guest_address -or
     $Inspection.bootstrap.host_address -cne $Config.host_address -or
     $Inspection.bootstrap.computer_name -cne $Inspection.computer_name -or
@@ -1434,6 +1568,55 @@ function Assert-EnvironmentA {
   }
   if ($Config.guest_address -notin @($Inspection.ipv4_addresses)) {
     throw "Environment AのIPv4 addressが固定値と一致しません。"
+  }
+  Assert-StartupTask -Inspection $Inspection
+}
+
+function Assert-StartupTask {
+  param([Parameter(Mandatory = $true)][psobject]$Inspection)
+  $task = $Inspection.startup_task
+  $marker = $Inspection.bootstrap
+  $expectedExecute = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $expectedScriptPath = Join-Path $env:ProgramData "LoLReplayToolVMLab\windows_vm_lab_bootstrap.ps1"
+  $expectedTaskArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$expectedScriptPath`" -StartupRepair -InterfaceAlias `"$($marker.interface_alias)`" -GuestAddress `"$($marker.guest_address)`" -HostAddress `"$($marker.host_address)`" -PrefixLength $($marker.prefix_length)"
+  if ($null -eq $task -or -not $task.present -or $task.name -cne "LoLReplayTool-VM-Lab-NetworkRepair" -or
+      $task.task_path -cne "\" -or
+      $task.principal -cne "SYSTEM" -or $task.logon_type -cne "ServiceAccount" -or $task.run_level -cne "Highest" -or
+      $task.enabled -cne "True" -or @($task.triggers).Count -ne 1 -or
+      [string]$task.triggers[0] -cne "MSFT_TaskBootTrigger" -or $null -eq $task.action -or
+      $task.action_count -ne 1 -or [string]$task.action.execute -cne $expectedExecute -or
+      [string]$task.action.arguments -cne $expectedTaskArgs -or
+      $task.script_path_source -cne "task-action" -or
+      -not $task.script_path_matches_expected -or
+      -not $task.marker_script_path_matches_action -or
+      -not $task.script_exists -or $task.script_sha256 -cne (Get-Sha256 -Path $bootstrapScript) -or
+      $null -eq $task.info -or $task.info.last_task_result -ne 0 -or
+      [string]::IsNullOrWhiteSpace([string]$task.info.last_run_time)) {
+    throw "startup network repair taskのaction/principal/triggerが不正です。"
+  }
+  if ($null -eq $marker.startup_task -or
+      $marker.startup_task.task_path -cne "\" -or
+      $marker.startup_task.script_path -cne $expectedScriptPath -or
+      $marker.startup_task.script_sha256 -cne (Get-Sha256 -Path $bootstrapScript) -or
+      $marker.startup_task.action -cne $expectedTaskArgs -or
+      $task.script_path -cne $expectedScriptPath) {
+    throw "startup network repair taskのscript hash証拠が不成立です。"
+  }
+  $repairAt = [DateTimeOffset]::MinValue
+  $taskRunAt = [DateTimeOffset]::MinValue
+  $bootstrapAt = [DateTimeOffset]::MinValue
+  $inspectionAt = [DateTimeOffset]::MinValue
+  if ($null -eq $Inspection.startup_repair -or
+      $Inspection.startup_repair.result -cne "passed" -or
+      $Inspection.startup_repair.interface_alias -cne $marker.interface_alias -or
+      $Inspection.startup_repair.guest_address -cne $marker.guest_address -or
+      $Inspection.startup_repair.host_address -cne $marker.host_address -or
+      -not [DateTimeOffset]::TryParse([string]$Inspection.startup_repair.completed_at_utc, [ref]$repairAt) -or
+      -not [DateTimeOffset]::TryParse([string]$task.info.last_run_time, [ref]$taskRunAt) -or
+      -not [DateTimeOffset]::TryParse([string]$marker.created_at_utc, [ref]$bootstrapAt) -or
+      -not [DateTimeOffset]::TryParse([string]$Inspection.captured_at_utc, [ref]$inspectionAt) -or
+      $taskRunAt -lt $bootstrapAt -or $repairAt -lt $taskRunAt -or $repairAt -gt $inspectionAt) {
+    throw "startup network repairの実行結果がありません。"
   }
 }
 
@@ -1481,6 +1664,7 @@ function Assert-EnvironmentB {
   ) {
     throw "Environment BでWinRM firewall境界が変化しました。"
   }
+  Assert-StartupTask -Inspection $Inspection
 }
 
 function Invoke-Doctor {
@@ -1533,8 +1717,7 @@ function Invoke-Doctor {
     $hostOnlyNetwork = Test-HostOnlyNetwork -Config $Config
     $snapshotIdentityExact = (
       $null -ne $readiness.definition -and
-      $readiness.definition.vm.vmx_file_sha256 -cne $null -and
-      $readiness.definition.vm.vmx_file_sha256 -ceq $Config.vmx_file_sha256 -and
+      $readiness.definition.vm.fingerprint_sha256 -ceq $Config.vm_definition_fingerprint_sha256 -and
       $readiness.definition.snapshot.uid -ceq $Config.snapshot_uid -and
       $readiness.definition.snapshot.fingerprint_sha256 -ceq $Config.snapshot_fingerprint_sha256
     )
@@ -1565,6 +1748,49 @@ function Invoke-Doctor {
       reason = "read-only preflight failed"
       validation_error = $_.Exception.Message
     }
+  }
+}
+
+function Request-GuestShutdown {
+  param(
+    [Parameter(Mandatory = $true)]
+    $Session
+  )
+
+  $records = @(
+    Invoke-Command -Session $Session -ScriptBlock {
+      $shutdown = Join-Path $env:WINDIR "System32\shutdown.exe"
+      & $shutdown /s /t 0
+      [ordered]@{
+        exit_code = $LASTEXITCODE
+        force_used = $false
+      }
+    } -ErrorAction Stop
+  )
+  if (
+    $records.Count -ne 1 -or
+    $null -eq $records[0].exit_code -or
+    [bool]$records[0].force_used
+  ) {
+    throw [IO.InvalidDataException]::new(
+      "guest shutdown.exeから一意で安全な終了結果を取得できませんでした。"
+    )
+  }
+  try {
+    $exitCode = [Convert]::ToInt32(
+      $records[0].exit_code,
+      [Globalization.CultureInfo]::InvariantCulture
+    )
+  } catch {
+    throw [IO.InvalidDataException]::new(
+      "guest shutdown.exeの終了コードを整数として取得できませんでした。",
+      $_.Exception
+    )
+  }
+  return [ordered]@{
+    shutdown_request_sent = "confirmed"
+    shutdown_exit_code = $exitCode
+    force_used = $false
   }
 }
 
@@ -1631,6 +1857,7 @@ function Invoke-LabRun {
     lifecycle = @()
     evidence_files = @()
     final_vm_state = "unknown"
+    manual_shutdown_required = $false
     error = $null
   }
   Write-EvidenceJson -Path $manifestPath -Value $manifest
@@ -1639,6 +1866,12 @@ function Invoke-LabRun {
   $vmStarted = $false
   $runError = $null
   $stopError = $null
+  $manualShutdownRequired = $false
+  $shutdownTransportError = $false
+  $shutdownResponseError = $false
+  $shutdownExitFailure = $false
+  $shutdownRequestSent = "not-attempted"
+  $shutdownExitCode = $null
   $lifecycle = @()
   try {
     $definitionBefore = Get-LabDefinition -Config $Config -ValidateExpected
@@ -1664,8 +1897,7 @@ function Invoke-LabRun {
     }
     $definitionAfterRevert = Get-LabDefinition `
       -Config $Config `
-      -ValidateExpected `
-      -IgnoreRawVmxHash
+      -ValidateExpected
     Write-EvidenceJson `
       -Path (Join-Path $runDirectory "definition-after-revert.json") `
       -Value $definitionAfterRevert
@@ -1729,51 +1961,82 @@ function Invoke-LabRun {
   } catch {
     $runError = $_.Exception.Message
   } finally {
+    $shutdownRequested = $false
+    $shutdownRequestError = $null
     if ($null -ne $session) {
-      Remove-PSSession -Session $session -ErrorAction SilentlyContinue
-    }
-    $shouldRequestStop = $vmStarted
-    if (-not $shouldRequestStop) {
+      $shutdownRequested = $true
       try {
-        $shouldRequestStop = Test-TargetVmRunning -Config $Config
-      } catch {
-        $stopError = "VM running state before cleanup is unknown: $($_.Exception.Message)"
-      }
-    }
-    if ($shouldRequestStop -and $null -eq $stopError) {
-      try {
-        Invoke-Vmrun `
-          -Config $Config `
-          -VmCredential $vmCredential `
-          -Arguments @("stop", $Config.vmx_path, "soft") |
-          Out-Null
-        $lifecycle += [ordered]@{
-          at_utc = [DateTime]::UtcNow.ToString("o")
-          operation = "stop-soft-requested"
+        $shutdownResult = Request-GuestShutdown -Session $session
+        $shutdownRequestSent = [string]$shutdownResult.shutdown_request_sent
+        $shutdownExitCode = [int]$shutdownResult.shutdown_exit_code
+        if ($shutdownExitCode -ne 0) {
+          $shutdownExitFailure = $true
+          $shutdownRequestError = "guest shutdown.exeの終了コードが0ではありません: $shutdownExitCode"
         }
-        $deadline = [DateTime]::UtcNow.AddSeconds(30)
-        do {
+      } catch {
+        $shutdownRequestError = $_.Exception.Message
+        $shutdownRequestSent = "unknown"
+        if ($_.Exception -is [IO.InvalidDataException]) {
+          $shutdownResponseError = $true
+        } else {
+          $shutdownTransportError = $true
+        }
+      }
+      $lifecycle += [ordered]@{
+        at_utc = [DateTime]::UtcNow.ToString("o")
+        operation = "guest-shutdown-requested"
+        shutdown_request_sent = $shutdownRequestSent
+        shutdown_exit_code = $shutdownExitCode
+        transport_error = $shutdownTransportError
+        response_error = $shutdownResponseError
+        request_error = $shutdownRequestError
+      }
+      Remove-PSSession -Session $session -ErrorAction SilentlyContinue
+    } elseif ($vmStarted) {
+      $stopError = "WinRM session未確立のためVMを停止できません。manual_shutdown_required=true"
+      $manualShutdownRequired = $true
+    }
+    if ($shutdownRequested) {
+      $deadline = [DateTime]::UtcNow.AddSeconds(60)
+      $stateError = $null
+      do {
+        try {
           if (-not (Test-TargetVmRunning -Config $Config)) {
             $manifest.final_vm_state = "stopped"
             break
           }
-          Start-Sleep -Seconds 2
-        } while ([DateTime]::UtcNow -lt $deadline)
-        if ($manifest.final_vm_state -cne "stopped") {
-          throw "soft stop後30秒以内にpowered-offを確認できません。hard stopは行いません。"
+        } catch {
+          $stateError = $_.Exception.Message
+          break
         }
-      } catch {
-        $stopError = $_.Exception.Message
+        Start-Sleep -Seconds 2
+      } while ([DateTime]::UtcNow -lt $deadline)
+      if ($manifest.final_vm_state -ceq "stopped") {
+        $manualShutdownRequired = $false
+        if ($shutdownExitFailure) {
+          $stopError = $shutdownRequestError
+        } else {
+          $stopError = $null
+        }
+      } else {
+        $detail = if ($null -ne $stateError) {
+          "VM state error: $stateError"
+        } elseif ($null -ne $shutdownRequestError) {
+          "shutdown request error: $shutdownRequestError"
+        } else {
+          "powered-off timeout"
+        }
+        $stopError = "guest shutdown後60秒以内にpowered-offを確認できません。manual_shutdown_required=true; $detail"
+        $manualShutdownRequired = $true
       }
-    } elseif (-not $shouldRequestStop -and $null -eq $stopError) {
+    } elseif (-not $vmStarted -and $null -eq $stopError) {
       $manifest.final_vm_state = "stopped"
     }
     if ($manifest.final_vm_state -ceq "stopped" -and $null -eq $stopError) {
       try {
         $definitionAfterStop = Get-LabDefinition `
           -Config $Config `
-          -ValidateExpected `
-          -IgnoreRawVmxHash
+          -ValidateExpected
         Write-EvidenceJson `
           -Path (Join-Path $runDirectory "definition-after-stop.json") `
           -Value $definitionAfterStop
@@ -1784,6 +2047,18 @@ function Invoke-LabRun {
   }
 
   $manifest.finished_at_utc = [DateTime]::UtcNow.ToString("o")
+  if ($manualShutdownRequired -and $manifest.final_vm_state -cne "stopped") {
+    try { $manifest.final_vm_state = if (Test-TargetVmRunning -Config $Config) { "running" } else { "unknown" } } catch { $manifest.final_vm_state = "unknown" }
+  }
+  $manifest.manual_shutdown_required = [bool]$manualShutdownRequired
+  $lifecycle += [ordered]@{
+    at_utc = [DateTime]::UtcNow.ToString("o")
+    operation = "guest-shutdown-observed"
+    shutdown_request_sent = $shutdownRequestSent
+    shutdown_exit_code = $shutdownExitCode
+    final_vm_state = $manifest.final_vm_state
+    manual_shutdown_required = [bool]$manualShutdownRequired
+  }
   $manifest.lifecycle = $lifecycle
   try {
     $manifest.evidence_files = @(
@@ -1809,12 +2084,12 @@ function Invoke-LabRun {
     $manifest.status = "failed"
     $manifest.error = [ordered]@{
       run = $runError
-      soft_stop = $stopError
+      guest_shutdown = $stopError
     }
   }
   Write-EvidenceJson -Path $manifestPath -Value $manifest
   if ($null -ne $runError -or $null -ne $stopError) {
-    throw "VM lab run failed: run=$runError soft_stop=$stopError evidence=$runDirectory"
+    throw "VM lab run failed: run=$runError guest_shutdown=$stopError evidence=$runDirectory"
   }
   return $manifest
 }

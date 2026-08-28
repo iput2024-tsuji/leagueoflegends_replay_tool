@@ -8,7 +8,8 @@ param(
   [ValidateNotNullOrEmpty()]
   [string]$HostAddress,
   [ValidateRange(8, 30)]
-  [int]$PrefixLength = 24
+  [int]$PrefixLength = 24,
+  [switch]$StartupRepair
 )
 
 Set-StrictMode -Version Latest
@@ -19,6 +20,7 @@ Import-Module NetAdapter -ErrorAction Stop
 Import-Module NetConnection -ErrorAction Stop
 Import-Module NetSecurity -ErrorAction Stop
 Import-Module NetTCPIP -ErrorAction Stop
+Import-Module ScheduledTasks -ErrorAction Stop
 
 function Get-Sha256 {
   param(
@@ -45,6 +47,40 @@ function Get-Sha256 {
   } finally {
     $stream.Dispose()
   }
+}
+
+function Invoke-StartupNetworkRepair {
+  Assert-Administrator
+  $deadline = [DateTime]::UtcNow.AddSeconds(60)
+  $lastError = "network adapter did not become ready"
+  do {
+    try {
+      $adapter = @(Get-NetAdapter -InterfaceAlias $InterfaceAlias -ErrorAction Stop)
+      $physical = @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq "Up" })
+      $addresses = @(Get-NetIPAddress -InterfaceAlias $InterfaceAlias -AddressFamily IPv4 -ErrorAction Stop)
+      $routes = @(Get-ActiveDefaultIpv4Routes)
+      if ($adapter.Count -ne 1 -or $adapter[0].Status -ne "Up") { throw "固定adapterがUpではありません。" }
+      if ($physical.Count -ne 1 -or $physical[0].InterfaceAlias -cne $InterfaceAlias) { throw "physical adapter境界が不成立です。" }
+      if ($addresses.Count -ne 1 -or @($addresses | Where-Object { $_.IPAddress -ceq $GuestAddress -and $_.PrefixLength -eq $PrefixLength }).Count -ne 1) { throw "固定IPv4が未準備または余分なIPv4があります。" }
+      if ($routes.Count -ne 0) { throw "default routeが存在します。" }
+      Set-NetConnectionProfile -InterfaceAlias $InterfaceAlias -NetworkCategory Private -ErrorAction Stop
+      $profiles = @(Get-NetConnectionProfile -InterfaceAlias $InterfaceAlias -ErrorAction Stop)
+      if ($profiles.Count -ne 1 -or [string]$profiles[0].NetworkCategory -cne "Private") { throw "Private profileへの変更を確認できません。" }
+      $markerRoot = Join-Path $env:ProgramData "LoLReplayToolVMLab"
+      New-Item -ItemType Directory -Path $markerRoot -Force | Out-Null
+      [ordered]@{ schema_version = 1; completed_at_utc = [DateTime]::UtcNow.ToString("o"); interface_alias = $InterfaceAlias; guest_address = $GuestAddress; host_address = $HostAddress; result = "passed" } |
+        ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $markerRoot "startup-repair.json") -Encoding utf8
+      exit 0
+    } catch {
+      $lastError = $_.Exception.Message
+      Start-Sleep -Seconds 2
+    }
+  } while ([DateTime]::UtcNow -lt $deadline)
+  $markerRoot = Join-Path $env:ProgramData "LoLReplayToolVMLab"
+  New-Item -ItemType Directory -Path $markerRoot -Force | Out-Null
+  [ordered]@{ schema_version = 1; completed_at_utc = [DateTime]::UtcNow.ToString("o"); interface_alias = $InterfaceAlias; guest_address = $GuestAddress; host_address = $HostAddress; result = "failed"; error = $lastError } |
+    ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $markerRoot "startup-repair.json") -Encoding utf8
+  throw "startup network repair failed: $lastError"
 }
 
 function Assert-Administrator {
@@ -126,6 +162,59 @@ function Get-SystemRuntimeInventory {
   )
 }
 
+function Get-Clr0400Evidence {
+  $names = @(
+    "msvcp140_clr0400.dll",
+    "vcruntime140_clr0400.dll",
+    "vcruntime140_1_clr0400.dll"
+  )
+  $system32 = Join-Path $env:WINDIR "System32"
+  $fsutil = Join-Path $system32 "fsutil.exe"
+  $sfc = Join-Path $system32 "sfc.exe"
+  $records = @(
+    foreach ($name in $names) {
+      $path = Join-Path $system32 $name
+      $file = if (Test-Path -LiteralPath $path -PathType Leaf) { Get-Item -LiteralPath $path } else { $null }
+      $signature = if ($null -eq $file) { $null } else { Get-AuthenticodeSignature -LiteralPath $path }
+      $original = if ($null -eq $file) { $null } else { $file.VersionInfo.OriginalFilename }
+      $hardlinkOutput = if ($null -eq $file) { @() } else { @(& $fsutil hardlink list $path 2>&1 | ForEach-Object { [string]$_ }) }
+      $hardlinkExit = if ($null -eq $file) { 1 } else { $LASTEXITCODE }
+      $sfcOutput = if ($null -eq $file) { @() } else { @(& $sfc /verifyfile=$path 2>&1 | ForEach-Object { [string]$_ }) }
+      $sfcExit = if ($null -eq $file) { 1 } else { $LASTEXITCODE }
+      [ordered]@{
+        name = $name
+        present = $null -ne $file
+        version = if ($null -eq $file) { $null } else { $file.VersionInfo.FileVersion }
+        size = if ($null -eq $file) { $null } else { $file.Length }
+        sha256 = if ($null -eq $file) { $null } else { Get-Sha256 -Path $path }
+        signature_status = if ($null -eq $signature) { $null } else { [string]$signature.Status }
+        signer_subject = if ($null -eq $signature -or $null -eq $signature.SignerCertificate) { $null } else { $signature.SignerCertificate.Subject }
+        original_filename = $original
+        hardlinks = $hardlinkOutput
+        hardlink_exit_code = $hardlinkExit
+        hardlinks_valid = ($null -ne $file -and $hardlinkExit -eq 0 -and ($hardlinkOutput -join "`n") -match '(?im)\\Windows\\System32\\' + [regex]::Escape($name) + '\s*$' -and ($hardlinkOutput -join "`n") -match '(?im)\\WinSxS\\amd64_netfx4-[^\\]+\\' + [regex]::Escape($name) + '\s*$')
+        sfc_output = $sfcOutput
+        sfc_exit_code = $sfcExit
+        valid = ($null -ne $file -and [string]$signature.Status -ceq "Valid" -and $signature.SignerCertificate.Subject -match '(^|,\s*)O=Microsoft Corporation(,|$)' -and $original -ieq $name -and $hardlinkExit -eq 0 -and ($hardlinkOutput -join "`n") -match '(?im)\\Windows\\System32\\' + [regex]::Escape($name) + '\s*$' -and ($hardlinkOutput -join "`n") -match '(?im)\\WinSxS\\amd64_netfx4-[^\\]+\\' + [regex]::Escape($name) + '\s*$' -and $sfcExit -eq 0)
+      }
+    }
+  )
+  return [ordered]@{
+    expected_names = $names
+    observed_names = @($records | Where-Object { $_.present } | ForEach-Object { $_.name })
+    exact_set = (@($records | Where-Object { $_.present }).Count -eq $names.Count)
+    files = $records
+    valid = (@($records | Where-Object { -not $_.valid }).Count -eq 0 -and @($records | Where-Object { $_.present }).Count -eq $names.Count)
+  }
+}
+
+function Test-Clr0400EvidencePolicy {
+  param([Parameter(Mandatory = $true)][psobject]$Evidence)
+  $expected = @("msvcp140_clr0400.dll", "vcruntime140_clr0400.dll", "vcruntime140_1_clr0400.dll")
+  if (-not $Evidence.valid -or -not $Evidence.exact_set) { return $false }
+  return $null -eq (Compare-Object -ReferenceObject $expected -DifferenceObject @($Evidence.observed_names) -CaseSensitive)
+}
+
 function Test-LocalPortIncludesWinRm {
   param(
     [AllowNull()]
@@ -148,11 +237,32 @@ function Test-LocalPortIncludesWinRm {
   return $false
 }
 
+function Get-ActiveDefaultIpv4Routes {
+  try {
+    return @(
+      Get-NetRoute `
+        -AddressFamily IPv4 `
+        -PolicyStore ActiveStore `
+        -ErrorAction Stop |
+        Where-Object { [string]$_.DestinationPrefix -ceq "0.0.0.0/0" }
+    )
+  } catch {
+    if (
+      [string]$_.CategoryInfo.Category -ceq "ObjectNotFound" -and
+      [string]$_.FullyQualifiedErrorId -ceq "CmdletizationQuery_NotFound,Get-NetRoute"
+    ) {
+      return @()
+    }
+    throw
+  }
+}
+
 function Get-ActiveInboundFirewallInventory {
+  param([ValidateSet("ActiveStore", "PersistentStore")][string]$PolicyStore = "ActiveStore")
   $rules = @(
     Get-NetFirewallRule `
       -Direction Inbound `
-      -PolicyStore ActiveStore `
+      -PolicyStore $PolicyStore `
       -ErrorAction Stop
   )
   # Read the effective policy once per table. Per-rule CIM calls make a clean
@@ -161,25 +271,25 @@ function Get-ActiveInboundFirewallInventory {
     port = @(
       Get-NetFirewallPortFilter `
         -All `
-        -PolicyStore ActiveStore `
+        -PolicyStore $PolicyStore `
         -ErrorAction Stop
     )
     service = @(
       Get-NetFirewallServiceFilter `
         -All `
-        -PolicyStore ActiveStore `
+        -PolicyStore $PolicyStore `
         -ErrorAction Stop
     )
     address = @(
       Get-NetFirewallAddressFilter `
         -All `
-        -PolicyStore ActiveStore `
+        -PolicyStore $PolicyStore `
         -ErrorAction Stop
     )
     interface = @(
       Get-NetFirewallInterfaceFilter `
         -All `
-        -PolicyStore ActiveStore `
+        -PolicyStore $PolicyStore `
         -ErrorAction Stop
     )
   }
@@ -187,10 +297,10 @@ function Get-ActiveInboundFirewallInventory {
   foreach ($rule in $rules) {
     $instanceId = [string]$rule.InstanceID
     if ([string]::IsNullOrWhiteSpace($instanceId)) {
-      throw "ActiveStore inbound ruleのInstanceIDが空です。"
+      throw "$PolicyStore inbound ruleのInstanceIDが空です。"
     }
     if ($ruleIds.ContainsKey($instanceId)) {
-      throw "ActiveStore inbound ruleのInstanceIDが重複しています: $instanceId"
+      throw "$PolicyStore inbound ruleのInstanceIDが重複しています: $instanceId"
     }
     $ruleIds[$instanceId] = $true
   }
@@ -200,16 +310,16 @@ function Get-ActiveInboundFirewallInventory {
     foreach ($filter in @($entry.Value)) {
       $instanceId = [string]$filter.InstanceID
       if ([string]::IsNullOrWhiteSpace($instanceId)) {
-        throw "ActiveStore $($entry.Key) filterのInstanceIDが空です。"
+        throw "$PolicyStore $($entry.Key) filterのInstanceIDが空です。"
       }
       if ($index.ContainsKey($instanceId)) {
-        throw "ActiveStore $($entry.Key) filterのInstanceIDが重複しています: $instanceId"
+        throw "$PolicyStore $($entry.Key) filterのInstanceIDが重複しています: $instanceId"
       }
       $index[$instanceId] = $filter
     }
     foreach ($instanceId in $ruleIds.Keys) {
       if (-not $index.ContainsKey($instanceId)) {
-        throw "ActiveStore inbound ruleに$($entry.Key) filterがありません: $instanceId"
+        throw "$PolicyStore inbound ruleに$($entry.Key) filterがありません: $instanceId"
       }
     }
     $filterIndexes[$entry.Key] = $index
@@ -221,7 +331,8 @@ function Get-ActiveInboundFirewallInventory {
 }
 
 function Get-WinRmRelatedFirewallRules {
-  $inventory = Get-ActiveInboundFirewallInventory
+  param([ValidateSet("ActiveStore", "PersistentStore")][string]$PolicyStore = "ActiveStore")
+  $inventory = Get-ActiveInboundFirewallInventory -PolicyStore $PolicyStore
   return @(
     foreach ($rule in @($inventory.rules)) {
       $instanceId = [string]$rule.InstanceID
@@ -243,6 +354,27 @@ function Get-WinRmRelatedFirewallRules {
       }
     }
   )
+}
+
+function Disable-PersistentWinRmRules {
+  $rules = @(Get-WinRmRelatedFirewallRules -PolicyStore PersistentStore)
+  $names = @{}
+  foreach ($rule in $rules) {
+    $name = [string]$rule.Name
+    if ([string]::IsNullOrWhiteSpace($name)) { throw "PersistentStore WinRM ruleのNameが空です。" }
+    if ([string]::IsNullOrWhiteSpace([string]$rule.InstanceID)) { throw "PersistentStore WinRM ruleのInstanceIDが空です: Name=$name" }
+    if ($names.ContainsKey($name)) { throw "PersistentStore WinRM ruleのNameが重複しています: $name" }
+    $names[$name] = $true
+  }
+  foreach ($rule in $rules) {
+    $name = [string]$rule.Name
+    try {
+      Disable-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction Stop
+    } catch {
+      throw "PersistentStore WinRM ruleを無効化できませんでした: Name=$name InstanceID=$($rule.InstanceID) SourceType=$($rule.PolicyStoreSourceType) Source=$($rule.PolicyStoreSource) Error=$($_.Exception.Message)"
+    }
+  }
+  return $rules
 }
 
 function Get-WinRmFirewallEvidence {
@@ -328,13 +460,25 @@ if (
 ) {
   throw "このlabではhost/guestを同一/24内の異なるaddressに固定してください。"
 }
+if ($StartupRepair) {
+  Invoke-StartupNetworkRepair
+}
 
 $runtimeBefore = Get-ExternalRuntimeState
 if ($runtimeBefore.installed) {
   throw "bootstrap前にx64 Visual C++ Redistributableが既に導入されています。"
 }
 $presentRuntimeDlls = @(Get-SystemRuntimeInventory)
-$blockingRuntimeDlls = @($presentRuntimeDlls)
+$clr0400Evidence = Get-Clr0400Evidence
+$clr0400Names = @($clr0400Evidence.expected_names)
+$blockingRuntimeDlls = @(
+  $presentRuntimeDlls | Where-Object {
+    $_.name -notin $clr0400Names
+  }
+)
+if (-not (Test-Clr0400EvidencePolicy -Evidence $clr0400Evidence)) {
+  throw "bootstrap前のCLR0400 DLL証拠が不成立です。"
+}
 if ($blockingRuntimeDlls.Count -ne 0) {
   throw "bootstrap前のSystem32に対象VC++ Runtime DLLがあります: $($blockingRuntimeDlls.name -join ', ')"
 }
@@ -393,13 +537,10 @@ Set-DnsClientServerAddress `
   -InterfaceAlias $InterfaceAlias `
   -ResetServerAddresses `
   -ErrorAction Stop
-Get-NetRoute `
-  -InterfaceAlias $InterfaceAlias `
-  -AddressFamily IPv4 `
-  -DestinationPrefix "0.0.0.0/0" `
-  -PolicyStore ActiveStore `
-  -ErrorAction SilentlyContinue |
-  Remove-NetRoute -Confirm:$false -ErrorAction Stop
+$routesToRemove = @(Get-ActiveDefaultIpv4Routes | Where-Object { $_.InterfaceAlias -ceq $InterfaceAlias })
+foreach ($route in $routesToRemove) {
+  Remove-NetRoute -InputObject $route -Confirm:$false -ErrorAction Stop
+}
 Set-NetConnectionProfile `
   -InterfaceAlias $InterfaceAlias `
   -NetworkCategory Private `
@@ -416,10 +557,11 @@ Set-ItemProperty `
   -Force
 
 $firewallRuleName = "LoLReplayTool-VM-Lab-WinRM"
-Get-WinRmRelatedFirewallRules |
-  Disable-NetFirewallRule -ErrorAction Stop
-Get-NetFirewallRule -Name $firewallRuleName -ErrorAction SilentlyContinue |
-  Remove-NetFirewallRule
+Disable-PersistentWinRmRules | Out-Null
+$existingFirewallRule = @(Get-NetFirewallRule -PolicyStore PersistentStore -Name $firewallRuleName -ErrorAction SilentlyContinue)
+if ($existingFirewallRule.Count -ne 0) {
+  Remove-NetFirewallRule -Name $firewallRuleName -PolicyStore PersistentStore -ErrorAction Stop
+}
 New-NetFirewallRule `
   -Name $firewallRuleName `
   -DisplayName "LoL Replay Tool VM Lab WinRM" `
@@ -431,16 +573,62 @@ New-NetFirewallRule `
   -LocalAddress $GuestAddress `
   -RemoteAddress $HostAddress `
   -Protocol TCP `
-  -LocalPort 5985 |
+  -LocalPort 5985 `
+  -PolicyStore PersistentStore `
+  -ErrorAction Stop |
   Out-Null
 
-$defaultRoutes = @(
-  Get-NetRoute `
-    -AddressFamily IPv4 `
-    -DestinationPrefix "0.0.0.0/0" `
-    -PolicyStore ActiveStore `
+$markerRoot = Join-Path $env:ProgramData "LoLReplayToolVMLab"
+$markerPath = Join-Path $markerRoot "bootstrap.json"
+$startupRepairPath = Join-Path $markerRoot "startup-repair.json"
+$startupTaskScriptPath = Join-Path $markerRoot "windows_vm_lab_bootstrap.ps1"
+New-Item -ItemType Directory -Path $markerRoot -Force | Out-Null
+if (Test-Path -LiteralPath $startupRepairPath -PathType Leaf) {
+  Remove-Item -LiteralPath $startupRepairPath -Force -ErrorAction Stop
+}
+if (-not [IO.Path]::GetFullPath($MyInvocation.MyCommand.Path).Equals(
+  [IO.Path]::GetFullPath($startupTaskScriptPath),
+  [StringComparison]::OrdinalIgnoreCase
+)) {
+  Copy-Item `
+    -LiteralPath $MyInvocation.MyCommand.Path `
+    -Destination $startupTaskScriptPath `
+    -Force `
     -ErrorAction Stop
+}
+$bootstrapHash = Get-Sha256 -Path $MyInvocation.MyCommand.Path
+if ((Get-Sha256 -Path $startupTaskScriptPath) -cne $bootstrapHash) {
+  throw "startup network repair scriptの固定copyを確認できませんでした。"
+}
+
+$startupTaskName = "LoLReplayTool-VM-Lab-NetworkRepair"
+$startupTaskPath = "\"
+$startupTaskAction = New-ScheduledTaskAction -Execute (Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe") -Argument (
+  "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$startupTaskScriptPath`" -StartupRepair -InterfaceAlias `"$InterfaceAlias`" -GuestAddress `"$GuestAddress`" -HostAddress `"$HostAddress`" -PrefixLength $PrefixLength"
 )
+$startupTaskPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+$startupTaskTrigger = New-ScheduledTaskTrigger -AtStartup
+$startupTask = New-ScheduledTask -Action $startupTaskAction -Principal $startupTaskPrincipal -Trigger $startupTaskTrigger
+Register-ScheduledTask -TaskName $startupTaskName -TaskPath $startupTaskPath -InputObject $startupTask -Force -ErrorAction Stop | Out-Null
+$startupTaskMatches = @(Get-ScheduledTask -TaskName $startupTaskName -TaskPath $startupTaskPath -ErrorAction Stop)
+if ($startupTaskMatches.Count -ne 1) {
+  throw "startup network repair taskがroot task pathにexact matchで1件ではありません。"
+}
+$startupTaskInfo = $startupTaskMatches[0]
+$expectedTaskArgs = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$startupTaskScriptPath`" -StartupRepair -InterfaceAlias `"$InterfaceAlias`" -GuestAddress `"$GuestAddress`" -HostAddress `"$HostAddress`" -PrefixLength $PrefixLength"
+if (
+  $startupTaskInfo.Principal.UserId -cne "SYSTEM" -or
+  [string]$startupTaskInfo.Principal.LogonType -cne "ServiceAccount" -or
+  [string]$startupTaskInfo.Principal.RunLevel -cne "Highest" -or
+  [string]$startupTaskInfo.Settings.Enabled -cne "True" -or
+  @($startupTaskInfo.Triggers).Count -ne 1 -or
+  [string]$startupTaskInfo.Triggers[0].CimClass.CimClassName -cne "MSFT_TaskBootTrigger" -or
+  @($startupTaskInfo.Actions).Count -ne 1 -or
+  [string]$startupTaskInfo.Actions[0].Execute -cne (Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe") -or
+  [string]$startupTaskInfo.Actions[0].Arguments -cne $expectedTaskArgs
+) { throw "startup network repair taskのaction/principal/triggerが不正です。" }
+
+$defaultRoutes = @(Get-ActiveDefaultIpv4Routes)
 if ($defaultRoutes.Count -ne 0) {
   throw "bootstrap後にdefault IPv4 routeが残っています。"
 }
@@ -455,11 +643,8 @@ if ($firewallEvidence.Count -ne 1 -or -not $firewallEvidence[0].exact_scope) {
   throw "WinRM firewall ruleをhost-onlyの固定scopeへ限定できませんでした。"
 }
 
-$markerRoot = Join-Path $env:ProgramData "LoLReplayToolVMLab"
-$markerPath = Join-Path $markerRoot "bootstrap.json"
-New-Item -ItemType Directory -Path $markerRoot -Force | Out-Null
 $marker = [ordered]@{
-  schema_version = 2
+  schema_version = 3
   created_at_utc = [DateTime]::UtcNow.ToString("o")
   computer_name = $env:COMPUTERNAME
   user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -469,10 +654,23 @@ $marker = [ordered]@{
   prefix_length = $PrefixLength
   runtime_before = $runtimeBefore
   system_runtime_dlls_present = $presentRuntimeDlls
+  clr0400_evidence = $clr0400Evidence
   vmware_tools_present = $false
   default_routes = $defaultRoutes
   winrm_firewall = $firewallEvidence
-  bootstrap_sha256 = Get-Sha256 -Path $MyInvocation.MyCommand.Path
+  startup_task = [ordered]@{
+    name = $startupTaskName
+    task_path = $startupTaskPath
+    script_path = $startupTaskScriptPath
+    script_sha256 = Get-Sha256 -Path $startupTaskScriptPath
+    principal = [string]$startupTaskInfo.Principal.UserId
+    logon_type = [string]$startupTaskInfo.Principal.LogonType
+    run_level = [string]$startupTaskInfo.Principal.RunLevel
+    enabled = [string]$startupTaskInfo.Settings.Enabled
+    trigger = @($startupTaskInfo.Triggers | ForEach-Object { $_.CimClass.CimClassName })
+    action = [string]$startupTaskInfo.Actions[0].Arguments
+  }
+  bootstrap_sha256 = $bootstrapHash
 }
 $marker | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $markerPath -Encoding utf8
 

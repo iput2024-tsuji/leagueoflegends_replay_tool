@@ -2728,10 +2728,15 @@ def test_build_scripts_accept_verified_python_and_provenance():
     assert '-m PyInstaller --noconfirm --clean "LoLReplayTool.spec"' in build
     assert "$originalPath = $env:PATH" in build
     assert (
-        "$env:PATH = $isolatedPathEntries -join [IO.Path]::PathSeparator"
-        in build
+        "$env:LOL_REPLAY_PYINSTALLER_PATH = $isolatedPath" in build
     )
+    assert '$env:PYTHONPATH = $pathGuardDir' in build
+    assert '$env:PATH = $isolatedPath' in build
+    assert 'PyInstaller用の固定PATHをPython processへ適用できません。' in build
     assert "$env:PATH = $originalPath" in build
+    assert "Remove-Item Env:PATH" in build
+    assert "Remove-Item Env:PYTHONPATH" in build
+    assert "Remove-Item Env:LOL_REPLAY_PYINSTALLER_PATH" in build
     assert "$isolatedPathEntries" in build
     assert "$originalPath +" not in build
     assert "(Split-Path -Parent $systemDirectory)" not in build

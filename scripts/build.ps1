@@ -96,17 +96,49 @@ $isolatedPathEntries = @(
     (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
   }
 ) | Select-Object -Unique
+$isolatedPath = $isolatedPathEntries -join [IO.Path]::PathSeparator
+$pathGuardDir = Join-Path $scriptDir "pyinstaller_sitecustomize"
+$pathGuardScript = Join-Path $pathGuardDir "sitecustomize.py"
+if (-not (Test-Path -LiteralPath $pathGuardScript -PathType Leaf)) {
+  throw "PyInstaller用のPATH guardが見つかりません: $pathGuardScript"
+}
 
 # PyInstaller resolves transitive PE dependencies from PATH. Limit that search
 # to the locked Python and Windows directories so unrelated host tools cannot
-# leak DLLs into the distribution.
+# leak DLLs into the distribution. PYTHONPATH loads the same guard in
+# PyInstaller's isolated Python subprocesses as well.
 $originalPath = $env:PATH
+$originalPythonPath = $env:PYTHONPATH
+$originalGuardedPath = $env:LOL_REPLAY_PYINSTALLER_PATH
+$hadPath = Test-Path Env:PATH
+$hadPythonPath = Test-Path Env:PYTHONPATH
+$hadGuardedPath = Test-Path Env:LOL_REPLAY_PYINSTALLER_PATH
 try {
-  $env:PATH = $isolatedPathEntries -join [IO.Path]::PathSeparator
+  $env:LOL_REPLAY_PYINSTALLER_PATH = $isolatedPath
+  $env:PYTHONPATH = $pathGuardDir
+  $env:PATH = $isolatedPath
+  & $selectedPython -c "import os, sys; expected = os.environ.get('LOL_REPLAY_PYINSTALLER_PATH'); sys.exit(0 if expected and os.environ.get('PATH') == expected else 1)"
+  if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller用の固定PATHをPython processへ適用できません。"
+  }
   & $selectedPython -m PyInstaller --noconfirm --clean "LoLReplayTool.spec"
   $pyInstallerExitCode = $LASTEXITCODE
 } finally {
-  $env:PATH = $originalPath
+  if ($hadPath) {
+    $env:PATH = $originalPath
+  } else {
+    Remove-Item Env:PATH -ErrorAction SilentlyContinue
+  }
+  if ($hadPythonPath) {
+    $env:PYTHONPATH = $originalPythonPath
+  } else {
+    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+  }
+  if ($hadGuardedPath) {
+    $env:LOL_REPLAY_PYINSTALLER_PATH = $originalGuardedPath
+  } else {
+    Remove-Item Env:LOL_REPLAY_PYINSTALLER_PATH -ErrorAction SilentlyContinue
+  }
 }
 if ($pyInstallerExitCode -ne 0) {
   exit $pyInstallerExitCode

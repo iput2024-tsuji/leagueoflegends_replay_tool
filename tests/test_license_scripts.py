@@ -132,6 +132,22 @@ def test_build_uses_fixed_icon_assets_without_regeneration():
     assert '"assets\\app\\app.png"' in script
 
 
+def test_repository_license_uses_locked_lf_bytes():
+    attributes = Path(".gitattributes").read_text(encoding="utf-8")
+    lock = _component_lock()
+    material = lock["application"]["license_materials"]
+    license_bytes = Path("LICENSE").read_bytes()
+
+    assert "LICENSE text eol=lf" in attributes.splitlines()
+    assert b"\r\n" not in license_bytes
+    assert material == [
+        {
+            "path": "LICENSE",
+            "sha256": sha256_file(Path("LICENSE")),
+        }
+    ]
+
+
 def test_pillow_is_dev_only_and_excluded_from_pyinstaller():
     from scripts.prepare_release_assets import release_gate_errors
 

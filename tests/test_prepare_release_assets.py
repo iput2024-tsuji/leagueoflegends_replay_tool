@@ -2726,5 +2726,14 @@ def test_build_scripts_accept_verified_python_and_provenance():
     assert '$buildArgs = @{}' in installer
     assert '@("-PythonExe", $selectedPython)' not in installer
     assert '-m PyInstaller --noconfirm --clean "LoLReplayTool.spec"' in build
+    assert "$originalPath = $env:PATH" in build
+    assert (
+        "$env:PATH = $isolatedPathEntries -join [IO.Path]::PathSeparator"
+        in build
+    )
+    assert "$env:PATH = $originalPath" in build
+    assert "$isolatedPathEntries" in build
+    assert "$originalPath +" not in build
+    assert "(Split-Path -Parent $systemDirectory)" not in build
     assert "apply_windows_runtime_policy(a.binaries)" in spec
     assert "a._save_guts()" in spec

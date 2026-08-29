@@ -65,9 +65,51 @@ foreach ($iconAsset in @("assets\app\app.ico", "assets\app\app.png")) {
 if ($LASTEXITCODE -ne 0) {
   throw "選択した Python 環境に PyInstaller がありません。pip install pyinstaller を実行してください。"
 }
-& $selectedPython -m PyInstaller --noconfirm --clean "LoLReplayTool.spec"
-if ($LASTEXITCODE -ne 0) {
-  exit $LASTEXITCODE
+
+$basePrefixOutput = @(& $selectedPython -c "import sys; print(sys.base_prefix)")
+if ($LASTEXITCODE -ne 0 -or $basePrefixOutput.Count -ne 1) {
+  throw "選択した Python の base prefix を一意に取得できません。"
+}
+$resolvedPythonBase = (
+  Resolve-Path -LiteralPath $basePrefixOutput[0].Trim() -ErrorAction Stop
+).Path
+$systemDirectory = [Environment]::GetFolderPath(
+  [Environment+SpecialFolder]::System
+)
+if (
+  [string]::IsNullOrWhiteSpace($systemDirectory) -or
+  -not (Test-Path -LiteralPath $systemDirectory -PathType Container)
+) {
+  throw "Windows system directoryを取得できません。"
+}
+$isolatedPathCandidates = @(
+  (Split-Path -Parent $selectedPython),
+  $resolvedPythonBase,
+  (Join-Path $resolvedPythonBase "DLLs"),
+  $systemDirectory
+)
+$isolatedPathEntries = @(
+  foreach ($candidate in $isolatedPathCandidates) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+      throw "PyInstaller用の固定PATH directoryが見つかりません: $candidate"
+    }
+    (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
+  }
+) | Select-Object -Unique
+
+# PyInstaller resolves transitive PE dependencies from PATH. Limit that search
+# to the locked Python and Windows directories so unrelated host tools cannot
+# leak DLLs into the distribution.
+$originalPath = $env:PATH
+try {
+  $env:PATH = $isolatedPathEntries -join [IO.Path]::PathSeparator
+  & $selectedPython -m PyInstaller --noconfirm --clean "LoLReplayTool.spec"
+  $pyInstallerExitCode = $LASTEXITCODE
+} finally {
+  $env:PATH = $originalPath
+}
+if ($pyInstallerExitCode -ne 0) {
+  exit $pyInstallerExitCode
 }
 Assert-BuildProvenance
 

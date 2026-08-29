@@ -754,6 +754,22 @@ function Install-ExternalRuntime {
   }
 }
 
+function Remove-ValidationCaptureFiles {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string[]]$Paths
+  )
+
+  foreach ($path in $Paths) {
+    if (Test-Path -LiteralPath $path) {
+      Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+    }
+    if (Test-Path -LiteralPath $path) {
+      throw "Environment B validation captureを削除できませんでした: $path"
+    }
+  }
+}
+
 function Invoke-PackagedSelfCheck {
   $runtime = Get-ExternalRuntimeState
   if (-not $runtime.installed -or [string]::IsNullOrWhiteSpace($runtime.version)) {
@@ -781,23 +797,56 @@ function Invoke-PackagedSelfCheck {
     -Label "Environment B validation script"
   $resultRoot = Join-Path $env:USERPROFILE "Desktop\VC-Runtime-Test-Results"
   $resultPath = Join-Path $resultRoot "environment-b-result.json"
+  $validationStdoutPath = Join-Path $resultRoot "environment-b-stdout.txt"
+  $validationStderrPath = Join-Path $resultRoot "environment-b-stderr.txt"
+  $validationCapturePaths = @($validationStdoutPath, $validationStderrPath)
+  New-Item -ItemType Directory -Path $resultRoot -Force | Out-Null
   if (Test-Path -LiteralPath $resultPath -PathType Leaf) {
     Remove-Item -LiteralPath $resultPath -Force
   }
   $windowsPowerShell = Join-Path `
     $env:WINDIR `
     "System32\WindowsPowerShell\v1.0\powershell.exe"
-  $validationOutput = @(
-    & $windowsPowerShell `
-      -NoProfile `
-      -NonInteractive `
-      -ExecutionPolicy Bypass `
-      -File $environmentBScript *>&1 |
-      ForEach-Object { [string]$_ }
-  )
-  $validationExitCode = $LASTEXITCODE
+  Remove-ValidationCaptureFiles -Paths $validationCapturePaths
+  $validationOutput = @()
+  $validationErrorOutput = @()
+  try {
+    $validationProcess = Start-Process `
+      -FilePath $windowsPowerShell `
+      -ArgumentList @(
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy Bypass",
+        "-File `"$environmentBScript`""
+      ) `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $validationStdoutPath `
+      -RedirectStandardError $validationStderrPath `
+      -Wait `
+      -PassThru
+    $validationExitCode = $validationProcess.ExitCode
+    if (Test-Path -LiteralPath $validationStdoutPath -PathType Leaf) {
+      $validationOutput = @(
+        Get-Content -LiteralPath $validationStdoutPath |
+          ForEach-Object { [string]$_ }
+      )
+    }
+    if (Test-Path -LiteralPath $validationStderrPath -PathType Leaf) {
+      $validationErrorOutput = @(
+        Get-Content -LiteralPath $validationStderrPath |
+          ForEach-Object { [string]$_ }
+      )
+    }
+  } finally {
+    Remove-ValidationCaptureFiles -Paths $validationCapturePaths
+  }
   if ($validationExitCode -ne 0) {
-    throw "Environment B validationが失敗しました: exit=$validationExitCode"
+    $failureEvidence = [ordered]@{
+      exit_code = $validationExitCode
+      stdout = $validationOutput
+      stderr = $validationErrorOutput
+    } | ConvertTo-Json -Depth 5 -Compress
+    throw "Environment B validationが失敗しました: $failureEvidence"
   }
   if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
     throw "Environment B validation resultが生成されませんでした。"
@@ -818,6 +867,7 @@ function Invoke-PackagedSelfCheck {
     runtime = $runtime
     validation_exit_code = $validationExitCode
     output = $validationOutput
+    error_output = $validationErrorOutput
     validation = $validationResult
   }
 }

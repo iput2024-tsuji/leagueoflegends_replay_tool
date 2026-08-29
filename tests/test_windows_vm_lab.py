@@ -1367,6 +1367,50 @@ def test_cleanup_never_uses_vmrun_stop_and_requires_guest_session():
     assert 'Arguments @("stop", $Config.vmx_path' not in source
 
 
+def test_lab_run_allows_three_minutes_for_cold_boot_winrm():
+    source = LAB_SCRIPT.read_text(encoding="utf-8-sig")
+    assert "[ValidateRange(1, 180)]" in source
+    assert "[int]$TimeoutSeconds = 180" in source
+    assert "-TimeoutSeconds 180" in source
+
+
+def test_lab_run_records_inspections_before_policy_assertions():
+    source = LAB_SCRIPT.read_text(encoding="utf-8-sig")
+    run_source = source.split("function Invoke-LabRun", 1)[1]
+    assert run_source.index('"environment-a.json"') < run_source.index(
+        "Assert-EnvironmentA"
+    )
+    assert run_source.index('"environment-b.json"') < run_source.index(
+        "Assert-EnvironmentB"
+    )
+
+
+def test_guest_self_check_captures_native_streams_without_remoting_errors():
+    source = GUEST_SCRIPT.read_text(encoding="utf-8-sig")
+    self_check = source.split("function Invoke-PackagedSelfCheck", 1)[1].split(
+        "$result = switch", 1
+    )[0]
+    assert "Start-Process `" in self_check
+    assert "-RedirectStandardOutput $validationStdoutPath" in self_check
+    assert "-RedirectStandardError $validationStderrPath" in self_check
+    assert "*>&1" not in self_check
+    assert "validation_exit_code = $validationExitCode" in self_check
+    assert "error_output = $validationErrorOutput" in self_check
+    assert "Remove-ValidationCaptureFiles -Paths $validationCapturePaths" in self_check
+    assert 'stdout = $validationOutput' in self_check
+    assert 'stderr = $validationErrorOutput' in self_check
+
+
+def test_guest_validation_capture_cleanup_is_fail_closed():
+    source = GUEST_SCRIPT.read_text(encoding="utf-8-sig")
+    cleanup = source.split("function Remove-ValidationCaptureFiles", 1)[1].split(
+        "function Invoke-PackagedSelfCheck", 1
+    )[0]
+    assert "Remove-Item -LiteralPath $path -Force -ErrorAction Stop" in cleanup
+    assert cleanup.count("Test-Path -LiteralPath $path") == 2
+    assert "validation captureを削除できませんでした" in cleanup
+
+
 @pytest.mark.parametrize(
     "powershell",
     [
@@ -1481,25 +1525,28 @@ $ast = [Management.Automation.Language.Parser]::ParseInput(
   [ref]$tokens,
   [ref]$errors
 )
-$fn = $ast.Find(
-  {
-    param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
-      $node.Name -eq "Assert-StartupTask"
-  },
-  $true
-)
-if ($errors.Count -ne 0 -or $null -eq $fn) { throw "policy extraction failed" }
-. ([scriptblock]::Create($fn.Extent.Text))
+if ($errors.Count -ne 0) { throw "policy extraction failed" }
+foreach ($functionName in @("ConvertTo-ExplicitDateTimeOffset", "Assert-StartupTask")) {
+  $fn = $ast.Find(
+    {
+      param($node)
+      $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -eq $functionName
+    },
+    $true
+  )
+  if ($null -eq $fn) { throw "policy extraction failed: $functionName" }
+  . ([scriptblock]::Create($fn.Extent.Text))
+}
 $script:bootstrapScript = "fixed-bootstrap.ps1"
 function Get-Sha256 { param([string]$Path) return "a" * 64 }
 $expectedScript = Join-Path $env:ProgramData "LoLReplayToolVMLab\windows_vm_lab_bootstrap.ps1"
 $expectedExecute = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"
 $expectedArguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$expectedScript`" -StartupRepair -InterfaceAlias `"Ethernet0`" -GuestAddress `"192.168.20.10`" -HostAddress `"192.168.20.1`" -PrefixLength 24"
 $valid = [ordered]@{
-  captured_at_utc = "2026-08-28T12:00:03Z"
+  captured_at_utc = "2026-08-28T05:00:03Z"
   bootstrap = [ordered]@{
-    created_at_utc = "2026-08-28T12:00:00Z"
+    created_at_utc = "2026-08-28T05:00:00Z"
     interface_alias = "Ethernet0"
     guest_address = "192.168.20.10"
     host_address = "192.168.20.1"
@@ -1528,14 +1575,14 @@ $valid = [ordered]@{
     marker_script_path_matches_action = $true
     script_exists = $true
     script_sha256 = "a" * 64
-    info = [ordered]@{ last_task_result = 0; last_run_time = "2026-08-28T12:00:01Z" }
+    info = [ordered]@{ last_task_result = 0; last_run_time = "2026-08-28T14:00:01+09:00" }
   }
   startup_repair = [ordered]@{
     result = "passed"
     interface_alias = "Ethernet0"
     guest_address = "192.168.20.10"
     host_address = "192.168.20.1"
-    completed_at_utc = "2026-08-28T12:00:02Z"
+    completed_at_utc = "2026-08-28T05:00:02Z"
   }
 }
 $validJson = $valid | ConvertTo-Json -Depth 12
@@ -1574,8 +1621,10 @@ $mutations = @(
   { param($x) $x.startup_repair.guest_address = "192.168.20.11" },
   { param($x) $x.startup_repair.host_address = "192.168.20.2" },
   { param($x) $x.startup_repair.completed_at_utc = "not-a-time" },
-  { param($x) $x.startup_task.info.last_run_time = "2026-08-28T11:59:59Z" },
-  { param($x) $x.startup_repair.completed_at_utc = "2026-08-28T12:00:04Z" }
+  { param($x) $x.startup_task.info.last_run_time = "2026-08-28T05:00:01" },
+  { param($x) $x.captured_at_utc = "2026-08-28T05:00:03" },
+  { param($x) $x.startup_task.info.last_run_time = "2026-08-28T04:59:59Z" },
+  { param($x) $x.startup_repair.completed_at_utc = "2026-08-28T05:00:04Z" }
 )
 foreach ($mutation in $mutations) {
   $candidate = $validJson | ConvertFrom-Json

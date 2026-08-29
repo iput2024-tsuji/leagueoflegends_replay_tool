@@ -1398,8 +1398,8 @@ function Open-LabSession {
     [psobject]$Config,
     [Parameter(Mandatory = $true)]
     [Management.Automation.PSCredential]$GuestCredential,
-    [ValidateRange(1, 120)]
-    [int]$TimeoutSeconds = 60
+    [ValidateRange(1, 180)]
+    [int]$TimeoutSeconds = 180
   )
 
   Import-Module Microsoft.WSMan.Management -ErrorAction Stop
@@ -1572,6 +1572,41 @@ function Assert-EnvironmentA {
   Assert-StartupTask -Inspection $Inspection
 }
 
+function ConvertTo-ExplicitDateTimeOffset {
+  param(
+    [Parameter(Mandatory = $true)]
+    [object]$Value
+  )
+
+  if ($Value -is [DateTimeOffset]) {
+    return [DateTimeOffset]$Value
+  }
+  if ($Value -is [DateTime]) {
+    if ($Value.Kind -eq [DateTimeKind]::Unspecified) {
+      throw "明示的なUTCまたはoffsetを持たない時刻です。"
+    }
+    return [DateTimeOffset]$Value
+  }
+  if ($Value -isnot [string]) {
+    throw "時刻の型が不正です。"
+  }
+
+  $text = ([string]$Value).Trim()
+  if ($text -cnotmatch '\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?(?:Z|[+-]\d{2}:\d{2})\z') {
+    throw "明示的なUTCまたはoffsetを持たない時刻です。"
+  }
+  $parsed = [DateTimeOffset]::MinValue
+  if (-not [DateTimeOffset]::TryParse(
+      $text,
+      [Globalization.CultureInfo]::InvariantCulture,
+      [Globalization.DateTimeStyles]::None,
+      [ref]$parsed
+    )) {
+    throw "時刻を解析できません。"
+  }
+  return $parsed
+}
+
 function Assert-StartupTask {
   param([Parameter(Mandatory = $true)][psobject]$Inspection)
   $task = $Inspection.startup_task
@@ -1602,20 +1637,23 @@ function Assert-StartupTask {
       $task.script_path -cne $expectedScriptPath) {
     throw "startup network repair taskのscript hash証拠が不成立です。"
   }
-  $repairAt = [DateTimeOffset]::MinValue
-  $taskRunAt = [DateTimeOffset]::MinValue
-  $bootstrapAt = [DateTimeOffset]::MinValue
-  $inspectionAt = [DateTimeOffset]::MinValue
   if ($null -eq $Inspection.startup_repair -or
       $Inspection.startup_repair.result -cne "passed" -or
       $Inspection.startup_repair.interface_alias -cne $marker.interface_alias -or
       $Inspection.startup_repair.guest_address -cne $marker.guest_address -or
-      $Inspection.startup_repair.host_address -cne $marker.host_address -or
-      -not [DateTimeOffset]::TryParse([string]$Inspection.startup_repair.completed_at_utc, [ref]$repairAt) -or
-      -not [DateTimeOffset]::TryParse([string]$task.info.last_run_time, [ref]$taskRunAt) -or
-      -not [DateTimeOffset]::TryParse([string]$marker.created_at_utc, [ref]$bootstrapAt) -or
-      -not [DateTimeOffset]::TryParse([string]$Inspection.captured_at_utc, [ref]$inspectionAt) -or
-      $taskRunAt -lt $bootstrapAt -or $repairAt -lt $taskRunAt -or $repairAt -gt $inspectionAt) {
+      $Inspection.startup_repair.host_address -cne $marker.host_address) {
+    throw "startup network repairの実行結果がありません。"
+  }
+  try {
+    $repairAt = ConvertTo-ExplicitDateTimeOffset `
+      -Value $Inspection.startup_repair.completed_at_utc
+    $taskRunAt = ConvertTo-ExplicitDateTimeOffset -Value $task.info.last_run_time
+    $bootstrapAt = ConvertTo-ExplicitDateTimeOffset -Value $marker.created_at_utc
+    $inspectionAt = ConvertTo-ExplicitDateTimeOffset -Value $Inspection.captured_at_utc
+  } catch {
+    throw "startup network repairの実行結果がありません。"
+  }
+  if ($taskRunAt -lt $bootstrapAt -or $repairAt -lt $taskRunAt -or $repairAt -gt $inspectionAt) {
     throw "startup network repairの実行結果がありません。"
   }
 }
@@ -1921,15 +1959,15 @@ function Invoke-LabRun {
     $session = Open-LabSession `
       -Config $Config `
       -GuestCredential $guestCredential `
-      -TimeoutSeconds 60
+      -TimeoutSeconds 180
     $environmentA = Invoke-GuestAction `
       -Config $Config `
       -Session $session `
       -GuestAction "Inspect"
-    Assert-EnvironmentA -Config $Config -Inspection $environmentA
     Write-EvidenceJson `
       -Path (Join-Path $runDirectory "environment-a.json") `
       -Value $environmentA
+    Assert-EnvironmentA -Config $Config -Inspection $environmentA
 
     $runtimeInstall = Invoke-GuestAction `
       -Config $Config `
@@ -1946,10 +1984,10 @@ function Invoke-LabRun {
       -Config $Config `
       -Session $session `
       -GuestAction "Inspect"
-    Assert-EnvironmentB -Config $Config -Inspection $environmentB
     Write-EvidenceJson `
       -Path (Join-Path $runDirectory "environment-b.json") `
       -Value $environmentB
+    Assert-EnvironmentB -Config $Config -Inspection $environmentB
 
     $selfCheck = Invoke-GuestAction `
       -Config $Config `

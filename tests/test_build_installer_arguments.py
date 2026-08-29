@@ -244,3 +244,13 @@ def test_skip_build_does_not_invoke_build_script(tmp_path):
     assert "CAPTURED_BUILD_ARGUMENTS" not in output
     assert not capture.exists()
     assert "LoLReplayTool.exe" in output
+
+
+def test_installer_uses_short_external_pytest_base_temp():
+    script = INSTALLER_SCRIPT.read_text(encoding="utf-8")
+
+    assert "$env:RUNNER_TEMP" in script
+    assert "[IO.Path]::GetTempPath()" in script
+    assert '"lrt-" + [guid]::NewGuid().ToString("N")' in script
+    assert '"--basetemp=$testTemp"' in script
+    assert "tests\\_tmp\\installer-build-" not in script

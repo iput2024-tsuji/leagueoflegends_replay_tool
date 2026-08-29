@@ -129,7 +129,22 @@ if (-not $SkipTests) {
   if (-not $selectedPython) {
     throw "Python が見つからないためテストを実行できません。"
   }
-  $testTemp = Join-Path $repoRoot ("tests\_tmp\installer-build-" + [guid]::NewGuid().ToString("N"))
+  $testTempRoot = if (-not [string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+    $env:RUNNER_TEMP
+  } else {
+    [IO.Path]::GetTempPath()
+  }
+  $resolvedTestTempRoot = (
+    Resolve-Path -LiteralPath $testTempRoot -ErrorAction Stop
+  ).Path
+  if (-not (Test-Path -LiteralPath $resolvedTestTempRoot -PathType Container)) {
+    throw "pytest用の一時領域が見つかりません: $testTempRoot"
+  }
+  # Keep the base path short. License fixtures include long upstream names and
+  # can otherwise exceed the legacy Windows MAX_PATH boundary in deep worktrees.
+  $testTemp = Join-Path $resolvedTestTempRoot (
+    "lrt-" + [guid]::NewGuid().ToString("N")
+  )
   & $selectedPython -m pytest -p no:cacheprovider "--basetemp=$testTemp" tests
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE

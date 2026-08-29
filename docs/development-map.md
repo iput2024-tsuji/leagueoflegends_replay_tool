@@ -182,3 +182,7 @@ Windows向け配布はonedir形式で、依存物を `_internal` に配置しま
 インストール先はユーザー単位で、設定・ログ・録画などの可変データはアプリ更新から分離されています。インストーラー定義や成果物構成を変更した場合は、新規インストール、上書き更新、アンインストール、データ保持・削除選択をWindows実機で確認します。
 
 上書き更新前の終了連携は、`installer/LoLReplayTool.iss`の`PrepareToInstall`からユーザーsession内のnamed eventをsignalし、アプリが返す安全終了完了eventと`src/single_instance.py`で保持するsingle-instance mutexの消失を両方待ちます。アプリは`src/app.py`から既存のworker終了chainへ入り、`src/recording_supervisor.py`と`src/obs_runtime.py`を通してstrict ownershipを確認できた管理対象OBSだけへ通常終了を要求します。録画開始との境界はsupervisor内のlockで確定し、録画中は更新要求を拒否します。旧version、完了通知前のアプリ異常終了、identity不明、worker停止失敗、管理対象OBSの通常終了timeoutではinstallerをfail-closeし、process名だけの終了やforce killへfallbackしません。
+
+Windows x64のインストール・上書き更新では、この安全終了処理より前にMicrosoft Visual C++ 2015–2022 Redistributable x64の前提条件を検査します。HKLM64/HKLM32のregistry viewから`Installed`と`Version`を確認し、最低`14.44.35211.0`未満、欠損、不整合、x64 Runtime不在はfail-closedとします。より新しい互換Versionは許可します。不足時はMicrosoft公式案内を示しますが、ブラウザー起動は対話時の同意後だけで、silent modeは非0終了します。Runtime DLLと`vc_redist.x64.exe`のダウンロード・同梱・自動実行・UAC昇格は行いません。
+
+custom native wheelの変更は、固定入力のSHA256、source archive、tool version、PE importの変換前後、再現可能recipe、provenanceを記録します。dist、完成インストーラー展開物、Release assetでapp-localまたはハッシュ付きMicrosoft Runtime DLL/importを検査し、未知の名前や件数差異もfail-closedで拒否します。legal/source gateと公開Release停止は完了扱いにしません。

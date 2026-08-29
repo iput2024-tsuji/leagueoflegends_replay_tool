@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Windows x64 distributions now require the Microsoft Visual C++ 2015–2022 Redistributable x64 as an external prerequisite and no longer bundle Microsoft Runtime DLLs or `vc_redist.x64.exe`. The installer checks the prerequisite before changing files and stops safely without automatic acquisition when it is missing.
+
 ### Fixed
 
 - During an in-place update, the installer now requests a safe shutdown from an app running in the system tray and waits for recording monitoring, settings work, and the managed OBS instance to stop normally before replacing files. If a match is being recorded, shutdown state cannot be verified, or normal shutdown times out, the update stops without force-quitting the app or OBS.

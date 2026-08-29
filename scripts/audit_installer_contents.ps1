@@ -6,6 +6,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$TempRoot,
   [string]$PythonExe = "",
+  [string]$OutputReceipt = "",
   [ValidateRange(1, 1800)]
   [int]$TimeoutSeconds = 600
 )
@@ -161,6 +162,20 @@ if (
   throw "runner一時rootと検査済みdistは互いに独立していなければなりません。"
 }
 
+$resolvedReceipt = $null
+if (-not [string]::IsNullOrWhiteSpace($OutputReceipt)) {
+  $resolvedReceipt = [System.IO.Path]::GetFullPath($OutputReceipt)
+  if (-not (Test-PathWithin -Root $resolvedTempRoot -Candidate $resolvedReceipt)) {
+    throw "installer監査receiptはrunner一時root内へ出力してください: $resolvedReceipt"
+  }
+  $receiptParent = Split-Path -Parent $resolvedReceipt
+  [void](Resolve-RealDirectory -Path $receiptParent -Label "installer監査receipt parent")
+  Assert-RealDirectoryChain -Path $receiptParent -Label "installer監査receipt parent"
+  if (Test-Path -LiteralPath $resolvedReceipt) {
+    throw "installer監査receiptは新規pathへ出力してください: $resolvedReceipt"
+  }
+}
+
 $venvPython = Join-Path $repoRoot "venv\Scripts\python.exe"
 $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
 if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
@@ -268,10 +283,19 @@ try {
 
   Push-Location $repoRoot
   try {
-    & $selectedPython -m scripts.installer_content_audit `
-      --distribution-root $resolvedDistribution `
-      --installed-root $payloadRoot `
-      --inno-script $innoScript
+    $auditArguments = @(
+      "-m", "scripts.installer_content_audit",
+      "--distribution-root", $resolvedDistribution,
+      "--installed-root", $payloadRoot,
+      "--inno-script", $innoScript
+    )
+    if ($resolvedReceipt) {
+      $auditArguments += @(
+        "--installer", $resolvedInstaller,
+        "--output-receipt", $resolvedReceipt
+      )
+    }
+    & $selectedPython @auditArguments
     if ($LASTEXITCODE -ne 0) {
       throw "完成installerの収録内容が検査済みdistと一致しません。"
     }

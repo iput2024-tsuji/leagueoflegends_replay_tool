@@ -5,29 +5,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import sys
 from pathlib import Path
 from typing import Any
 
 import pefile
 
-GENERIC_RUNTIME_NAMES = frozenset(
-    {
-        "msvcp140.dll",
-        "msvcp140_1.dll",
-        "msvcp140_2.dll",
-        "vcruntime140.dll",
-        "vcruntime140_1.dll",
-        "vcomp140.dll",
-        "concrt140.dll",
-    }
-)
-_RUNTIME_PREFIXES = ("msvcp", "vcruntime", "vcomp", "concrt")
-_HASHED_RUNTIME = re.compile(
-    r"^(?:msvcp140(?:_[12])?|vcruntime140(?:_1)?|vcomp140|concrt140)-[0-9a-f]+\.dll$",
-    re.IGNORECASE,
-)
+from scripts.pyinstaller_runtime_policy import classify_microsoft_runtime_name
 
 
 class AuditError(ValueError):
@@ -35,14 +19,7 @@ class AuditError(ValueError):
 
 
 def _runtime_kind(name: str) -> str | None:
-    lowered = name.lower()
-    if lowered in GENERIC_RUNTIME_NAMES:
-        return "generic"
-    if _HASHED_RUNTIME.fullmatch(name):
-        return "hashed"
-    if lowered.endswith(".dll") and lowered.startswith(_RUNTIME_PREFIXES):
-        return "unknown"
-    return None
+    return classify_microsoft_runtime_name(name)
 
 
 def _decode_name(value: Any) -> str:

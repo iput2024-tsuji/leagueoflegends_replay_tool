@@ -284,6 +284,14 @@ The default installation directory is `%LOCALAPPDATA%\Programs\LoLReplayTool`, s
 
 The uninstaller provides separate unchecked options for deleting application data and recordings. Recording cleanup only targets `%LOCALAPPDATA%\LoLReplayTool\recordings`; an external recording directory configured by the user is not deleted.
 
+### Windows runtime prerequisite
+
+Windows x64 distributions require the user to install the Microsoft Visual C++ 2015–2022 Redistributable x64 in advance. Microsoft Runtime DLLs and `vc_redist.x64.exe` are not bundled in the application, installer, or Release assets, and the installer does not download, install, or elevate for the Runtime.
+
+Before changing files for a new install or overwrite update, the installer checks the 64-bit and 32-bit HKLM registry views, `Installed`, and `Version`. It fails closed when the x64 Runtime is missing, incomplete, inconsistent, or below minimum version `14.44.35211.0`; newer compatible versions are accepted. When the prerequisite is missing, the installer gives Microsoft’s official guidance. A browser is opened only after interactive user consent; silent mode does not prompt or browse and exits non-zero.
+
+Custom wheels are verified with pinned input wheels, source archives, tools, SHA256 values, PE import inventories before and after transformation, and a reproducible build recipe. The CI / Release workflows audit the dist directory, expanded installer, and Release assets at their respective stages and fail closed on app-local or hashed Microsoft Runtime DLLs/imports. This is a technical packaging policy, not a legal conclusion about GPL or Microsoft terms. The legal gate, public-Release hold, and withdrawn v0.5.2 status remain unchanged.
+
 ## Publishing a GitHub Release
 
 Publish only after the licensing review, a dedicated Release-preparation Issue,

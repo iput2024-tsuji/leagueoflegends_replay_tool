@@ -378,6 +378,113 @@ def test_inno_update_shutdown_protocol_is_fail_closed_and_never_targets_obs_by_n
     assert "obs64" not in source.casefold()
 
 
+def test_inno_runtime_prerequisite_is_checked_before_update_shutdown() -> None:
+    source = (REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss").read_text(
+        encoding="utf-8"
+    )
+
+    assert "PrivilegesRequired=lowest" in source
+    assert "VisualCppRuntimeKey = 'SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64'" in source
+    assert "VisualCppRuntimeMinimumVersion = '14.44.35211.0'" in source
+    assert "RegQueryDWordValue(HKLM64" in source
+    assert "RegQueryDWordValue(HKLM32" in source
+    assert "Installed64 <> 1" in source
+    assert "RegQueryStringValue(HKLM64" in source
+    assert "StrToVersion(VersionText, PackedVersion)" in source
+    assert "ComparePackedVersion(Version64Packed, MinimumVersionPacked) < 0" in source
+    assert "RegKeyExists(HKLM32" in source
+    assert "ComparePackedVersion(Version32Packed, Version64Packed) <> 0" in source
+    assert "WizardSilent" in source
+    assert "ShellExec('open', VisualCppRuntimeHelpURL" in source
+    assert "vc_redist.x64.exe" not in source.casefold()
+    assert "DownloadTemporaryFile" not in source
+    assert "\n  Exec(" not in source
+    prepare = source[source.index("function PrepareToInstall"):]
+    assert prepare.index("Result := CheckVisualCppRuntime;") < prepare.index(
+        "Result := RequestSafeUpdateShutdown;"
+    )
+
+
+def test_inno_runtime_prerequisite_code_is_in_audit_allowlist() -> None:
+    assert audit.validate_inno_audit_guards(
+        REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss"
+    ) == []
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "Result := CheckVisualCppRuntime;\n  Result := RequestSafeUpdateShutdown;",
+        "Result := RequestSafeUpdateShutdown;\n  Result := CheckVisualCppRuntime;",
+    ],
+)
+def test_inno_runtime_prerequisite_order_change_is_detectable(
+    tmp_path: Path, replacement: str
+) -> None:
+    source = (REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss").read_text(
+        encoding="utf-8"
+    )
+    original = "Result := CheckVisualCppRuntime;\n  if Result <> '' then\n    Exit;\n  Result := RequestSafeUpdateShutdown;"
+    assert original in source
+    candidate = tmp_path / "runtime-order.iss"
+    candidate.write_text(source.replace(original, replacement, 1), encoding="utf-8")
+
+    assert audit.validate_inno_audit_guards(candidate)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        (
+            "StrToVersion(VersionText, PackedVersion)",
+            "True",
+        ),
+        (
+            "ComparePackedVersion(Version64Packed, MinimumVersionPacked) < 0",
+            "ComparePackedVersion(Version64Packed, MinimumVersionPacked) >= 0",
+        ),
+        (
+            "ComparePackedVersion(Version32Packed, Version64Packed) <> 0",
+            "ComparePackedVersion(Version32Packed, Version64Packed) = 0",
+        ),
+        ("if not WizardSilent then", "if WizardSilent then"),
+        (
+            "ShellExec('open', VisualCppRuntimeHelpURL",
+            "ShellExec('runas', VisualCppRuntimeHelpURL",
+        ),
+    ],
+)
+def test_inno_runtime_prerequisite_weakening_is_detectable(
+    tmp_path: Path, original: str, replacement: str
+) -> None:
+    source = (REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss").read_text(
+        encoding="utf-8"
+    )
+    assert original in source
+    candidate = tmp_path / "runtime-weakened.iss"
+    candidate.write_text(source.replace(original, replacement, 1), encoding="utf-8")
+
+    assert audit.validate_inno_audit_guards(candidate)
+
+
+@pytest.mark.parametrize("call", ["Exec('vc_redist.x64.exe'", "DownloadTemporaryFile("])
+def test_inno_runtime_automatic_acquisition_is_detectable(
+    tmp_path: Path, call: str
+) -> None:
+    source = (REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss").read_text(
+        encoding="utf-8"
+    )
+    marker = "function CheckVisualCppRuntime: String;"
+    assert marker in source
+    candidate = tmp_path / "runtime-auto-install.iss"
+    candidate.write_text(
+        source.replace(marker, call + "\n" + marker, 1),
+        encoding="utf-8",
+    )
+
+    assert audit.validate_inno_audit_guards(candidate)
+
+
 @pytest.mark.parametrize(
     ("original", "replacement", "expected"),
     [
@@ -571,6 +678,21 @@ def test_audit_runner_validates_inno_before_starting_setup() -> None:
 
     assert preflight < setup_start < payload_audit
     assert '"/CONTENTAUDIT=1"' in source
+    assert '"--output-receipt", $resolvedReceipt' in source
+
+
+def test_release_workflow_binds_assets_to_finished_installer_audit() -> None:
+    source = (
+        REPOSITORY_ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+
+    audit = source.index("name: Audit finished installer contents")
+    create = source.index("name: Create and verify release assets")
+    assert "-OutputReceipt $auditReceipt" in source[audit:create]
+    assert "INSTALLER_AUDIT_RECEIPT=$auditReceipt" in source[audit:create]
+    assert "--installer-audit-receipt $env:INSTALLER_AUDIT_RECEIPT" in source[
+        create:
+    ]
 
 
 def test_failure_isolation_runner_accepts_only_payload_mismatch_failure() -> None:

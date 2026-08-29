@@ -350,6 +350,14 @@ dist\installer\LoLReplayTool-Setup-<version>.exe
 
 アンインストール時は、設定・ログ・利用者がアプリデータ内へ配置したOBS/FFmpeg/mpvと、録画ファイルを削除するチェックボックスを個別に表示します。どちらも初期状態はOFFです。録画削除の対象は`%LOCALAPPDATA%\LoLReplayTool\recordings`だけで、設定で指定した外部録画保存先は削除しません。
 
+### Windows Runtimeの前提条件
+
+Windows x64配布物は、利用者側にMicrosoft Visual C++ 2015–2022 Redistributable x64が事前導入されていることを前提とします。Microsoft Runtime DLLおよび`vc_redist.x64.exe`はアプリ、インストーラー、Release assetへ同梱せず、インストーラーもダウンロード・自動インストール・UAC昇格を行いません。
+
+インストーラーはインストールまたは上書き更新のファイル変更前に、HKLMの64-bit/32-bit registry view、`Installed`、`Version`を検査します。x64 Runtimeを確認できない場合、情報が欠損・不整合の場合、またはVersionが最低`14.44.35211.0`未満の場合はfail-closedで停止します。より新しい互換Versionは許可します。不足時はMicrosoft公式案内ページを示し、対話実行時に利用者が同意した場合だけブラウザーを開きます。silent modeでは対話せず、非0終了します。
+
+custom wheelは固定した入力wheel・source archive・tool、SHA256、PE import一覧、変換前後のinventory、再現可能なbuild recipeで検証します。CI / Release workflowはdist、完成インストーラー展開物、Release assetをそれぞれ監査し、app-localまたはハッシュ付きのMicrosoft Runtime DLL/importをfail-closedで拒否します。これは技術的な配布方針であり、GPLまたはMicrosoft条件への法的適合を断定するものではありません。legal gate、公開Release停止、v0.5.2撤回状態は維持します。
+
 ### GitHub Releaseの公開
 
 公開Releaseは、ライセンス確認、Release準備Issue、CI、Windows実機確認を

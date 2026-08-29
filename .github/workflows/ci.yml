@@ -219,13 +219,48 @@ jobs:
       - name: Install build dependencies
         shell: pwsh
         run: |
+          $binaryCache = Join-Path $env:RUNNER_TEMP "LoLReplayTool-binary-cache"
+          $generatedRequirements = Join-Path $env:RUNNER_TEMP "build-requirements.txt"
+          $installPlan = Join-Path $env:RUNNER_TEMP "build-install-plan.json"
+          $pipReport = Join-Path $env:RUNNER_TEMP "build-pip-report.json"
+          $buildProvenance = Join-Path $env:RUNNER_TEMP "build-build-provenance.json"
+
+          & $env:WINDOWS_PYTHON -m scripts.prepare_release_assets `
+            prepare-binary-install `
+            --components .\compliance\components.json `
+            --requirements .\requirements-dev.txt `
+            --cache-dir $binaryCache `
+            --output-requirements $generatedRequirements `
+            --output-plan $installPlan
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           & $env:WINDOWS_PYTHON -m pip `
             --isolated `
             --disable-pip-version-check `
             install `
             --no-input `
             --require-virtualenv `
-            -r requirements-dev.txt
+            --no-cache-dir `
+            --no-deps `
+            --only-binary=:all: `
+            --require-hashes `
+            --force-reinstall `
+            --no-index `
+            --report $pipReport `
+            -r $generatedRequirements
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $env:WINDOWS_PYTHON -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $env:WINDOWS_PYTHON -m scripts.prepare_release_assets `
+            attest-binary-install `
+            --components .\compliance\components.json `
+            --plan $installPlan `
+            --pip-report $pipReport `
+            --output-provenance $buildProvenance
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "BUILD_PROVENANCE=$buildProvenance" | Out-File `
+            -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Prepare verified Inno Setup
         shell: pwsh
@@ -240,10 +275,14 @@ jobs:
             -Components .\compliance\components.json `
             -DownloadDirectory $innoDownload `
             -InstallDirectory $innoRoot `
-            -OutputProvenance $innoProvenance
+            -OutputProvenance $innoProvenance `
+            -BuildProvenance $env:BUILD_PROVENANCE
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
+          $buildProvenanceSha256 = (
+            Get-FileHash -LiteralPath $env:BUILD_PROVENANCE -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
           "INNO_SETUP_ROOT=$innoRoot" | Out-File `
             -FilePath $env:GITHUB_ENV `
             -Encoding utf8 `
@@ -252,16 +291,24 @@ jobs:
             -FilePath $env:GITHUB_ENV `
             -Encoding utf8 `
             -Append
+          "BUILD_PROVENANCE_SHA256=$buildProvenanceSha256" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
 
       - name: Build application
         shell: pwsh
-        run: .\scripts\build.ps1 -PythonExe $env:WINDOWS_PYTHON
+        run: .\scripts\build.ps1 `
+          -PythonExe $env:WINDOWS_PYTHON `
+          -BuildProvenance $env:BUILD_PROVENANCE `
+          -BuildProvenanceSha256 $env:BUILD_PROVENANCE_SHA256
 
       - name: Validate packaged license materials
         shell: pwsh
         run: |
           & $env:WINDOWS_PYTHON -m scripts.check_license_compliance `
-            .\dist\LoLReplayTool
+            .\dist\LoLReplayTool `
+            --build-provenance-sha256 $env:BUILD_PROVENANCE_SHA256
 
       - name: Run packaged self-check
         shell: pwsh
@@ -276,6 +323,8 @@ jobs:
         run: |
           .\scripts\build_installer.ps1 `
             -PythonExe $env:WINDOWS_PYTHON `
+            -BuildProvenance $env:BUILD_PROVENANCE `
+            -BuildProvenanceSha256 $env:BUILD_PROVENANCE_SHA256 `
             -InnoSetupRoot $env:INNO_SETUP_ROOT `
             -InnoSetupProvenance $env:INNO_SETUP_PROVENANCE `
             -SkipTests `

@@ -10,14 +10,20 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from scripts import pe_runtime_audit
+from scripts.binary_install_policy import (
+    BinaryInstallPolicyError,
+    external_vc_runtime_policy,
+)
 
 HASHED_RUNTIME = "msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll"
 PROVENANCE_NAME = "external-vc-runtime-wheel-provenance.json"
@@ -35,6 +41,10 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "size": 12_438_590,
         "sha256": (
             "7d5d7999df434a038d75a748275cd6c0094b0ecdb0837342b332a82defc4dc4d"
+        ),
+        "output_size": 11_986_254,
+        "output_sha256": (
+            "9dc25f88035a08173708074f82f25478c0417040dfffc853521bc4e4f6346f03"
         ),
         "record": "numpy-2.4.1.dist-info/RECORD",
         "affected": {
@@ -91,6 +101,10 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "sha256": (
             "b35d14bb5d8285d9494fe93815a9e9307c0876e10f1e8e89ac5b88f728ec8dcf"
         ),
+        "output_size": 9_500_776,
+        "output_sha256": (
+            "47b6bf18d390f68c187779f30d4a8cd7788d922bc414b5af994b04a552fa7ff2"
+        ),
         "record": "pandas-3.0.2.dist-info/RECORD",
         "affected": {"pandas/_libs/window/aggregations.cp314-win_amd64.pyd"},
         "runtime_members": {f"pandas.libs/{HASHED_RUNTIME}"},
@@ -120,6 +134,10 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "size": 78_433_821,
         "sha256": (
             "c4b7f7d66cc58bddf1bc1ca28dfcf7a45f58cfcb11d81d13a0510409dd4957ac"
+        ),
+        "output_size": 75_519_530,
+        "output_sha256": (
+            "b1a5dfcd0d181285cf79fea6a8a507f4b5c171c095edf75049ff57c8b2e0dc40"
         ),
         "record": "pyqt6_qt6-6.10.2.dist-info/RECORD",
         "affected": set(),
@@ -179,6 +197,10 @@ EXPECTED: dict[str, dict[str, Any]] = {
         "sha256": (
             "56079a99c20d230e873ea40753102102734c5953366972a71d5cb39a32bc40c6"
         ),
+        "output_size": 7_682_065,
+        "output_sha256": (
+            "d619c4153217ee20e61b04bf64e1717efa982be29cae8e6a82cda1c565c4ad69"
+        ),
         "record": "scikit_learn-1.8.0.dist-info/RECORD",
         "affected": set(),
         "runtime_members": {
@@ -204,16 +226,44 @@ EXPECTED: dict[str, dict[str, Any]] = {
 
 DELVEWHEEL_ARTIFACTS = {
     "delvewheel-1.13.0-py3-none-any.whl": {
+        "url": (
+            "https://files.pythonhosted.org/packages/13/f9/"
+            "8163f9145012263743dee49333f3a39bf214b83dac0ede7b06bb9ff7287c/"
+            "delvewheel-1.13.0-py3-none-any.whl"
+        ),
         "size": 59_411,
         "sha256": (
             "eb8c34dee5d8816516befde73bf5cf9ea6142955f41d3baf25381c0136b28608"
         ),
     },
     "delvewheel-1.13.0.tar.gz": {
+        "url": (
+            "https://files.pythonhosted.org/packages/3c/ba/"
+            "4ce769b09cdee86c576a35fc17bb954fa22f81037884a028c978a8479fe1/"
+            "delvewheel-1.13.0.tar.gz"
+        ),
         "size": 63_742,
         "sha256": (
             "440601f289c953d5b60e96af8a8dbe2729584d90b663e39c5eade6b9043b48f6"
         ),
+    },
+}
+PEFILE_ARTIFACT = {
+    "filename": "pefile-2024.8.26-py3-none-any.whl",
+    "url": (
+        "https://files.pythonhosted.org/packages/54/16/"
+        "12b82f791c7f50ddec566873d5bdd245baa1491bac11d15ffb98aecc8f8b/"
+        "pefile-2024.8.26-py3-none-any.whl"
+    ),
+    "size": 74_766,
+    "sha256": "76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f",
+}
+PEFILE_VERSION = "2024.8.26"
+TOOL_ARTIFACTS = {
+    **DELVEWHEEL_ARTIFACTS,
+    PEFILE_ARTIFACT["filename"]: {
+        key: PEFILE_ARTIFACT[key]
+        for key in ("url", "size", "sha256")
     },
 }
 
@@ -252,6 +302,76 @@ def _sha(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _path_is_link_or_reparse(path: Path) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0) & reparse_flag
+    )
+
+
+def _require_directory(path: Path, label: str) -> None:
+    if _path_is_link_or_reparse(path) or not path.is_dir():
+        raise WheelError(f"{label} is unavailable or linked: {path}")
+
+
+def _require_regular_file(path: Path, label: str) -> None:
+    if _path_is_link_or_reparse(path) or not path.is_file():
+        raise WheelError(f"{label} is unavailable or linked: {path}")
+
+
+def _require_locked_file(
+    path: Path,
+    *,
+    size: int,
+    sha256: str,
+    label: str,
+) -> None:
+    _require_regular_file(path, label)
+    if path.stat().st_size != size or _sha(path) != sha256:
+        raise WheelError(f"locked hash or size mismatch: {label}")
+
+
+@contextmanager
+def _temporary_import_paths(paths: list[Path]) -> Iterator[None]:
+    original = list(sys.path)
+    sys.path[:0] = [str(path.resolve()) for path in paths]
+    try:
+        yield
+    finally:
+        sys.path[:] = original
+
+
+def _pe_runtime_audit_module() -> Any:
+    from scripts import pe_runtime_audit
+
+    return pe_runtime_audit
+
+
+def _load_locked_pe_runtime_audit(pefile_wheel: Path) -> Any:
+    _require_locked_file(
+        pefile_wheel,
+        size=int(PEFILE_ARTIFACT["size"]),
+        sha256=str(PEFILE_ARTIFACT["sha256"]),
+        label=f"pefile artifact {pefile_wheel.name}",
+    )
+    with _temporary_import_paths([pefile_wheel]):
+        audit = _pe_runtime_audit_module()
+    pefile_location = Path(audit.pefile.__file__).resolve()
+    pefile_prefix = str(pefile_wheel.resolve()).rstrip("\\/") + os.sep
+    if not str(pefile_location).casefold().startswith(pefile_prefix.casefold()):
+        raise WheelError("pefile was not imported from the locked wheel")
+    if audit.pefile.__version__ != PEFILE_VERSION:
+        raise WheelError(
+            f"pefile version must be {PEFILE_VERSION}, got "
+            f"{audit.pefile.__version__}"
+        )
+    return audit
 
 
 def _safe_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
@@ -315,6 +435,12 @@ def _archive_lock_fields(entry: dict[str, Any]) -> dict[str, Any]:
 
 def _lock_entries(lock: Path) -> dict[str, dict[str, Any]]:
     data = json.loads(lock.read_text(encoding="utf-8"))
+    try:
+        policy = external_vc_runtime_policy(data)
+    except BinaryInstallPolicyError as exc:
+        raise WheelError(str(exc)) from exc
+    if policy is None:
+        raise WheelError("components lock has no external VC++ Runtime policy")
     components = data.get("runtime_components")
     if not isinstance(components, list):
         raise WheelError("components lock has no runtime_components list")
@@ -341,6 +467,13 @@ def _lock_entries(lock: Path) -> dict[str, dict[str, Any]]:
             raise WheelError(f"locked wheel metadata differs for {name}")
         if value.get("source_archives") != manifest["source_archives"]:
             raise WheelError(f"locked source archives differ for {name}")
+        output = policy["wheels"].get(str(value.get("component")))
+        if output != {
+            "filename": name,
+            "size": manifest["output_size"],
+            "sha256": manifest["output_sha256"],
+        }:
+            raise WheelError(f"locked external Runtime wheel differs for {name}")
         entries[name] = {
             **expected_archive,
             "source_archives": manifest["source_archives"],
@@ -348,10 +481,23 @@ def _lock_entries(lock: Path) -> dict[str, dict[str, Any]]:
     missing = set(EXPECTED) - set(entries)
     if missing:
         raise WheelError(f"lock missing wheels: {sorted(missing)}")
+    expected_components = {value["component"] for value in EXPECTED.values()}
+    if set(policy["required_components"]) != expected_components:
+        raise WheelError("external Runtime component set differs from recipe")
+    expected_tools = {
+        name: {"filename": name, **value}
+        for name, value in TOOL_ARTIFACTS.items()
+    }
+    actual_tools = {
+        value["filename"]: value for value in policy["tool_artifacts"]
+    }
+    if actual_tools != expected_tools:
+        raise WheelError("external Runtime tool artifacts differ from recipe")
     return entries
 
 
 def validate_inputs(input_dir: Path, lock: Path) -> dict[str, Path]:
+    _require_directory(input_dir, "wheel input directory")
     entries = _lock_entries(lock)
     try:
         candidates = list(input_dir.iterdir())
@@ -366,40 +512,67 @@ def validate_inputs(input_dir: Path, lock: Path) -> dict[str, Path]:
         raise WheelError(f"wheel candidate set differs: {sorted(wheels)}")
     for name, path in wheels.items():
         expected = entries[name]
-        if (
-            path.stat().st_size != expected["size"]
-            or _sha(path) != expected["sha256"]
-        ):
-            raise WheelError(f"locked hash or size mismatch: {name}")
+        _require_locked_file(
+            path,
+            size=expected["size"],
+            sha256=expected["sha256"],
+            label=name,
+        )
     return wheels
 
 
-def _validate_tool_artifacts(tool_dir: Path) -> tuple[Path, dict[str, Any]]:
+def _validate_tool_artifacts(
+    tool_dir: Path,
+) -> tuple[Path, Path, dict[str, Any]]:
+    _require_directory(tool_dir, "delvewheel artifact directory")
     evidence: dict[str, Any] = {}
-    for name, expected in DELVEWHEEL_ARTIFACTS.items():
+    for name, expected in TOOL_ARTIFACTS.items():
         path = tool_dir / name
-        if not path.is_file():
-            raise WheelError(f"delvewheel artifact missing: {name}")
-        if (
-            path.stat().st_size != expected["size"]
-            or _sha(path) != expected["sha256"]
-        ):
-            raise WheelError(f"delvewheel artifact differs: {name}")
-        evidence[name] = dict(expected)
-    return tool_dir / "delvewheel-1.13.0-py3-none-any.whl", evidence
+        _require_locked_file(
+            path,
+            size=expected["size"],
+            sha256=expected["sha256"],
+            label=f"delvewheel artifact {name}",
+        )
+        evidence[name] = {
+            "size": expected["size"],
+            "sha256": expected["sha256"],
+        }
+    return (
+        tool_dir / "delvewheel-1.13.0-py3-none-any.whl",
+        tool_dir / str(PEFILE_ARTIFACT["filename"]),
+        evidence,
+    )
 
 
-def _tool_environment(tool_wheel: Path) -> dict[str, str]:
+def _tool_environment(tool_wheel: Path, pefile_wheel: Path) -> dict[str, str]:
     environment = os.environ.copy()
     existing = environment.get("PYTHONPATH")
-    environment["PYTHONPATH"] = str(tool_wheel.resolve()) + (
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(tool_wheel.resolve()), str(pefile_wheel.resolve()))
+    ) + (
         os.pathsep + existing if existing else ""
     )
     return environment
 
 
-def _check_delvewheel(tool_wheel: Path) -> str:
-    environment = _tool_environment(tool_wheel)
+def _check_delvewheel(tool_wheel: Path, pefile_wheel: Path) -> str:
+    expected = DELVEWHEEL_ARTIFACTS.get(tool_wheel.name)
+    if expected is None:
+        raise WheelError(f"unexpected delvewheel artifact: {tool_wheel.name}")
+    _require_locked_file(
+        tool_wheel,
+        size=expected["size"],
+        sha256=expected["sha256"],
+        label=f"delvewheel artifact {tool_wheel.name}",
+    )
+    _require_locked_file(
+        pefile_wheel,
+        size=int(PEFILE_ARTIFACT["size"]),
+        sha256=str(PEFILE_ARTIFACT["sha256"]),
+        label=f"pefile artifact {pefile_wheel.name}",
+    )
+    environment = _tool_environment(tool_wheel, pefile_wheel)
     result = subprocess.run(
         [
             sys.executable,
@@ -442,7 +615,7 @@ def _patch_loader(path: Path) -> tuple[str, str]:
     return before_sha, hashlib.sha256(after).hexdigest()
 
 
-def _replace_needed(path: Path, tool_wheel: Path) -> None:
+def _replace_needed(path: Path, tool_wheel: Path, pefile_wheel: Path) -> None:
     result = subprocess.run(
         [
             sys.executable,
@@ -456,7 +629,7 @@ def _replace_needed(path: Path, tool_wheel: Path) -> None:
         ],
         capture_output=True,
         text=True,
-        env=_tool_environment(tool_wheel),
+        env=_tool_environment(tool_wheel, pefile_wheel),
     )
     if result.returncode:
         detail = (result.stderr or result.stdout).strip()
@@ -498,10 +671,10 @@ def _write_wheel(files: dict[str, bytes], output: Path, record: str) -> None:
             archive.writestr(info, files[name], compresslevel=9)
 
 
-def _audit_tree(root: Path, *, phase: str) -> dict[str, Any]:
+def _audit_tree(root: Path, *, phase: str, audit: Any) -> dict[str, Any]:
     try:
-        return pe_runtime_audit.build_inventory(root)
-    except (pe_runtime_audit.AuditError, OSError) as exc:
+        return audit.build_inventory(root)
+    except (audit.AuditError, OSError) as exc:
         raise WheelError(f"PE audit failed ({phase}): {exc}") from exc
 
 
@@ -565,7 +738,30 @@ def transform_wheel(
     manifest: dict[str, Any],
     provenance: dict[str, Any],
     tool_wheel: Path,
+    pefile_wheel: Path,
+    audit: Any,
 ) -> None:
+    _require_locked_file(
+        source,
+        size=manifest["size"],
+        sha256=manifest["sha256"],
+        label=f"wheel input {source.name}",
+    )
+    expected_tool = DELVEWHEEL_ARTIFACTS.get(tool_wheel.name)
+    if expected_tool is None:
+        raise WheelError(f"unexpected delvewheel artifact: {tool_wheel.name}")
+    _require_locked_file(
+        tool_wheel,
+        size=expected_tool["size"],
+        sha256=expected_tool["sha256"],
+        label=f"delvewheel artifact {tool_wheel.name}",
+    )
+    _require_locked_file(
+        pefile_wheel,
+        size=int(PEFILE_ARTIFACT["size"]),
+        sha256=str(PEFILE_ARTIFACT["sha256"]),
+        label=f"pefile artifact {pefile_wheel.name}",
+    )
     with tempfile.TemporaryDirectory(prefix="vc-wheel-") as temp:
         root = Path(temp)
         with zipfile.ZipFile(source) as archive:
@@ -576,13 +772,13 @@ def transform_wheel(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
 
-        before_inventory = _audit_tree(root, phase="before")
+        before_inventory = _audit_tree(root, phase="before", audit=audit)
         _validate_before(before_inventory, manifest)
 
         affected = sorted(manifest["affected"])
         for relative in affected:
             target = root / relative
-            _replace_needed(target, tool_wheel)
+            _replace_needed(target, tool_wheel, pefile_wheel)
             files[relative] = target.read_bytes()
 
         loader_hashes: tuple[str, str] | None = None
@@ -596,9 +792,19 @@ def transform_wheel(
             del files[name]
             (root / name).unlink()
 
-        after_inventory = _audit_tree(root, phase="after")
+        after_inventory = _audit_tree(root, phase="after", audit=audit)
         _validate_after(after_inventory, manifest)
         _write_wheel(files, output, manifest["record"])
+        output_size = output.stat().st_size
+        output_sha256 = _sha(output)
+        if (
+            output_size != manifest["output_size"]
+            or output_sha256 != manifest["output_sha256"]
+        ):
+            raise WheelError(
+                f"deterministic output differs for {manifest['distribution']}: "
+                f"size={output_size} sha256={output_sha256}"
+            )
         provenance["wheels"].append(
             {
                 "filename": source.name,
@@ -610,8 +816,8 @@ def transform_wheel(
                 "loader_sha256": loader_hashes,
                 "pe_before": before_inventory,
                 "pe_after": after_inventory,
-                "output_sha256": _sha(output),
-                "output_size": output.stat().st_size,
+                "output_sha256": output_sha256,
+                "output_size": output_size,
             }
         )
 
@@ -621,13 +827,16 @@ def run(input_dir: Path, output_dir: Path, lock: Path, tool_dir: Path) -> None:
         required = ".".join(map(str, REQUIRED_PYTHON))
         actual = ".".join(map(str, sys.version_info[:3]))
         raise WheelError(f"requires Python {required}, got {actual}")
-    if output_dir.exists():
+    _require_regular_file(lock, "component lock")
+    if os.path.lexists(output_dir):
         raise WheelError(f"output directory already exists: {output_dir}")
     wheels = validate_inputs(input_dir, lock)
     locked = _lock_entries(lock)
-    tool_wheel, tool_evidence = _validate_tool_artifacts(tool_dir)
-    delvewheel_version = _check_delvewheel(tool_wheel)
+    tool_wheel, pefile_wheel, tool_evidence = _validate_tool_artifacts(tool_dir)
+    audit = _load_locked_pe_runtime_audit(pefile_wheel)
+    delvewheel_version = _check_delvewheel(tool_wheel, pefile_wheel)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
+    _require_directory(output_dir.parent, "output parent directory")
     staging = Path(
         tempfile.mkdtemp(prefix=f".{output_dir.name}-", dir=output_dir.parent)
     )
@@ -641,7 +850,7 @@ def run(input_dir: Path, output_dir: Path, lock: Path, tool_dir: Path) -> None:
             "tools": {
                 "delvewheel_version": delvewheel_version,
                 "artifacts": tool_evidence,
-                "pefile_version": pe_runtime_audit.pefile.__version__,
+                "pefile_version": audit.pefile.__version__,
             },
             "transformation": {
                 "replace_needed": [HASHED_RUNTIME, "MSVCP140.dll"],
@@ -668,6 +877,8 @@ def run(input_dir: Path, output_dir: Path, lock: Path, tool_dir: Path) -> None:
                 EXPECTED[name],
                 provenance,
                 tool_wheel,
+                pefile_wheel,
+                audit,
             )
         provenance["wheels"].sort(key=lambda item: item["filename"])
         (staging / PROVENANCE_NAME).write_text(
@@ -680,11 +891,180 @@ def run(input_dir: Path, output_dir: Path, lock: Path, tool_dir: Path) -> None:
         actual_outputs = {path.name for path in staging.iterdir()}
         if actual_outputs != expected_outputs:
             raise WheelError(f"staged output set differs: {sorted(actual_outputs)}")
+        validate_output_directory(staging, lock)
         staging.replace(output_dir)
         committed = True
     finally:
         if not committed:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def validate_provenance_payload(
+    provenance: dict[str, Any],
+    lock: Path,
+) -> dict[str, Any]:
+    """Validate a transformation record without trusting its enclosing file."""
+
+    entries = _lock_entries(lock)
+    if not isinstance(provenance, dict) or set(provenance) != {
+        "schema",
+        "python",
+        "script_sha256",
+        "components_lock_sha256",
+        "tools",
+        "transformation",
+        "inputs",
+        "wheels",
+    }:
+        raise WheelError("transformation provenance fields differ")
+    if (
+        provenance.get("schema") != "external-vc-runtime-wheel-provenance/v1"
+        or provenance.get("python") != sys.version.split()[0]
+        or provenance.get("script_sha256") != _sha(Path(__file__))
+        or provenance.get("components_lock_sha256") != _sha(lock)
+    ):
+        raise WheelError("transformation provenance identity differs")
+    expected_tool_evidence = {
+        name: {"size": value["size"], "sha256": value["sha256"]}
+        for name, value in TOOL_ARTIFACTS.items()
+    }
+    if provenance.get("tools") != {
+        "delvewheel_version": "1.13.0",
+        "artifacts": expected_tool_evidence,
+        "pefile_version": PEFILE_VERSION,
+    }:
+        raise WheelError("transformation tool provenance differs")
+    expected_transformation = {
+        "replace_needed": [HASHED_RUNTIME, "MSVCP140.dll"],
+        "scikit_loader": [
+            LOADER_SHA256,
+            hashlib.sha256(LOADER_REPLACEMENT).hexdigest(),
+        ],
+    }
+    if provenance.get("transformation") != expected_transformation:
+        raise WheelError("transformation recipe provenance differs")
+    expected_inputs = {
+        name: {
+            "url": entries[name]["url"],
+            "size": entries[name]["size"],
+            "sha256": entries[name]["sha256"],
+            "source_archives": entries[name]["source_archives"],
+        }
+        for name in sorted(entries)
+    }
+    if provenance.get("inputs") != expected_inputs:
+        raise WheelError("transformation input provenance differs")
+    raw_wheels = provenance.get("wheels")
+    if not isinstance(raw_wheels, list) or len(raw_wheels) != len(EXPECTED):
+        raise WheelError("transformation wheel records differ")
+    records = {
+        record.get("filename"): record
+        for record in raw_wheels
+        if isinstance(record, dict)
+    }
+    if set(records) != set(EXPECTED) or len(records) != len(raw_wheels):
+        raise WheelError("transformation wheel record set differs")
+    record_keys = {
+        "filename",
+        "component",
+        "input_size",
+        "input_sha256",
+        "affected_pe",
+        "removed_runtime_members",
+        "loader_sha256",
+        "pe_before",
+        "pe_after",
+        "output_sha256",
+        "output_size",
+    }
+    for name, manifest in EXPECTED.items():
+        record = records[name]
+        if set(record) != record_keys:
+            raise WheelError(f"transformation wheel fields differ: {name}")
+        expected_loader = (
+            [
+                LOADER_SHA256,
+                hashlib.sha256(LOADER_REPLACEMENT).hexdigest(),
+            ]
+            if manifest["component"] == "scikit-learn"
+            else None
+        )
+        if (
+            record.get("component") != manifest["distribution"]
+            or record.get("input_size") != manifest["size"]
+            or record.get("input_sha256") != manifest["sha256"]
+            or record.get("affected_pe") != sorted(manifest["affected"])
+            or record.get("removed_runtime_members")
+            != sorted(manifest["runtime_members"])
+            or record.get("loader_sha256") != expected_loader
+            or record.get("output_size") != manifest["output_size"]
+            or record.get("output_sha256") != manifest["output_sha256"]
+            or not isinstance(record.get("pe_before"), dict)
+            or not isinstance(record.get("pe_after"), dict)
+        ):
+            raise WheelError(f"transformation wheel provenance differs: {name}")
+        _validate_before(record["pe_before"], manifest)
+        _validate_after(record["pe_after"], manifest)
+    return provenance
+
+
+def validate_output_directory(output_dir: Path, lock: Path) -> dict[str, Any]:
+    """Revalidate fixed output hashes and the complete transformation record."""
+
+    _require_regular_file(lock, "component lock")
+    _require_directory(output_dir, "output directory")
+    expected_outputs = set(EXPECTED) | {PROVENANCE_NAME}
+    candidates = list(output_dir.iterdir())
+    actual_outputs = {path.name for path in candidates if path.is_file()}
+    if actual_outputs != expected_outputs or any(
+        _path_is_link_or_reparse(path) or not path.is_file()
+        for path in candidates
+    ):
+        raise WheelError(f"output set differs: {sorted(actual_outputs)}")
+    provenance_path = output_dir / PROVENANCE_NAME
+    try:
+        provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WheelError(f"cannot read transformation provenance: {exc}") from exc
+    validate_provenance_payload(provenance, lock)
+    for name, manifest in EXPECTED.items():
+        output = output_dir / name
+        try:
+            _require_locked_file(
+                output,
+                size=manifest["output_size"],
+                sha256=manifest["output_sha256"],
+                label=f"transformation wheel {name}",
+            )
+        except WheelError as exc:
+            raise WheelError(f"transformation wheel bytes differ: {name}") from exc
+    return provenance
+
+
+def validate_embedded_provenance_record(
+    record: Any,
+    lock: Path,
+) -> dict[str, Any]:
+    """Validate the self-contained transformation evidence in build provenance."""
+
+    if not isinstance(record, dict) or set(record) != {
+        "provenance_sha256",
+        "provenance",
+    }:
+        raise WheelError("embedded transformation provenance fields differ")
+    provenance = record.get("provenance")
+    serialized = (
+        json.dumps(
+            provenance,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+    if record.get("provenance_sha256") != hashlib.sha256(serialized).hexdigest():
+        raise WheelError("embedded transformation provenance SHA256 differs")
+    return validate_provenance_payload(provenance, lock)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -702,6 +1082,7 @@ def main(argv: list[str] | None = None) -> int:
         run(args.input_dir, args.output_dir, args.components, args.tool_artifacts)
     except (
         WheelError,
+        BinaryInstallPolicyError,
         OSError,
         subprocess.CalledProcessError,
         zipfile.BadZipFile,

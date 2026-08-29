@@ -1188,7 +1188,7 @@ function Invoke-BoundedProcess {
 function Invoke-Installer {
   param(
     [Parameter(Mandatory = $true)][psobject]$Paths,
-    [Parameter(Mandatory = $true)][string[]]$Arguments
+    [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments
   )
   $installer = Get-InstallerPath
   $installerHash = Assert-FileHash -Path $installer -ExpectedSha256 $InstallerSha256 -Label "application installer"

@@ -311,6 +311,42 @@ def test_installer_actions_are_forwarded_and_host_validated():
     assert "$installerB.a_sentinel_sha256 -cne $installerA.sentinel_sha256" in host
 
 
+@pytest.mark.skipif(
+    WINDOWS_POWERSHELL is None, reason="Windows PowerShell is unavailable"
+)
+def test_invoke_installer_accepts_empty_arguments_in_windows_powershell():
+    """PowerShell 5.1 treats a mandatory empty string array as unbound."""
+    source = GUEST_SCRIPT.read_text(encoding="utf-8-sig")
+    assert (
+        "[Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$Arguments"
+        in source
+    )
+    command = r'''
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+  $env:TARGET_SCRIPT, [ref]$null, [ref]$null
+)
+$fn = $ast.Find({ param($node)
+  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+  $node.Name -eq "Invoke-Installer"
+}, $true)
+$paramBlock = $fn.Body.ParamBlock.Extent.Text
+. ([scriptblock]::Create("function Test-EmptyArguments { $paramBlock; return `$Arguments.Count }"))
+if ((Test-EmptyArguments -Paths ([pscustomobject]@{}) -Arguments @()) -ne 0) { exit 1 }
+'''
+    result = subprocess.run(
+        [
+            WINDOWS_POWERSHELL,
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        env={**os.environ, "TARGET_SCRIPT": str(GUEST_SCRIPT)},
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
 @pytest.mark.skipif(os.name != "nt", reason="IMAPI2FS is Windows-only")
 def test_iso_builder_creates_hashed_media_without_mutating_source(
     external_temp: Path,

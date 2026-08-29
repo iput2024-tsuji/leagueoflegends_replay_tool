@@ -191,6 +191,24 @@ def test_app_local_icu_files_are_rejected_case_insensitively(
         audit.build_inventory(tmp_path, enforce_external=True)
 
 
+@pytest.mark.parametrize(
+    "relative",
+    ["pkg/ucrtbase.dll", "pkg/API-MS-WIN-CRT-RUNTIME-L1-1-0.DLL"],
+)
+def test_app_local_windows_crt_files_are_rejected_case_insensitively(
+    tmp_path, fake_pe, relative
+):
+    target = tmp_path / Path(relative)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"crt")
+    fake_pe({target.name: _pe()})
+
+    result = audit.build_inventory(tmp_path)
+    assert result["summary"]["app_local_runtime_files"] == [relative]
+    with pytest.raises(audit.AuditError, match="app-local Runtime files"):
+        audit.build_inventory(tmp_path, enforce_external=True)
+
+
 def test_cli_output_is_deterministic_and_output_file_is_quiet(tmp_path, fake_pe, capsys):
     (tmp_path / "a.exe").write_bytes(b"a")
     fake_pe({"a.exe": _pe(normal=(b"MSVCP140.dll",))})

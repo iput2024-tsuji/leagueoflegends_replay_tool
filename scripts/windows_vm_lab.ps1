@@ -132,6 +132,8 @@ function Assert-RelativePayloadPath {
 
   if (
     [IO.Path]::IsPathRooted($Path) -or
+    $Path -match '^[A-Za-z]:' -or
+    $Path -match '^[\\/]' -or
     $Path -match '(^|[\\/])\.\.([\\/]|$)'
   ) {
     throw "$Label は親参照を含まない相対pathで指定してください: $Path"

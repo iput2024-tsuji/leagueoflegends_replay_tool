@@ -2579,6 +2579,16 @@ def test_windows_runtime_policy_excludes_all_known_app_local_runtimes(
             "BINARY",
         ),
         ("ucrtbase.dll", r"C:\Windows\System32\ucrtbase.dll", "BINARY"),
+        (
+            r"pkg\ucrtbase.dll",
+            str(tmp_path / "ucrtbase.dll"),
+            "BINARY",
+        ),
+        (
+            r"pkg\api-ms-win-crt-runtime-l1-1-0.dll",
+            str(tmp_path / "api-ms-win-crt-runtime-l1-1-0.dll"),
+            "BINARY",
+        ),
         ("VCOMP140.DLL", r"C:\Windows\System32\VCOMP140.DLL", "BINARY"),
         (
             r"sklearn\.libs\vcomp140.dll",
@@ -2613,7 +2623,16 @@ def test_windows_runtime_policy_excludes_all_known_app_local_runtimes(
         ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION"),
     ]
 
-    filtered = runtime_policy.apply_windows_runtime_policy(binaries)
+    with pytest.raises(RuntimeError, match="app-local Windows Runtime"):
+        runtime_policy.apply_windows_runtime_policy(binaries)
+
+    filtered = runtime_policy.apply_windows_runtime_policy(
+        [
+            entry
+            for entry in binaries
+            if not entry[0].replace("\\", "/").startswith("pkg/")
+        ]
+    )
 
     assert filtered == [("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION")]
     assert runtime_policy.is_windows_os_runtime_name("ucrtbase.dll")

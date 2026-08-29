@@ -47,6 +47,16 @@ def is_windows_os_runtime_name(toc_name: str) -> bool:
     )
 
 
+def is_app_local_windows_os_runtime_name(toc_name: str) -> bool:
+    """Return whether any path contains a Windows OS CRT DLL basename."""
+
+    basename = toc_name.replace("\\", "/").rsplit("/", 1)[-1]
+    lowered = basename.casefold()
+    return lowered == "ucrtbase.dll" or _WINDOWS_OS_RUNTIME_NAME.fullmatch(
+        basename
+    ) is not None
+
+
 def classify_microsoft_runtime_name(toc_name: str) -> str | None:
     """Classify an app-local Microsoft Runtime basename, including nested paths."""
 
@@ -84,6 +94,12 @@ def apply_windows_runtime_policy(
                 f"PyInstaller emitted an unexpected binary type: {entry_type}"
             )
         normalized_name = toc_name.replace("\\", "/")
+        if "/" in normalized_name and is_app_local_windows_os_runtime_name(
+            normalized_name
+        ):
+            raise RuntimeError(
+                f"PyInstaller emitted an app-local Windows Runtime: {toc_name}"
+            )
         runtime_kind = classify_microsoft_runtime_name(normalized_name)
         if runtime_kind == "unknown":
             raise RuntimeError(

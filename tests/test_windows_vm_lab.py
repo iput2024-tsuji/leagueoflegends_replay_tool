@@ -279,7 +279,10 @@ def test_schema_v2_and_invalid_installer_fields_fail_closed(external_temp: Path)
     assert rejected.returncode != 0
 
 
-@pytest.mark.parametrize("installer_path", ["../setup.exe", "C:/setup.exe"])
+@pytest.mark.parametrize(
+    "installer_path",
+    ["../setup.exe", "C:/setup.exe", "C:setup.exe", r"\setup.exe", "//server/setup.exe"],
+)
 def test_installer_path_must_be_relative_without_parent(external_temp: Path, installer_path: str):
     config, values = _config(external_temp)
     values["installer_relative_path"] = installer_path

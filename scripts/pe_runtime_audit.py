@@ -12,7 +12,10 @@ from typing import Any
 
 import pefile
 
-from scripts.pyinstaller_runtime_policy import classify_microsoft_runtime_name
+from scripts.pyinstaller_runtime_policy import (
+    classify_microsoft_runtime_name,
+    is_app_local_windows_os_runtime_name,
+)
 
 
 class AuditError(ValueError):
@@ -104,7 +107,7 @@ def build_inventory(
     for path in candidates:
         relative = path.relative_to(root_path).as_posix()
         runtime = _runtime_kind(path.name)
-        if runtime:
+        if runtime or is_app_local_windows_os_runtime_name(path.name):
             app_local.append(relative)
         if _is_icu_dll_name(path.name):
             app_local_icu.append(relative)

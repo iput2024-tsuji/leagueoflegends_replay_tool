@@ -18,6 +18,16 @@ pytestmark = pytest.mark.skipif(
 
 RUNNER = Path("scripts/run_packaged_self_check.ps1").resolve()
 POWERSHELL = shutil.which("pwsh")
+WINDOWS_POWERSHELL = shutil.which("powershell")
+
+
+def test_runner_uses_direct_process_api_for_reliable_exit_codes():
+    script = RUNNER.read_text(encoding="utf-8")
+
+    assert "System.Diagnostics.ProcessStartInfo" in script
+    assert "$startInfo.UseShellExecute = $false" in script
+    assert "Start-Process" not in script
+    assert "WaitAll($readTasks, $TimeoutMilliseconds)" in script
 
 
 def _run_self_check(
@@ -31,9 +41,10 @@ def _run_self_check(
     taskkill_timeout_seconds: int = 2,
     taskkill_prefix_argument: Path | None = None,
     extra_env: dict[str, str] | None = None,
+    powershell: str | None = POWERSHELL,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
-    if POWERSHELL is None:
-        pytest.skip("pwsh is unavailable")
+    if powershell is None:
+        pytest.skip("requested PowerShell is unavailable")
     temp_root = tmp_path / "runner-temp"
     temp_root.mkdir(exist_ok=True)
     fake_app = tmp_path / f"fake-self-check-{name}.py"
@@ -43,14 +54,22 @@ def _run_self_check(
     for key, value in (extra_env or {}).items():
         monkeypatch.setenv(key, value)
 
+    runner = RUNNER
+    if powershell == WINDOWS_POWERSHELL:
+        runner = tmp_path / "run-packaged-self-check-utf8-bom.ps1"
+        runner.write_text(
+            RUNNER.read_text(encoding="utf-8-sig"),
+            encoding="utf-8-sig",
+        )
+
     command = [
-        POWERSHELL,
+        powershell,
         "-NoProfile",
         "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        str(RUNNER),
+        str(runner),
         "-AppExe",
         sys.executable,
         "-TempRoot",
@@ -113,9 +132,17 @@ def _is_process_running(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+@pytest.mark.parametrize(
+    "powershell",
+    [
+        pytest.param(POWERSHELL, id="pwsh"),
+        pytest.param(WINDOWS_POWERSHELL, id="windows-powershell-5.1"),
+    ],
+)
 def test_packaged_self_check_uses_unique_data_dir_and_reports_success(
     tmp_path,
     monkeypatch,
+    powershell,
 ):
     body = """
 import os
@@ -133,12 +160,14 @@ print("success-stderr", file=sys.stderr, flush=True)
         monkeypatch,
         name="success-first",
         body=body,
+        powershell=powershell,
     )
     second, second_data_dir = _run_self_check(
         tmp_path,
         monkeypatch,
         name="success-second",
         body=body,
+        powershell=powershell,
     )
 
     assert first.returncode == 0, _combined_output(first)
@@ -156,9 +185,17 @@ print("success-stderr", file=sys.stderr, flush=True)
         assert "packaged self-check passed" in output
 
 
+@pytest.mark.parametrize(
+    "powershell",
+    [
+        pytest.param(POWERSHELL, id="pwsh"),
+        pytest.param(WINDOWS_POWERSHELL, id="windows-powershell-5.1"),
+    ],
+)
 def test_packaged_self_check_captures_utf8_from_cp1252_child_streams(
     tmp_path,
     monkeypatch,
+    powershell,
 ):
     body = """
 import io
@@ -191,6 +228,7 @@ raise SystemExit(exit_code)
         name="cp1252-child-streams",
         body=body,
         extra_env={"SELF_CHECK_REPO_ROOT": str(Path.cwd())},
+        powershell=powershell,
     )
     output = _combined_output(result)
 
@@ -203,7 +241,18 @@ raise SystemExit(exit_code)
     assert "packaged self-check passed" in output
 
 
-def test_packaged_self_check_reports_nonzero_and_cleans_up(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "powershell",
+    [
+        pytest.param(POWERSHELL, id="pwsh"),
+        pytest.param(WINDOWS_POWERSHELL, id="windows-powershell-5.1"),
+    ],
+)
+def test_packaged_self_check_reports_nonzero_and_cleans_up(
+    tmp_path,
+    monkeypatch,
+    powershell,
+):
     body = """
 import os
 import sys
@@ -219,8 +268,9 @@ raise SystemExit(7)
     result, data_dir = _run_self_check(
         tmp_path,
         monkeypatch,
-        name="nonzero",
+        name=f"nonzero-{Path(powershell).stem if powershell else 'missing'}",
         body=body,
+        powershell=powershell,
     )
     output = _combined_output(result)
 

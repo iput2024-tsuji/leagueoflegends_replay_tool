@@ -44,6 +44,61 @@ function Resolve-TaskkillExecutable {
   return $command.Source
 }
 
+function ConvertTo-ProcessArguments {
+  param([string[]]$Arguments)
+
+  return (($Arguments | ForEach-Object {
+        $argument = [string]$_
+        if ($argument.Length -eq 0) { return '""' }
+        '"' + ($argument -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
+      }) -join ' ')
+}
+
+function Start-RedirectedProcess {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [string[]]$Arguments = @()
+  )
+
+  $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $FilePath
+  $startInfo.Arguments = ConvertTo-ProcessArguments -Arguments $Arguments
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  $process = [System.Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  if (-not $process.Start()) {
+    $process.Dispose()
+    throw "processを起動できませんでした: $FilePath"
+  }
+  [pscustomobject]@{
+    Process = $process
+    StdoutTask = $process.StandardOutput.ReadToEndAsync()
+    StderrTask = $process.StandardError.ReadToEndAsync()
+  }
+}
+
+function Save-RedirectedProcessOutput {
+  param(
+    [Parameter(Mandatory = $true)]$ProcessHandle,
+    [Parameter(Mandatory = $true)][string]$StdoutPath,
+    [Parameter(Mandatory = $true)][string]$StderrPath,
+    [ValidateRange(1, 60000)][int]$TimeoutMilliseconds = 10000
+  )
+
+  $readTasks = [Threading.Tasks.Task[]]@(
+    $ProcessHandle.StdoutTask,
+    $ProcessHandle.StderrTask
+  )
+  if (-not [Threading.Tasks.Task]::WaitAll($readTasks, $TimeoutMilliseconds)) {
+    throw "redirected process outputを${TimeoutMilliseconds}ms以内に回収できませんでした。"
+  }
+  Set-Content -LiteralPath $StdoutPath -Value $ProcessHandle.StdoutTask.GetAwaiter().GetResult() -Encoding utf8
+  Set-Content -LiteralPath $StderrPath -Value $ProcessHandle.StderrTask.GetAwaiter().GetResult() -Encoding utf8
+}
+
 function Stop-ProcessBestEffort {
   param(
     [Parameter(Mandatory = $true)]
@@ -112,6 +167,7 @@ function Stop-SelfCheckProcessTree {
   $taskkillStdout = Join-Path $DiagnosticDirectory "taskkill-stdout.txt"
   $taskkillStderr = Join-Path $DiagnosticDirectory "taskkill-stderr.txt"
   $taskkillProcess = $null
+  $taskkillHandle = $null
   $taskkillExitCode = $null
   $taskkillTimedOut = $false
   $taskkillExecutionError = $null
@@ -126,13 +182,8 @@ function Stop-SelfCheckProcessTree {
       "/T",
       "/F"
     )
-    $taskkillProcess = Start-Process `
-      -FilePath $resolvedTaskkill `
-      -ArgumentList $taskkillArguments `
-      -WindowStyle Hidden `
-      -RedirectStandardOutput $taskkillStdout `
-      -RedirectStandardError $taskkillStderr `
-      -PassThru
+    $taskkillHandle = Start-RedirectedProcess -FilePath $resolvedTaskkill -Arguments $taskkillArguments
+    $taskkillProcess = $taskkillHandle.Process
     if (-not $taskkillProcess.WaitForExit($TaskkillTimeout * 1000)) {
       $taskkillTimedOut = $true
       try {
@@ -166,6 +217,9 @@ function Stop-SelfCheckProcessTree {
     $taskkillExecutionError = $_.Exception.Message
   } finally {
     try {
+      if ($null -ne $taskkillHandle) {
+        Save-RedirectedProcessOutput -ProcessHandle $taskkillHandle -StdoutPath $taskkillStdout -StderrPath $taskkillStderr
+      }
       if (Test-Path -LiteralPath $taskkillStdout -PathType Leaf) {
         $taskkillStdoutText = Get-Content -LiteralPath $taskkillStdout -Raw
       }
@@ -253,6 +307,7 @@ $selfCheckTimedOut = $false
 $selfCheckExecutionError = $null
 $selfCheckDirRemoved = $false
 $selfCheckProcessDisposed = $false
+$selfCheckHandle = $null
 $cleanupErrors = [System.Collections.Generic.List[string]]::new()
 
 Write-Host "packaged self-check data directory: $selfCheckDir"
@@ -260,13 +315,8 @@ try {
   New-Item -ItemType Directory -Path $selfCheckDir -ErrorAction Stop | Out-Null
   $env:LOL_REPLAY_TOOL_DATA_DIR = $selfCheckDir
   try {
-    $selfCheckProcess = Start-Process `
-      -FilePath $resolvedAppExe `
-      -ArgumentList $SelfCheckArguments `
-      -WindowStyle Hidden `
-      -RedirectStandardOutput $selfCheckStdout `
-      -RedirectStandardError $selfCheckStderr `
-      -PassThru
+    $selfCheckHandle = Start-RedirectedProcess -FilePath $resolvedAppExe -Arguments $SelfCheckArguments
+    $selfCheckProcess = $selfCheckHandle.Process
     if (-not $selfCheckProcess.WaitForExit($TimeoutSeconds * 1000)) {
       $selfCheckTimedOut = $true
       try {
@@ -302,6 +352,9 @@ try {
   }
 
   try {
+    if ($null -ne $selfCheckHandle) {
+      Save-RedirectedProcessOutput -ProcessHandle $selfCheckHandle -StdoutPath $selfCheckStdout -StderrPath $selfCheckStderr
+    }
     if (Test-Path -LiteralPath $selfCheckStdout -PathType Leaf) {
       $selfCheckStdoutText = Get-Content -LiteralPath $selfCheckStdout -Raw -Encoding utf8
     }

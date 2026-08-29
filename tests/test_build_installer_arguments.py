@@ -253,4 +253,5 @@ def test_installer_uses_short_external_pytest_base_temp():
     assert "[IO.Path]::GetTempPath()" in script
     assert '"lrt-" + [guid]::NewGuid().ToString("N")' in script
     assert '"--basetemp=$testTemp"' in script
+    assert "& $selectedPython -B -m pytest" in script
     assert "tests\\_tmp\\installer-build-" not in script

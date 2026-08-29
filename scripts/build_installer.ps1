@@ -145,7 +145,7 @@ if (-not $SkipTests) {
   $testTemp = Join-Path $resolvedTestTempRoot (
     "lrt-" + [guid]::NewGuid().ToString("N")
   )
-  & $selectedPython -m pytest -p no:cacheprovider "--basetemp=$testTemp" tests
+  & $selectedPython -B -m pytest -p no:cacheprovider "--basetemp=$testTemp" tests
   if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
   }

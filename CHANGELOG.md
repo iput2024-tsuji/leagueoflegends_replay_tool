@@ -5,6 +5,7 @@
 ### 変更
 
 - Windows x64配布物ではMicrosoft Visual C++ 2015–2022 Redistributable x64を外部前提とし、Microsoft Runtime DLLと`vc_redist.x64.exe`を同梱しない方式へ変更しました。インストーラーはファイル変更前に前提条件を検査し、不足時は自動取得せず安全に中止します。
+- 正式対応OSをWindows 11へ限定しました。配布物はx64版（Windows 11 ARM64ではx64エミュレーション、ARM64-native版なし）です。PyQt6-Qt6 6.10.2のQt6Coreが参照するWindows標準ICUを利用し、ICU DLLは同梱しません。Windows 10対応は別途検証するまで宣言しません。
 
 ### 修正
 

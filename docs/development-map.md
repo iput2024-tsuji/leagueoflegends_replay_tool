@@ -179,6 +179,8 @@ Windows向け配布はonedir形式で、依存物を `_internal` に配置しま
 
 ### Inno Setup
 
+正式対応OSはWindows 11（build 22000以降）です。配布物はx64版で、installerの`ArchitecturesAllowed=x64compatible`はx64 WindowsとWindows 11 ARM64のx64エミュレーションを許可しますが、ARM64-native版は提供しません。PyQt6-Qt6 6.10.2のQt6Coreが参照するICUはWindows標準のSystem32版を利用し、ICU DLLを配布物へ同梱しません。Windows 10対応はLTSC 2019等の対象環境で同じnativeロードとQt locale／Unicode検証が完了するまで宣言しません。installerの`MinVersion`、`ArchitecturesAllowed`、README日英版を同期してください。最終PyInstaller onedirのICU graph確認には`python -m scripts.pe_runtime_audit <dist> --require-qt-system-icu`を使用します。
+
 インストール先はユーザー単位で、設定・ログ・録画などの可変データはアプリ更新から分離されています。インストーラー定義や成果物構成を変更した場合は、新規インストール、上書き更新、アンインストール、データ保持・削除選択をWindows実機で確認します。
 
 上書き更新前の終了連携は、`installer/LoLReplayTool.iss`の`PrepareToInstall`からユーザーsession内のnamed eventをsignalし、アプリが返す安全終了完了eventと`src/single_instance.py`で保持するsingle-instance mutexの消失を両方待ちます。アプリは`src/app.py`から既存のworker終了chainへ入り、`src/recording_supervisor.py`と`src/obs_runtime.py`を通してstrict ownershipを確認できた管理対象OBSだけへ通常終了を要求します。録画開始との境界はsupervisor内のlockで確定し、録画中は更新要求を拒否します。旧version、完了通知前のアプリ異常終了、identity不明、worker停止失敗、管理対象OBSの通常終了timeoutではinstallerをfail-closeし、process名だけの終了やforce killへfallbackしません。

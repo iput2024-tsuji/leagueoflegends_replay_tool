@@ -2072,10 +2072,15 @@ def test_build_script_fails_closed_on_user_provided_runtime_artifacts():
     assert "throw \"利用者が用意するOBS／standalone FFmpeg" in script
 
 
-def test_existing_distribution_manifest_detects_missing_record(tmp_path):
+def test_existing_distribution_manifest_detects_missing_record(monkeypatch, tmp_path):
     root = tmp_path / "distribution"
     _write_distribution_materials(root)
     manifest_path = _write_existing_inventory(root)
+    monkeypatch.setattr(
+        compliance,
+        "_external_vc_runtime_errors",
+        lambda _root: [],
+    )
 
     assert validate_distribution(root) == []
 
@@ -2629,7 +2634,7 @@ def test_distribution_runtime_audit_fails_closed(monkeypatch, tmp_path):
     monkeypatch.setattr(pe_runtime_audit, "build_inventory", reject)
 
     assert compliance._external_vc_runtime_errors(tmp_path) == [
-        "External VC++ Runtime PE audit failed: hashed Runtime import"
+        "External native Runtime PE audit failed: hashed Runtime import"
     ]
     assert runtime_policy.classify_microsoft_runtime_name(
         r"numpy.libs\msvcp140-a4c2229b.dll"
@@ -2637,6 +2642,28 @@ def test_distribution_runtime_audit_fails_closed(monkeypatch, tmp_path):
     assert runtime_policy.classify_microsoft_runtime_name(
         r"PyQt6\Qt6\bin\MSVCP140.dll"
     ) == "generic"
+
+
+def test_distribution_runtime_audit_requires_fixed_qt_system_icu(
+    monkeypatch, tmp_path
+):
+    from scripts import pe_runtime_audit
+
+    observed = {}
+
+    def accept(root, **kwargs):
+        observed["root"] = root
+        observed.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(pe_runtime_audit, "build_inventory", accept)
+
+    assert compliance._external_vc_runtime_errors(tmp_path) == []
+    assert observed == {
+        "root": tmp_path,
+        "enforce_external": True,
+        "require_qt_system_icu": True,
+    }
 
 
 @pytest.mark.parametrize(

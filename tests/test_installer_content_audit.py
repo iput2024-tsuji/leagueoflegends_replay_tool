@@ -262,6 +262,70 @@ def test_inno_structure_accepts_explicitly_guarded_registry_entry(
     assert audit.validate_inno_audit_guards(candidate) == []
 
 
+def test_inno_requires_windows_11_minimum_version(tmp_path: Path) -> None:
+    source = (REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss").read_text(
+        encoding="utf-8"
+    )
+
+    assert audit.validate_inno_audit_guards(
+        REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss"
+    ) == []
+    for unsafe_version in ("10.0", "10.0.19045", "10.0.22621"):
+        candidate = tmp_path / f"windows-{unsafe_version}.iss"
+        candidate.write_text(
+            source.replace("MinVersion=10.0.22000", f"MinVersion={unsafe_version}"),
+            encoding="utf-8",
+        )
+
+        errors = audit.validate_inno_audit_guards(candidate)
+
+        assert any("minversion is not audit-safe" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "unsafe_architecture",
+    ["x86compatible", "arm64", "x64os", "x64compatible and not arm64"],
+)
+def test_inno_keeps_x64_compatible_distribution_boundary(
+    tmp_path: Path,
+    unsafe_architecture: str,
+) -> None:
+    source = (REPOSITORY_ROOT / "installer" / "LoLReplayTool.iss").read_text(
+        encoding="utf-8"
+    )
+    candidate = tmp_path / "changed-architecture.iss"
+    candidate.write_text(
+        source.replace(
+            "ArchitecturesAllowed=x64compatible",
+            f"ArchitecturesAllowed={unsafe_architecture}",
+        ),
+        encoding="utf-8",
+    )
+
+    errors = audit.validate_inno_audit_guards(candidate)
+
+    assert any("architecturesallowed is not audit-safe" in error for error in errors)
+
+
+def test_installer_payload_applies_distribution_policy_to_both_trees(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    distribution, installed = _matching_roots(tmp_path)
+    observed: list[Path] = []
+
+    def validate(root: Path) -> list[str]:
+        observed.append(root)
+        return ["system ICU policy failed"] if root == installed else []
+
+    monkeypatch.setattr(audit, "validate_distribution", validate)
+
+    errors = audit.audit_installer_payload(distribution, installed)
+
+    assert observed == [distribution.resolve(), installed.resolve()]
+    assert "Installer payload compliance: system ICU policy failed" in errors
+
+
 @pytest.mark.parametrize(
     "replacement",
     [

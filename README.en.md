@@ -286,6 +286,8 @@ The uninstaller provides separate unchecked options for deleting application dat
 
 ### Windows runtime prerequisite
 
+The formally supported operating system is Windows 11. The distribution is x64, and the installer requires an x64-compatible Windows 11 environment (build 22000 or later). It can run on x64 Windows and under Windows 11 ARM64 x64 emulation; no ARM64-native build is provided. Qt6Core from the pinned PyQt6-Qt6 6.10.2 wheel uses the Windows system ICU from System32, and ICU DLLs are not bundled in the application, installer, or Release assets. Windows 10 support is not claimed until separate real-environment validation is complete.
+
 Windows x64 distributions require the user to install the Microsoft Visual C++ 2015–2022 Redistributable x64 in advance. Microsoft Runtime DLLs and `vc_redist.x64.exe` are not bundled in the application, installer, or Release assets, and the installer does not download, install, or elevate for the Runtime.
 
 Before changing files for a new install or overwrite update, the installer checks the 64-bit and 32-bit HKLM registry views, `Installed`, and `Version`. It fails closed when the x64 Runtime is missing, incomplete, inconsistent, or below minimum version `14.44.35211.0`; newer compatible versions are accepted. When the prerequisite is missing, the installer gives Microsoft’s official guidance. A browser is opened only after interactive user consent; silent mode does not prompt or browse and exits non-zero.

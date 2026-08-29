@@ -281,9 +281,11 @@ INNO_WINDOWS_RESERVED_NAMES = frozenset(
 )
 INNO_REQUIRED_SETUP_VALUES = {
     "appid": "{{B8D87E69-41F7-4B28-978D-2F8FA5AF4BE2}",
+    "architecturesallowed": "x64compatible",
     "changesassociations": "no",
     "changesenvironment": "no",
     "createuninstallregkey": "not IsContentAuditMode",
+    "minversion": "10.0.22000",
     "privilegesrequired": "lowest",
     "uninstallable": "not IsContentAuditMode",
 }

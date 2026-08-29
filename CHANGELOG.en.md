@@ -5,6 +5,7 @@
 ### Changed
 
 - Windows x64 distributions now require the Microsoft Visual C++ 2015–2022 Redistributable x64 as an external prerequisite and no longer bundle Microsoft Runtime DLLs or `vc_redist.x64.exe`. The installer checks the prerequisite before changing files and stops safely without automatic acquisition when it is missing.
+- The supported operating system is now Windows 11. The distribution is x64 (x64 emulation on Windows 11 ARM64; no ARM64-native build). The application uses the Windows system ICU referenced by Qt6Core in the pinned PyQt6-Qt6 6.10.2 wheel and does not bundle ICU DLLs. Windows 10 support remains unclaimed pending separate validation.
 
 ### Fixed
 

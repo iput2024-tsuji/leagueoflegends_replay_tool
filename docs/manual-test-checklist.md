@@ -184,6 +184,10 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 
 ## ビルドとself-check
 
+- [ ] 正式対応OSはWindows 11（build 22000以降）、配布物はx64版、installerは`x64compatible`であり、Windows 10対応やARM64-native版を宣言していない
+- [ ] 固定PyQt6-Qt6 6.10.2のQt6Coreが要求する`icuuc.dll`をfresh processでロードし、loaded module handleから実際の`%SystemRoot%\System32\icuuc.dll`であること、ICU DLLのapp-local配置が0件であることを確認する
+- [ ] Qtのlocale、collation、Unicode境界処理を実行し、System32 ICUを利用した結果を記録する
+
 - [ ] 利用者管理のOBS、standalone FFmpeg、mpv DLLを含まない通常成果物で`pwsh -NoProfile -File .\scripts\build.ps1`が成功する
 - [ ] `.\dist\LoLReplayTool\LoLReplayTool.exe --self-check` が終了コード0になる
 - [ ] OBS、mpv、FFmpeg未配置の警告が想定どおりで、必須診断は成功する

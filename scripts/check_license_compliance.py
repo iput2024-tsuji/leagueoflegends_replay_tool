@@ -2564,7 +2564,7 @@ def _forbidden_user_runtime_errors(
 
 
 def _external_vc_runtime_errors(distribution_root: Path) -> list[str]:
-    """Reject app-local, hashed, unknown, or unreadable PE Runtime state."""
+    """Reject unsafe Microsoft Runtime or Qt system ICU PE state."""
 
     from scripts import pe_runtime_audit
 
@@ -2572,9 +2572,10 @@ def _external_vc_runtime_errors(distribution_root: Path) -> list[str]:
         pe_runtime_audit.build_inventory(
             distribution_root,
             enforce_external=True,
+            require_qt_system_icu=True,
         )
     except (pe_runtime_audit.AuditError, OSError) as exc:
-        return [f"External VC++ Runtime PE audit failed: {exc}"]
+        return [f"External native Runtime PE audit failed: {exc}"]
     return []
 
 

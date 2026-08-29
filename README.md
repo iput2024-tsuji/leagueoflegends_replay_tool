@@ -352,6 +352,8 @@ dist\installer\LoLReplayTool-Setup-<version>.exe
 
 ### Windows Runtimeの前提条件
 
+正式対応OSはWindows 11です。配布物はx64版で、インストーラーはWindows 11（build 22000以降）のx64-compatible環境を最低条件とします。x64 Windowsに加えてWindows 11 ARM64のx64エミュレーション上でもインストーラーを実行できますが、ARM64-native版は提供しません。PyQt6-Qt6 6.10.2のQt6Coreが参照するICUはWindows標準のSystem32版を利用し、ICU DLLをアプリ、インストーラー、Release assetへ同梱しません。Windows 10対応は、対応する実機検証が完了するまで宣言しません。
+
 Windows x64配布物は、利用者側にMicrosoft Visual C++ 2015–2022 Redistributable x64が事前導入されていることを前提とします。Microsoft Runtime DLLおよび`vc_redist.x64.exe`はアプリ、インストーラー、Release assetへ同梱せず、インストーラーもダウンロード・自動インストール・UAC昇格を行いません。
 
 インストーラーはインストールまたは上書き更新のファイル変更前に、HKLMの64-bit/32-bit registry view、`Installed`、`Version`を検査します。x64 Runtimeを確認できない場合、情報が欠損・不整合の場合、またはVersionが最低`14.44.35211.0`未満の場合はfail-closedで停止します。より新しい互換Versionは許可します。不足時はMicrosoft公式案内ページを示し、対話実行時に利用者が同意した場合だけブラウザーを開きます。silent modeでは対話せず、非0終了します。

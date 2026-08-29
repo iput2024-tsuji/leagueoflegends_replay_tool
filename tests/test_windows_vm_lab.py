@@ -1636,7 +1636,12 @@ foreach ($mutation in $mutations) {
 '''
     result = subprocess.run(
         [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
-        env={**os.environ, "TARGET_SCRIPT": str(LAB_SCRIPT)},
+        env={
+            **os.environ,
+            "TARGET_SCRIPT": str(LAB_SCRIPT),
+            "ProgramData": os.environ.get("ProgramData") or "/ProgramData",
+            "WINDIR": os.environ.get("WINDIR") or "/Windows",
+        },
         capture_output=True,
         text=True,
         encoding="utf-8",

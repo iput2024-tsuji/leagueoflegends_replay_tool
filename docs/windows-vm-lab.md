@@ -17,6 +17,8 @@ CI、Release工程には接続しません。
 - VM停止は確立済みWinRMからのguest shutdown requestだけです。失敗してもhard power offへfallbackしません。
 - credential、VM、ISO、test evidenceはrepository外へ置きます。
 - 実LoL録画はこのlabの対象外です。
+- installer actionは固定user `vmtest`のprofileだけで実行し、native processへ渡す引数は
+  空白・quoteなしの固定値へ限定します。各processは300秒でtimeoutします。
 
 ## 操作
 
@@ -27,7 +29,7 @@ CI、Release工程には接続しません。
 | `Capture` | なし | VMX/VMSDからUUID、MAC、暗号化方式、A0 fingerprintを取得 |
 | `Plan` | なし | config、固定hash、実行順、禁止事項をJSONで表示 |
 | `Doctor` | なし | VM identity、snapshot、credential、host-only、TrustedHostsをread-only確認 |
-| `Run` | あり | A0復元、Environment A、Runtime導入、Environment B、self-check、guest shutdown |
+| `Run` | あり | A0復元、Environment A installer拒否、Runtime導入、Environment B installer/self-check/update/uninstall、guest shutdown |
 
 `Run`は次の順序を固定し、途中をskipできません。
 
@@ -38,10 +40,20 @@ CI、Release工程には接続しません。
 4. VMを`nogui`で起動
 5. WinRMでEnvironment Aを検査
 6. Runtime未導入、canonical/hashed VC++ Runtime DLLなし、VMware Toolsなし、default routeなしを確認
-7. ISO内のMicrosoft署名済みRuntime installerを固定SHA256で検査して導入
-8. Runtime versionと必要なSystem32 DLLを確認
-9. ISO内の既存Environment B検査を実行し、全package hashとpackaged self-checkを確認
-10. JSON evidenceをホストへ保存してguest shutdownを要求
+7. 完成installerをsilent実行し、Runtime不足のexit 7、install root/registry/shortcut/user-data不変を確認
+8. controlled install rootでも同じ拒否とtree不変を確認し、自作rootだけ削除
+9. ISO内のMicrosoft署名済みRuntime installerを固定SHA256で検査して導入
+10. Runtime versionと必要なSystem32 DLLを確認
+11. ISO内の既存Environment B検査と直接app self-checkを実行
+12. 完成installerを新規install、installed app self-check、上書き更新、silent uninstallの順に実行
+13. uninstall後のapp/registry/shortcut消失とuser-data sentinel保持を確認
+14. JSON evidenceをホストへ保存してguest shutdownを要求
+
+Environment Aのexit 7は、Inno Setup 6.7.3の`PrepareToInstall`が続行不能と判断した場合の
+公式終了コードです（[Setup Exit Codes](https://jrsoftware.org/ishelp/topic_setupexitcodes.htm)、
+[PrepareToInstall](https://jrsoftware.org/ishelp/topic_scriptevents.htm)、2026-08-29確認）。
+installer logはbounded textとしてJSON evidenceへ保存した後、guest profile配下の自動作成した
+GUID directoryだけをpath・reparse point検査後に削除します。
 
 ## 固定test ISO
 
@@ -149,7 +161,7 @@ configもrepository外へ置きます。passwordそのものをJSONへ書いて�
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "vmrun_path": "F:\\VMware\\App\\vmrun.exe",
   "vmx_path": "F:\\VMware\\VMs\\LoLReplayTool-VC-Runtime-Lab\\LoLReplayTool-VC-Runtime-Lab.vmx",
   "vm_encryption_credential_path": "F:\\VMware\\Secrets\\vc-runtime-lab-vm.xml",
@@ -172,6 +184,8 @@ configもrepository外へ置きます。passwordそのものをJSONへ書いて�
   "payload_volume_label": "LOL_VC_PR134",
   "runtime_installer_relative_path": "vc_redist.x64.exe",
   "runtime_installer_sha256": "843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c",
+  "installer_relative_path": "installer/LoLReplayTool-Setup-0.5.2.exe",
+  "installer_sha256": "<lowercase SHA256>",
   "minimum_runtime_version": "14.44.35211.0",
   "app_relative_path": "LoLReplayTool-external-build\\LoLReplayTool.exe",
   "app_sha256": "3f8ec9a46c9509ed07197a765424eee95ebce50673a2500dd590cfa729aab09d",
@@ -182,7 +196,7 @@ configもrepository外へ置きます。passwordそのものをJSONへ書いて�
 }
 ```
 
-`capture`は`Capture`だけで許可されます。`replacement_values`を転記していないconfigは、`Plan`、
+`capture`は`Capture`だけで許可されます。schema 3のinstaller path/hashを含め、`replacement_values`を転記していないconfigは、`Plan`、
 `Doctor`、`Run`で拒否されます。VMX file全体のSHA256は取得時点の証拠として記録します。
 実行gateでは、snapshot復元時にVMwareが更新する`encryption.data`、電源状態、作業用delta disk名だけを
 除いた全VMX key/valueをsemantic fingerprintとして固定します。作業用delta diskは名前を固定せず、
@@ -238,6 +252,8 @@ evidenceへ出力しません。
 - Microsoft署名を確認できない
 - Runtime installが0または3010以外で終了する
 - 3010により再起動が必要になる
+- Environment A installerがexit 7以外を返す、または状態を変更する
+- Environment B installer/self-check/update/uninstallのいずれかが失敗する
 - WinRM firewallの有効規則を固定scopeの1件へ限定できない
 - WinRM、Environment B検査、packaged self-check、guest OS shutdown後のpowered-off確認が失敗する
 

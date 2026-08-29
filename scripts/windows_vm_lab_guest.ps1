@@ -1,10 +1,12 @@
 ﻿param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("Inspect", "InstallRuntime", "SelfCheck")]
+  [ValidateSet("Inspect", "InstallRuntime", "SelfCheck", "InstallerEnvironmentA", "InstallerEnvironmentB")]
   [string]$Action,
   [string]$PayloadVolumeLabel = "",
   [string]$RuntimeInstallerRelativePath = "",
   [string]$RuntimeInstallerSha256 = "",
+  [string]$InstallerRelativePath = "",
+  [string]$InstallerSha256 = "",
   [string]$MinimumRuntimeVersion = "",
   [string]$AppRelativePath = "",
   [string]$AppSha256 = "",
@@ -456,6 +458,11 @@ function Get-PayloadInspection {
       sha256 = $RuntimeInstallerSha256
     },
     [ordered]@{
+      label = "completed application installer"
+      relative_path = $InstallerRelativePath
+      sha256 = $InstallerSha256
+    },
+    [ordered]@{
       label = "packaged application"
       relative_path = $AppRelativePath
       sha256 = $AppSha256
@@ -872,10 +879,621 @@ function Invoke-PackagedSelfCheck {
   }
 }
 
+function Get-InstallerPath {
+  return Resolve-PayloadFile -VolumeLabel $PayloadVolumeLabel -RelativePath $InstallerRelativePath
+}
+
+function Test-GuestPathWithin {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Root
+  )
+  $fullPath = [IO.Path]::GetFullPath($Path)
+  $fullRoot = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+  return $fullPath.StartsWith($fullRoot, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-ProfilePath {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+  $profile = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+  $fullPath = [IO.Path]::GetFullPath($Path)
+  if (-not (Test-GuestPathWithin -Path $fullPath -Root $profile)) {
+    throw "$Label が専用guest profileの外側です: $fullPath"
+  }
+
+  $existing = $fullPath
+  while (-not (Test-Path -LiteralPath $existing)) {
+    $parent = Split-Path -Parent $existing
+    if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $existing) {
+      throw "$Label の既存親directoryを確認できません: $fullPath"
+    }
+    $existing = $parent
+  }
+  while ($true) {
+    $item = Get-Item -LiteralPath $existing -Force -ErrorAction Stop
+    if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+      throw "$Label のpath chainにreparse pointがあります: $($item.FullName)"
+    }
+    if ($item.FullName.TrimEnd('\') -ieq $profile) {
+      break
+    }
+    $parent = Split-Path -Parent $item.FullName
+    if ([string]::IsNullOrWhiteSpace($parent) -or $parent -ceq $item.FullName) {
+      throw "$Label のpath chainがguest profileへ到達しません: $fullPath"
+    }
+    $existing = $parent
+  }
+  return $fullPath
+}
+
+function Assert-RegularTree {
+  param([Parameter(Mandatory = $true)][string]$Root)
+  if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return }
+  foreach ($item in @(
+    Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+    Get-ChildItem -LiteralPath $Root -Force -Recurse -ErrorAction Stop
+  )) {
+    $linkType = $item.PSObject.Properties["LinkType"]
+    if (
+      ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+      ($null -ne $linkType -and -not [string]::IsNullOrWhiteSpace([string]$linkType.Value))
+    ) {
+      throw "検証対象pathにlinkまたはreparse pointがあります: $($item.FullName)"
+    }
+  }
+}
+
+function Get-TreeSnapshot {
+  param([Parameter(Mandatory = $true)][string]$Root)
+  if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+    return [ordered]@{ exists = $false; entries = @() }
+  }
+  Assert-RegularTree -Root $Root
+  $base = (Get-Item -LiteralPath $Root -Force).FullName.TrimEnd('\')
+  $entries = @(
+    Get-ChildItem -LiteralPath $Root -Force -Recurse -ErrorAction Stop |
+      Sort-Object FullName |
+      ForEach-Object {
+        if (-not $_.FullName.StartsWith($base + '\', [StringComparison]::OrdinalIgnoreCase)) {
+          throw "検証対象entryがtree rootの外側です: $($_.FullName)"
+        }
+        $relative = $_.FullName.Substring($base.Length + 1).Replace('\', '/')
+        if ($_.PSIsContainer) {
+          [ordered]@{ path = $relative; type = "directory" }
+        } else {
+          [ordered]@{
+            path = $relative
+            type = "file"
+            size = $_.Length
+            sha256 = Get-Sha256 -Path $_.FullName
+          }
+        }
+      }
+  )
+  return [ordered]@{ exists = $true; entries = $entries }
+}
+
+function Get-RegularFileState {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return [ordered]@{ exists = $false; size = $null; sha256 = $null }
+  }
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  $linkType = $item.PSObject.Properties["LinkType"]
+  if (
+    $item.PSIsContainer -or
+    ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+    ($null -ne $linkType -and -not [string]::IsNullOrWhiteSpace([string]$linkType.Value))
+  ) {
+    throw "検証対象fileがregular fileではありません: $Path"
+  }
+  return [ordered]@{
+    exists = $true
+    size = $item.Length
+    sha256 = Get-Sha256 -Path $item.FullName
+  }
+}
+
+function Get-RegistryState {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return [ordered]@{ exists = $false; values = @() }
+  }
+  $properties = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+  $values = @(
+    $properties.PSObject.Properties |
+      Where-Object { $_.Name -cnotmatch '^PS' } |
+      Sort-Object Name |
+      ForEach-Object {
+        [ordered]@{ name = $_.Name; value = [string]$_.Value }
+      }
+  )
+  return [ordered]@{ exists = $true; values = $values }
+}
+
+function Get-InstallerTestPaths {
+  $profile = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+  if ((Split-Path -Leaf $profile) -ine "vmtest") {
+    throw "installer VM検証は専用guest user vmtestでのみ実行できます: $profile"
+  }
+  $expectedLocalAppData = Join-Path $profile "AppData\Local"
+  $expectedRoamingAppData = Join-Path $profile "AppData\Roaming"
+  if ([IO.Path]::GetFullPath($env:LOCALAPPDATA) -ine [IO.Path]::GetFullPath($expectedLocalAppData)) {
+    throw "LOCALAPPDATAが専用guest profileの固定pathではありません。"
+  }
+  if ([IO.Path]::GetFullPath($env:APPDATA) -ine [IO.Path]::GetFullPath($expectedRoamingAppData)) {
+    throw "APPDATAが専用guest profileの固定pathではありません。"
+  }
+
+  $paths = [ordered]@{
+    profile = $profile
+    local_app_data = $expectedLocalAppData
+    install_root = Join-Path $expectedLocalAppData "Programs\LoLReplayTool"
+    user_data_root = Join-Path $expectedLocalAppData "LoLReplayTool"
+    start_menu = Join-Path $expectedRoamingAppData "Microsoft\Windows\Start Menu\Programs\LoL Replay Tool.lnk"
+    desktop = Join-Path ([Environment]::GetFolderPath("Desktop")) "LoL Replay Tool.lnk"
+    uninstall_registry = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{B8D87E69-41F7-4B28-978D-2F8FA5AF4BE2}_is1"
+    log_parent = Join-Path $expectedLocalAppData "Temp"
+  }
+  foreach ($name in @("install_root", "user_data_root", "start_menu", "desktop", "log_parent")) {
+    $paths[$name] = Assert-ProfilePath -Path $paths[$name] -Label $name
+  }
+  return [pscustomobject]$paths
+}
+
+function Get-InstallState {
+  param([Parameter(Mandatory = $true)][psobject]$Paths)
+  return [ordered]@{
+    install_tree = Get-TreeSnapshot -Root $Paths.install_root
+    user_data_tree = Get-TreeSnapshot -Root $Paths.user_data_root
+    uninstall_registry = Get-RegistryState -Path $Paths.uninstall_registry
+    start_menu = Get-RegularFileState -Path $Paths.start_menu
+    desktop = Get-RegularFileState -Path $Paths.desktop
+  }
+}
+
+function ConvertTo-StateJson {
+  param([Parameter(Mandatory = $true)]$Value)
+  return ($Value | ConvertTo-Json -Depth 20 -Compress)
+}
+
+function Assert-StateEqual {
+  param(
+    [Parameter(Mandatory = $true)]$Before,
+    [Parameter(Mandatory = $true)]$After,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+  if ((ConvertTo-StateJson -Value $Before) -cne (ConvertTo-StateJson -Value $After)) {
+    throw "$Label のbefore/after stateが一致しません。"
+  }
+}
+
+function Assert-InstallerAbsentState {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+  if (
+    $State.install_tree.exists -or
+    $State.uninstall_registry.exists -or
+    $State.start_menu.exists -or
+    $State.desktop.exists
+  ) {
+    throw "$Label にapp、registry、またはshortcutが存在します。"
+  }
+}
+
+function Assert-InstallerPresentState {
+  param(
+    [Parameter(Mandatory = $true)]$State,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+  if (
+    -not $State.install_tree.exists -or
+    -not $State.uninstall_registry.exists -or
+    -not $State.start_menu.exists -or
+    $State.desktop.exists
+  ) {
+    throw "$Label のapp、registry、またはshortcut stateが不正です。"
+  }
+}
+
+function New-RandomSentinel {
+  param([Parameter(Mandatory = $true)][string]$Path)
+  if (Test-Path -LiteralPath $Path) {
+    throw "controlled sentinelが既に存在します: $Path"
+  }
+  $bytes = [byte[]]::new(32)
+  $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+  try {
+    $rng.GetBytes($bytes)
+  } finally {
+    $rng.Dispose()
+  }
+  [IO.File]::WriteAllBytes($Path, $bytes)
+  return Get-RegularFileState -Path $Path
+}
+
+function Limit-Text {
+  param([AllowNull()][string]$Text)
+  if ($null -eq $Text -or $Text.Length -le 12000) { return $Text }
+  return $Text.Substring(0, 6000) + "`n...[truncated]...`n" + $Text.Substring($Text.Length - 6000)
+}
+
+function Invoke-BoundedProcess {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [Parameter(Mandatory = $true)][string[]]$Arguments,
+    [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+    [int]$TimeoutMilliseconds = 300000
+  )
+  $file = Get-Item -LiteralPath $FilePath -Force -ErrorAction Stop
+  $linkType = $file.PSObject.Properties["LinkType"]
+  if (
+    $file.PSIsContainer -or
+    ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+    ($null -ne $linkType -and -not [string]::IsNullOrWhiteSpace([string]$linkType.Value))
+  ) {
+    throw "実行対象がregular fileではありません: $FilePath"
+  }
+  if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+    throw "process working directoryがありません: $WorkingDirectory"
+  }
+
+  $startInfo = [Diagnostics.ProcessStartInfo]::new()
+  $startInfo.FileName = $file.FullName
+  $startInfo.WorkingDirectory = $WorkingDirectory
+  $startInfo.UseShellExecute = $false
+  $startInfo.CreateNoWindow = $true
+  $startInfo.RedirectStandardOutput = $true
+  $startInfo.RedirectStandardError = $true
+  foreach ($argument in $Arguments) {
+    if ([string]::IsNullOrWhiteSpace($argument) -or $argument -match '[\s"]') {
+      throw "process argumentに空白またはquoteを含めることはできません: $argument"
+    }
+  }
+  $startInfo.Arguments = $Arguments -join " "
+  $utf8 = [Text.UTF8Encoding]::new($false)
+  $startInfo.StandardOutputEncoding = $utf8
+  $startInfo.StandardErrorEncoding = $utf8
+
+  $process = [Diagnostics.Process]::new()
+  $process.StartInfo = $startInfo
+  try {
+    if (-not $process.Start()) {
+      throw "processを開始できません: $FilePath"
+    }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+      $process.Kill()
+      $process.WaitForExit()
+      throw "processがtimeoutしました: $FilePath"
+    }
+    $stdout = $stdoutTask.Result
+    $stderr = $stderrTask.Result
+    return [ordered]@{
+      exit_code = $process.ExitCode
+      stdout = Limit-Text -Text $stdout
+      stderr = Limit-Text -Text $stderr
+    }
+  } finally {
+    $process.Dispose()
+  }
+}
+
+function Invoke-Installer {
+  param(
+    [Parameter(Mandatory = $true)][psobject]$Paths,
+    [Parameter(Mandatory = $true)][string[]]$Arguments
+  )
+  $installer = Get-InstallerPath
+  $installerHash = Assert-FileHash -Path $installer -ExpectedSha256 $InstallerSha256 -Label "application installer"
+  $logRoot = Join-Path $Paths.log_parent ("LoLReplayTool-VM-Installer-" + [guid]::NewGuid().ToString("N"))
+  [void](Assert-ProfilePath -Path $logRoot -Label "installer log root")
+  if (Test-Path -LiteralPath $logRoot) {
+    throw "installer log rootが既に存在します: $logRoot"
+  }
+  $logCreated = $false
+  $processResult = $null
+  $logText = $null
+  $logCleanup = $false
+  try {
+    New-Item -ItemType Directory -Path $logRoot -ErrorAction Stop | Out-Null
+    $logCreated = $true
+    Assert-RegularTree -Root $logRoot
+    $logPath = Join-Path $logRoot "setup.log"
+    $allArguments = @(
+      "/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NOCANCEL", "/NORESTART",
+      "/NOCLOSEAPPLICATIONS", "/NORESTARTAPPLICATIONS", "/TASKS=", "/LANG=japanese",
+      "/LOG=$logPath"
+    ) + $Arguments
+    $processResult = Invoke-BoundedProcess `
+      -FilePath $installer `
+      -Arguments $allArguments `
+      -WorkingDirectory $logRoot
+    if (Test-Path -LiteralPath $logPath -PathType Leaf) {
+      $logText = Limit-Text -Text (Get-Content -LiteralPath $logPath -Raw -ErrorAction Stop)
+    }
+  } finally {
+    if ($logCreated) {
+      Assert-RegularTree -Root $logRoot
+      $resolvedLogRoot = (Resolve-Path -LiteralPath $logRoot -ErrorAction Stop).Path
+      if ($resolvedLogRoot -ine $logRoot) {
+        throw "installer log rootの物理pathが変化しました。"
+      }
+      [void](Assert-ProfilePath -Path $resolvedLogRoot -Label "installer log cleanup")
+      Remove-Item -LiteralPath $resolvedLogRoot -Force -Recurse -ErrorAction Stop
+      if (Test-Path -LiteralPath $logRoot) {
+        throw "installer log rootを削除できません。"
+      }
+      $logCleanup = $true
+    }
+  }
+  return [ordered]@{
+    installer = $InstallerRelativePath
+    installer_sha256 = $installerHash
+    exit_code = $processResult.exit_code
+    stdout = $processResult.stdout
+    stderr = $processResult.stderr
+    log = $logText
+    log_cleanup = $logCleanup
+  }
+}
+
+function Invoke-InstallerEnvironmentA {
+  $paths = Get-InstallerTestPaths
+  $initial = Get-InstallState -Paths $paths
+  Assert-InstallerAbsentState -State $initial -Label "Environment A initial state"
+  if ($initial.user_data_tree.exists) {
+    throw "Environment Aのcontrolled user-data rootが既に存在します。"
+  }
+  New-Item -ItemType Directory -Path $paths.user_data_root -ErrorAction Stop | Out-Null
+  Assert-RegularTree -Root $paths.user_data_root
+  $sentinelPath = Join-Path $paths.user_data_root "vm-a-sentinel.bin"
+  $sentinelState = New-RandomSentinel -Path $sentinelPath
+
+  $before = Get-InstallState -Paths $paths
+  $result = Invoke-Installer -Paths $paths -Arguments @()
+  $after = Get-InstallState -Paths $paths
+  if ($result.exit_code -ne 7) {
+    throw "Environment A installerが期待するexit 7ではありません: $($result.exit_code)"
+  }
+  Assert-InstallerAbsentState -State $after -Label "Environment A new-install rejection"
+  Assert-StateEqual -Before $before -After $after -Label "Environment A new-install rejection"
+
+  $controlledCreated = $false
+  $controlledBefore = $null
+  $controlledAfter = $null
+  $controlledResult = $null
+  $cleanupState = $null
+  $cleanup = $false
+  $controlledParent = Split-Path -Parent $paths.install_root
+  [void](Assert-ProfilePath -Path $controlledParent -Label "controlled install parent")
+  $controlledParentCreated = $false
+  try {
+    if (Test-Path -LiteralPath $paths.install_root) {
+      throw "controlled install rootが既に存在します。"
+    }
+    if (-not (Test-Path -LiteralPath $controlledParent -PathType Container)) {
+      New-Item -ItemType Directory -Path $controlledParent -ErrorAction Stop | Out-Null
+      $controlledParentCreated = $true
+      Assert-RegularTree -Root $controlledParent
+    }
+    New-Item -ItemType Directory -Path $paths.install_root -ErrorAction Stop | Out-Null
+    $controlledCreated = $true
+    Assert-RegularTree -Root $paths.install_root
+    $controlledSentinelPath = Join-Path $paths.install_root "vm-a-controlled-sentinel.bin"
+    [void](New-RandomSentinel -Path $controlledSentinelPath)
+    $controlledBefore = Get-InstallState -Paths $paths
+    $controlledResult = Invoke-Installer -Paths $paths -Arguments @()
+    $controlledAfter = Get-InstallState -Paths $paths
+    if ($controlledResult.exit_code -ne 7) {
+      throw "Environment A controlled updateが期待するexit 7ではありません: $($controlledResult.exit_code)"
+    }
+    Assert-StateEqual `
+      -Before $controlledBefore `
+      -After $controlledAfter `
+      -Label "Environment A controlled update rejection"
+  } finally {
+    if ($controlledCreated) {
+      Assert-RegularTree -Root $paths.install_root
+      $resolvedRoot = (Resolve-Path -LiteralPath $paths.install_root -ErrorAction Stop).Path
+      if ($resolvedRoot -ine $paths.install_root) {
+        throw "controlled install rootの物理pathが変化しました。"
+      }
+      [void](Assert-ProfilePath -Path $resolvedRoot -Label "controlled install root cleanup")
+      Remove-Item -LiteralPath $resolvedRoot -Force -Recurse -ErrorAction Stop
+      if (Test-Path -LiteralPath $paths.install_root) {
+        throw "controlled install rootを削除できません。"
+      }
+      $cleanup = $true
+    }
+    if ($controlledParentCreated) {
+      Assert-RegularTree -Root $controlledParent
+      if (@(Get-ChildItem -LiteralPath $controlledParent -Force -ErrorAction Stop).Count -ne 0) {
+        throw "controlled install parentに想定外のentryが残っています。"
+      }
+      Remove-Item -LiteralPath $controlledParent -Force -ErrorAction Stop
+      if (Test-Path -LiteralPath $controlledParent) {
+        throw "controlled install parentを削除できません。"
+      }
+    }
+  }
+  $cleanupState = Get-InstallState -Paths $paths
+  Assert-InstallerAbsentState -State $cleanupState -Label "Environment A cleanup"
+  if ((Get-RegularFileState -Path $sentinelPath).sha256 -cne $sentinelState.sha256) {
+    throw "Environment A cleanup後にuser-data sentinelが変化しました。"
+  }
+  return [ordered]@{
+    schema_version = 1
+    action = "InstallerEnvironmentA"
+    captured_at_utc = [DateTime]::UtcNow.ToString("o")
+    computer_name = $env:COMPUTERNAME
+    passed = $true
+    sentinel_sha256 = $sentinelState.sha256
+    before = $before
+    after = $after
+    result = $result
+    controlled_before = $controlledBefore
+    controlled_after = $controlledAfter
+    controlled_result = $controlledResult
+    controlled_cleanup = $cleanup
+    cleanup_state = $cleanupState
+  }
+}
+
+function Invoke-InstallerEnvironmentB {
+  $paths = Get-InstallerTestPaths
+  $precondition = Get-InstallState -Paths $paths
+  Assert-InstallerAbsentState -State $precondition -Label "Environment B precondition"
+  if (-not $precondition.user_data_tree.exists) {
+    throw "Environment B controlled user-data rootがありません。"
+  }
+  $aSentinelPath = Join-Path $paths.user_data_root "vm-a-sentinel.bin"
+  $aSentinelState = Get-RegularFileState -Path $aSentinelPath
+  if (-not $aSentinelState.exists) {
+    throw "Environment BへA sentinelが引き継がれていません。"
+  }
+
+  $install = Invoke-Installer -Paths $paths -Arguments @()
+  if ($install.exit_code -ne 0) {
+    throw "Environment B installer新規installが失敗しました: $($install.exit_code)"
+  }
+  $afterInstall = Get-InstallState -Paths $paths
+  Assert-InstallerPresentState -State $afterInstall -Label "Environment B install"
+  $appPath = Join-Path $paths.install_root "LoLReplayTool.exe"
+  $uninstallerPath = Join-Path $paths.install_root "unins000.exe"
+  $appBeforeUpdate = Get-RegularFileState -Path $appPath
+  $uninstallerState = Get-RegularFileState -Path $uninstallerPath
+  if (-not $appBeforeUpdate.exists -or -not $uninstallerState.exists) {
+    throw "Environment B installed appまたはuninstallerがありません。"
+  }
+  if ((Get-RegularFileState -Path $aSentinelPath).sha256 -cne $aSentinelState.sha256) {
+    throw "Environment B installがA sentinelを変更しました。"
+  }
+
+  $selfCheck = Invoke-BoundedProcess `
+    -FilePath $appPath `
+    -Arguments @("--self-check", "--json") `
+    -WorkingDirectory $paths.install_root
+  if ($selfCheck.exit_code -ne 0) {
+    throw "installed app self-checkが失敗しました: $($selfCheck.exit_code)"
+  }
+  try {
+    $selfJson = $selfCheck.stdout | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw "installed app self-check JSONが不正です: $($_.Exception.Message)"
+  }
+  $analyticsChecks = @($selfJson.checks | Where-Object { $_.name -ceq "analytics_runtime" })
+  $nativeChecks = @($selfJson.checks | Where-Object { $_.name -ceq "native_modules" })
+  if (
+    -not [bool]$selfJson.ok -or
+    $analyticsChecks.Count -ne 1 -or
+    $analyticsChecks[0].status -cne "ok" -or
+    $nativeChecks.Count -ne 1 -or
+    $nativeChecks[0].status -cne "ok"
+  ) {
+    throw "installed app self-checkのnative/analytics検査が不合格です。"
+  }
+
+  $updateSentinelPath = Join-Path $paths.user_data_root "vm-b-update-sentinel.bin"
+  $updateSentinelState = New-RandomSentinel -Path $updateSentinelPath
+  $beforeUpdate = Get-InstallState -Paths $paths
+  $update = Invoke-Installer -Paths $paths -Arguments @()
+  if ($update.exit_code -ne 0) {
+    throw "Environment B installer上書き更新が失敗しました: $($update.exit_code)"
+  }
+  $afterUpdate = Get-InstallState -Paths $paths
+  Assert-InstallerPresentState -State $afterUpdate -Label "Environment B update"
+  Assert-StateEqual `
+    -Before $beforeUpdate.user_data_tree `
+    -After $afterUpdate.user_data_tree `
+    -Label "Environment B update user-data"
+  if ((Get-RegularFileState -Path $aSentinelPath).sha256 -cne $aSentinelState.sha256) {
+    throw "Environment B updateがA sentinelを変更しました。"
+  }
+  if ((Get-RegularFileState -Path $updateSentinelPath).sha256 -cne $updateSentinelState.sha256) {
+    throw "Environment B updateがupdate sentinelを変更しました。"
+  }
+  $appAfterUpdate = Get-RegularFileState -Path $appPath
+  if ($appAfterUpdate.sha256 -cne $appBeforeUpdate.sha256) {
+    throw "同一installerによるupdate後にapp hashが変化しました。"
+  }
+
+  $uninstallerHash = (Get-RegularFileState -Path $uninstallerPath).sha256
+  $uninstall = Invoke-BoundedProcess `
+    -FilePath $uninstallerPath `
+    -Arguments @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") `
+    -WorkingDirectory $paths.log_parent
+  if ($uninstall.exit_code -ne 0) {
+    throw "silent uninstallが失敗しました: $($uninstall.exit_code)"
+  }
+  $deadline = [DateTime]::UtcNow.AddSeconds(15)
+  do {
+    $installExists = Test-Path -LiteralPath $paths.install_root
+    $registryExists = Test-Path -LiteralPath $paths.uninstall_registry
+    $startMenuExists = Test-Path -LiteralPath $paths.start_menu
+    $desktopExists = Test-Path -LiteralPath $paths.desktop
+    if (-not $installExists -and -not $registryExists -and -not $startMenuExists -and -not $desktopExists) {
+      break
+    }
+    Start-Sleep -Milliseconds 200
+  } while ([DateTime]::UtcNow -lt $deadline)
+
+  $afterUninstall = Get-InstallState -Paths $paths
+  Assert-InstallerAbsentState -State $afterUninstall -Label "Environment B uninstall"
+  Assert-StateEqual `
+    -Before $afterUpdate.user_data_tree `
+    -After $afterUninstall.user_data_tree `
+    -Label "Environment B uninstall user-data"
+  if ((Get-RegularFileState -Path $aSentinelPath).sha256 -cne $aSentinelState.sha256) {
+    throw "uninstall後にA sentinelが変化しました。"
+  }
+  if ((Get-RegularFileState -Path $updateSentinelPath).sha256 -cne $updateSentinelState.sha256) {
+    throw "uninstall後にupdate sentinelが変化しました。"
+  }
+
+  return [ordered]@{
+    schema_version = 1
+    action = "InstallerEnvironmentB"
+    captured_at_utc = [DateTime]::UtcNow.ToString("o")
+    computer_name = $env:COMPUTERNAME
+    passed = $true
+    a_sentinel_sha256 = $aSentinelState.sha256
+    update_sentinel_sha256 = $updateSentinelState.sha256
+    precondition = $precondition
+    install = $install
+    after_install = $afterInstall
+    self_check_exit_code = $selfCheck.exit_code
+    self_check = [ordered]@{
+      ok = [bool]$selfJson.ok
+      analytics_runtime = $analyticsChecks[0]
+      native_modules = $nativeChecks[0]
+      stdout = $selfCheck.stdout
+      stderr = $selfCheck.stderr
+    }
+    before_update = $beforeUpdate
+    update = $update
+    after_update = $afterUpdate
+    app_sha256_before_update = $appBeforeUpdate.sha256
+    app_sha256_after_update = $appAfterUpdate.sha256
+    uninstaller_sha256 = $uninstallerHash
+    uninstall_exit_code = $uninstall.exit_code
+    uninstall = $uninstall
+    after_uninstall = $afterUninstall
+  }
+}
+
 $result = switch ($Action) {
   "Inspect" { Get-Inspection }
   "InstallRuntime" { Install-ExternalRuntime }
   "SelfCheck" { Invoke-PackagedSelfCheck }
+  "InstallerEnvironmentA" { Invoke-InstallerEnvironmentA }
+  "InstallerEnvironmentB" { Invoke-InstallerEnvironmentB }
 }
 
 $result | ConvertTo-Json -Depth 12 -Compress

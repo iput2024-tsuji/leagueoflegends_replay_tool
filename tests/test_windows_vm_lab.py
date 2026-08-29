@@ -183,7 +183,7 @@ def _config(external_temp: Path, **overrides: object) -> tuple[Path, dict[str, o
     nat_config = external_temp / "vmnetnat.conf"
     nat_config.write_text("device = vmnet8\n", encoding="utf-8")
     values: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "vmrun_path": str(vmrun),
         "vmx_path": str(vmx),
         "vm_encryption_credential_path": str(
@@ -207,6 +207,8 @@ def _config(external_temp: Path, **overrides: object) -> tuple[Path, dict[str, o
         "payload_iso_sha256": hashlib.sha256(iso.read_bytes()).hexdigest(),
         "payload_volume_label": "LOLVC134",
         "runtime_installer_relative_path": "runtime/vc_redist.x64.exe",
+        "installer_relative_path": "installer/LoLReplayTool-Setup-0.5.2.exe",
+        "installer_sha256": "f" * 64,
         "runtime_installer_sha256": "1" * 64,
         "minimum_runtime_version": "14.44.35211.0",
         "app_relative_path": "app/LoLReplayTool.exe",
@@ -264,6 +266,51 @@ def _json_output(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
     return json.loads(lines[-1])
 
 
+def test_schema_v2_and_invalid_installer_fields_fail_closed(external_temp: Path):
+    config, values = _config(external_temp)
+    values["schema_version"] = 2
+    config.write_text(json.dumps(values), encoding="utf-8")
+    rejected = _run_lab(config, "Plan")
+    assert rejected.returncode != 0
+    values["schema_version"] = 3
+    values.pop("installer_sha256")
+    config.write_text(json.dumps(values), encoding="utf-8")
+    rejected = _run_lab(config, "Plan")
+    assert rejected.returncode != 0
+
+
+@pytest.mark.parametrize("installer_path", ["../setup.exe", "C:/setup.exe"])
+def test_installer_path_must_be_relative_without_parent(external_temp: Path, installer_path: str):
+    config, values = _config(external_temp)
+    values["installer_relative_path"] = installer_path
+    config.write_text(json.dumps(values), encoding="utf-8")
+    rejected = _run_lab(config, "Plan")
+    assert rejected.returncode != 0
+
+
+def test_installer_actions_are_forwarded_and_host_validated():
+    host = LAB_SCRIPT.read_text(encoding="utf-8")
+    guest = GUEST_SCRIPT.read_text(encoding="utf-8")
+    assert '"InstallerEnvironmentA"' in host
+    assert '"InstallerEnvironmentB"' in host
+    assert "$Config.installer_relative_path" in host
+    assert "$Config.installer_sha256" in host
+    assert "$result.controlled_cleanup" in host
+    assert "$result.uninstall_exit_code -ne 0" in host
+    assert "ProcessStartInfo" in guest
+    assert "$startInfo.Arguments =" in guest
+    assert "ArgumentList.Add" not in guest
+    assert "GetRelativePath" not in guest
+    assert "RandomNumberGenerator]::Fill" not in guest
+    assert "ConvertTo-NativeArgument" not in guest
+    assert "process argumentに空白またはquote" in guest
+    assert "$result.result.log_cleanup" in host
+    assert 'Where-Object { $_.path -ceq "vm-a-sentinel.bin" }' in host
+    assert 'Where-Object { $_.path -ceq "vm-b-update-sentinel.bin" }' in host
+    assert "InstallerEnvironmentA" in guest and "InstallerEnvironmentB" in guest
+    assert "$installerB.a_sentinel_sha256 -cne $installerA.sentinel_sha256" in host
+
+
 @pytest.mark.skipif(os.name != "nt", reason="IMAPI2FS is Windows-only")
 def test_iso_builder_creates_hashed_media_without_mutating_source(
     external_temp: Path,
@@ -272,9 +319,11 @@ def test_iso_builder_creates_hashed_media_without_mutating_source(
         pytest.skip("Windows PowerShell is unavailable")
     source = external_temp / "source-kit"
     (source / "LoLReplayTool-external-build").mkdir(parents=True)
+    (source / "installer").mkdir()
     (source / "evidence").mkdir()
     files = {
         "vc_redist.x64.exe": b"runtime",
+        "installer/LoLReplayTool-Setup-0.5.2.exe": b"installer",
         "LoLReplayTool-external-build/LoLReplayTool.exe": b"app",
         "02-test-environment-b.ps1": b"environment b",
         "run_packaged_self_check.ps1": b"runner",
@@ -332,6 +381,7 @@ def test_iso_builder_creates_hashed_media_without_mutating_source(
 def test_iso_builder_pins_tracked_runner_and_windows_powershell_encoding():
     source = ISO_BUILD_SCRIPT.read_text(encoding="utf-8-sig")
 
+    assert '"installer\\LoLReplayTool-Setup-0.5.2.exe"' in source
     assert '$selfCheckRunner = Join-Path $scriptDirectory "run_packaged_self_check.ps1"' in source
     assert "Copy-Item -LiteralPath $selfCheckRunner" in source
     assert '$utf8WithBom = [Text.UTF8Encoding]::new($true)' in source
@@ -431,9 +481,11 @@ def test_plan_is_non_mutating_and_keeps_a_b_order(external_temp: Path):
             "verify Environment A has no x64 Redistributable, VMware Tools, "
             "or default route"
         ),
+        "run the completed installer in Environment A and verify exit code 7 with no state changes",
         "install fixed Microsoft-signed Redistributable from the hashed ISO",
         "verify Environment B Runtime version",
         "run the fixed packaged self-check with isolated data",
+        "install, update, and silently uninstall the completed installer in Environment B",
         "write JSON evidence",
         "request guest OS shutdown",
     ]
@@ -1288,16 +1340,22 @@ def test_run_requires_all_explicit_mutation_confirmations(external_temp: Path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="guest probe uses Windows cmdlets")
-def test_guest_inspection_returns_machine_readable_schema():
+def test_guest_inspection_returns_machine_readable_schema(tmp_path: Path):
     if POWERSHELL is None:
         pytest.skip("pwsh is unavailable")
-    command = r'''
+    module_dir = tmp_path / "NetTCPIP"
+    module_dir.mkdir()
+    (module_dir / "NetTCPIP.psm1").write_text(
+        r'''
 function Get-NetRoute {
   param([string]$AddressFamily, [string]$PolicyStore, [string]$ErrorAction)
   return @()
 }
-& $env:TARGET_SCRIPT -Action Inspect
-'''
+Export-ModuleMember -Function Get-NetRoute
+''',
+        encoding="utf-8-sig",
+    )
+    command = r'''& $env:TARGET_SCRIPT -Action Inspect'''
     result = subprocess.run(
         [
             POWERSHELL,
@@ -1308,7 +1366,13 @@ function Get-NetRoute {
             "-Command",
             command,
         ],
-        env={**os.environ, "TARGET_SCRIPT": str(GUEST_SCRIPT)},
+        env={
+            **os.environ,
+            "TARGET_SCRIPT": str(GUEST_SCRIPT),
+            "PSModulePath": str(tmp_path)
+            + os.pathsep
+            + os.environ.get("PSModulePath", ""),
+        },
         capture_output=True,
         text=True,
         encoding="utf-8",

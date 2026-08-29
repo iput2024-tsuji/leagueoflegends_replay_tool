@@ -18,6 +18,7 @@ $bootstrapScript = Join-Path $scriptDirectory "windows_vm_lab_bootstrap.ps1"
 $selfCheckRunner = Join-Path $scriptDirectory "run_packaged_self_check.ps1"
 $requiredPaths = @(
   "vc_redist.x64.exe",
+  "installer\LoLReplayTool-Setup-0.5.2.exe",
   "LoLReplayTool-external-build\LoLReplayTool.exe",
   "02-test-environment-b.ps1",
   "run_packaged_self_check.ps1",

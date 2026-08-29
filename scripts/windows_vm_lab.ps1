@@ -213,6 +213,8 @@ function Read-LabConfig {
     "payload_iso_sha256",
     "payload_volume_label",
     "runtime_installer_relative_path",
+    "installer_relative_path",
+    "installer_sha256",
     "runtime_installer_sha256",
     "minimum_runtime_version",
     "app_relative_path",
@@ -231,7 +233,7 @@ function Read-LabConfig {
   if ($missingProperties.Count -gt 0) {
     throw "VM lab configに必須propertyがありません: $($missingProperties -join ', ')"
   }
-  if ([int]$config.schema_version -ne 2) {
+  if ([int]$config.schema_version -ne 3) {
     throw "未対応のVM lab config schemaです: $($config.schema_version)"
   }
 
@@ -291,11 +293,16 @@ function Read-LabConfig {
   $runtimeRelativePath = Get-RequiredString `
     -Config $config `
     -Name "runtime_installer_relative_path"
+  $installerRelativePath = Get-RequiredString `
+    -Config $config `
+    -Name "installer_relative_path"
+  $installerSha256 = (Get-RequiredString -Config $config -Name "installer_sha256").ToLowerInvariant()
   $appRelativePath = Get-RequiredString -Config $config -Name "app_relative_path"
   $environmentBScriptRelativePath = Get-RequiredString `
     -Config $config `
     -Name "environment_b_script_relative_path"
   Assert-RelativePayloadPath -Path $runtimeRelativePath -Label "runtime installer path"
+  Assert-RelativePayloadPath -Path $installerRelativePath -Label "application installer path"
   Assert-RelativePayloadPath -Path $appRelativePath -Label "application path"
   Assert-RelativePayloadPath `
     -Path $environmentBScriptRelativePath `
@@ -317,7 +324,8 @@ function Read-LabConfig {
     $payloadIsoSha256,
     $runtimeInstallerSha256,
     $appSha256,
-    $environmentBScriptSha256
+    $environmentBScriptSha256,
+    $installerSha256
   )) {
     if ($hash -cnotmatch '^[0-9a-f]{64}$') {
       throw "VM lab configのSHA256が不正です。"
@@ -390,7 +398,7 @@ function Read-LabConfig {
   }
 
   return [pscustomobject][ordered]@{
-    schema_version = 2
+    schema_version = 3
     config_path = $resolvedConfigPath
     config_sha256 = Get-Sha256 -Path $resolvedConfigPath
     vmrun_path = $vmrunPath
@@ -414,6 +422,8 @@ function Read-LabConfig {
     payload_iso_sha256 = $payloadIsoSha256
     payload_volume_label = $volumeLabel
     runtime_installer_relative_path = $runtimeRelativePath
+    installer_relative_path = $installerRelativePath
+    installer_sha256 = $installerSha256
     runtime_installer_sha256 = $runtimeInstallerSha256
     minimum_runtime_version = $minimumRuntimeVersion
     app_relative_path = $appRelativePath
@@ -1155,9 +1165,11 @@ function Get-LabPlan {
       "start VM without GUI",
       "verify WinRM over host-only vmnet1",
       "verify Environment A has no x64 Redistributable, VMware Tools, or default route",
+      "run the completed installer in Environment A and verify exit code 7 with no state changes",
       "install fixed Microsoft-signed Redistributable from the hashed ISO",
       "verify Environment B Runtime version",
       "run the fixed packaged self-check with isolated data",
+      "install, update, and silently uninstall the completed installer in Environment B",
       "write JSON evidence",
     "request guest OS shutdown"
     )
@@ -1429,7 +1441,7 @@ function Invoke-GuestAction {
     [Parameter(Mandatory = $true)]
     [Management.Automation.Runspaces.PSSession]$Session,
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Inspect", "InstallRuntime", "SelfCheck")]
+    [ValidateSet("Inspect", "InstallRuntime", "SelfCheck", "InstallerEnvironmentA", "InstallerEnvironmentB")]
     [string]$GuestAction
   )
 
@@ -1442,6 +1454,8 @@ function Invoke-GuestAction {
         $Config.payload_volume_label,
         $Config.runtime_installer_relative_path,
         $Config.runtime_installer_sha256,
+        $Config.installer_relative_path,
+        $Config.installer_sha256,
         $Config.minimum_runtime_version,
         $Config.app_relative_path,
         $Config.app_sha256,
@@ -1470,6 +1484,70 @@ function Invoke-GuestAction {
     )
   ) {
     throw "guest action '$GuestAction' のschema/action/computer/timestampが不正です。"
+  }
+  if ($GuestAction -ceq "InstallerEnvironmentA") {
+    if (
+      -not $result.passed -or
+      $result.result.exit_code -ne 7 -or
+      $result.controlled_result.exit_code -ne 7 -or
+      -not $result.result.log_cleanup -or
+      -not $result.controlled_result.log_cleanup -or
+      $result.result.installer_sha256 -cne $Config.installer_sha256 -or
+      $result.controlled_result.installer_sha256 -cne $Config.installer_sha256 -or
+      -not $result.controlled_cleanup -or
+      [string]$result.sentinel_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+      $null -eq $result.before -or
+      $null -eq $result.after -or
+      $null -eq $result.controlled_before -or
+      $null -eq $result.controlled_after -or
+      $result.cleanup_state.install_tree.exists -or
+      -not $result.cleanup_state.user_data_tree.exists
+    ) {
+      throw "Environment A installer検証が不合格です。"
+    }
+  }
+  if ($GuestAction -ceq "InstallerEnvironmentB") {
+    if (
+      -not $result.passed -or
+      $result.install.exit_code -ne 0 -or
+      -not $result.install.log_cleanup -or
+      $result.install.installer_sha256 -cne $Config.installer_sha256 -or
+      $result.self_check_exit_code -ne 0 -or
+      -not $result.self_check.ok -or
+      $result.self_check.analytics_runtime.status -cne "ok" -or
+      $result.self_check.native_modules.status -cne "ok" -or
+      $result.update.exit_code -ne 0 -or
+      -not $result.update.log_cleanup -or
+      $result.update.installer_sha256 -cne $Config.installer_sha256 -or
+      $result.uninstall_exit_code -ne 0 -or
+      [string]$result.a_sentinel_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+      [string]$result.update_sentinel_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+      $result.after_uninstall.install_tree.exists -or
+      $result.after_uninstall.uninstall_registry.exists -or
+      $result.after_uninstall.start_menu.exists -or
+      $result.after_uninstall.desktop.exists -or
+      -not $result.after_uninstall.user_data_tree.exists
+    ) {
+      throw "Environment B installer検証が不合格です。"
+    }
+    $finalASentinel = @(
+      $result.after_uninstall.user_data_tree.entries |
+        Where-Object { $_.path -ceq "vm-a-sentinel.bin" }
+    )
+    $finalUpdateSentinel = @(
+      $result.after_uninstall.user_data_tree.entries |
+        Where-Object { $_.path -ceq "vm-b-update-sentinel.bin" }
+    )
+    if (
+      $finalASentinel.Count -ne 1 -or
+      $finalASentinel[0].type -cne "file" -or
+      $finalASentinel[0].sha256 -cne $result.a_sentinel_sha256 -or
+      $finalUpdateSentinel.Count -ne 1 -or
+      $finalUpdateSentinel[0].type -cne "file" -or
+      $finalUpdateSentinel[0].sha256 -cne $result.update_sentinel_sha256
+    ) {
+      throw "Environment B uninstall後のuser-data sentinel証拠が不正です。"
+    }
   }
   return $result
 }
@@ -1969,6 +2047,14 @@ function Invoke-LabRun {
       -Value $environmentA
     Assert-EnvironmentA -Config $Config -Inspection $environmentA
 
+    $installerA = Invoke-GuestAction `
+      -Config $Config `
+      -Session $session `
+      -GuestAction "InstallerEnvironmentA"
+    Write-EvidenceJson `
+      -Path (Join-Path $runDirectory "installer-environment-a.json") `
+      -Value $installerA
+
     $runtimeInstall = Invoke-GuestAction `
       -Config $Config `
       -Session $session `
@@ -1996,6 +2082,17 @@ function Invoke-LabRun {
     Write-EvidenceJson `
       -Path (Join-Path $runDirectory "packaged-self-check.json") `
       -Value $selfCheck
+
+    $installerB = Invoke-GuestAction `
+      -Config $Config `
+      -Session $session `
+      -GuestAction "InstallerEnvironmentB"
+    Write-EvidenceJson `
+      -Path (Join-Path $runDirectory "installer-environment-b.json") `
+      -Value $installerB
+    if ($installerB.a_sentinel_sha256 -cne $installerA.sentinel_sha256) {
+      throw "Environment A/Bのuser-data sentinelが一致しません。"
+    }
   } catch {
     $runError = $_.Exception.Message
   } finally {

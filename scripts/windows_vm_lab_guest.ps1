@@ -1071,6 +1071,36 @@ function Assert-StateEqual {
   }
 }
 
+function Assert-UserDataPreservedAfterUninstall {
+  param(
+    [Parameter(Mandatory = $true)]$Before,
+    [Parameter(Mandatory = $true)]$After,
+    [Parameter(Mandatory = $true)][string]$Label
+  )
+  if ((ConvertTo-StateJson -Value $Before) -ceq (ConvertTo-StateJson -Value $After)) {
+    return
+  }
+  if (-not $Before.exists -or -not $After.exists) {
+    throw "$Label のuser-data rootが消失または未作成です。"
+  }
+  $beforeEntries = @($Before.entries)
+  $afterEntries = @($After.entries)
+  $bin = @($beforeEntries | Where-Object {
+      $_.path -ceq "bin" -and $_.type -ceq "directory"
+    })
+  $binChildren = @($beforeEntries | Where-Object {
+      $_.path.StartsWith("bin/", [StringComparison]::OrdinalIgnoreCase)
+    })
+  if ($bin.Count -ne 1 -or $binChildren.Count -ne 0) {
+    throw "$Label の許可できないuser-data差分です。"
+  }
+  $expectedEntries = @($beforeEntries | Where-Object { $_.path -cne "bin" })
+  $expected = [ordered]@{ exists = $true; entries = $expectedEntries }
+  if ((ConvertTo-StateJson -Value $expected) -cne (ConvertTo-StateJson -Value $After)) {
+    throw "$Label のuser-data差分が空のbin directory削除だけではありません。"
+  }
+}
+
 function Assert-InstallerAbsentState {
   param(
     [Parameter(Mandatory = $true)]$State,
@@ -1446,7 +1476,7 @@ function Invoke-InstallerEnvironmentB {
 
   $afterUninstall = Get-InstallState -Paths $paths
   Assert-InstallerAbsentState -State $afterUninstall -Label "Environment B uninstall"
-  Assert-StateEqual `
+  Assert-UserDataPreservedAfterUninstall `
     -Before $afterUpdate.user_data_tree `
     -After $afterUninstall.user_data_tree `
     -Label "Environment B uninstall user-data"

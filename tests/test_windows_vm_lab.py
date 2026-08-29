@@ -314,6 +314,77 @@ def test_installer_actions_are_forwarded_and_host_validated():
 @pytest.mark.skipif(
     WINDOWS_POWERSHELL is None, reason="Windows PowerShell is unavailable"
 )
+def test_uninstall_allows_only_empty_bin_directory_removal():
+    command = r'''
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+  $env:TARGET_SCRIPT, [ref]$tokens, [ref]$errors
+)
+foreach ($name in @("ConvertTo-StateJson", "Assert-UserDataPreservedAfterUninstall")) {
+  $fn = $ast.Find({ param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq $name
+  }, $true)
+  if ($null -eq $fn) { throw "helper not found: $name" }
+  . ([scriptblock]::Create($fn.Extent.Text))
+}
+function Assert-Accepts($before, $after) {
+  Assert-UserDataPreservedAfterUninstall -Before $before -After $after -Label "case"
+}
+$base = [ordered]@{
+  exists = $true
+  entries = @(
+    [ordered]@{ path = "recordings"; type = "directory" },
+    [ordered]@{ path = "settings.json"; type = "file"; size = 1; sha256 = "a" },
+    [ordered]@{ path = "bin"; type = "directory" }
+  )
+}
+$exact = $base | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+Assert-Accepts $exact ($base | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+$withoutBin = [ordered]@{
+  exists = $true
+  entries = @($base.entries | Where-Object { $_.path -cne "bin" })
+}
+Assert-Accepts $exact ($withoutBin | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+$withBinChild = [ordered]@{
+  exists = $true
+  entries = @($base.entries + [ordered]@{ path = "bin/child.txt"; type = "file"; size = 1; sha256 = "b" })
+}
+$removedBinAndChild = [ordered]@{
+  exists = $true
+  entries = @($withBinChild.entries | Where-Object { $_.path -notlike "bin*" })
+}
+$failed = $false
+try {
+  Assert-UserDataPreservedAfterUninstall `
+    -Before ($withBinChild | ConvertTo-Json -Depth 10 | ConvertFrom-Json) `
+    -After ($removedBinAndChild | ConvertTo-Json -Depth 10 | ConvertFrom-Json) `
+    -Label "removed bin subtree"
+} catch { $failed = $true }
+if (-not $failed) { throw "removed populated bin subtree was accepted" }
+$badCases = @(
+  [ordered]@{ exists = $true; entries = @($base.entries + [ordered]@{ path = "new.txt"; type = "file"; size = 1; sha256 = "b" }) },
+  [ordered]@{ exists = $true; entries = @($base.entries | Where-Object { $_.path -cne "settings.json" }) },
+  [ordered]@{ exists = $true; entries = @($base.entries + [ordered]@{ path = "bin\child.txt"; type = "file"; size = 1; sha256 = "b" }) },
+  [ordered]@{ exists = $false; entries = @() }
+)
+foreach ($bad in $badCases) {
+  $failed = $false
+  try { Assert-UserDataPreservedAfterUninstall -Before $exact -After $bad -Label "bad" } catch { $failed = $true }
+  if (-not $failed) { throw "invalid uninstall tree was accepted" }
+}
+'''
+    result = subprocess.run(
+        [WINDOWS_POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", command],
+        env={**os.environ, "TARGET_SCRIPT": str(GUEST_SCRIPT)},
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
+@pytest.mark.skipif(
+    WINDOWS_POWERSHELL is None, reason="Windows PowerShell is unavailable"
+)
 def test_invoke_installer_accepts_empty_arguments_in_windows_powershell():
     """PowerShell 5.1 treats a mandatory empty string array as unbound."""
     source = GUEST_SCRIPT.read_text(encoding="utf-8-sig")

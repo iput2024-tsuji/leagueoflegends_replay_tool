@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -202,11 +204,120 @@ def _native_runtime_summary() -> str:
     if gray.shape != (2, 2):
         raise RuntimeError(f"OpenCV conversion returned an unexpected shape: {gray.shape}")
 
+    qt_summary = _qt_runtime_summary(QtCore)
     return (
-        f"PyQt6/Qt {QtCore.qVersion()}; NumPy {np.__version__}; "
+        f"{qt_summary}; NumPy {np.__version__}; "
         f"pandas {pd.__version__}; scikit-learn {sklearn.__version__}; "
         f"OpenCV {cv2.__version__}"
     )
+
+
+def _qt_runtime_summary(QtCore: Any) -> str:
+    application = QtCore.QCoreApplication.instance()
+    if application is None:
+        application = QtCore.QCoreApplication(["LoLReplayTool-self-check"])
+
+    locale = QtCore.QLocale("ja_JP")
+    number_text = locale.toString(1234.5, "f", 1)
+    date_text = locale.toString(
+        QtCore.QDate(2026, 8, 30),
+        QtCore.QLocale.FormatType.LongFormat,
+    )
+    if not number_text or not date_text:
+        raise RuntimeError("Qt locale formatting returned an empty result")
+
+    collator = QtCore.QCollator(locale)
+    if collator.compare("あ", "い") >= 0:
+        raise RuntimeError("Qt Japanese collation returned an unexpected order")
+
+    boundary_finder = QtCore.QTextBoundaryFinder(
+        QtCore.QTextBoundaryFinder.BoundaryType.Word,
+        "録画テスト replay",
+    )
+    if boundary_finder.toNextBoundary() <= 0:
+        raise RuntimeError("Qt Unicode boundary detection returned no boundary")
+
+    summary = f"PyQt6/Qt {QtCore.qVersion()} (locale/collation/Unicode ok)"
+    if os.name == "nt":
+        summary += f"; {_windows_system_icu_summary()}"
+    return summary
+
+
+def _windows_system_icu_summary() -> str:
+    build = _windows_build_number()
+    if build < 22000:
+        raise RuntimeError(
+            f"Windows build {build} is below the supported Windows 11 minimum 22000"
+        )
+    system_directory = _windows_system_directory()
+    loaded_path = _loaded_windows_module_path("icuuc.dll")
+    expected_path = os.path.join(system_directory, "icuuc.dll")
+    actual_canonical = _canonical_path(loaded_path)
+    expected_canonical = _canonical_path(expected_path)
+    if actual_canonical != expected_canonical:
+        raise RuntimeError(
+            "Qt loaded icuuc.dll outside the Windows system directory: "
+            f"actual={loaded_path}; expected={expected_path}"
+        )
+    return f"Windows build {build}; icuuc.dll={loaded_path}"
+
+
+def _windows_build_number() -> int:
+    return int(sys.getwindowsversion().build)
+
+
+def _windows_system_directory() -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_system_directory = kernel32.GetSystemDirectoryW
+    get_system_directory.argtypes = [wintypes.LPWSTR, wintypes.UINT]
+    get_system_directory.restype = wintypes.UINT
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_system_directory(buffer, len(buffer))
+    if length == 0 or length >= len(buffer):
+        raise OSError(
+            ctypes.get_last_error(),
+            "GetSystemDirectoryW failed or returned a truncated path",
+        )
+    return buffer.value
+
+
+def _loaded_windows_module_path(module_name: str) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_module_handle = kernel32.GetModuleHandleW
+    get_module_handle.argtypes = [wintypes.LPCWSTR]
+    get_module_handle.restype = wintypes.HMODULE
+    handle = get_module_handle(module_name)
+    if not handle:
+        raise OSError(
+            ctypes.get_last_error(),
+            f"{module_name} is not loaded in the self-check process",
+        )
+
+    get_module_filename = kernel32.GetModuleFileNameW
+    get_module_filename.argtypes = [
+        wintypes.HMODULE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    get_module_filename.restype = wintypes.DWORD
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = get_module_filename(handle, buffer, len(buffer))
+    if length == 0 or length >= len(buffer):
+        raise OSError(
+            ctypes.get_last_error(),
+            f"GetModuleFileNameW failed or truncated {module_name}",
+        )
+    return buffer.value
+
+
+def _canonical_path(path: str) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
 
 
 def _is_writable_directory(path: str | Path) -> bool:

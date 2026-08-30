@@ -29,6 +29,11 @@ from collections.abc import Callable, Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
+from scripts.binary_install_policy import (
+    BinaryInstallPolicyError,
+    expected_install_archive,
+    external_vc_runtime_policy,
+)
 from scripts.collect_licenses import (
     COMPONENTS_FILE,
     canonicalize_distribution_name,
@@ -432,6 +437,18 @@ def _release_binary_policy_errors(lock: dict[str, Any]) -> list[str]:
     for component in _component_entries(lock):
         if component.get("component") in required:
             errors.extend(_wheel_compatibility_errors(component, policy))
+    try:
+        external_policy = external_vc_runtime_policy(lock)
+    except BinaryInstallPolicyError as exc:
+        errors.append(f"external_vc_runtime_policy: {exc}")
+    else:
+        if external_policy is not None and not set(
+            external_policy["required_components"]
+        ).issubset(required):
+            errors.append(
+                "external_vc_runtime_policy: component set is outside the "
+                "release binary policy"
+            )
     return errors
 
 
@@ -1459,6 +1476,185 @@ def flatten_exact_requirements(
     return pins, sorted(inputs, key=lambda item: item["path"].casefold())
 
 
+def _prepare_external_vc_runtime_wheels(
+    *,
+    components_file: Path,
+    lock: dict[str, Any],
+    cache_dir: Path,
+    binary_payload: dict[str, Any],
+    opener: Callable[..., BinaryIO],
+) -> dict[str, Any] | None:
+    try:
+        policy = external_vc_runtime_policy(lock)
+    except BinaryInstallPolicyError as exc:
+        raise ReleaseAssetError(str(exc)) from exc
+    if policy is None:
+        return None
+    from scripts import prepare_external_vc_runtime_wheels as external_wheels
+
+    output_dir = cache_dir / "external-vc-runtime-wheels"
+    if os.path.lexists(output_dir):
+        raise ReleaseAssetError(
+            f"External VC++ Runtime wheel output already exists: {output_dir}"
+        )
+    tool_dir = cache_dir / "external-vc-runtime-tools"
+    fetch_verified_sources(policy["tool_artifacts"], tool_dir, opener=opener)
+    binary_by_component = {
+        str(item["component"]): item for item in binary_payload["archives"]
+    }
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".external-vc-runtime-input-",
+            dir=cache_dir,
+        ) as temporary:
+            input_dir = Path(temporary)
+            for component_name in policy["required_components"]:
+                binary = binary_by_component.get(component_name)
+                if binary is None:
+                    raise ReleaseAssetError(
+                        "External VC++ Runtime component has no verified source "
+                        f"wheel: {component_name}"
+                    )
+                source = cache_dir / str(binary["filename"])
+                _require_regular_file(source, label="External Runtime source wheel")
+                shutil.copyfile(source, input_dir / source.name)
+            external_wheels.run(
+                input_dir,
+                output_dir,
+                components_file,
+                tool_dir,
+            )
+        provenance = external_wheels.validate_output_directory(
+            output_dir,
+            components_file,
+        )
+    except (
+        BinaryInstallPolicyError,
+        external_wheels.WheelError,
+        OSError,
+        subprocess.CalledProcessError,
+        zipfile.BadZipFile,
+    ) as exc:
+        raise ReleaseAssetError(
+            f"External VC++ Runtime wheel preparation failed: {exc}"
+        ) from exc
+    provenance_path = output_dir / external_wheels.PROVENANCE_NAME
+    return {
+        "directory": str(output_dir.resolve()),
+        "provenance": str(provenance_path.resolve()),
+        "provenance_sha256": sha256_file(provenance_path),
+        "payload": provenance,
+    }
+
+
+def _resolve_external_vc_runtime_plan(
+    *,
+    components_file: Path,
+    lock: dict[str, Any],
+    plan: dict[str, Any],
+    plan_path: Path,
+) -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None]:
+    try:
+        policy = external_vc_runtime_policy(lock)
+    except BinaryInstallPolicyError as exc:
+        raise ReleaseAssetError(str(exc)) from exc
+    if plan.get("components_file") != str(components_file.resolve()):
+        raise ReleaseAssetError("Binary install plan component lock path differs.")
+    raw = plan.get("external_vc_runtime_wheels")
+    if policy is None:
+        if raw is not None:
+            raise ReleaseAssetError(
+                "Binary install plan has unexpected external Runtime wheels."
+            )
+        return None, None, None
+    if not isinstance(raw, dict) or set(raw) != {
+        "directory",
+        "provenance",
+        "provenance_sha256",
+    }:
+        raise ReleaseAssetError(
+            "Binary install plan external Runtime provenance is invalid."
+        )
+    directory = Path(str(raw["directory"]))
+    provenance_path = Path(str(raw["provenance"]))
+    if (
+        not _is_within_directory(plan_path.parent, directory)
+        or provenance_path.parent.resolve() != directory.resolve()
+    ):
+        raise ReleaseAssetError(
+            "External Runtime wheel directory escapes the install plan directory."
+        )
+    _require_regular_file(
+        provenance_path,
+        label="External Runtime wheel provenance",
+    )
+    if raw["provenance_sha256"] != sha256_file(provenance_path):
+        raise ReleaseAssetError(
+            "External Runtime wheel provenance SHA256 differs from the plan."
+        )
+    from scripts import prepare_external_vc_runtime_wheels as external_wheels
+
+    try:
+        payload = external_wheels.validate_output_directory(
+            directory,
+            components_file,
+        )
+    except (BinaryInstallPolicyError, external_wheels.WheelError, OSError) as exc:
+        raise ReleaseAssetError(
+            f"External Runtime wheel validation failed: {exc}"
+        ) from exc
+    return directory, payload, raw
+
+
+def _binary_install_requirements(
+    *,
+    lock: dict[str, Any],
+    pins: list[dict[str, str]],
+    binary_by_name: dict[str, dict[str, Any]],
+    binary_cache_dir: Path,
+    external_dir: Path | None,
+) -> list[tuple[dict[str, Any], Path]]:
+    components = {
+        canonicalize_distribution_name(str(item["distribution"])): item
+        for item in _component_entries(lock)
+        if item.get("distribution")
+    }
+    result: list[tuple[dict[str, Any], Path]] = []
+    for pin in pins:
+        binary = binary_by_name.get(pin["canonical_name"])
+        component = components.get(pin["canonical_name"])
+        if binary is None or component is None:
+            raise ReleaseAssetError(
+                f"Release requirement has no locked wheel: {pin['name']}"
+            )
+        try:
+            source_kind, archive = expected_install_archive(lock, component)
+        except BinaryInstallPolicyError as exc:
+            raise ReleaseAssetError(str(exc)) from exc
+        if source_kind == "external-vc-runtime-wheel":
+            if external_dir is None:
+                raise ReleaseAssetError(
+                    f"External Runtime wheel is missing: {pin['name']}"
+                )
+            path = external_dir / str(archive["filename"])
+        else:
+            path = binary_cache_dir / str(archive["filename"])
+        record: dict[str, Any] = {
+            **pin,
+            "source": source_kind,
+            "component": binary["component"],
+            "distribution": binary["distribution"],
+            **archive,
+        }
+        if source_kind == "external-vc-runtime-wheel":
+            record["upstream_archive"] = {
+                key: binary[key]
+                for key in ("filename", "url", "sha256", "size")
+            }
+        result.append((record, path))
+    return result
+
+
 def prepare_binary_install(
     *,
     components_file: Path,
@@ -1469,6 +1665,10 @@ def prepare_binary_install(
     opener: Callable[..., BinaryIO] = urllib.request.urlopen,
 ) -> dict[str, Any]:
     lock = _load_lock(components_file)
+    if not _is_within_directory(output_plan.parent, cache_dir):
+        raise ReleaseAssetError(
+            "Binary cache must remain inside the install plan directory."
+        )
     pins, requirement_inputs = flatten_exact_requirements(requirements_file)
     pins_by_name = {item["canonical_name"]: item for item in pins}
     locked_distributions: dict[str, dict[str, Any]] = {}
@@ -1505,32 +1705,38 @@ def prepare_binary_install(
         canonicalize_distribution_name(str(record["distribution"])): record
         for record in binary_payload["archives"]
     }
+    external = _prepare_external_vc_runtime_wheels(
+        components_file=components_file,
+        lock=lock,
+        cache_dir=cache_dir,
+        binary_payload=binary_payload,
+        opener=opener,
+    )
+    external_dir = Path(external["directory"]) if external is not None else None
+    install_requirements = _binary_install_requirements(
+        lock=lock,
+        pins=pins,
+        binary_by_name=binary_by_name,
+        binary_cache_dir=cache_dir,
+        external_dir=external_dir,
+    )
     lines = [
         "# Generated from exact repository pins and verified locked wheels.",
         "# Do not edit or reuse outside this release run.",
     ]
     plan_requirements = []
-    for pin in pins:
-        binary = binary_by_name.get(pin["canonical_name"])
-        if binary is None:
-            raise ReleaseAssetError(
-                f"Release requirement has no locked wheel: {pin['name']}"
-            )
-        wheel_path = cache_dir / str(binary["filename"])
+    for requirement, wheel_path in install_requirements:
+        _require_regular_file(wheel_path, label="Verified install wheel")
+        wheel_record = {
+            "distribution": requirement["name"],
+            "version": requirement["version"],
+        }
+        _verify_wheel_metadata(wheel_path, wheel_record)
         wheel_url = wheel_path.resolve().as_uri()
         lines.append(
-            f"{pin['name']} @ {wheel_url}#sha256={binary['sha256']}"
+            f"{requirement['name']} @ {wheel_url}#sha256={requirement['sha256']}"
         )
-        plan_requirements.append(
-            {
-                **pin,
-                "source": "locked-wheel",
-                "component": binary["component"],
-                "filename": binary["filename"],
-                "sha256": binary["sha256"],
-                "size": binary["size"],
-            }
-        )
+        plan_requirements.append(requirement)
 
     for target, label in (
         (output_requirements, "Generated release requirements"),
@@ -1546,6 +1752,7 @@ def prepare_binary_install(
     ).encode("utf-8")
     plan = {
         "schema_version": 1,
+        "components_file": str(components_file.resolve()),
         "component_lock_sha256": sha256_file(components_file),
         "requirements_file": str(requirements_file.resolve()),
         "requirements_inputs": requirement_inputs,
@@ -1556,6 +1763,14 @@ def prepare_binary_install(
         "release_binary_policy": lock["release_binary_policy"],
         "binary_manifest": str(binary_manifest_path.resolve()),
         "binary_manifest_sha256": sha256_file(binary_manifest_path),
+        "external_vc_runtime_wheels": (
+            {
+                key: external[key]
+                for key in ("directory", "provenance", "provenance_sha256")
+            }
+            if external is not None
+            else None
+        ),
         "requirements": plan_requirements,
     }
     output_plan.write_text(
@@ -1656,6 +1871,21 @@ def _generated_pyc_matches_source(pyc_path: Path, source_path: Path) -> bool:
     )
 
 
+def _generated_pyc_source(pyc_path: Path) -> Path | None:
+    """Return the source for a PEP 3147 cache path, including dotted filenames."""
+    cache_tag = sys.implementation.cache_tag
+    if cache_tag is None or pyc_path.parent.name.casefold() != "__pycache__":
+        return None
+    match = re.fullmatch(
+        rf"(?P<stem>.+)\.{re.escape(cache_tag)}(?:\.opt-[12])?\.pyc",
+        pyc_path.name,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    return (pyc_path.parent.parent / f"{match.group('stem')}.py").resolve()
+
+
 def _verify_installed_distribution_from_wheel(
     distribution_name: str,
     wheel_path: Path,
@@ -1675,6 +1905,7 @@ def _verify_installed_distribution_from_wheel(
             f"Installed distribution root escapes environment: {distribution_name}"
         )
     expected_by_target: dict[str, dict[str, Any]] = {}
+    expected_by_wheel_path: dict[str, dict[str, Any]] = {}
     record_target: Path | None = None
     for artifact in wheel_inventory["artifacts"]:
         target = _installed_wheel_target(
@@ -1688,6 +1919,10 @@ def _verify_installed_distribution_from_wheel(
                 f"Wheel members collide after installation: {distribution_name}"
             )
         expected_by_target[key] = {**artifact, "target": target}
+        expected_by_wheel_path[str(artifact["path"]).casefold()] = {
+            **artifact,
+            "target": target,
+        }
         if artifact["path"] == wheel_inventory["record_path"]:
             record_target = target
     if record_target is None:
@@ -1705,6 +1940,12 @@ def _verify_installed_distribution_from_wheel(
             f"Installed RECORD is invalid for {distribution_name}: {exc}"
         ) from exc
     actual_by_target: dict[str, dict[str, Any]] = {}
+    recorded_metadata_targets: set[str] = set()
+    locked_record_targets: set[str] = set()
+    expected_record_kinds: dict[str, set[str]] = {}
+    record_self_spellings: set[str] = set()
+    missing_record_targets: set[str] = set()
+    relocated_record_targets: set[str] = set()
     for row in installed_rows:
         if len(row) != 3 or not row[0]:
             raise ReleaseAssetError(
@@ -1717,17 +1958,98 @@ def _verify_installed_distribution_from_wheel(
                 f"Installed RECORD escapes environment for {distribution_name}: {row[0]}"
             )
         key = os.path.normcase(str(candidate))
-        if key in actual_by_target:
-            raise ReleaseAssetError(
-                f"Installed RECORD path is duplicated for {distribution_name}: {row[0]}"
+        recorded_metadata_targets.add(key)
+        if not os.path.lexists(candidate):
+            if key in missing_record_targets:
+                raise ReleaseAssetError(
+                    f"Installed RECORD path is duplicated for {distribution_name}: {row[0]}"
+                )
+            missing_record_targets.add(key)
+            try:
+                wheel_member = _safe_archive_member(
+                    row[0],
+                    label=f"installed RECORD for {distribution_name}",
+                ).as_posix()
+            except ReleaseAssetError:
+                wheel_member = ""
+            expected_origin = expected_by_wheel_path.get(wheel_member.casefold())
+            member_parts = PurePosixPath(wheel_member).parts
+            is_relocated_script = (
+                expected_origin is not None
+                and len(member_parts) >= 3
+                and member_parts[0].casefold().endswith(".data")
+                and member_parts[1].casefold() == "scripts"
+                and candidate != expected_origin["target"]
             )
+            if not is_relocated_script:
+                raise ReleaseAssetError(
+                    f"Installed distribution file must be a regular file: {candidate}"
+                )
+            encoded = base64.urlsafe_b64encode(
+                bytes.fromhex(str(expected_origin["sha256"]))
+            ).rstrip(b"=").decode("ascii")
+            if (
+                row[1] != f"sha256={encoded}"
+                or row[2] != str(expected_origin["size"])
+            ):
+                raise ReleaseAssetError(
+                    f"Relocated script RECORD differs from locked wheel: "
+                    f"{distribution_name}: {row[0]}"
+                )
+            locked_record_targets.add(
+                os.path.normcase(str(expected_origin["target"]))
+            )
+            relocated_record_targets.add(key)
+            continue
         _require_regular_file(candidate, label="Installed distribution file")
         if candidate == record_target:
             if row[1] or row[2]:
                 raise ReleaseAssetError(
                     f"Installed RECORD self-entry must be unhashed: {distribution_name}"
                 )
+            spelling = row[0].casefold()
+            if spelling in record_self_spellings or len(record_self_spellings) >= 2:
+                raise ReleaseAssetError(
+                    f"Installed RECORD self-entry is duplicated: {distribution_name}"
+                )
+            record_self_spellings.add(spelling)
+        elif key in expected_by_target:
+            expected = expected_by_target[key]
+            actual_size = candidate.stat().st_size
+            actual_sha256 = sha256_file(candidate)
+            if (
+                actual_size != expected["size"]
+                or actual_sha256 != expected["sha256"]
+            ):
+                raise ReleaseAssetError(
+                    f"Installed file differs from locked wheel for {distribution_name}: "
+                    f"{expected['path']}"
+                )
+            encoded = base64.urlsafe_b64encode(
+                bytes.fromhex(actual_sha256)
+            ).rstrip(b"=").decode("ascii")
+            if row[1] == f"sha256={encoded}" and row[2] == str(actual_size):
+                record_kind = "locked"
+                locked_record_targets.add(key)
+            elif not row[1] and not row[2]:
+                record_kind = "pip-generated"
+            else:
+                raise ReleaseAssetError(
+                    f"Installed RECORD digest differs for {distribution_name}: {row[0]}"
+                )
+            kinds = expected_record_kinds.setdefault(key, set())
+            if record_kind in kinds or len(kinds) >= 2:
+                raise ReleaseAssetError(
+                    f"Installed RECORD path is duplicated for {distribution_name}: {row[0]}"
+                )
+            kinds.add(record_kind)
+            if key in actual_by_target:
+                continue
         elif candidate.suffix.casefold() == ".pyc" and "__pycache__" in candidate.parts:
+            if key in actual_by_target:
+                raise ReleaseAssetError(
+                    f"Installed RECORD path is duplicated for {distribution_name}: {row[0]}"
+                )
             if bool(row[1]) != bool(row[2]):
                 raise ReleaseAssetError(
                     f"Generated pyc RECORD row is incomplete: {distribution_name}: "
@@ -1746,6 +2068,10 @@ def _verify_installed_distribution_from_wheel(
                         f"{distribution_name}: {row[0]}"
                     )
         else:
+            if key in actual_by_target:
+                raise ReleaseAssetError(
+                    f"Installed RECORD path is duplicated for {distribution_name}: {row[0]}"
+                )
             encoded = base64.urlsafe_b64encode(
                 bytes.fromhex(sha256_file(candidate))
             ).rstrip(b"=").decode("ascii")
@@ -1759,11 +2085,24 @@ def _verify_installed_distribution_from_wheel(
             "sha256": sha256_file(candidate),
         }
 
+    unlocked_targets = sorted(
+        str(expected_by_target[key]["path"])
+        for key in actual_by_target
+        if key in expected_by_target
+        and Path(str(expected_by_target[key]["target"])) != record_target
+        and key not in locked_record_targets
+    )
+    if unlocked_targets:
+        raise ReleaseAssetError(
+            f"Installed RECORD has no locked-wheel digest for {distribution_name}: "
+            + ", ".join(unlocked_targets[:5])
+        )
+
     metadata_files = {
         os.path.normcase(str(Path(installed.locate_file(item)).resolve()))
         for item in installed.files or ()
     }
-    if metadata_files != set(actual_by_target):
+    if metadata_files | relocated_record_targets != recorded_metadata_targets:
         raise ReleaseAssetError(
             f"Installed metadata file set differs from RECORD: {distribution_name}"
         )
@@ -1821,9 +2160,8 @@ def _verify_installed_distribution_from_wheel(
             generated.append({**actual, "reason": name.casefold()})
             continue
         if name.casefold().endswith(".pyc") and "__pycache__" in target.parts:
-            try:
-                source = Path(importlib.util.source_from_cache(str(target))).resolve()
-            except (NotImplementedError, ValueError):
+            source = _generated_pyc_source(target)
+            if source is None:
                 source = Path()
             source_key = os.path.normcase(str(source))
             if source_key not in expected_source_targets or not _generated_pyc_matches_source(
@@ -2175,27 +2513,32 @@ def attest_binary_install(
         canonicalize_distribution_name(str(record["distribution"])): record
         for record in binary_payload["archives"]
     }
-    expected_plan_requirements = []
-    for pin in live_pins:
-        binary = binary_by_name.get(pin["canonical_name"])
-        if binary is None:
-            raise ReleaseAssetError(
-                f"Release requirement has no verified wheel: {pin['name']}"
-            )
-        expected_plan_requirements.append(
-            {
-                **pin,
-                "source": "locked-wheel",
-                "component": binary["component"],
-                "filename": binary["filename"],
-                "sha256": binary["sha256"],
-                "size": binary["size"],
-            }
+    external_dir, external_payload, external_plan = (
+        _resolve_external_vc_runtime_plan(
+            components_file=components_file,
+            lock=lock,
+            plan=plan,
+            plan_path=plan_path,
         )
+    )
+    expected_install_requirements = _binary_install_requirements(
+        lock=lock,
+        pins=live_pins,
+        binary_by_name=binary_by_name,
+        binary_cache_dir=binary_manifest_path.parent,
+        external_dir=external_dir,
+    )
+    expected_plan_requirements = [
+        requirement for requirement, _path in expected_install_requirements
+    ]
     if expected_requirements != expected_plan_requirements:
         raise ReleaseAssetError("Binary install plan requirements differ from lock.")
     expected_by_name = {
         str(item["canonical_name"]): item for item in expected_requirements
+    }
+    expected_paths = {
+        str(requirement["canonical_name"]): path
+        for requirement, path in expected_install_requirements
     }
     reported_by_name: dict[str, dict[str, Any]] = {}
     for item in raw_install:
@@ -2236,11 +2579,6 @@ def attest_binary_install(
             raise ReleaseAssetError(
                 f"Installed distribution version differs for {canonical}."
             )
-        binary = binary_by_name.get(canonical)
-        if binary is None:
-            raise ReleaseAssetError(
-                f"Installed distribution has no verified wheel: {canonical}"
-            )
         download_info = report_item.get("download_info")
         if not isinstance(download_info, dict) or report_item.get("is_direct") is not True:
             raise ReleaseAssetError(
@@ -2254,14 +2592,14 @@ def attest_binary_install(
         reported_path = Path(
             urllib.request.url2pathname(urllib.parse.unquote(parsed_url.path))
         )
-        expected_path = binary_manifest_path.parent / str(binary["filename"])
+        expected_path = expected_paths[canonical]
         if reported_path.resolve() != expected_path.resolve():
             raise ReleaseAssetError(
                 f"Locked wheel report path differs for {canonical}."
             )
         archive_info = download_info.get("archive_info")
         hashes = archive_info.get("hashes") if isinstance(archive_info, dict) else None
-        if not isinstance(hashes, dict) or hashes.get("sha256") != binary["sha256"]:
+        if not isinstance(hashes, dict) or hashes.get("sha256") != expected["sha256"]:
             raise ReleaseAssetError(
                 f"Locked wheel report SHA256 differs for {canonical}."
             )
@@ -2279,13 +2617,13 @@ def attest_binary_install(
         if (
             direct_url.get("url") != expected_path.resolve().as_uri()
             or not isinstance(direct_hashes, dict)
-            or direct_hashes.get("sha256") != binary["sha256"]
+            or direct_hashes.get("sha256") != expected["sha256"]
         ):
             raise ReleaseAssetError(
                 f"Installed direct_url provenance differs for {canonical}."
             )
         installed_inventory = _verify_installed_distribution_from_wheel(
-            str(binary["distribution"]),
+            str(expected["name"]),
             expected_path,
         )
         allowed_environment_files.update(
@@ -2294,12 +2632,18 @@ def attest_binary_install(
         )
         installed_binaries.append(
             {
-                "component": binary["component"],
-                "distribution": binary["distribution"],
-                "version": binary["version"],
-                "filename": binary["filename"],
-                "size": binary["size"],
-                "sha256": binary["sha256"],
+                "component": expected["component"],
+                "distribution": expected["distribution"],
+                "version": expected["version"],
+                "source": expected["source"],
+                "filename": expected["filename"],
+                "size": expected["size"],
+                "sha256": expected["sha256"],
+                **(
+                    {"upstream_archive": expected["upstream_archive"]}
+                    if "upstream_archive" in expected
+                    else {}
+                ),
                 "installed_files_sha256": installed_inventory["inventory_sha256"],
                 "installed_files": installed_inventory["files"],
             }
@@ -2317,6 +2661,14 @@ def attest_binary_install(
         "requirements_inputs": plan["requirements_inputs"],
         "requirements_set_sha256": plan["requirements_set_sha256"],
         "binary_manifest_sha256": plan["binary_manifest_sha256"],
+        "external_vc_runtime_wheels": (
+            {
+                "provenance_sha256": external_plan["provenance_sha256"],
+                "provenance": external_payload,
+            }
+            if external_plan is not None and external_payload is not None
+            else None
+        ),
         "python_implementation": sys.implementation.name,
         "python_version": actual_python,
         "platform": "win_amd64",
@@ -2978,6 +3330,70 @@ def _load_asset_list(path: Path) -> dict[str, Any]:
     return payload
 
 
+def validate_installer_audit_receipt(
+    receipt_path: Path,
+    *,
+    installer: Path,
+    distribution_root: Path,
+) -> str:
+    """Bind Release creation to the exact installer and dist that were audited."""
+
+    _require_regular_file(receipt_path, label="Installer content audit receipt")
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseAssetError(
+            f"Cannot read installer content audit receipt: {exc}"
+        ) from exc
+    if not isinstance(receipt, dict) or set(receipt) != {
+        "schema_version",
+        "installer",
+        "distribution",
+        "inno_script",
+    }:
+        raise ReleaseAssetError("Installer content audit receipt fields differ.")
+    if receipt.get("schema_version") != 1:
+        raise ReleaseAssetError("Unsupported installer content audit receipt schema.")
+
+    _require_regular_file(installer, label="Installer")
+    expected_installer = {
+        "filename": installer.name,
+        "size": installer.stat().st_size,
+        "sha256": sha256_file(installer),
+    }
+    inno_script = Path(__file__).resolve().parents[1] / "installer" / "LoLReplayTool.iss"
+    _require_regular_file(inno_script, label="Inno Setup script")
+    expected_inno = {
+        "filename": inno_script.name,
+        "size": inno_script.stat().st_size,
+        "sha256": sha256_file(inno_script),
+    }
+    from scripts.installer_content_audit import (
+        InstallerContentAuditError,
+        tree_inventory_identity,
+    )
+
+    try:
+        expected_distribution = tree_inventory_identity(distribution_root)
+    except (InstallerContentAuditError, OSError) as exc:
+        raise ReleaseAssetError(
+            f"Cannot revalidate audited distribution inventory: {exc}"
+        ) from exc
+    if receipt.get("installer") != expected_installer:
+        raise ReleaseAssetError(
+            "Installer bytes differ from the completed content audit."
+        )
+    if receipt.get("distribution") != expected_distribution:
+        raise ReleaseAssetError(
+            "Distribution bytes differ from the completed installer content audit."
+        )
+    if receipt.get("inno_script") != expected_inno:
+        raise ReleaseAssetError(
+            "Inno Setup script differs from the completed content audit."
+        )
+    return sha256_file(receipt_path)
+
+
 def verify_release_asset_payload(
     payload: dict[str, Any],
     *,
@@ -3007,6 +3423,7 @@ def verify_release_asset_payload(
         "version",
         "inno_setup_provenance_sha256",
         "installer_sha256",
+        "content_audit_receipt_sha256",
     }:
         raise ReleaseAssetError(
             "Release asset list contains invalid installer build provenance."
@@ -3021,6 +3438,14 @@ def verify_release_asset_payload(
         is None
         or not isinstance(installer_build.get("installer_sha256"), str)
         or SHA256_PATTERN.fullmatch(installer_build["installer_sha256"]) is None
+        or not isinstance(
+            installer_build.get("content_audit_receipt_sha256"),
+            str,
+        )
+        or SHA256_PATTERN.fullmatch(
+            installer_build["content_audit_receipt_sha256"]
+        )
+        is None
     ):
         raise ReleaseAssetError(
             "Release asset list contains invalid Inno Setup or installer identity."
@@ -3170,6 +3595,7 @@ def create_release_assets(
     *,
     version: str,
     installer: Path,
+    installer_audit_receipt: Path,
     application_source: Path,
     distribution_root: Path,
     output_dir: Path,
@@ -3186,6 +3612,11 @@ def create_release_assets(
     if not COMMIT_PATTERN.fullmatch(source_commit):
         raise ReleaseAssetError(f"Invalid release source commit: {source_commit}")
     _require_regular_file(installer, label="Installer")
+    installer_audit_receipt_sha256 = validate_installer_audit_receipt(
+        installer_audit_receipt,
+        installer=installer,
+        distribution_root=distribution_root,
+    )
     _require_regular_file(application_source, label="Application source")
     expected_installer_name = f"LoLReplayTool-Setup-{version}.exe"
     if installer.name != expected_installer_name:
@@ -3265,6 +3696,7 @@ def create_release_assets(
             "version": INNO_VERSION,
             "inno_setup_provenance_sha256": inno_identity,
             "installer_sha256": sha256_file(installer),
+            "content_audit_receipt_sha256": installer_audit_receipt_sha256,
         },
         "assets": [str(path.resolve()) for path in assets],
         "sha256sums": str(checksum_path.resolve()),
@@ -3348,6 +3780,7 @@ def _create_parser() -> argparse.ArgumentParser:
     create.add_argument("--version", required=True)
     create.add_argument("--source-commit", required=True)
     create.add_argument("--installer", required=True, type=Path)
+    create.add_argument("--installer-audit-receipt", required=True, type=Path)
     create.add_argument("--application-source", required=True, type=Path)
     create.add_argument("--distribution-root", required=True, type=Path)
     create.add_argument("--output-dir", required=True, type=Path)
@@ -3446,6 +3879,7 @@ def main(argv: list[str] | None = None) -> int:
             version=args.version,
             source_commit=args.source_commit,
             installer=args.installer,
+            installer_audit_receipt=args.installer_audit_receipt,
             application_source=args.application_source,
             distribution_root=args.distribution_root,
             output_dir=args.output_dir,

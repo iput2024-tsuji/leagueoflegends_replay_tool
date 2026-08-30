@@ -75,6 +75,64 @@
       "yarl"
     ]
   },
+  "external_vc_runtime_policy": {
+    "schema_version": 1,
+    "minimum_redistributable_version": "14.44.35211.0",
+    "official_information_url": "https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist",
+    "recipe": "scripts/prepare_external_vc_runtime_wheels.py",
+    "required_components": [
+      "numpy",
+      "pandas",
+      "qt",
+      "scikit-learn"
+    ],
+    "tool_artifacts": [
+      {
+        "filename": "delvewheel-1.13.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/13/f9/8163f9145012263743dee49333f3a39bf214b83dac0ede7b06bb9ff7287c/delvewheel-1.13.0-py3-none-any.whl",
+        "sha256": "eb8c34dee5d8816516befde73bf5cf9ea6142955f41d3baf25381c0136b28608",
+        "size": 59411
+      },
+      {
+        "filename": "delvewheel-1.13.0.tar.gz",
+        "url": "https://files.pythonhosted.org/packages/3c/ba/4ce769b09cdee86c576a35fc17bb954fa22f81037884a028c978a8479fe1/delvewheel-1.13.0.tar.gz",
+        "sha256": "440601f289c953d5b60e96af8a8dbe2729584d90b663e39c5eade6b9043b48f6",
+        "size": 63742
+      },
+      {
+        "filename": "pefile-2024.8.26-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/54/16/12b82f791c7f50ddec566873d5bdd245baa1491bac11d15ffb98aecc8f8b/pefile-2024.8.26-py3-none-any.whl",
+        "sha256": "76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f",
+        "size": 74766
+      }
+    ],
+    "wheels": [
+      {
+        "component": "numpy",
+        "filename": "numpy-2.4.1-cp314-cp314-win_amd64.whl",
+        "sha256": "9dc25f88035a08173708074f82f25478c0417040dfffc853521bc4e4f6346f03",
+        "size": 11986254
+      },
+      {
+        "component": "pandas",
+        "filename": "pandas-3.0.2-cp314-cp314-win_amd64.whl",
+        "sha256": "47b6bf18d390f68c187779f30d4a8cd7788d922bc414b5af994b04a552fa7ff2",
+        "size": 9500776
+      },
+      {
+        "component": "qt",
+        "filename": "pyqt6_qt6-6.10.2-py3-none-win_amd64.whl",
+        "sha256": "b1a5dfcd0d181285cf79fea6a8a507f4b5c171c095edf75049ff57c8b2e0dc40",
+        "size": 75519530
+      },
+      {
+        "component": "scikit-learn",
+        "filename": "scikit_learn-1.8.0-cp314-cp314-win_amd64.whl",
+        "sha256": "d619c4153217ee20e61b04bf64e1717efa982be29cae8e6a82cda1c565c4ad69",
+        "size": 7682065
+      }
+    ]
+  },
   "application": {
     "component": "lol-replay-tool",
     "version_file": "VERSION",
@@ -82,7 +140,7 @@
     "license_materials": [
       {
         "path": "LICENSE",
-        "sha256": "230184f60bae2feaf244f10a8bac053c8ff33a183bcc365b4d8b876d2b7f4809"
+        "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
       }
     ],
     "artifact_patterns": [
@@ -1048,13 +1106,11 @@
       "component": "microsoft-vc-runtime-python",
       "version": "14.42.34438.0",
       "license": "Microsoft Visual C++ Redistributable terms",
-      "artifact_patterns": [
-        "_internal/VCRUNTIME140.dll",
-        "_internal/VCRUNTIME140_1.dll"
-      ],
+      "artifact_patterns": [],
+      "distribution_policy": "excluded from application artifacts; resolved by the external Microsoft Visual C++ 2015–2022 Redistributable x64 prerequisite",
       "corresponding_source_required": false,
       "build_provenance_verified": true,
-      "verified_runtime_artifacts": [
+      "excluded_upstream_runtime_artifacts": [
         {
           "path": "_internal/VCRUNTIME140.dll",
           "archive_member": "vcruntime140.dll",
@@ -1080,37 +1136,33 @@
         }
       ],
       "source_exception": {
-        "kind": "proprietary-runtime-redistribution",
+        "kind": "external-runtime-prerequisite-review",
         "review_completed": false,
         "evidence": "",
-        "scope": "CPython 3.14.6 official Windows binary MSVC runtime",
+        "scope": "CPython 3.14.6 imports resolved by the external Microsoft x64 Redistributable",
         "reviewer": "",
         "date": ""
       },
       "license_materials_exception": {
-        "reason": "Microsoft redistribution terms require reviewed applicability evidence",
+        "reason": "Microsoft external-prerequisite terms and GPL boundary require reviewed applicability evidence",
         "review_completed": false,
         "evidence": "",
-        "scope": "CPython root VCRUNTIME files",
+        "scope": "External Microsoft Runtime prerequisite for CPython",
         "reviewer": "",
         "date": ""
       },
       "release_legal_review_required": true,
-      "release_gate_reason": "CPython 3.14.6同梱のMSVC 14.42.34438.0 runtimeについて、再配布条件またはGPLv3 System Libraries例外の適用根拠を専門家が確認するまで公開しない。"
+      "release_gate_reason": "CPython 3.14.6が外部Microsoft x64 Redistributableを利用する境界について、GPLv3 System Libraries例外その他の適用根拠を専門家が確認するまで公開しない。"
     },
     {
       "component": "microsoft-vc-runtime",
       "version": "wheel-provided MSVC runtime files; exact versions vary by locked wheel",
       "license": "Microsoft Visual C++ Redistributable terms",
-      "artifact_patterns": [
-        "_internal/VCOMP140*.dll",
-        "_internal/**/msvcp140*.dll",
-        "_internal/**/vcruntime140*.dll",
-        "_internal/**/vcomp140*.dll"
-      ],
+      "artifact_patterns": [],
+      "distribution_policy": "removed by deterministic wheel repair; imports are resolved by the external Microsoft Visual C++ 2015–2022 Redistributable x64 prerequisite",
       "corresponding_source_required": false,
       "build_provenance_verified": true,
-      "verified_runtime_artifacts": [
+      "excluded_upstream_runtime_artifacts": [
         {
           "path": "_internal/numpy.libs/msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll",
           "wheel_member": "numpy.libs/msvcp140-a4c2229bdc2a2a630acdc095b4d86008.dll",
@@ -1185,23 +1237,23 @@
         }
       ],
       "source_exception": {
-        "kind": "proprietary-runtime-redistribution",
+        "kind": "external-runtime-prerequisite-review",
         "review_completed": false,
         "evidence": "",
-        "scope": "locked Python wheel MSVC runtime files",
+        "scope": "relinked wheel imports resolved by the external Microsoft x64 Redistributable",
         "reviewer": "",
         "date": ""
       },
       "license_materials_exception": {
-        "reason": "Wheel-specific Microsoft redistribution terms require review",
+        "reason": "Microsoft external-prerequisite terms and GPL boundary require review",
         "review_completed": false,
         "evidence": "",
-        "scope": "Qt, NumPy, and scikit-learn wheel MSVC runtime files",
+        "scope": "External Microsoft Runtime prerequisite for Qt, NumPy, pandas, and scikit-learn",
         "reviewer": "",
         "date": ""
       },
       "release_legal_review_required": true,
-      "release_gate_reason": "Microsoft Visual C++ runtimeの再配布条件、正確なversion別の出所、system libraryまたは対応ソース例外の適用根拠を専門家が確認し、証拠を記録するまで公開しない。"
+      "release_gate_reason": "外部Microsoft Visual C++ Runtime前提とGPLv3 System Libraries例外その他の適用境界を専門家が確認し、証拠を記録するまで公開しない。"
     },
     {
       "component": "aiohappyeyeballs",

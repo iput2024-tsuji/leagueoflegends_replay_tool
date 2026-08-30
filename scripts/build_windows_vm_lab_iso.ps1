@@ -4,8 +4,9 @@ param(
   [string]$SourceKitPath,
   [Parameter(Mandatory = $true)]
   [string]$OutputPath,
+  [Parameter(Mandatory = $true)]
   [ValidatePattern('^[0-9a-f]{40}$')]
-  [string]$PayloadCommit = "1d5f79209646edda33911470ed132a9d5f4d440c"
+  [string]$PayloadCommit
 )
 
 Set-StrictMode -Version Latest
@@ -16,10 +17,11 @@ $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $bootstrapCmd = Join-Path $scriptDirectory "windows_vm_lab_bootstrap.cmd"
 $bootstrapScript = Join-Path $scriptDirectory "windows_vm_lab_bootstrap.ps1"
 $selfCheckRunner = Join-Path $scriptDirectory "run_packaged_self_check.ps1"
+$environmentBScript = Join-Path $scriptDirectory "windows_vm_lab_environment_b.ps1"
 $requiredPaths = @(
   "vc_redist.x64.exe",
+  "installer\LoLReplayTool-Setup-0.5.2.exe",
   "LoLReplayTool-external-build\LoLReplayTool.exe",
-  "02-test-environment-b.ps1",
   "run_packaged_self_check.ps1",
   "evidence\package-sha256.csv",
   "evidence\pe-runtime-audit.json",
@@ -133,7 +135,7 @@ foreach ($required in $requiredPaths) {
     throw "Required source kit file does not exist: $required"
   }
 }
-foreach ($tracked in @($bootstrapCmd, $bootstrapScript, $selfCheckRunner)) {
+foreach ($tracked in @($bootstrapCmd, $bootstrapScript, $selfCheckRunner, $environmentBScript)) {
   if (-not (Test-Path -LiteralPath $tracked -PathType Leaf)) {
     throw "Tracked VM lab file does not exist: $tracked"
   }
@@ -157,6 +159,7 @@ $image = $null
 $result = $null
 $rawStream = $null
 $completed = $false
+$environmentBMediaSha256 = $null
 try {
   New-Item -ItemType Directory -Path $staging -ErrorAction Stop | Out-Null
   Get-ChildItem -LiteralPath $source -Force |
@@ -175,6 +178,9 @@ try {
   ) -Force
   Copy-Item -LiteralPath $selfCheckRunner -Destination (
     Join-Path $staging "run_packaged_self_check.ps1"
+  ) -Force
+  Copy-Item -LiteralPath $environmentBScript -Destination (
+    Join-Path $staging "02-test-environment-b.ps1"
   ) -Force
 
   # Windows PowerShell 5.1 treats a BOM-less script as the active ANSI code
@@ -200,6 +206,7 @@ try {
   $manifestFiles = @(
     foreach ($relativePath in @(
       $requiredPaths +
+      @("02-test-environment-b.ps1") +
       @("00-Bootstrap-VM-Lab.cmd", "windows_vm_lab_bootstrap.ps1")
     )) {
       $file = Get-Item -LiteralPath (Join-Path $staging $relativePath)
@@ -210,6 +217,13 @@ try {
       }
     }
   )
+  $environmentBManifestEntries = @(
+    $manifestFiles | Where-Object { $_.path -ceq "02-test-environment-b.ps1" }
+  )
+  if ($environmentBManifestEntries.Count -ne 1) {
+    throw "Tracked Environment B script must appear exactly once in the media manifest."
+  }
+  $environmentBMediaSha256 = $environmentBManifestEntries[0].sha256
   $mediaManifest = [ordered]@{
     schema = "lol-vm-lab-media/v1"
     volume_label = "LOL_VC_PR134"
@@ -270,4 +284,5 @@ $iso = Get-Item -LiteralPath $resolvedOutput
   sha256 = Get-Sha256 -Path $iso.FullName
   volume_label = "LOL_VC_PR134"
   payload_commit = $PayloadCommit
+  environment_b_script_sha256 = $environmentBMediaSha256
 } | ConvertTo-Json -Compress

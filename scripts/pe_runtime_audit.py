@@ -12,21 +12,9 @@ from typing import Any
 
 import pefile
 
-GENERIC_RUNTIME_NAMES = frozenset(
-    {
-        "msvcp140.dll",
-        "msvcp140_1.dll",
-        "msvcp140_2.dll",
-        "vcruntime140.dll",
-        "vcruntime140_1.dll",
-        "vcomp140.dll",
-        "concrt140.dll",
-    }
-)
-_RUNTIME_PREFIXES = ("msvcp", "vcruntime", "vcomp", "concrt")
-_HASHED_RUNTIME = re.compile(
-    r"^(?:msvcp140(?:_[12])?|vcruntime140(?:_1)?|vcomp140|concrt140)-[0-9a-f]+\.dll$",
-    re.IGNORECASE,
+from scripts.pyinstaller_runtime_policy import (
+    classify_microsoft_runtime_name,
+    is_app_local_windows_os_runtime_name,
 )
 
 
@@ -34,15 +22,28 @@ class AuditError(ValueError):
     """An input cannot be safely audited."""
 
 
+_ICU_DLL_NAME = re.compile(r"icu.*\.dll\Z", re.IGNORECASE)
+_EXPECTED_QT_SYSTEM_ICU_IMPORT = {
+    "name": "icuuc.dll",
+    "pe": "_internal/PyQt6/Qt6/bin/Qt6Core.dll",
+    "import_type": "normal",
+}
+
+
 def _runtime_kind(name: str) -> str | None:
-    lowered = name.lower()
-    if lowered in GENERIC_RUNTIME_NAMES:
-        return "generic"
-    if _HASHED_RUNTIME.fullmatch(name):
-        return "hashed"
-    if lowered.endswith(".dll") and lowered.startswith(_RUNTIME_PREFIXES):
-        return "unknown"
-    return None
+    return classify_microsoft_runtime_name(name)
+
+
+def _is_icu_dll_name(name: str) -> bool:
+    return bool(_ICU_DLL_NAME.fullmatch(name))
+
+
+def _normalized_import(item: dict[str, str]) -> tuple[str, str, str]:
+    return (
+        item["pe"].casefold(),
+        item["name"].casefold(),
+        item["import_type"],
+    )
 
 
 def _decode_name(value: Any) -> str:
@@ -78,7 +79,14 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def build_inventory(root: str | Path, *, enforce_external: bool = False) -> dict[str, Any]:
+def build_inventory(
+    root: str | Path,
+    *,
+    enforce_external: bool = False,
+    require_qt_system_icu: bool = False,
+) -> dict[str, Any]:
+    """Audit a PE tree; the Qt ICU requirement targets the final onedir layout."""
+
     root_path = Path(root)
     if not root_path.is_dir():
         raise AuditError(f"root is not a directory: {root_path}")
@@ -92,13 +100,17 @@ def build_inventory(root: str | Path, *, enforce_external: bool = False) -> dict
     files: list[dict[str, Any]] = []
     reverse: dict[str, list[dict[str, str]]] = {}
     app_local: list[str] = []
+    app_local_icu: list[str] = []
     hashed_imports: list[dict[str, str]] = []
     unknown_imports: list[dict[str, str]] = []
+    icu_imports: list[dict[str, str]] = []
     for path in candidates:
         relative = path.relative_to(root_path).as_posix()
         runtime = _runtime_kind(path.name)
-        if runtime:
+        if runtime or is_app_local_windows_os_runtime_name(path.name):
             app_local.append(relative)
+        if _is_icu_dll_name(path.name):
+            app_local_icu.append(relative)
         pe = None
         try:
             pe = pefile.PE(str(path), fast_load=False)
@@ -111,10 +123,12 @@ def build_inventory(root: str | Path, *, enforce_external: bool = False) -> dict
                 close()
         files.append({"path": relative, "size": path.stat().st_size, "sha256": _sha256(path), "imports": imports})
         for item in imports:
+            ref = {"pe": relative, "import_type": item["type"]}
+            if _is_icu_dll_name(item["name"]):
+                icu_imports.append({"name": item["name"], **ref})
             kind = _runtime_kind(item["name"])
             if not kind:
                 continue
-            ref = {"pe": relative, "import_type": item["type"]}
             reverse.setdefault(item["name"].lower(), []).append(ref)
             if kind == "hashed":
                 hashed_imports.append({"name": item["name"], **ref})
@@ -124,10 +138,18 @@ def build_inventory(root: str | Path, *, enforce_external: bool = False) -> dict
         refs.sort(key=lambda item: (item["pe"].casefold(), item["import_type"]))
     reverse = {name: reverse[name] for name in sorted(reverse, key=str.casefold)}
     app_local.sort(key=str.casefold)
+    app_local_icu.sort(key=str.casefold)
     hashed_imports.sort(key=lambda item: (item["name"].casefold(), item["pe"].casefold(), item["import_type"]))
     unknown_imports.sort(key=lambda item: (item["name"].casefold(), item["pe"].casefold(), item["import_type"]))
+    icu_imports.sort(
+        key=lambda item: (
+            item["name"].casefold(),
+            item["pe"].casefold(),
+            item["import_type"],
+        )
+    )
     inventory = {
-        "schema_version": 1,
+        "schema_version": 2,
         "tool": {
             "name": "pe_runtime_audit",
             "pefile_version": pefile.__version__,
@@ -141,9 +163,13 @@ def build_inventory(root: str | Path, *, enforce_external: bool = False) -> dict
             "app_local_runtime_files": app_local,
             "hashed_imports": hashed_imports,
             "unknown_runtime_imports": unknown_imports,
+            "app_local_icu_files": app_local_icu,
+            "icu_imports": icu_imports,
         },
     }
-    if enforce_external and (app_local or hashed_imports or unknown_imports):
+    if require_qt_system_icu:
+        enforce_external = True
+    if enforce_external:
         failures = []
         if app_local:
             failures.append(f"app-local Runtime files: {', '.join(app_local)}")
@@ -163,7 +189,35 @@ def build_inventory(root: str | Path, *, enforce_external: bool = False) -> dict
                     for item in unknown_imports
                 )
             )
-        raise AuditError("external runtime enforcement failed; " + "; ".join(failures))
+        if app_local_icu:
+            failures.append(f"app-local ICU files: {', '.join(app_local_icu)}")
+        expected_icu = _normalized_import(_EXPECTED_QT_SYSTEM_ICU_IMPORT)
+        actual_icu = [_normalized_import(item) for item in icu_imports]
+        if require_qt_system_icu and actual_icu != [expected_icu]:
+            actual_text = ", ".join(
+                f"{item['pe']} -> {item['name']} ({item['import_type']})"
+                for item in icu_imports
+            ) or "none"
+            failures.append(
+                "Qt system ICU import graph differs; expected "
+                f"{_EXPECTED_QT_SYSTEM_ICU_IMPORT['pe']} -> "
+                f"{_EXPECTED_QT_SYSTEM_ICU_IMPORT['name']} "
+                f"({_EXPECTED_QT_SYSTEM_ICU_IMPORT['import_type']}); actual "
+                f"{actual_text}"
+            )
+        elif any(_normalized_import(item) != expected_icu for item in icu_imports):
+            failures.append(
+                "unexpected ICU imports: "
+                + ", ".join(
+                    f"{item['pe']} -> {item['name']} ({item['import_type']})"
+                    for item in icu_imports
+                    if _normalized_import(item) != expected_icu
+                )
+            )
+        if failures:
+            raise AuditError(
+                "external runtime enforcement failed; " + "; ".join(failures)
+            )
     return inventory
 
 
@@ -175,10 +229,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--enforce-external", action="store_true")
+    parser.add_argument(
+        "--enforce-external",
+        action="store_true",
+        help="reject app-local Runtime/ICU DLLs and unexpected imports",
+    )
+    parser.add_argument(
+        "--require-qt-system-icu",
+        action="store_true",
+        help=(
+            "require the fixed Qt6Core -> icuuc.dll graph in the final "
+            "PyInstaller onedir layout (implies --enforce-external)"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
-        output = _json_bytes(build_inventory(args.root, enforce_external=args.enforce_external))
+        output = _json_bytes(
+            build_inventory(
+                args.root,
+                enforce_external=args.enforce_external,
+                require_qt_system_icu=args.require_qt_system_icu,
+            )
+        )
         if args.output:
             args.output.write_text(output, encoding="utf-8", newline="\n")
         else:

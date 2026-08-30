@@ -12,6 +12,34 @@ LoL Replay Toolは`GPL-3.0-only`で提供され、プロジェクトのライセ
 特定ビルド内のファイルを識別するための補助資料であり、適用される
 ライセンス本文や法的判断に代わるものではありません。
 
+## Microsoft Visual C++ Runtime prerequisite / Microsoft Visual C++ Runtimeの前提条件
+
+The Windows x64 application uses the Microsoft Visual C++ 2015–2022
+Redistributable x64 as a user-installed external prerequisite. Its DLLs and
+`vc_redist.x64.exe` are not included in the application, installer, or Release
+assets. The installer does not download, execute, or elevate to install the
+Redistributable. Before file changes, it checks both HKLM registry views,
+`Installed`, and `Version`, accepts newer compatible versions, and fails closed
+when the x64 prerequisite is missing, inconsistent, or below `14.44.35211.0`.
+Interactive users may consent to open Microsoft's official guidance page;
+silent installation never browses or prompts and exits non-zero.
+
+Windows x64アプリケーションは、利用者が導入するMicrosoft Visual C++
+2015–2022 Redistributable x64を外部前提とします。DLLと`vc_redist.x64.exe`は
+アプリ、インストーラー、Release資産へ含めません。インストーラーはRuntimeを
+ダウンロード・実行・UAC昇格して導入せず、ファイル変更前にHKLMの両registry view、
+`Installed`、`Version`を検査します。より新しい互換Versionは許可し、x64前提が
+不足・不整合、または`14.44.35211.0`未満ならfail-closedで停止します。
+対話時のみ利用者の同意後にMicrosoft公式案内ページを開き、silent modeでは
+ブラウザーも対話も行わず非0で終了します。
+
+This records packaging behavior only and is not legal advice or a completed
+GPL/Microsoft redistribution review. The corresponding source, provenance, and
+public-Release gates remain open until their explicit criteria are met.
+これは配布方式の記録であり、法的助言やGPL/Microsoft再配布条件の確認完了を
+意味しません。対応source、provenance、公開Release gateは完了条件を満たすまで
+維持します。
+
 ## Components in the Windows application / Windows配布物に含まれるもの
 
 | Component | Role | License summary |

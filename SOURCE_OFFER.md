@@ -53,6 +53,38 @@ wheel内native sourceの未確認は公開を止めるRelease gateです。生�
 component分類を記録する技術的なinventoryであり、ライセンス本文や法的確認に
 代わるものではありません。
 
+## Microsoft Visual C++ Runtime prerequisite
+
+Windows x64 binary distributions use the Microsoft Visual C++ 2015–2022
+Redistributable x64 as an external, user-installed prerequisite. Runtime DLLs
+and `vc_redist.x64.exe` are intentionally absent from the application,
+installer, and Release assets; the installer does not download or install
+them. It checks both HKLM registry views, `Installed`, and `Version` before any
+file change, accepts newer compatible versions, and fails closed if the x64
+prerequisite is missing, inconsistent, or below `14.44.35211.0`. Interactive
+guidance may open Microsoft's official page only after consent; silent mode
+returns a non-zero status without browsing or prompting.
+
+Custom native wheels used by a future binary build must be produced by a
+reproducible source-build or repair recipe with pinned wheel/source/tool
+inputs, SHA256 values, PE import inventories, and build provenance. The recipe
+must show that hashed Microsoft Runtime imports and app-local Runtime files
+are absent from the dist, expanded installer, and Release assets; these checks
+remain fail-closed. This document does not mark the legal or source-provenance
+review complete, and no public Release is authorized while those gates remain
+open.
+
+Windows x64バイナリ配布物は、利用者が導入するMicrosoft Visual C++
+2015–2022 Redistributable x64を外部前提とします。Runtime DLLと
+`vc_redist.x64.exe`はアプリ、インストーラー、Release資産へ含めず、
+インストーラーもダウンロード・導入しません。ファイル変更前にHKLM両view、
+`Installed`、`Version`を検査し、より新しい互換Versionを許可しますが、x64前提が
+不足・不整合、または`14.44.35211.0`未満ならfail-closedで停止します。
+対話時の公式案内は同意後だけ開き、silent modeはブラウザーや対話を行わず非0で
+終了します。custom native wheelのsource、固定hash、PE import、provenanceと、
+CI / Release workflowがdist・完成installer展開物・Release assetで実施する、
+app-local/ハッシュ付きRuntimeを拒否する監査は、公開Releaseの前提として未完了です。
+
 Inno Setup 6.7.3 is a build-time toolchain whose selected Setup/Uninstall
 stubs and LZMA decompression code are embedded in the public installer. The
 compiler, LZMA compression components and other build-only files are not

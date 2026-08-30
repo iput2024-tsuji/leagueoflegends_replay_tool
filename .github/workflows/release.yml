@@ -279,11 +279,17 @@ jobs:
       - name: Audit finished installer contents
         shell: pwsh
         run: |
+          $auditReceipt = Join-Path $env:RUNNER_TEMP "installer-content-audit.json"
           .\scripts\audit_installer_contents.ps1 `
             -InstallerPath ".\dist\installer\LoLReplayTool-Setup-$env:APP_VERSION.exe" `
             -DistributionRoot .\dist\LoLReplayTool `
             -TempRoot $env:RUNNER_TEMP `
-            -PythonExe $env:RELEASE_PYTHON
+            -PythonExe $env:RELEASE_PYTHON `
+            -OutputReceipt $auditReceipt
+          "INSTALLER_AUDIT_RECEIPT=$auditReceipt" | Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Encoding utf8 `
+            -Append
 
       - name: Test installer audit failure isolation
         shell: pwsh
@@ -326,6 +332,7 @@ jobs:
             --version $env:APP_VERSION `
             --source-commit $env:RELEASE_COMMIT `
             --installer $installer `
+            --installer-audit-receipt $env:INSTALLER_AUDIT_RECEIPT `
             --application-source $source `
             --distribution-root .\dist\LoLReplayTool `
             --output-dir .\dist\installer `
@@ -339,6 +346,14 @@ jobs:
             verify `
             --asset-list .\dist\installer\release-assets.json `
             --components .\compliance\components.json
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          & $env:RELEASE_PYTHON -m scripts.pe_runtime_audit `
+            .\dist\installer `
+            --enforce-external `
+            --output "$env:RUNNER_TEMP\release-asset-pe-imports.json"
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

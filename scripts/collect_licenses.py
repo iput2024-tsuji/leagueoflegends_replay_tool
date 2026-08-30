@@ -18,6 +18,11 @@ from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from scripts.binary_install_policy import (
+    BinaryInstallPolicyError,
+    expected_install_archive,
+    external_vc_runtime_policy,
+)
 from scripts.inno_setup_provenance import (
     InnoSetupProvenanceError,
     validate_build_provenance as validate_inno_build_provenance,
@@ -72,12 +77,24 @@ def verified_wheel_record_inventory(
             members: dict[str, zipfile.ZipInfo] = {}
             seen: set[str] = set()
             for info in archive.infolist():
-                relative = safe_relative_path(info.filename).as_posix()
-                if relative != info.filename.replace("\\", "/"):
+                if "\\" in info.filename:
+                    raise RuntimeError(
+                        f"Wheel member uses a backslash: {info.filename}"
+                    )
+                archive_name = info.filename.replace("\\", "/")
+                raw_relative = (
+                    archive_name[:-1] if info.is_dir() else archive_name
+                )
+                normalized = safe_relative_path(raw_relative).as_posix()
+                expected_name = normalized + "/" if info.is_dir() else normalized
+                if expected_name != archive_name:
                     raise RuntimeError(f"Wheel member is not normalized: {info.filename}")
-                folded = relative.casefold()
+                relative = expected_name
+                folded = normalized.casefold()
                 if folded in seen:
-                    raise RuntimeError(f"Wheel member collides by case: {relative}")
+                    raise RuntimeError(
+                        f"Wheel member collides by case or type: {relative}"
+                    )
                 seen.add(folded)
                 if info.flag_bits & 0x1:
                     raise RuntimeError(f"Encrypted wheel member is forbidden: {relative}")
@@ -356,6 +373,8 @@ def collect_distribution_licenses(
     expected_license: str | None = None,
     component: str | None = None,
     binary_archive: dict[str, Any] | None = None,
+    installed_binary_archive: dict[str, Any] | None = None,
+    binary_source: str = "locked-wheel",
     verified_binary_components: set[str] | None = None,
     seen_targets: dict[str, Path] | None = None,
     locked_license_materials: list[dict[str, Any]] | None = None,
@@ -450,6 +469,14 @@ def collect_distribution_licenses(
         result["binary_install_verified"] = bool(
             component and component in (verified_binary_components or set())
         )
+        if installed_binary_archive is not None:
+            result["installed_binary_archive"] = {
+                "source": binary_source,
+                **{
+                    key: installed_binary_archive[key]
+                    for key in ("filename", "sha256", "size")
+                },
+            }
     return result
 
 
@@ -1014,6 +1041,31 @@ def _validated_build_provenance(
             [],
         )
     )
+    try:
+        external_policy = external_vc_runtime_policy(component_lock)
+    except BinaryInstallPolicyError as exc:
+        raise RuntimeError(str(exc)) from exc
+    external_record = payload.get("external_vc_runtime_wheels")
+    if external_policy is None:
+        if external_record is not None:
+            raise RuntimeError(
+                "Build provenance has unexpected external Runtime wheels."
+            )
+    else:
+        from scripts.prepare_external_vc_runtime_wheels import (
+            WheelError,
+            validate_embedded_provenance_record,
+        )
+
+        try:
+            validate_embedded_provenance_record(
+                external_record,
+                components_file,
+            )
+        except (BinaryInstallPolicyError, WheelError, OSError) as exc:
+            raise RuntimeError(
+                f"Build provenance external Runtime record is invalid: {exc}"
+            ) from exc
     records = payload.get("installed_binaries")
     if not isinstance(records, list):
         raise RuntimeError("Build provenance has no installed binary list.")
@@ -1056,12 +1108,39 @@ def _validated_build_provenance(
             raise RuntimeError(
                 f"Build provenance component is not locked: {component_name}"
             )
+        try:
+            source_kind, installed_archive = expected_install_archive(
+                component_lock,
+                component,
+            )
+        except BinaryInstallPolicyError as exc:
+            raise RuntimeError(str(exc)) from exc
         for field in ("filename", "sha256", "size"):
-            if record.get(field) != archive.get(field):
+            if record.get(field) != installed_archive.get(field):
                 raise RuntimeError(
                     f"Build provenance differs from binary lock for "
                     f"{component_name}.{field}."
                 )
+        if record.get("source") != source_kind:
+            raise RuntimeError(
+                f"Build provenance source differs for {component_name}."
+            )
+        expected_upstream = (
+            {
+                key: archive[key]
+                for key in ("filename", "url", "sha256", "size")
+            }
+            if source_kind == "external-vc-runtime-wheel"
+            else None
+        )
+        if record.get("upstream_archive") != expected_upstream:
+            raise RuntimeError(
+                f"Build provenance upstream archive differs for {component_name}."
+            )
+        if record.get("distribution") != component.get("distribution"):
+            raise RuntimeError(
+                f"Build provenance distribution differs for {component_name}."
+            )
         if record.get("version") != component.get("version"):
             raise RuntimeError(
                 f"Build provenance version differs for {component_name}."
@@ -1145,6 +1224,13 @@ def collect_licenses(
         )
     ]
     for component in runtime_components:
+        try:
+            binary_source, installed_archive = expected_install_archive(
+                component_lock,
+                component,
+            )
+        except BinaryInstallPolicyError as exc:
+            raise RuntimeError(str(exc)) from exc
         manifest.append(
             collect_distribution_licenses(
                 str(component["distribution"]),
@@ -1153,6 +1239,14 @@ def collect_licenses(
                 expected_license=str(component["license"]),
                 component=str(component["component"]),
                 binary_archive=component.get("binary_archive"),
+                installed_binary_archive=(
+                    installed_archive
+                    if binary_source == "external-vc-runtime-wheel"
+                    and str(component["component"])
+                    in verified_binary_components
+                    else None
+                ),
+                binary_source=binary_source,
                 verified_binary_components=verified_binary_components,
                 seen_targets=seen_targets,
                 locked_license_materials=component.get("license_materials"),
@@ -1161,6 +1255,13 @@ def collect_licenses(
     for build_component in component_lock.get("build_components", []):
         distribution_name = str(build_component["distribution"])
         locked_component = locked[canonicalize_distribution_name(distribution_name)]
+        try:
+            binary_source, installed_archive = expected_install_archive(
+                component_lock,
+                locked_component,
+            )
+        except BinaryInstallPolicyError as exc:
+            raise RuntimeError(str(exc)) from exc
         manifest.append(
             collect_distribution_licenses(
                 distribution_name,
@@ -1169,6 +1270,14 @@ def collect_licenses(
                 expected_license=str(locked_component["license"]),
                 component=str(locked_component["component"]),
                 binary_archive=locked_component.get("binary_archive"),
+                installed_binary_archive=(
+                    installed_archive
+                    if binary_source == "external-vc-runtime-wheel"
+                    and str(locked_component["component"])
+                    in verified_binary_components
+                    else None
+                ),
+                binary_source=binary_source,
                 verified_binary_components=verified_binary_components,
                 seen_targets=seen_targets,
                 locked_license_materials=locked_component.get("license_materials"),

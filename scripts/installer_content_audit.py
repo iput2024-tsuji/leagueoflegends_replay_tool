@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import stat
@@ -59,11 +60,93 @@ INNO_PREPARE_TO_INSTALL_GUARD = re.compile(
     r"Exit\s*;",
     re.IGNORECASE | re.DOTALL,
 )
+INNO_RUNTIME_PREREQUISITE_ORDER = re.compile(
+    r"function\s+PrepareToInstall\s*\(.*?"
+    r"Result\s*:=\s*CheckVisualCppRuntime\s*;.*?"
+    r"if\s+Result\s*<>\s*''\s+then\s*Exit\s*;.*?"
+    r"Result\s*:=\s*RequestSafeUpdateShutdown\s*;",
+    re.IGNORECASE | re.DOTALL,
+)
+INNO_RUNTIME_PREREQUISITE_PATTERNS = (
+    re.compile(
+        r"VisualCppRuntimeKey\s*=\s*"
+        r"'SOFTWARE\\Microsoft\\VisualStudio\\14\.0\\VC\\Runtimes\\x64'\s*;",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"VisualCppRuntimeMinimumVersion\s*=\s*'14\.44\.35211\.0'\s*;",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"VisualCppRuntimeHelpURL\s*=\s*"
+        r"'https://learn\.microsoft\.com/cpp/windows/latest-supported-vc-redist'\s*;",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"StrToVersion\s*\(\s*VersionText\s*,\s*PackedVersion\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"RegQueryDWordValue\s*\(\s*HKLM64\s*,\s*VisualCppRuntimeKey\s*,"
+        r"\s*'Installed'\s*,\s*Installed64\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(r"Installed64\s*<>\s*1", re.IGNORECASE),
+    re.compile(
+        r"RegQueryStringValue\s*\(\s*HKLM64\s*,\s*VisualCppRuntimeKey\s*,"
+        r"\s*'Version'\s*,\s*Version64\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"TryParseVisualCppVersion\s*\(\s*VisualCppRuntimeMinimumVersion\s*,"
+        r"\s*MinimumVersionPacked\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"TryParseVisualCppVersion\s*\(\s*Version64\s*,\s*Version64Packed\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"ComparePackedVersion\s*\(\s*Version64Packed\s*,"
+        r"\s*MinimumVersionPacked\s*\)\s*<\s*0",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"RegKeyExists\s*\(\s*HKLM32\s*,\s*VisualCppRuntimeKey\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"RegQueryDWordValue\s*\(\s*HKLM32\s*,\s*VisualCppRuntimeKey\s*,"
+        r"\s*'Installed'\s*,\s*Installed32\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"RegQueryStringValue\s*\(\s*HKLM32\s*,\s*VisualCppRuntimeKey\s*,"
+        r"\s*'Version'\s*,\s*Version32\s*\)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"ComparePackedVersion\s*\(\s*Version32Packed\s*,"
+        r"\s*Version64Packed\s*\)\s*<>\s*0",
+        re.IGNORECASE,
+    ),
+    re.compile(r"if\s+not\s+WizardSilent\s+then", re.IGNORECASE),
+    re.compile(
+        r"ShellExec\s*\(\s*'open'\s*,\s*VisualCppRuntimeHelpURL",
+        re.IGNORECASE,
+    ),
+)
+INNO_RUNTIME_FORBIDDEN_CODE = re.compile(
+    r"\bDownloadTemporaryFile(?:WithISSigVerify)?\s*\(|"
+    r"(?<!Shell)\bExec\s*\(",
+    re.IGNORECASE,
+)
 INNO_CODE_DECLARATION = re.compile(
     r"\b(?:function|procedure)\s+([A-Za-z_][A-Za-z0-9_]*)\b",
     re.IGNORECASE,
 )
 INNO_ALLOWED_CODE_DECLARATIONS = (
+    "checkvisualcppruntime",
     "closehandle",
     "curuninstallstepchanged",
     "deletemanagedrecordings",
@@ -79,6 +162,8 @@ INNO_ALLOWED_CODE_DECLARATIONS = (
     "resetevent",
     "setevent",
     "showuninstalloptions",
+    "tryparsevisualcppversion",
+    "visualcppruntimefailure",
     "waitforsingleobject",
 )
 INNO_SIDE_EFFECT_SECTIONS = frozenset(
@@ -196,9 +281,11 @@ INNO_WINDOWS_RESERVED_NAMES = frozenset(
 )
 INNO_REQUIRED_SETUP_VALUES = {
     "appid": "{{B8D87E69-41F7-4B28-978D-2F8FA5AF4BE2}",
+    "architecturesallowed": "x64compatible",
     "changesassociations": "no",
     "changesenvironment": "no",
     "createuninstallregkey": "not IsContentAuditMode",
+    "minversion": "10.0.22000",
     "privilegesrequired": "lowest",
     "uninstallable": "not IsContentAuditMode",
 }
@@ -356,6 +443,31 @@ def _validate_inno_code(source: str) -> list[str]:
     ):
         errors.append(
             "Inno PrepareToInstall must exit before side effects in content-audit mode."
+        )
+    if INNO_RUNTIME_PREREQUISITE_ORDER.search(code) is None:
+        errors.append(
+            "Inno PrepareToInstall must check the external VC++ Runtime before update shutdown."
+        )
+    missing_runtime_checks = [
+        index
+        for index, pattern in enumerate(
+            INNO_RUNTIME_PREREQUISITE_PATTERNS,
+            start=1,
+        )
+        if pattern.search(code) is None
+    ]
+    if missing_runtime_checks:
+        errors.append(
+            "Inno external VC++ Runtime prerequisite checks differ from the "
+            "fail-closed policy: "
+            + ", ".join(map(str, missing_runtime_checks))
+        )
+    if (
+        "vc_redist.x64.exe" in code.casefold()
+        or INNO_RUNTIME_FORBIDDEN_CODE.search(structural_code) is not None
+    ):
+        errors.append(
+            "Inno external VC++ Runtime prerequisite must not download or execute Runtime installers."
         )
     return errors
 
@@ -734,6 +846,92 @@ def inventory_tree(root: Path) -> TreeInventory:
     )
 
 
+def tree_inventory_identity(root: Path) -> dict[str, int | str]:
+    """Return a deterministic identity for the exact audited distribution tree."""
+
+    inventory = inventory_tree(root)
+    if inventory.forbidden_runtimes:
+        raise InstallerContentAuditError(
+            "Audited distribution contains forbidden external Runtime paths."
+        )
+    directories = sorted(
+        inventory.directories.values(),
+        key=lambda value: (value.casefold(), value),
+    )
+    files = [
+        {
+            "path": record.path,
+            "size": record.size,
+            "sha256": record.sha256,
+        }
+        for record in sorted(
+            inventory.files.values(),
+            key=lambda value: (value.path.casefold(), value.path),
+        )
+    ]
+    serialized = json.dumps(
+        {"directories": directories, "files": files},
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return {
+        "file_count": len(files),
+        "directory_count": len(directories),
+        "total_size": sum(int(record["size"]) for record in files),
+        "sha256": hashlib.sha256(serialized).hexdigest(),
+    }
+
+
+def _regular_file_identity(path: Path, *, label: str) -> dict[str, int | str]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise InstallerContentAuditError(
+            f"Cannot inspect {label}: {path}: {exc}"
+        ) from exc
+    if _is_reparse_point(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise InstallerContentAuditError(
+            f"{label} must be a regular file, not a link: {path}"
+        )
+    return {
+        "filename": path.name,
+        "size": metadata.st_size,
+        "sha256": _sha256_file(path),
+    }
+
+
+def create_installer_audit_receipt(
+    *,
+    installer: Path,
+    distribution_root: Path,
+    inno_script: Path,
+    output: Path,
+) -> dict[str, object]:
+    """Seal the exact installer and dist bytes that passed the payload audit."""
+
+    if os.path.lexists(output):
+        raise InstallerContentAuditError(
+            f"Installer audit receipt already exists: {output}"
+        )
+    _canonical_real_directory(output.parent, label="audit receipt parent")
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "installer": _regular_file_identity(installer, label="installer"),
+        "distribution": tree_inventory_identity(distribution_root),
+        "inno_script": _regular_file_identity(inno_script, label="Inno script"),
+    }
+    try:
+        with output.open("x", encoding="utf-8", newline="\n") as destination:
+            json.dump(payload, destination, ensure_ascii=False, indent=2)
+            destination.write("\n")
+    except OSError as exc:
+        raise InstallerContentAuditError(
+            f"Cannot write installer audit receipt: {output}: {exc}"
+        ) from exc
+    return payload
+
+
 def _required_path_errors(root: Path, *, label: str) -> list[str]:
     errors: list[str] = []
     for relative in REQUIRED_INSTALLER_PATHS:
@@ -873,11 +1071,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--distribution-root", type=Path)
     parser.add_argument("--installed-root", type=Path)
     parser.add_argument("--inno-script", required=True, type=Path)
+    parser.add_argument("--installer", type=Path)
+    parser.add_argument("--output-receipt", type=Path)
     parser.add_argument("--validate-inno-only", action="store_true")
     args = parser.parse_args(argv)
 
     if args.validate_inno_only:
-        if args.distribution_root is not None or args.installed_root is not None:
+        if (
+            args.distribution_root is not None
+            or args.installed_root is not None
+            or args.installer is not None
+            or args.output_receipt is not None
+        ):
             parser.error(
                 "--validate-inno-only cannot be combined with payload roots"
             )
@@ -887,6 +1092,10 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(
                 "--distribution-root and --installed-root are required for payload audit"
             )
+        if (args.installer is None) != (args.output_receipt is None):
+            parser.error(
+                "--installer and --output-receipt must be specified together"
+            )
         errors = [
             *validate_inno_audit_guards(args.inno_script),
             *audit_installer_payload(args.distribution_root, args.installed_root),
@@ -895,6 +1104,13 @@ def main(argv: list[str] | None = None) -> int:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
+    if args.output_receipt is not None:
+        create_installer_audit_receipt(
+            installer=args.installer,
+            distribution_root=args.distribution_root,
+            inno_script=args.inno_script,
+            output=args.output_receipt,
+        )
     if args.validate_inno_only:
         print(f"Inno audit structure validation passed: {args.inno_script}")
     else:

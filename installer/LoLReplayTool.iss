@@ -22,7 +22,7 @@ DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
-MinVersion=10.0
+MinVersion=10.0.22000
 OutputDir=..\dist\installer
 OutputBaseFilename=LoLReplayTool-Setup-{#AppVersion}
 SetupIconFile=..\assets\app\app.ico
@@ -76,6 +76,9 @@ const
   UpdateShutdownEventName = 'Local\LoLReplayTool.UpdateShutdown';
   UpdateShutdownBlockedEventName = 'Local\LoLReplayTool.UpdateShutdownBlocked';
   UpdateShutdownCompleteEventName = 'Local\LoLReplayTool.UpdateShutdownComplete';
+  VisualCppRuntimeKey = 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64';
+  VisualCppRuntimeMinimumVersion = '14.44.35211.0';
+  VisualCppRuntimeHelpURL = 'https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist';
 
 function OpenMutex(DesiredAccess: LongWord; InheritHandle: BOOL;
   const Name: String): THandle;
@@ -100,6 +103,95 @@ var
 function IsContentAuditMode: Boolean;
 begin
   Result := ExpandConstant('{param:contentaudit|}') = '1';
+end;
+
+function VisualCppRuntimeFailure(const Detail: String): String;
+var
+  ErrorCode: Integer;
+begin
+  Result := 'Microsoft Visual C++ 2015–2022 Redistributable x64 が必要です。' + #13#10 +
+    Detail + #13#10 + VisualCppRuntimeHelpURL;
+  if not WizardSilent then
+    if MsgBox(Result + #13#10 + #13#10 +
+      'Microsoft公式ページをブラウザーで開きますか？', mbError, MB_YESNO) = IDYES then
+      if not ShellExec('open', VisualCppRuntimeHelpURL, '', '',
+        SW_SHOWNORMAL, ewNoWait, ErrorCode) then
+        Log(Format('Microsoft公式ページを開けませんでした: %d', [ErrorCode]));
+end;
+
+function TryParseVisualCppVersion(VersionText: String;
+  var PackedVersion: Int64): Boolean;
+begin
+  if (Length(VersionText) > 0) and
+    ((VersionText[1] = 'v') or (VersionText[1] = 'V')) then
+    Delete(VersionText, 1, 1);
+  Result := (VersionText <> '') and StrToVersion(VersionText, PackedVersion);
+end;
+
+function CheckVisualCppRuntime: String;
+var
+  Installed64: Cardinal;
+  Installed32: Cardinal;
+  Version64: String;
+  Version32: String;
+  Version64Packed: Int64;
+  Version32Packed: Int64;
+  MinimumVersionPacked: Int64;
+  HasKey32: Boolean;
+begin
+  Result := '';
+  if not IsWin64 then
+  begin
+    Result := VisualCppRuntimeFailure(
+      'このインストーラーには64bit Windowsが必要なため、インストールを中止しました。');
+    Exit;
+  end;
+
+  if not RegQueryDWordValue(HKLM64, VisualCppRuntimeKey, 'Installed', Installed64) or
+    (Installed64 <> 1) or
+    not RegQueryStringValue(HKLM64, VisualCppRuntimeKey, 'Version', Version64) then
+  begin
+    Result := VisualCppRuntimeFailure(
+      '64bit版Runtimeの登録情報を確認できないため、インストールを中止しました。');
+    Exit;
+  end;
+
+  if not TryParseVisualCppVersion(VisualCppRuntimeMinimumVersion,
+    MinimumVersionPacked) then
+  begin
+    Result := VisualCppRuntimeFailure(
+      'インストーラー内の必要version設定が不正なため、インストールを中止しました。');
+    Exit;
+  end;
+
+  if not TryParseVisualCppVersion(Version64, Version64Packed) then
+  begin
+    Result := VisualCppRuntimeFailure(
+      '64bit版Runtimeのversion情報が不正なため、インストールを中止しました。');
+    Exit;
+  end;
+
+  if ComparePackedVersion(Version64Packed, MinimumVersionPacked) < 0 then
+  begin
+    Result := VisualCppRuntimeFailure(
+      '64bit版Runtimeが必要なversion未満のため、インストールを中止しました。');
+    Exit;
+  end;
+
+  HasKey32 := RegKeyExists(HKLM32, VisualCppRuntimeKey);
+  if HasKey32 then
+  begin
+    if not RegQueryDWordValue(HKLM32, VisualCppRuntimeKey, 'Installed', Installed32) or
+      (Installed32 <> 1) or
+      not RegQueryStringValue(HKLM32, VisualCppRuntimeKey, 'Version', Version32) or
+      not TryParseVisualCppVersion(Version32, Version32Packed) or
+      (ComparePackedVersion(Version32Packed, Version64Packed) <> 0) then
+    begin
+      Result := VisualCppRuntimeFailure(
+        'Runtimeの32bit/64bit registry viewが不整合なため、インストールを中止しました。');
+      Exit;
+    end;
+  end;
 end;
 
 function QueryApplicationRunning(var QueryFailed: Boolean): Boolean;
@@ -264,6 +356,9 @@ begin
     Exit;
   end;
 
+  Result := CheckVisualCppRuntime;
+  if Result <> '' then
+    Exit;
   Result := RequestSafeUpdateShutdown;
 end;
 

@@ -5,6 +5,7 @@ import io
 import json
 import os
 import platform
+import py_compile
 import shutil
 import stat
 import subprocess
@@ -14,7 +15,11 @@ from pathlib import Path
 
 import pytest
 
-from scripts import prepare_release_assets as release_assets
+from scripts import (
+    collect_licenses,
+    installer_content_audit,
+    prepare_release_assets as release_assets,
+)
 from scripts.prepare_release_assets import (
     ReleaseAssetError,
     binary_archive_records,
@@ -61,6 +66,46 @@ def _wheel_bytes(name: str = "demo", version: str = "1.0") -> bytes:
             archive.writestr(member_path, payload)
         archive.writestr(record_path, record)
     return wheel_buffer.getvalue()
+
+
+def _wheel_with_comment(wheel: bytes, comment: bytes) -> bytes:
+    result = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(wheel)) as source:
+        with zipfile.ZipFile(result, "w") as output:
+            for info in source.infolist():
+                output.writestr(info, source.read(info))
+            output.comment = comment
+    return result.getvalue()
+
+
+def test_wheel_record_inventory_accepts_normalized_directory_entries(tmp_path):
+    original = _wheel_bytes()
+    wheel = tmp_path / "demo-1.0-cp314-cp314-win_amd64.whl"
+    with zipfile.ZipFile(io.BytesIO(original)) as source:
+        with zipfile.ZipFile(wheel, "w") as output:
+            output.mkdir("demo-1.0.dist-info/")
+            for info in source.infolist():
+                output.writestr(info, source.read(info))
+
+    inventory = collect_licenses.verified_wheel_record_inventory(
+        wheel,
+        distribution="demo",
+        version="1.0",
+    )
+
+    assert inventory["distribution"] == "demo"
+    assert all(not item["path"].endswith("/") for item in inventory["artifacts"])
+
+
+def test_generated_pyc_source_accepts_dotted_module_names(tmp_path):
+    source = tmp_path / "hook-PIL.Image.py"
+    source.write_text("value = 1\n", encoding="utf-8")
+    pyc = Path(release_assets.importlib.util.cache_from_source(str(source)))
+    pyc.parent.mkdir()
+    py_compile.compile(str(source), cfile=str(pyc), doraise=True)
+
+    assert release_assets._generated_pyc_source(pyc) == source.resolve()
+    assert release_assets._generated_pyc_matches_source(pyc, source)
 
 
 def _runtime_zip_bytes(
@@ -164,6 +209,37 @@ def _installable_wheel_bytes(name: str = "demo", version: str = "1.0") -> bytes:
             archive.writestr(member_path, payload)
         archive.writestr(record_path, record)
     return wheel_buffer.getvalue()
+
+
+def _wheel_with_data_script_bytes(name: str = "demo", version: str = "1.0") -> bytes:
+    dist_info = f"{name}-{version}.dist-info"
+    members = {
+        f"{name}.data/scripts/{name}.exe": b"locked script\n",
+        f"{dist_info}/METADATA": (
+            f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+        ).encode(),
+        f"{dist_info}/WHEEL": (
+            b"Wheel-Version: 1.0\nGenerator: tests\n"
+            b"Root-Is-Purelib: false\nTag: py3-none-win_amd64\n"
+        ),
+    }
+    record_path = f"{dist_info}/RECORD"
+    rows = []
+    for member_path, payload in members.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(payload).digest())
+        record_member = member_path.replace("/", "\\")
+        rows.append(
+            f"{record_member},sha256={digest.rstrip(b'=').decode('ascii')},{len(payload)}"
+        )
+    record_member = record_path.replace("/", "\\")
+    members[record_path] = (
+        "\n".join([*rows, f"{record_member},,"]) + "\n"
+    ).encode()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w") as archive:
+        for member_path, payload in members.items():
+            archive.writestr(member_path, payload)
+    return output.getvalue()
 
 
 def _binary_lock(wheel: bytes) -> dict[str, object]:
@@ -366,11 +442,23 @@ def _create_asset_set(
     )
     if provenance_seal != "actual":
         build_provenance_sha256 = provenance_seal
+    installer_audit_receipt = tmp_path / "installer-content-audit.json"
+    installer_content_audit.create_installer_audit_receipt(
+        installer=installer,
+        distribution_root=distribution,
+        inno_script=(
+            Path(__file__).resolve().parents[1]
+            / "installer"
+            / "LoLReplayTool.iss"
+        ),
+        output=installer_audit_receipt,
+    )
     output = tmp_path / "release"
     payload = create_release_assets(
         version="1.2.3",
         source_commit="a" * 40,
         installer=installer,
+        installer_audit_receipt=installer_audit_receipt,
         application_source=source,
         distribution_root=distribution,
         output_dir=output,
@@ -415,6 +503,9 @@ def test_create_release_assets_uses_fixed_names_and_hashes(monkeypatch, tmp_path
         "version": "6.7.3",
         "inno_setup_provenance_sha256": "b" * 64,
         "installer_sha256": _sha(b"installer"),
+        "content_audit_receipt_sha256": release_assets.sha256_file(
+            tmp_path / "installer-content-audit.json"
+        ),
     }
     assert names == [
         "LoLReplayTool-Setup-1.2.3.exe",
@@ -1249,6 +1340,224 @@ def test_binary_install_plan_binds_requirements_and_locked_wheel(
     assert plan["generated_requirements_sha256"] == release_assets.sha256_file(
         generated
     )
+
+
+def test_binary_install_plan_selects_fixed_external_runtime_wheel(
+    monkeypatch,
+    tmp_path,
+):
+    upstream_wheel = _wheel_bytes()
+    transformed_wheel = _wheel_with_comment(
+        upstream_wheel, b"external VC runtime transformation"
+    )
+    lock = _binary_lock(upstream_wheel)
+    component = lock["runtime_components"][0]
+    wheel_name = component["binary_archive"]["filename"]
+    lock["external_vc_runtime_policy"] = {
+        "schema_version": 1,
+        "minimum_redistributable_version": "14.44.35211.0",
+        "official_information_url": (
+            "https://learn.microsoft.com/en-us/cpp/windows/"
+            "latest-supported-vc-redist"
+        ),
+        "recipe": "scripts/prepare_external_vc_runtime_wheels.py",
+        "required_components": [component["component"]],
+        "tool_artifacts": [
+            {
+                "filename": "tool.whl",
+                "url": "https://files.pythonhosted.org/packages/tool.whl",
+                "size": 1,
+                "sha256": "a" * 64,
+            }
+        ],
+        "wheels": [
+            {
+                "component": component["component"],
+                "filename": wheel_name,
+                "size": len(transformed_wheel),
+                "sha256": _sha(transformed_wheel),
+            }
+        ],
+    }
+    monkeypatch.setattr(
+        release_assets,
+        "REQUIRED_RELEASE_BINARY_COMPONENTS",
+        frozenset({component["component"]}),
+    )
+
+    def fake_prepare_external_wheels(**kwargs):
+        output_dir = kwargs["cache_dir"] / "external-vc-runtime-wheels"
+        output_dir.mkdir()
+        (output_dir / wheel_name).write_bytes(transformed_wheel)
+        provenance = output_dir / "external-vc-runtime-wheel-provenance.json"
+        provenance.write_text('{"fixture": true}\n', encoding="utf-8")
+        return {
+            "directory": str(output_dir.resolve()),
+            "provenance": str(provenance.resolve()),
+            "provenance_sha256": release_assets.sha256_file(provenance),
+            "payload": {"fixture": True},
+        }
+
+    monkeypatch.setattr(
+        release_assets,
+        "_prepare_external_vc_runtime_wheels",
+        fake_prepare_external_wheels,
+    )
+    lock_path = tmp_path / "components.json"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("demo==1.0\n", encoding="utf-8")
+    cache = tmp_path / "binary-cache"
+    generated = tmp_path / "release-requirements.txt"
+    plan_path = tmp_path / "release-install-plan.json"
+
+    plan = release_assets.prepare_binary_install(
+        components_file=lock_path,
+        requirements_file=requirements,
+        cache_dir=cache,
+        output_requirements=generated,
+        output_plan=plan_path,
+        opener=lambda _request, *, timeout: io.BytesIO(upstream_wheel),
+    )
+
+    transformed_path = cache / "external-vc-runtime-wheels" / wheel_name
+    requirement = plan["requirements"][0]
+    assert requirement["source"] == "external-vc-runtime-wheel"
+    assert requirement["sha256"] == _sha(transformed_wheel)
+    assert requirement["upstream_archive"]["sha256"] == _sha(upstream_wheel)
+    assert generated.read_text(encoding="utf-8").splitlines()[-1] == (
+        f"demo @ {transformed_path.resolve().as_uri()}"
+        f"#sha256={_sha(transformed_wheel)}"
+    )
+
+
+@pytest.mark.parametrize("tamper_target", ["installer", "distribution"])
+def test_release_rejects_post_audit_payload_swap(
+    tmp_path: Path,
+    tamper_target: str,
+) -> None:
+    installer = tmp_path / "LoLReplayTool-Setup-1.2.3.exe"
+    installer.write_bytes(b"audited installer")
+    distribution = tmp_path / "distribution"
+    distribution.mkdir()
+    application = distribution / "LoLReplayTool.exe"
+    application.write_bytes(b"audited application")
+    inno_script = (
+        Path(__file__).resolve().parents[1]
+        / "installer"
+        / "LoLReplayTool.iss"
+    )
+    receipt = tmp_path / "installer-content-audit.json"
+    installer_content_audit.create_installer_audit_receipt(
+        installer=installer,
+        distribution_root=distribution,
+        inno_script=inno_script,
+        output=receipt,
+    )
+
+    if tamper_target == "installer":
+        installer.write_bytes(b"replaced installer")
+    else:
+        application.write_bytes(b"replaced application")
+
+    with pytest.raises(ReleaseAssetError, match="bytes differ"):
+        release_assets.validate_installer_audit_receipt(
+            receipt,
+            installer=installer,
+            distribution_root=distribution,
+        )
+
+
+def test_installed_record_accepts_relocated_script_aliases_only_when_locked(
+    monkeypatch,
+    tmp_path,
+):
+    wheel = _wheel_with_data_script_bytes()
+    wheel_path = tmp_path / "demo-1.0-py3-none-win_amd64.whl"
+    wheel_path.write_bytes(wheel)
+    environment = tmp_path / "environment"
+    site_packages = environment / "Lib" / "site-packages"
+    scripts_root = environment / "Scripts"
+    record_path = site_packages / "demo-1.0.dist-info" / "RECORD"
+    site_packages.mkdir(parents=True)
+    scripts_root.mkdir(parents=True)
+    script = scripts_root / "demo.exe"
+    script.write_bytes(b"locked script\n")
+
+    with zipfile.ZipFile(io.BytesIO(wheel)) as archive:
+        locked = archive.read("demo.data/scripts/demo.exe")
+        digest = base64.urlsafe_b64encode(hashlib.sha256(locked).digest())
+        metadata = archive.read("demo-1.0.dist-info/METADATA")
+        wheel_metadata = archive.read("demo-1.0.dist-info/WHEEL")
+    encoded = digest.rstrip(b"=").decode("ascii")
+    metadata_digest = base64.urlsafe_b64encode(hashlib.sha256(metadata).digest())
+    wheel_digest = base64.urlsafe_b64encode(hashlib.sha256(wheel_metadata).digest())
+    record_path.parent.mkdir()
+    (record_path.parent / "METADATA").write_bytes(metadata)
+    (record_path.parent / "WHEEL").write_bytes(wheel_metadata)
+    record_path.write_text(
+        "\n".join(
+                [
+                    f"demo.data\\scripts\\demo.exe,sha256={encoded},{len(locked)}",
+                    "..\\..\\Scripts\\demo.exe,,",
+                    "demo-1.0.dist-info/METADATA,,",
+                    f"demo-1.0.dist-info\\METADATA,sha256={metadata_digest.rstrip(b'=').decode('ascii')},{len(metadata)}",
+                    "demo-1.0.dist-info/WHEEL,,",
+                    f"demo-1.0.dist-info\\WHEEL,sha256={wheel_digest.rstrip(b'=').decode('ascii')},{len(wheel_metadata)}",
+                    "demo-1.0.dist-info/RECORD,,",
+                    "demo-1.0.dist-info\\RECORD,,",
+                ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class FakeDistribution:
+        version = "1.0"
+        files = (
+            "RECORD_MARKER",
+            "METADATA_MARKER",
+            "WHEEL_MARKER",
+            "SCRIPT_MARKER",
+        )
+        entry_points = ()
+
+        @staticmethod
+        def locate_file(item):
+            return {
+                "": site_packages,
+                "RECORD_MARKER": record_path,
+                "METADATA_MARKER": record_path.parent / "METADATA",
+                "WHEEL_MARKER": record_path.parent / "WHEEL",
+                "SCRIPT_MARKER": script,
+            }[str(item)]
+
+    monkeypatch.setattr(importlib.metadata, "distribution", lambda _name: FakeDistribution())
+    monkeypatch.setattr(release_assets.sys, "prefix", str(environment))
+    monkeypatch.setattr(
+        release_assets.sysconfig,
+        "get_path",
+        lambda name: str(scripts_root) if name == "scripts" else None,
+    )
+
+    inventory = release_assets._verify_installed_distribution_from_wheel(
+        "demo",
+        wheel_path,
+    )
+    assert any(item["path"].casefold().endswith("/demo.exe") for item in inventory["files"])
+
+    record_path.write_text(
+        record_path.read_text(encoding="utf-8").replace(
+            f"sha256={encoded}",
+            "sha256=" + ("0" * 43),
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ReleaseAssetError, match="Relocated script RECORD differs"):
+        release_assets._verify_installed_distribution_from_wheel(
+            "demo",
+            wheel_path,
+        )
 
 
 def test_binary_install_attestation_rejects_plan_and_report_tampering(
@@ -2186,6 +2495,28 @@ def test_release_asset_list_can_be_reverified_after_safe_relocation(
     verify_release_asset_list(relocated_list, asset_dir=relocated)
 
 
+def test_ci_windows_build_uses_external_runtime_wheels_and_provenance() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
+    build_job = workflow[workflow.index("  build-windows:"):]
+    install = build_job.index("name: Install build dependencies")
+    inno = build_job.index("name: Prepare verified Inno Setup")
+    build = build_job.index("name: Build application")
+    assert "prepare-binary-install" in build_job[install:build]
+    assert "attest-binary-install" in build_job[install:build]
+    assert "--no-index" in build_job[install:build]
+    assert "--require-hashes" in build_job[install:build]
+    assert "--report $pipReport" in build_job[install:build]
+    assert "--output-provenance $buildProvenance" in build_job[install:build]
+    assert "-BuildProvenance $env:BUILD_PROVENANCE" in build_job[inno:build]
+    assert build_job.index(
+        "BUILD_PROVENANCE_SHA256=$buildProvenanceSha256"
+    ) > build_job.index("-BuildProvenance $env:BUILD_PROVENANCE", inno)
+    assert "-BuildProvenance $env:BUILD_PROVENANCE" in build_job[build:]
+    assert "-BuildProvenanceSha256 $env:BUILD_PROVENANCE_SHA256" in build_job[build:]
+
+
 def test_release_workflow_requires_manual_approval_and_remote_verification():
     workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8"
@@ -2280,8 +2611,16 @@ def test_release_workflow_requires_manual_approval_and_remote_verification():
         "            verify",
         prepare_create,
     )
-    prepare_seal = workflow.index("$releaseAssetsSha256 = (", prepare_verify)
-    assert prepare_create < prepare_verify < prepare_seal
+    prepare_pe_audit = workflow.index(
+        "& $env:RELEASE_PYTHON -m scripts.pe_runtime_audit `",
+        prepare_verify,
+    )
+    prepare_seal = workflow.index("$releaseAssetsSha256 = (", prepare_pe_audit)
+    assert "--enforce-external" in workflow[prepare_pe_audit:prepare_seal]
+    assert "release-asset-pe-imports.json" in workflow[
+        prepare_pe_audit:prepare_seal
+    ]
+    assert prepare_create < prepare_verify < prepare_pe_audit < prepare_seal
     manifest_seal = workflow.index(
         "$actualReleaseAssetsSha256 = (",
         workflow.index("name: Re-verify Release assets after transfer"),
@@ -2328,10 +2667,9 @@ def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
     assert windows_workflow.count("& $env:WINDOWS_PYTHON -m pytest `") == 1
     assert "python -m pip" not in windows_workflow
     assert "run: python -m" not in windows_workflow
-    assert (
-        "run: .\\scripts\\build.ps1 -PythonExe $env:WINDOWS_PYTHON"
-        in windows_workflow
-    )
+    assert "run: .\\scripts\\build.ps1 `\n          -PythonExe $env:WINDOWS_PYTHON" in windows_workflow
+    assert "-BuildProvenance $env:BUILD_PROVENANCE" in windows_workflow
+    assert "-BuildProvenanceSha256 $env:BUILD_PROVENANCE_SHA256" in windows_workflow
     assert "& $env:WINDOWS_PYTHON -m scripts.check_license_compliance" in (
         windows_workflow
     )
@@ -2388,5 +2726,19 @@ def test_build_scripts_accept_verified_python_and_provenance():
     assert '$buildArgs = @{}' in installer
     assert '@("-PythonExe", $selectedPython)' not in installer
     assert '-m PyInstaller --noconfirm --clean "LoLReplayTool.spec"' in build
+    assert "$originalPath = $env:PATH" in build
+    assert (
+        "$env:LOL_REPLAY_PYINSTALLER_PATH = $isolatedPath" in build
+    )
+    assert '$env:PYTHONPATH = $pathGuardDir' in build
+    assert '$env:PATH = $isolatedPath' in build
+    assert 'PyInstaller用の固定PATHをPython processへ適用できません。' in build
+    assert "$env:PATH = $originalPath" in build
+    assert "Remove-Item Env:PATH" in build
+    assert "Remove-Item Env:PYTHONPATH" in build
+    assert "Remove-Item Env:LOL_REPLAY_PYINSTALLER_PATH" in build
+    assert "$isolatedPathEntries" in build
+    assert "$originalPath +" not in build
+    assert "(Split-Path -Parent $systemDirectory)" not in build
     assert "apply_windows_runtime_policy(a.binaries)" in spec
     assert "a._save_guts()" in spec

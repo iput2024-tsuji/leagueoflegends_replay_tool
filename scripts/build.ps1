@@ -65,9 +65,83 @@ foreach ($iconAsset in @("assets\app\app.ico", "assets\app\app.png")) {
 if ($LASTEXITCODE -ne 0) {
   throw "選択した Python 環境に PyInstaller がありません。pip install pyinstaller を実行してください。"
 }
-& $selectedPython -m PyInstaller --noconfirm --clean "LoLReplayTool.spec"
-if ($LASTEXITCODE -ne 0) {
-  exit $LASTEXITCODE
+
+$basePrefixOutput = @(& $selectedPython -c "import sys; print(sys.base_prefix)")
+if ($LASTEXITCODE -ne 0 -or $basePrefixOutput.Count -ne 1) {
+  throw "選択した Python の base prefix を一意に取得できません。"
+}
+$resolvedPythonBase = (
+  Resolve-Path -LiteralPath $basePrefixOutput[0].Trim() -ErrorAction Stop
+).Path
+$systemDirectory = [Environment]::GetFolderPath(
+  [Environment+SpecialFolder]::System
+)
+if (
+  [string]::IsNullOrWhiteSpace($systemDirectory) -or
+  -not (Test-Path -LiteralPath $systemDirectory -PathType Container)
+) {
+  throw "Windows system directoryを取得できません。"
+}
+$isolatedPathCandidates = @(
+  (Split-Path -Parent $selectedPython),
+  $resolvedPythonBase,
+  (Join-Path $resolvedPythonBase "DLLs"),
+  $systemDirectory
+)
+$isolatedPathEntries = @(
+  foreach ($candidate in $isolatedPathCandidates) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
+      throw "PyInstaller用の固定PATH directoryが見つかりません: $candidate"
+    }
+    (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path
+  }
+) | Select-Object -Unique
+$isolatedPath = $isolatedPathEntries -join [IO.Path]::PathSeparator
+$pathGuardDir = Join-Path $scriptDir "pyinstaller_sitecustomize"
+$pathGuardScript = Join-Path $pathGuardDir "sitecustomize.py"
+if (-not (Test-Path -LiteralPath $pathGuardScript -PathType Leaf)) {
+  throw "PyInstaller用のPATH guardが見つかりません: $pathGuardScript"
+}
+
+# PyInstaller resolves transitive PE dependencies from PATH. Limit that search
+# to the locked Python and Windows directories so unrelated host tools cannot
+# leak DLLs into the distribution. PYTHONPATH loads the same guard in
+# PyInstaller's isolated Python subprocesses as well.
+$originalPath = $env:PATH
+$originalPythonPath = $env:PYTHONPATH
+$originalGuardedPath = $env:LOL_REPLAY_PYINSTALLER_PATH
+$hadPath = Test-Path Env:PATH
+$hadPythonPath = Test-Path Env:PYTHONPATH
+$hadGuardedPath = Test-Path Env:LOL_REPLAY_PYINSTALLER_PATH
+try {
+  $env:LOL_REPLAY_PYINSTALLER_PATH = $isolatedPath
+  $env:PYTHONPATH = $pathGuardDir
+  $env:PATH = $isolatedPath
+  & $selectedPython -c "import os, sys; expected = os.environ.get('LOL_REPLAY_PYINSTALLER_PATH'); sys.exit(0 if expected and os.environ.get('PATH') == expected else 1)"
+  if ($LASTEXITCODE -ne 0) {
+    throw "PyInstaller用の固定PATHをPython processへ適用できません。"
+  }
+  & $selectedPython -m PyInstaller --noconfirm --clean "LoLReplayTool.spec"
+  $pyInstallerExitCode = $LASTEXITCODE
+} finally {
+  if ($hadPath) {
+    $env:PATH = $originalPath
+  } else {
+    Remove-Item Env:PATH -ErrorAction SilentlyContinue
+  }
+  if ($hadPythonPath) {
+    $env:PYTHONPATH = $originalPythonPath
+  } else {
+    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+  }
+  if ($hadGuardedPath) {
+    $env:LOL_REPLAY_PYINSTALLER_PATH = $originalGuardedPath
+  } else {
+    Remove-Item Env:LOL_REPLAY_PYINSTALLER_PATH -ErrorAction SilentlyContinue
+  }
+}
+if ($pyInstallerExitCode -ne 0) {
+  exit $pyInstallerExitCode
 }
 Assert-BuildProvenance
 

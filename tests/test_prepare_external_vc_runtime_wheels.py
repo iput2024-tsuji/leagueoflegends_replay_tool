@@ -5,9 +5,12 @@ import csv
 import hashlib
 import io
 import json
+import os
+import subprocess
 import zipfile
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -55,7 +58,35 @@ def _lock_payload() -> dict[str, object]:
                 "source_archives": deepcopy(manifest["source_archives"]),
             }
         )
-    return {"runtime_components": components}
+    return {
+        "runtime_components": components,
+        "build_components": [],
+        "external_vc_runtime_policy": {
+            "schema_version": 1,
+            "minimum_redistributable_version": "14.44.35211.0",
+            "official_information_url": (
+                "https://learn.microsoft.com/en-us/cpp/windows/"
+                "latest-supported-vc-redist"
+            ),
+            "recipe": "scripts/prepare_external_vc_runtime_wheels.py",
+            "required_components": sorted(
+                manifest["component"] for manifest in target.EXPECTED.values()
+            ),
+            "tool_artifacts": [
+                {"filename": name, **deepcopy(record)}
+                for name, record in target.TOOL_ARTIFACTS.items()
+            ],
+            "wheels": [
+                {
+                    "component": manifest["component"],
+                    "filename": name,
+                    "size": manifest["output_size"],
+                    "sha256": manifest["output_sha256"],
+                }
+                for name, manifest in target.EXPECTED.items()
+            ],
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -255,6 +286,79 @@ def test_run_rejects_non_release_python(monkeypatch, tmp_path) -> None:
     assert not (tmp_path / "output").exists()
 
 
+@pytest.mark.parametrize("boundary", ["input", "tools"])
+def test_external_wheel_boundaries_reject_linked_directories(
+    tmp_path: Path, boundary: str
+) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    link = tmp_path / boundary
+    try:
+        link.symlink_to(external, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Directory symlinks are unavailable: {exc}")
+
+    with pytest.raises(target.WheelError, match="linked"):
+        if boundary == "input":
+            target.validate_inputs(link, tmp_path / "components.json")
+        else:
+            target._validate_tool_artifacts(link)
+
+
+def test_external_wheel_boundary_rejects_linked_file(tmp_path: Path) -> None:
+    external = tmp_path / "external.whl"
+    external.write_bytes(b"wheel")
+    link = tmp_path / "linked.whl"
+    try:
+        link.symlink_to(external)
+    except OSError as exc:
+        pytest.skip(f"File symlinks are unavailable: {exc}")
+
+    with pytest.raises(target.WheelError, match="linked"):
+        target._require_regular_file(link, "wheel input")
+
+
+def test_locked_audit_rejects_ambient_pefile(monkeypatch, tmp_path: Path) -> None:
+    wheel = tmp_path / str(target.PEFILE_ARTIFACT["filename"])
+    wheel.write_bytes(b"locked wheel")
+    ambient = tmp_path / "site-packages" / "pefile.py"
+    monkeypatch.setattr(target, "_require_locked_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        target,
+        "_pe_runtime_audit_module",
+        lambda: SimpleNamespace(
+            pefile=SimpleNamespace(
+                __file__=str(ambient),
+                __version__=target.PEFILE_VERSION,
+            )
+        ),
+    )
+
+    with pytest.raises(target.WheelError, match="locked wheel"):
+        target._load_locked_pe_runtime_audit(wheel)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction behavior")
+def test_external_wheel_boundary_rejects_windows_junction(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    junction = tmp_path / "junction"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        pytest.skip(completed.stderr or completed.stdout or "mklink /J failed")
+    try:
+        assert target._path_is_link_or_reparse(junction)
+        with pytest.raises(target.WheelError, match="linked"):
+            target.validate_inputs(junction, tmp_path / "components.json")
+    finally:
+        junction.rmdir()
+
+
 def test_run_leaves_no_partial_output_on_failure(monkeypatch, tmp_path) -> None:
     input_dir = tmp_path / "input"
     input_dir.mkdir()
@@ -278,12 +382,29 @@ def test_run_leaves_no_partial_output_on_failure(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         target,
         "_validate_tool_artifacts",
-        lambda *_: (tmp_path / "delvewheel.whl", {}),
+        lambda *_: (
+            tmp_path / "delvewheel.whl",
+            tmp_path / "pefile.whl",
+            {},
+        ),
+    )
+    monkeypatch.setattr(
+        target,
+        "_load_locked_pe_runtime_audit",
+        lambda *_: SimpleNamespace(
+            pefile=SimpleNamespace(__version__="2024.8.26")
+        ),
     )
     monkeypatch.setattr(target, "_check_delvewheel", lambda *_: "1.13.0")
 
     def fail_after_one(
-        source, output, manifest, provenance, tool_wheel
+        source,
+        output,
+        manifest,
+        provenance,
+        tool_wheel,
+        pefile_wheel,
+        audit,
     ) -> None:
         nonlocal calls
         calls += 1

@@ -11,7 +11,23 @@ _WINDOWS_OS_RUNTIME_NAME = re.compile(
     r"api-ms-win-(?:core|crt)-[a-z0-9-]+\.dll\Z",
     re.IGNORECASE,
 )
-_SCIKIT_LEARN_VCOMP_NAME = "sklearn/.libs/vcomp140.dll"
+MICROSOFT_RUNTIME_NAMES = frozenset(
+    {
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "vcomp140.dll",
+        "concrt140.dll",
+    }
+)
+_HASHED_MICROSOFT_RUNTIME_NAME = re.compile(
+    r"(?:msvcp140(?:_[12])?|vcruntime140(?:_1)?|vcomp140|concrt140)"
+    r"-[0-9a-f]+\.dll\Z",
+    re.IGNORECASE,
+)
+_MICROSOFT_RUNTIME_PREFIXES = ("msvcp", "vcruntime", "vcomp", "concrt")
 _UNUSED_QT_RUNTIME_NAMES = {
     "pyqt6/qt6/bin/opengl32sw.dll",
     "pyqt6/qt6/bin/qt6pdf.dll",
@@ -31,20 +47,39 @@ def is_windows_os_runtime_name(toc_name: str) -> bool:
     )
 
 
-def is_root_vcomp_name(toc_name: str) -> bool:
-    """Return whether a TOC entry is PyInstaller's redundant root VCOMP copy."""
+def is_app_local_windows_os_runtime_name(toc_name: str) -> bool:
+    """Return whether any path contains a Windows OS CRT DLL basename."""
+
+    basename = toc_name.replace("\\", "/").rsplit("/", 1)[-1]
+    lowered = basename.casefold()
+    return lowered == "ucrtbase.dll" or _WINDOWS_OS_RUNTIME_NAME.fullmatch(
+        basename
+    ) is not None
+
+
+def classify_microsoft_runtime_name(toc_name: str) -> str | None:
+    """Classify an app-local Microsoft Runtime basename, including nested paths."""
 
     normalized = toc_name.replace("\\", "/")
-    return "/" not in normalized and normalized.casefold() == "vcomp140.dll"
+    basename = normalized.rsplit("/", 1)[-1]
+    lowered = basename.casefold()
+    if lowered in MICROSOFT_RUNTIME_NAMES:
+        return "generic"
+    if _HASHED_MICROSOFT_RUNTIME_NAME.fullmatch(basename) is not None:
+        return "hashed"
+    if lowered.endswith(".dll") and lowered.startswith(
+        _MICROSOFT_RUNTIME_PREFIXES
+    ):
+        return "unknown"
+    return None
 
 
 def apply_windows_runtime_policy(
     binaries: Iterable[PyInstallerBinary],
 ) -> list[PyInstallerBinary]:
-    """Remove host OS runtimes and unused Qt runtime artifacts."""
+    """Remove known external runtimes and reject unknown Runtime names."""
 
     retained: list[PyInstallerBinary] = []
-    scikit_learn_vcomp_count = 0
     seen_destinations: set[str] = set()
     for entry in binaries:
         if (
@@ -59,18 +94,23 @@ def apply_windows_runtime_policy(
                 f"PyInstaller emitted an unexpected binary type: {entry_type}"
             )
         normalized_name = toc_name.replace("\\", "/")
+        if "/" in normalized_name and is_app_local_windows_os_runtime_name(
+            normalized_name
+        ):
+            raise RuntimeError(
+                f"PyInstaller emitted an app-local Windows Runtime: {toc_name}"
+            )
+        runtime_kind = classify_microsoft_runtime_name(normalized_name)
+        if runtime_kind == "unknown":
+            raise RuntimeError(
+                f"PyInstaller emitted an unknown Microsoft Runtime: {toc_name}"
+            )
         if (
             is_windows_os_runtime_name(toc_name)
-            or is_root_vcomp_name(toc_name)
+            or runtime_kind is not None
             or normalized_name.casefold() in _UNUSED_QT_RUNTIME_NAMES
         ):
             continue
-        if normalized_name.casefold() == _SCIKIT_LEARN_VCOMP_NAME:
-            if entry_type != "BINARY":
-                raise RuntimeError(
-                    "The locked scikit-learn VCOMP entry is not a binary."
-                )
-            scikit_learn_vcomp_count += 1
         destination_key = normalized_name.casefold()
         if destination_key in seen_destinations:
             raise RuntimeError(
@@ -78,8 +118,4 @@ def apply_windows_runtime_policy(
             )
         seen_destinations.add(destination_key)
         retained.append(entry)
-    if scikit_learn_vcomp_count != 1:
-        raise RuntimeError(
-            "PyInstaller must collect exactly one locked scikit-learn vcomp140.dll."
-        )
     return retained

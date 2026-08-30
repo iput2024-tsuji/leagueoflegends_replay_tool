@@ -132,6 +132,22 @@ def test_build_uses_fixed_icon_assets_without_regeneration():
     assert '"assets\\app\\app.png"' in script
 
 
+def test_repository_license_uses_locked_lf_bytes():
+    attributes = Path(".gitattributes").read_text(encoding="utf-8")
+    lock = _component_lock()
+    material = lock["application"]["license_materials"]
+    license_bytes = Path("LICENSE").read_bytes()
+
+    assert "LICENSE text eol=lf" in attributes.splitlines()
+    assert b"\r\n" not in license_bytes
+    assert material == [
+        {
+            "path": "LICENSE",
+            "sha256": sha256_file(Path("LICENSE")),
+        }
+    ]
+
+
 def test_pillow_is_dev_only_and_excluded_from_pyinstaller():
     from scripts.prepare_release_assets import release_gate_errors
 
@@ -408,6 +424,10 @@ def test_microsoft_python_runtime_artifacts_match_release_profile():
         if component.get("component") == "microsoft-vc-runtime-python"
     )
     assert python_component["build_provenance_verified"] is True
+    assert python_component["artifact_patterns"] == []
+    assert "excluded from application artifacts" in python_component[
+        "distribution_policy"
+    ]
     assert python_component["license_materials"] == [
         {
             "path": "licenses/python-packages/Python/LICENSE.txt",
@@ -425,9 +445,10 @@ def test_microsoft_python_runtime_artifacts_match_release_profile():
         artifact["path"]: artifact
         for artifact in profile["core_native_inventory"]["artifacts"]
     }
-    assert len(python_component["verified_runtime_artifacts"]) == 2
+    excluded = python_component["excluded_upstream_runtime_artifacts"]
+    assert len(excluded) == 2
     prefix = Path(sys.base_prefix)
-    for artifact in python_component["verified_runtime_artifacts"]:
+    for artifact in excluded:
         assert artifact["source_component"] == "python"
         assert Path(artifact["path"]).name.casefold() == Path(
             artifact["archive_member"]
@@ -437,14 +458,14 @@ def test_microsoft_python_runtime_artifacts_match_release_profile():
         assert artifact["sha256"] == expected["sha256"]
     if sys.version.split()[0] != release_version:
         pytest.skip(f"release runtime file check requires CPython {release_version}")
-    for artifact in python_component["verified_runtime_artifacts"]:
+    for artifact in excluded:
         source = prefix / Path(*artifact["archive_member"].split("/"))
         assert source.stat().st_size == artifact["size"]
         assert sha256_file(source) == artifact["sha256"]
         assert _windows_file_version(source) == artifact["file_version"]
 
 
-def test_microsoft_wheel_runtime_artifacts_match_locked_distributions():
+def test_microsoft_wheel_runtime_artifacts_match_locked_upstream_wheels():
     if os.name != "nt":
         pytest.skip("Microsoft runtime artifact locks are Windows-specific")
 
@@ -455,6 +476,10 @@ def test_microsoft_wheel_runtime_artifacts_match_locked_distributions():
         if component.get("component") == "microsoft-vc-runtime"
     )
     assert wheel_component["build_provenance_verified"] is True
+    assert wheel_component["artifact_patterns"] == []
+    assert "removed by deterministic wheel repair" in wheel_component[
+        "distribution_policy"
+    ]
     assert wheel_component["source_exception"]["review_completed"] is False
     assert wheel_component["license_materials_exception"]["review_completed"] is False
     assert wheel_component["release_legal_review_required"] is True
@@ -480,8 +505,9 @@ def test_microsoft_wheel_runtime_artifacts_match_locked_distributions():
             8096518,
         ),
     }
-    assert len(wheel_component["verified_runtime_artifacts"]) == 8
-    for artifact in wheel_component["verified_runtime_artifacts"]:
+    excluded = wheel_component["excluded_upstream_runtime_artifacts"]
+    assert len(excluded) == 8
+    for artifact in excluded:
         distribution_name = artifact["distribution"]
         source_component = distributions[distribution_name]
         assert artifact["source_component"] == source_component
@@ -499,12 +525,9 @@ def test_microsoft_wheel_runtime_artifacts_match_locked_distributions():
             archive["sha256"],
             archive["size"],
         ) == expected_wheels[distribution_name]
-        distribution = metadata.distribution(distribution_name)
-        assert distribution.version == source_component_lock["version"]
-        source = Path(distribution.locate_file(artifact["wheel_member"]))
-        assert source.stat().st_size == artifact["size"]
-        assert sha256_file(source) == artifact["sha256"]
-        assert _windows_file_version(source) == artifact["file_version"]
+        assert artifact["size"] > 0
+        assert re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"])
+        assert re.fullmatch(r"\d+(?:\.\d+){3}", artifact["file_version"])
 
 
 def test_numpy_and_scipy_openblas_windows_build_evidence_matches_wheels():
@@ -1939,6 +1962,11 @@ def test_toc_and_dist_are_bidirectionally_inventoried(monkeypatch, tmp_path):
         "_validate_pyinstaller_build",
         lambda *_args, **_kwargs: ([], {"test_fixture": True}),
     )
+    monkeypatch.setattr(
+        compliance,
+        "_external_vc_runtime_errors",
+        lambda _root: [],
+    )
 
     assert validate_distribution(
         root,
@@ -2044,10 +2072,15 @@ def test_build_script_fails_closed_on_user_provided_runtime_artifacts():
     assert "throw \"利用者が用意するOBS／standalone FFmpeg" in script
 
 
-def test_existing_distribution_manifest_detects_missing_record(tmp_path):
+def test_existing_distribution_manifest_detects_missing_record(monkeypatch, tmp_path):
     root = tmp_path / "distribution"
     _write_distribution_materials(root)
     manifest_path = _write_existing_inventory(root)
+    monkeypatch.setattr(
+        compliance,
+        "_external_vc_runtime_errors",
+        lambda _root: [],
+    )
 
     assert validate_distribution(root) == []
 
@@ -2252,28 +2285,25 @@ def test_installer_build_self_check_has_an_explicit_timeout():
 
 
 @pytest.mark.parametrize(
-    ("path", "source_name", "owner", "expected"),
+    ("path", "source_name", "owner"),
     [
         (
             "_internal/PyQt6/Qt6/bin/MSVCP140.dll",
             "MSVCP140.dll",
             "qt",
-            "microsoft-vc-runtime",
         ),
         (
             "_internal/numpy.libs/msvcp140-a4c2229b.dll",
             "msvcp140-a4c2229b.dll",
             "numpy",
-            "microsoft-vc-runtime",
         ),
     ],
 )
-def test_native_runtime_overrides_wheel_owner(
+def test_native_runtime_is_rejected_regardless_of_wheel_owner(
     tmp_path,
     path,
     source_name,
     owner,
-    expected,
 ):
     source = tmp_path / source_name
     source.write_bytes(b"native")
@@ -2283,7 +2313,7 @@ def test_native_runtime_overrides_wheel_owner(
             {"path": path, "source": str(source), "toc_name": source_name},
             {compliance._path_key(source): owner},
         )
-        == expected
+        is None
     )
 
 
@@ -2533,7 +2563,7 @@ def test_system_vcomp_is_not_accepted_as_a_redistributable_source(
     )
 
 
-def test_windows_runtime_policy_excludes_host_runtime_and_retains_wheel_vcomp(
+def test_windows_runtime_policy_excludes_all_known_app_local_runtimes(
     tmp_path,
 ):
     wheel_vcomp = tmp_path / "sklearn" / ".libs" / "vcomp140.dll"
@@ -2549,10 +2579,30 @@ def test_windows_runtime_policy_excludes_host_runtime_and_retains_wheel_vcomp(
             "BINARY",
         ),
         ("ucrtbase.dll", r"C:\Windows\System32\ucrtbase.dll", "BINARY"),
+        (
+            r"pkg\ucrtbase.dll",
+            str(tmp_path / "ucrtbase.dll"),
+            "BINARY",
+        ),
+        (
+            r"pkg\api-ms-win-crt-runtime-l1-1-0.dll",
+            str(tmp_path / "api-ms-win-crt-runtime-l1-1-0.dll"),
+            "BINARY",
+        ),
         ("VCOMP140.DLL", r"C:\Windows\System32\VCOMP140.DLL", "BINARY"),
         (
             r"sklearn\.libs\vcomp140.dll",
             str(wheel_vcomp),
+            "BINARY",
+        ),
+        (
+            r"numpy.libs\msvcp140-a4c2229b.dll",
+            str(tmp_path / "msvcp140-a4c2229b.dll"),
+            "BINARY",
+        ),
+        (
+            r"PyQt6\Qt6\bin\VCRUNTIME140_1.DLL",
+            str(tmp_path / "VCRUNTIME140_1.DLL"),
             "BINARY",
         ),
         (
@@ -2573,12 +2623,18 @@ def test_windows_runtime_policy_excludes_host_runtime_and_retains_wheel_vcomp(
         ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION"),
     ]
 
-    filtered = runtime_policy.apply_windows_runtime_policy(binaries)
+    with pytest.raises(RuntimeError, match="app-local Windows Runtime"):
+        runtime_policy.apply_windows_runtime_policy(binaries)
 
-    assert filtered == [
-        (r"sklearn\.libs\vcomp140.dll", str(wheel_vcomp), "BINARY"),
-        ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION"),
-    ]
+    filtered = runtime_policy.apply_windows_runtime_policy(
+        [
+            entry
+            for entry in binaries
+            if not entry[0].replace("\\", "/").startswith("pkg/")
+        ]
+    )
+
+    assert filtered == [("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION")]
     assert runtime_policy.is_windows_os_runtime_name("ucrtbase.dll")
     assert runtime_policy.is_windows_os_runtime_name(
         "API-MS-WIN-CORE-FILE-L1-2-0.DLL"
@@ -2588,16 +2644,66 @@ def test_windows_runtime_policy_excludes_host_runtime_and_retains_wheel_vcomp(
     )
 
 
-def test_windows_runtime_policy_fails_without_exact_wheel_vcomp(tmp_path):
-    with pytest.raises(RuntimeError, match="exactly one locked scikit-learn"):
+def test_distribution_runtime_audit_fails_closed(monkeypatch, tmp_path):
+    from scripts import pe_runtime_audit
+
+    def reject(*args, **kwargs):
+        raise pe_runtime_audit.AuditError("hashed Runtime import")
+
+    monkeypatch.setattr(pe_runtime_audit, "build_inventory", reject)
+
+    assert compliance._external_vc_runtime_errors(tmp_path) == [
+        "External native Runtime PE audit failed: hashed Runtime import"
+    ]
+    assert runtime_policy.classify_microsoft_runtime_name(
+        r"numpy.libs\msvcp140-a4c2229b.dll"
+    ) == "hashed"
+    assert runtime_policy.classify_microsoft_runtime_name(
+        r"PyQt6\Qt6\bin\MSVCP140.dll"
+    ) == "generic"
+
+
+def test_distribution_runtime_audit_requires_fixed_qt_system_icu(
+    monkeypatch, tmp_path
+):
+    from scripts import pe_runtime_audit
+
+    observed = {}
+
+    def accept(root, **kwargs):
+        observed["root"] = root
+        observed.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(pe_runtime_audit, "build_inventory", accept)
+
+    assert compliance._external_vc_runtime_errors(tmp_path) == []
+    assert observed == {
+        "root": tmp_path,
+        "enforce_external": True,
+        "require_qt_system_icu": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "msvcp140_3.dll",
+        "VCRUNTIME140_clr0400.dll",
+        r"nested\vcomp999.dll",
+        "concrt141.dll",
+    ],
+)
+def test_windows_runtime_policy_rejects_unknown_runtime_names(tmp_path, name):
+    with pytest.raises(RuntimeError, match="unknown Microsoft Runtime"):
         runtime_policy.apply_windows_runtime_policy(
-            [("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION")]
+            [(name, str(tmp_path / Path(name).name), "BINARY")]
         )
 
-    duplicate = (
-        r"sklearn\.libs\vcomp140.dll",
-        str(tmp_path / "vcomp140.dll"),
-        "BINARY",
-    )
+
+def test_windows_runtime_policy_accepts_zero_runtime_and_rejects_duplicates(tmp_path):
+    demo = ("demo.pyd", str(tmp_path / "demo.pyd"), "EXTENSION")
+    assert runtime_policy.apply_windows_runtime_policy([demo]) == [demo]
+
     with pytest.raises(RuntimeError, match="duplicate binary destination"):
-        runtime_policy.apply_windows_runtime_policy([duplicate, duplicate])
+        runtime_policy.apply_windows_runtime_policy([demo, demo])

@@ -184,6 +184,10 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 
 ## ビルドとself-check
 
+- [ ] 正式対応OSはWindows 11（build 22000以降）、配布物はx64版、installerは`x64compatible`であり、Windows 10対応やARM64-native版を宣言していない
+- [ ] 固定PyQt6-Qt6 6.10.2のQt6Coreが要求する`icuuc.dll`をfresh processでロードし、loaded module handleから実際の`%SystemRoot%\System32\icuuc.dll`であること、ICU DLLのapp-local配置が0件であることを確認する
+- [ ] Qtのlocale、collation、Unicode境界処理を実行し、System32 ICUを利用した結果を記録する
+
 - [ ] 利用者管理のOBS、standalone FFmpeg、mpv DLLを含まない通常成果物で`pwsh -NoProfile -File .\scripts\build.ps1`が成功する
 - [ ] `.\dist\LoLReplayTool\LoLReplayTool.exe --self-check` が終了コード0になる
 - [ ] OBS、mpv、FFmpeg未配置の警告が想定どおりで、必須診断は成功する
@@ -201,6 +205,15 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 - [ ] 新しいランタイム依存ファイルや権限要件を追加した
 
 確認時は、新規インストール、上書き更新、アンインストールを行い、設定・録画の保持、削除オプション、スタートメニュー、管理者権限不要の動作を記録します。
+
+Microsoft Visual C++ 2015–2022 Redistributable x64を外部前提とする変更では、次の結果も記録します。
+
+- [ ] x64 Redistributable未導入、`Installed`欠損、Version欠損、必要Version未満、x86のみ、registry不整合で、ファイル変更・既存アプリ変更・shortcut作成・user data変更なしにfail-closedとなる
+- [ ] x64 Redistributable導入済みでは新規インストールと上書き更新が成功し、より新しい互換Versionも受け入れる
+- [ ] 対話時の不足案内はMicrosoft公式ページだけを示し、同意した場合だけブラウザーを開く。silent modeは対話・ブラウザーなしで明確な非0終了となる
+- [ ] Runtime DLLおよび`vc_redist.x64.exe`がアプリ、installer、Release assetへ存在せず、自動download/install/UAC昇格も行われない
+- [ ] dist、完成installer展開物、Release assetの監査が、大小文字やサブディレクトリにかかわらず`msvcp*.dll`、`vcruntime*.dll`、`vcomp*.dll`、`concrt*.dll`とハッシュ付きRuntime importを拒否する
+- [ ] custom wheelの固定入力、source archive、tool、SHA256、PE import変換前後、provenanceを再実行して同一結果となり、未知対象・件数差異・hash変更を拒否する
 
 上書き更新の安全終了を変更した場合は、次も記録します。
 

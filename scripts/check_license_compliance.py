@@ -24,6 +24,11 @@ from importlib import metadata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from scripts.binary_install_policy import (
+    BinaryInstallPolicyError,
+    expected_install_archive,
+    external_vc_runtime_policy,
+)
 from scripts.collect_licenses import (
     COMPONENTS_FILE,
     PROJECT_DOCUMENTS,
@@ -37,7 +42,7 @@ from scripts.collect_licenses import (
 )
 from scripts.external_runtime_policy import is_user_provided_runtime_path
 from scripts.pyinstaller_runtime_policy import (
-    is_root_vcomp_name,
+    classify_microsoft_runtime_name,
     is_windows_os_runtime_name,
 )
 from src.license_info import validate_distribution_documents
@@ -381,6 +386,32 @@ def validate_package_manifest(
                         f"Binary install verification flag is missing for "
                         f"{package_name}."
                     )
+                if lock is not None:
+                    try:
+                        binary_source, installed_archive = expected_install_archive(
+                            lock,
+                            expected_component,
+                        )
+                    except BinaryInstallPolicyError as exc:
+                        errors.append(str(exc))
+                    else:
+                        expected_installed = (
+                            {
+                                "source": binary_source,
+                                **{
+                                    key: installed_archive[key]
+                                    for key in ("filename", "sha256", "size")
+                                },
+                            }
+                            if binary_source == "external-vc-runtime-wheel"
+                            and package.get("binary_install_verified") is True
+                            else None
+                        )
+                        if package.get("installed_binary_archive") != expected_installed:
+                            errors.append(
+                                "Installed binary archive provenance differs for "
+                                f"{package_name}."
+                            )
             elif "binary_archive" in package or "binary_install_verified" in package:
                 errors.append(
                     f"Unexpected binary archive provenance for {package_name}."
@@ -625,7 +656,8 @@ def _parse_pyinstaller_tocs(collect_path: Path) -> dict[str, Any]:
     unexpected_windows_runtime = [
         name
         for name, _source, _entry_type in binaries
-        if is_windows_os_runtime_name(name) or is_root_vcomp_name(name)
+        if is_windows_os_runtime_name(name)
+        or classify_microsoft_runtime_name(name) is not None
     ]
     if unexpected_windows_runtime:
         raise ValueError(
@@ -2375,26 +2407,6 @@ def _python_core_source_locks(
     return result
 
 
-def _microsoft_runtime_owner_matches(
-    owner: str | None,
-    final_path: str,
-    source: Path,
-    python_core_sources: dict[str, dict[str, Any]],
-) -> bool:
-    final_lower = final_path.casefold()
-    if _path_key(source) in python_core_sources:
-        return final_lower == f"_internal/{source.name.casefold()}"
-    allowed_prefixes = {
-        "qt": "_internal/pyqt6/qt6/bin/",
-        "numpy": "_internal/numpy.libs/",
-        "scikit-learn": "_internal/sklearn/.libs/",
-    }
-    prefix = allowed_prefixes.get(owner or "")
-    if prefix is not None and final_lower.startswith(prefix):
-        return True
-    return owner == "scikit-learn" and final_lower == "_internal/vcomp140.dll"
-
-
 def _classify_toc_entry(
     entry: dict[str, str],
     source_owners: dict[str, str],
@@ -2408,22 +2420,8 @@ def _classify_toc_entry(
     owner = source_owners.get(_path_key(source))
     python_core = python_core_sources.get(_path_key(source))
 
-    if re.fullmatch(
-        r"(?:msvcp140(?:_[12])?|vcruntime140(?:_1)?|vcomp140)(?:-[0-9a-f]+)?\.dll",
-        source_lower,
-    ):
-        if not _microsoft_runtime_owner_matches(
-            owner,
-            final_path,
-            source,
-            python_core_sources,
-        ):
-            return None
-        return (
-            "microsoft-vc-runtime-python"
-            if python_core is not None
-            else "microsoft-vc-runtime"
-        )
+    if classify_microsoft_runtime_name(source_lower) is not None:
+        return None
     python_dependency_owners = {
         "_bz2.pyd": "python-bzip2",
         "_ctypes.pyd": "python-libffi",
@@ -2563,6 +2561,22 @@ def _forbidden_user_runtime_errors(
                 f"{relative}"
             )
     return errors
+
+
+def _external_vc_runtime_errors(distribution_root: Path) -> list[str]:
+    """Reject unsafe Microsoft Runtime or Qt system ICU PE state."""
+
+    from scripts import pe_runtime_audit
+
+    try:
+        pe_runtime_audit.build_inventory(
+            distribution_root,
+            enforce_external=True,
+            require_qt_system_icu=True,
+        )
+    except (pe_runtime_audit.AuditError, OSError) as exc:
+        return [f"External native Runtime PE audit failed: {exc}"]
+    return []
 
 
 def _package_license_paths(package_manifest: dict[str, Any] | None) -> set[str]:
@@ -3014,6 +3028,32 @@ def _validate_build_provenance(
     expected_components = set(
         lock.get("release_binary_policy", {}).get("required_components", [])
     )
+    try:
+        external_policy = external_vc_runtime_policy(lock)
+    except BinaryInstallPolicyError as exc:
+        errors.append(str(exc))
+        external_policy = None
+    external_record = payload.get("external_vc_runtime_wheels")
+    if external_policy is None:
+        if external_record is not None:
+            errors.append(
+                "Build provenance has unexpected external Runtime wheels."
+            )
+    else:
+        from scripts.prepare_external_vc_runtime_wheels import (
+            WheelError,
+            validate_embedded_provenance_record,
+        )
+
+        try:
+            validate_embedded_provenance_record(
+                external_record,
+                distribution_root / "licenses" / "components.json",
+            )
+        except (BinaryInstallPolicyError, WheelError, OSError) as exc:
+            errors.append(
+                f"Build provenance external Runtime record is invalid: {exc}"
+            )
     if set(package_manifest.get("verified_binary_components", [])) != expected_components:
         errors.append("Package manifest verified binary component set differs.")
     records = payload.get("installed_binaries")
@@ -3062,11 +3102,37 @@ def _validate_build_provenance(
                 f"Build provenance component has no binary lock: {component_name}"
             )
             continue
+        try:
+            source_kind, installed_archive = expected_install_archive(
+                lock,
+                component,
+            )
+        except BinaryInstallPolicyError as exc:
+            errors.append(str(exc))
+            continue
         for field in ("filename", "sha256", "size"):
-            if record.get(field) != archive.get(field):
+            if record.get(field) != installed_archive.get(field):
                 errors.append(
                     f"Build provenance differs for {component_name}.{field}."
                 )
+        if record.get("source") != source_kind:
+            errors.append(f"Build provenance source differs for {component_name}.")
+        expected_upstream = (
+            {
+                key: archive[key]
+                for key in ("filename", "url", "sha256", "size")
+            }
+            if source_kind == "external-vc-runtime-wheel"
+            else None
+        )
+        if record.get("upstream_archive") != expected_upstream:
+            errors.append(
+                f"Build provenance upstream archive differs for {component_name}."
+            )
+        if record.get("distribution") != component.get("distribution"):
+            errors.append(
+                f"Build provenance distribution differs for {component_name}."
+            )
         if record.get("version") != component.get("version"):
             errors.append(f"Build provenance version differs for {component_name}.")
         try:
@@ -3425,6 +3491,7 @@ def validate_distribution(
         errors.append(str(exc))
         return errors
     errors.extend(_forbidden_user_runtime_errors(distribution_root, physical))
+    errors.extend(_external_vc_runtime_errors(distribution_root))
     lock_path = distribution_root / "licenses" / "components.json"
     package_manifest_path = distribution_root / "licenses" / "python-packages.json"
     if not _regular_nonempty_file(lock_path):

@@ -1,6 +1,8 @@
 import io
 import json
 
+import pytest
+
 import main as app_entrypoint
 from src import self_check
 
@@ -42,10 +44,60 @@ def test_native_runtime_summary_exercises_locked_native_modules():
     summary = self_check._native_runtime_summary()
 
     assert "PyQt6/Qt 6.10.2" in summary
+    assert "locale/collation/Unicode ok" in summary
     assert "NumPy 2.4.1" in summary
     assert "pandas 3.0.2" in summary
     assert "scikit-learn 1.8.0" in summary
     assert "OpenCV 4.13.0" in summary
+    if self_check.os.name == "nt":
+        assert "Windows build" in summary
+        assert "icuuc.dll=" in summary
+
+
+def test_windows_system_icu_summary_accepts_loaded_system_copy(
+    monkeypatch, tmp_path
+):
+    system_directory = tmp_path / "Windows" / "System32"
+    system_directory.mkdir(parents=True)
+    icu_path = system_directory / "icuuc.dll"
+    icu_path.write_bytes(b"system ICU")
+    monkeypatch.setattr(self_check, "_windows_build_number", lambda: 22631)
+    monkeypatch.setattr(
+        self_check, "_windows_system_directory", lambda: str(system_directory)
+    )
+    monkeypatch.setattr(
+        self_check, "_loaded_windows_module_path", lambda _name: str(icu_path)
+    )
+
+    summary = self_check._windows_system_icu_summary()
+
+    assert "Windows build 22631" in summary
+    assert f"icuuc.dll={icu_path}" in summary
+
+
+def test_windows_system_icu_summary_rejects_app_local_copy(monkeypatch, tmp_path):
+    system_directory = tmp_path / "Windows" / "System32"
+    system_directory.mkdir(parents=True)
+    app_local = tmp_path / "app" / "icuuc.dll"
+    app_local.parent.mkdir()
+    app_local.write_bytes(b"app-local ICU")
+    monkeypatch.setattr(self_check, "_windows_build_number", lambda: 22631)
+    monkeypatch.setattr(
+        self_check, "_windows_system_directory", lambda: str(system_directory)
+    )
+    monkeypatch.setattr(
+        self_check, "_loaded_windows_module_path", lambda _name: str(app_local)
+    )
+
+    with pytest.raises(RuntimeError, match="outside the Windows system directory"):
+        self_check._windows_system_icu_summary()
+
+
+def test_windows_system_icu_summary_rejects_pre_windows_11(monkeypatch):
+    monkeypatch.setattr(self_check, "_windows_build_number", lambda: 19045)
+
+    with pytest.raises(RuntimeError, match="below the supported Windows 11"):
+        self_check._windows_system_icu_summary()
 
 
 def test_self_check_cli_reconfigures_cp1252_streams_to_utf8(monkeypatch):

@@ -578,6 +578,7 @@ def test_vm_lab_powershell_files_parse_without_errors(powershell: str | None):
         pytest.param(WINDOWS_POWERSHELL, id="windows-powershell-5.1"),
     ],
 )
+@pytest.mark.skipif(os.name != "nt", reason="Windows manifest path policy is Windows-only")
 def test_environment_b_manifest_path_accepts_windows_separators_and_rejects_escape(
     powershell: str | None, external_temp: Path
 ):

@@ -17,6 +17,7 @@ LAB_SCRIPT = Path("scripts/windows_vm_lab.ps1").resolve()
 GUEST_SCRIPT = Path("scripts/windows_vm_lab_guest.ps1").resolve()
 BOOTSTRAP_SCRIPT = Path("scripts/windows_vm_lab_bootstrap.ps1").resolve()
 ISO_BUILD_SCRIPT = Path("scripts/build_windows_vm_lab_iso.ps1").resolve()
+ENVIRONMENT_B_SCRIPT = Path("scripts/windows_vm_lab_environment_b.ps1").resolve()
 
 
 def test_clr0400_evidence_boundary_is_present_and_fail_closed():
@@ -435,7 +436,7 @@ def test_iso_builder_creates_hashed_media_without_mutating_source(
         "vc_redist.x64.exe": b"runtime",
         "installer/LoLReplayTool-Setup-0.5.2.exe": b"installer",
         "LoLReplayTool-external-build/LoLReplayTool.exe": b"app",
-        "02-test-environment-b.ps1": b"environment b",
+        "02-test-environment-b.ps1": b"untrusted external environment b",
         "run_packaged_self_check.ps1": b"runner",
         "evidence/package-sha256.csv": b"manifest",
         "evidence/pe-runtime-audit.json": b"pe audit",
@@ -452,6 +453,7 @@ def test_iso_builder_creates_hashed_media_without_mutating_source(
         path.chmod(0o444)
     output = external_temp / "media" / "managed.iso"
     output.parent.mkdir()
+    payload_commit = "1" * 40
 
     try:
         result = subprocess.run(
@@ -467,6 +469,8 @@ def test_iso_builder_creates_hashed_media_without_mutating_source(
                 str(source),
                 "-OutputPath",
                 str(output),
+                "-PayloadCommit",
+                payload_commit,
             ],
             capture_output=True,
             text=True,
@@ -483,16 +487,32 @@ def test_iso_builder_creates_hashed_media_without_mutating_source(
     assert output.is_file()
     assert built["sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()
     assert built["volume_label"] == "LOL_VC_PR134"
+    assert built["payload_commit"] == payload_commit
+    tracked_environment_b = ENVIRONMENT_B_SCRIPT.read_bytes()
+    normalized_environment_b = (
+        b"\xef\xbb\xbf"
+        + tracked_environment_b.decode("utf-8-sig").encode("utf-8")
+    )
+    assert built["environment_b_script_sha256"] == hashlib.sha256(
+        normalized_environment_b
+    ).hexdigest()
     assert (source / "create-test-iso.ps1").read_bytes() == b"local-only builder"
+    assert environment_b.read_bytes() == b"untrusted external environment b"
     assert old_manifest.read_bytes() == b"old read-only manifest"
     assert not (source / "00-Bootstrap-VM-Lab.cmd").exists()
 
 
 def test_iso_builder_pins_tracked_runner_and_windows_powershell_encoding():
     source = ISO_BUILD_SCRIPT.read_text(encoding="utf-8-sig")
+    manifest_start = source.index("$manifestFiles")
+    manifest_end = source.index("$mediaManifest", manifest_start)
 
     assert '"installer\\LoLReplayTool-Setup-0.5.2.exe"' in source
     assert '$selfCheckRunner = Join-Path $scriptDirectory "run_packaged_self_check.ps1"' in source
+    assert '$environmentBScript = Join-Path $scriptDirectory "windows_vm_lab_environment_b.ps1"' in source
+    assert 'Copy-Item -LiteralPath $environmentBScript' in source
+    assert '"02-test-environment-b.ps1"' in source[manifest_start:manifest_end]
+    assert "$environmentBManifestEntries.Count -ne 1" in source
     assert "Copy-Item -LiteralPath $selfCheckRunner" in source
     assert '$utf8WithBom = [Text.UTF8Encoding]::new($true)' in source
     for name in (
@@ -515,7 +535,13 @@ def test_vm_lab_powershell_files_parse_without_errors(powershell: str | None):
         pytest.skip("requested PowerShell runtime is unavailable")
     paths = ", ".join(
         f"'{str(path).replace(chr(39), chr(39) * 2)}'"
-        for path in (LAB_SCRIPT, GUEST_SCRIPT, BOOTSTRAP_SCRIPT, ISO_BUILD_SCRIPT)
+        for path in (
+            LAB_SCRIPT,
+            GUEST_SCRIPT,
+            BOOTSTRAP_SCRIPT,
+            ISO_BUILD_SCRIPT,
+            ENVIRONMENT_B_SCRIPT,
+        )
     )
     command = (
         f"$paths = @({paths}); $failed = $false; "
@@ -542,6 +568,77 @@ def test_vm_lab_powershell_files_parse_without_errors(powershell: str | None):
         check=False,
     )
 
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
+@pytest.mark.parametrize(
+    "powershell",
+    [
+        pytest.param(POWERSHELL, id="pwsh"),
+        pytest.param(WINDOWS_POWERSHELL, id="windows-powershell-5.1"),
+    ],
+)
+def test_environment_b_manifest_path_accepts_windows_separators_and_rejects_escape(
+    powershell: str | None, external_temp: Path
+):
+    if powershell is None:
+        pytest.skip("requested PowerShell runtime is unavailable")
+    root = external_temp / "package-root"
+    (root / "_internal").mkdir(parents=True)
+    (root / "_internal" / "_asyncio.pyd").write_bytes(b"fixture")
+    command = r'''
+$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile(
+  $env:TARGET_SCRIPT, [ref]$tokens, [ref]$errors
+)
+if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+$fn = $ast.Find({ param($node)
+  $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+  $node.Name -eq "Resolve-SafeManifestPath"
+}, $true)
+if ($null -eq $fn) { throw "Resolve-SafeManifestPath was not found" }
+. ([scriptblock]::Create($fn.Extent.Text))
+$root = $env:PACKAGE_ROOT
+$positive = @(
+  "_internal/_asyncio.pyd",
+  "_internal\_asyncio.pyd"
+)
+foreach ($path in $positive) {
+  $resolved = Resolve-SafeManifestPath -Root $root -RelativePath $path
+  if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+    throw "Expected manifest path was rejected or unresolved: $path"
+  }
+}
+$negative = @(
+  "../escape.pyd", "..\escape.pyd", ".\_asyncio.pyd", "_internal//x.pyd",
+  "C:\escape.pyd", "C:escape.pyd", "\escape.pyd", "/escape.pyd",
+  "\\server\share\escape.pyd", "_internal\_asyncio.pyd:stream"
+)
+$negative += "_internal/" + [char]0 + "bad.pyd"
+foreach ($path in $negative) {
+  $accepted = $false
+  try {
+    Resolve-SafeManifestPath -Root $root -RelativePath $path | Out-Null
+    $accepted = $true
+  } catch { }
+  if ($accepted) { throw "Unsafe manifest path was accepted: $path" }
+}
+exit 0
+'''
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command", command],
+        env={
+            **os.environ,
+            "TARGET_SCRIPT": str(ENVIRONMENT_B_SCRIPT),
+            "PACKAGE_ROOT": str(root),
+        },
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
     assert result.returncode == 0, result.stdout + "\n" + result.stderr
 
 

@@ -57,21 +57,26 @@ GUID directoryだけをpath・reparse point検査後に削除します。
 
 ## 固定test ISO
 
-既存のIssue #133 test kitへ、このbranchで管理するbootstrapとpackaged self-check runnerを
-一時stagingしてISOを作成します。
+既存のIssue #133 test kitへ、このbranchで管理するbootstrap、packaged self-check runner、
+Environment B検査scriptを一時stagingしてISOを作成します。
 元のtest kitは変更せず、出力ISOはrepository外へ新規作成します。
 
 ```powershell
+$payloadCommit = (git rev-parse HEAD).Trim()
 .\scripts\build_windows_vm_lab_iso.ps1 `
   -SourceKitPath .\downloads\issue133-vm-test-kit `
-  -OutputPath F:\VMware\Media\lol-vc-runtime-test-pr134-managed.iso
+  -OutputPath F:\VMware\Media\lol-vc-runtime-test-pr134-managed.iso `
+  -PayloadCommit $payloadCommit
 ```
 
-builderは必要なapp、Runtime installer、Environment B script、package manifest、PE audit、wheel
-provenanceが揃うことを確認し、tracked bootstrapとrunnerを追加します。stockのWindows PowerShell
-5.1がguest scriptをcode page依存で誤読しないよう、直接実行する`.ps1`はUTF-8 BOM付きへ正規化します。
+builderは必要なapp、Runtime installer、package manifest、PE audit、wheel provenanceが
+揃うことを確認し、tracked bootstrap、runner、Environment B検査scriptを追加します。
+外部test kitにある同名scriptは信頼せず、tracked版で必ず上書きします。stockのWindows
+PowerShell 5.1がguest scriptをcode page依存で誤読しないよう、直接実行する`.ps1`はUTF-8
+BOM付きへ正規化します。
 ISO内には主要fileのsize/SHA256を持つ
-`vm-lab-media-manifest.json`も入ります。出力されたISOのSHA256だけをlocal configへ固定します。
+`vm-lab-media-manifest.json`も入ります。builderが出力するISOとEnvironment B scriptの
+SHA256をlocal configへ固定します。
 このISOはlocal test inputであり、アプリ、installer、Release assetではありません。
 
 ## 一度だけ必要なVM準備
@@ -188,10 +193,10 @@ configもrepository外へ置きます。passwordそのものをJSONへ書いて�
   "installer_sha256": "<lowercase SHA256>",
   "minimum_runtime_version": "14.44.35211.0",
   "app_relative_path": "LoLReplayTool-external-build\\LoLReplayTool.exe",
-  "app_sha256": "3f8ec9a46c9509ed07197a765424eee95ebce50673a2500dd590cfa729aab09d",
+  "app_sha256": "<lowercase SHA256>",
   "environment_b_script_relative_path": "02-test-environment-b.ps1",
-  "environment_b_script_sha256": "0a19971d4ecb8417ac06229f1e0bf124130c29760c791978d3153bc691992d46",
-  "payload_commit": "1d5f79209646edda33911470ed132a9d5f4d440c",
+  "environment_b_script_sha256": "<builder environment_b_script_sha256>",
+  "payload_commit": "<40-character lowercase Git commit SHA>",
   "artifact_root": "F:\\VMware\\Evidence\\vc-runtime-pr134"
 }
 ```

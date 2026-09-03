@@ -89,9 +89,7 @@ try:
     )
     from .post_game_result import (
         PostGameResult,
-        normalize_game_result_value,
-        normalize_lcu_team,
-        opposing_lcu_team,
+        resolve_post_game_result,
     )
     from .recorder_config import (  # noqa: F401 - compatibility exports
         AppConfig as RecorderAppConfig,
@@ -172,9 +170,7 @@ except ImportError:
     )
     from post_game_result import (
         PostGameResult,
-        normalize_game_result_value,
-        normalize_lcu_team,
-        opposing_lcu_team,
+        resolve_post_game_result,
     )
     from recorder_config import (  # noqa: F401 - compatibility exports
         AppConfig as RecorderAppConfig,
@@ -3748,14 +3744,15 @@ class LoLAutoRecorder(RecordingSessionManager):
         for event in events:
             if not self.is_game_end_event(event):
                 continue
-            result_value = (
-                event.get("Result") or event.get("result") or event.get("GameResult") or event.get("gameResult")
+            result_value = _first_mapping_value(
+                event, "Result", "result", "GameResult", "gameResult"
             )
-            winning_team = (
-                event.get("WinningTeam") or event.get("winningTeam") or event.get("Team") or event.get("team")
+            winning_team = _first_mapping_value(
+                event, "WinningTeam", "winningTeam", "Team", "team"
             )
-            self.game_result = normalize_game_result_value(result_value) or result_value
-            self.winning_team = normalize_lcu_team(winning_team) or winning_team
+            self.game_result, self.winning_team, self.player_team = resolve_post_game_result(
+                result_value, winning_team, self.player_team
+            )
             if self.game_result or self.winning_team:
                 self.match_metadata["result_source"] = "live_client_game_end"
             return
@@ -3767,16 +3764,11 @@ class LoLAutoRecorder(RecordingSessionManager):
     def _apply_post_game_result_payload(self, payload: dict[str, Any] | None) -> bool:
         if not isinstance(payload, dict):
             return False
-        game_result = normalize_game_result_value(payload.get("game_result") or payload.get("result"))
-        winning_team = normalize_lcu_team(payload.get("winning_team") or payload.get("winningTeam"))
-        player_team = normalize_lcu_team(payload.get("player_team") or payload.get("playerTeam"))
-
-        if game_result is None and player_team and winning_team:
-            game_result = "Win" if player_team == winning_team else "Loss"
-        if winning_team is None and player_team and game_result == "Win":
-            winning_team = player_team
-        if winning_team is None and player_team and game_result == "Loss":
-            winning_team = opposing_lcu_team(player_team)
+        game_result, winning_team, player_team = resolve_post_game_result(
+            _first_mapping_value(payload, "game_result", "result"),
+            _first_mapping_value(payload, "winning_team", "winningTeam"),
+            _first_mapping_value(payload, "player_team", "playerTeam"),
+        )
 
         changed = False
         if not self.game_result and game_result:
@@ -3832,20 +3824,30 @@ class LoLAutoRecorder(RecordingSessionManager):
         if not isinstance(game_data, dict):
             return False
 
-        result_value = game_data.get("gameResult") or game_data.get("result")
-        winning_team = game_data.get("winningTeam") or game_data.get("winning_team")
+        result_value = _first_mapping_value(game_data, "gameResult", "result")
+        winning_team = _first_mapping_value(game_data, "winningTeam", "winning_team")
+        player_team = self.player_team
+        if player_team in (None, ""):
+            player_team = _first_mapping_value(game_data, "playerTeam", "player_team")
+        game_result, winning_team, player_team = resolve_post_game_result(
+            result_value, winning_team, player_team
+        )
         changed = False
+        result_changed = False
         if self.game_result is None:
-            game_result = normalize_game_result_value(result_value) or result_value
             if game_result:
                 self.game_result = game_result
                 changed = True
+                result_changed = True
         if self.winning_team is None:
-            normalized_winning_team = normalize_lcu_team(winning_team) or winning_team
-            if normalized_winning_team:
-                self.winning_team = normalized_winning_team
+            if winning_team:
+                self.winning_team = winning_team
                 changed = True
-        if changed:
+                result_changed = True
+        if self.player_team is None and player_team:
+            self.player_team = player_team
+            changed = True
+        if result_changed:
             self.match_metadata["result_source"] = "live_client_game_data"
         return changed
 

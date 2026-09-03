@@ -3,6 +3,7 @@ from src.post_game_result import (
     normalize_game_result_value,
     normalize_lcu_team,
     opposing_lcu_team,
+    resolve_post_game_result,
 )
 
 
@@ -60,3 +61,53 @@ def test_post_game_normalizers_accept_known_result_shapes():
     assert normalize_game_result_value("victory") == "Win"
     assert normalize_game_result_value(False) == "Loss"
     assert opposing_lcu_team("ORDER") == "CHAOS"
+
+
+def test_resolve_post_game_result_derives_winning_team_from_player_result():
+    assert resolve_post_game_result("Lose", None, "blue") == ("Loss", "CHAOS", "ORDER")
+    assert resolve_post_game_result("Loss", None, "CHAOS") == ("Loss", "ORDER", "CHAOS")
+    assert resolve_post_game_result("Win", None, "ORDER") == ("Win", "ORDER", "ORDER")
+    assert resolve_post_game_result("victory", None, "red") == ("Win", "CHAOS", "CHAOS")
+
+
+def test_resolve_post_game_result_does_not_guess_for_invalid_explicit_team():
+    assert resolve_post_game_result("Win", "Unknown", "ORDER") == ("Win", None, "ORDER")
+
+
+def test_resolve_post_game_result_does_not_guess_for_explicit_unknown_result():
+    assert resolve_post_game_result("Remake", "CHAOS", "ORDER") == ("Remake", "CHAOS", "ORDER")
+
+
+def test_resolve_post_game_result_does_not_store_unknown_non_string_result():
+    assert resolve_post_game_result({"status": "Unknown"}, None, "ORDER") == (None, None, "ORDER")
+
+
+def test_resolve_post_game_result_treats_whitespace_as_missing():
+    assert resolve_post_game_result("   ", "CHAOS", "ORDER") == ("Loss", "CHAOS", "ORDER")
+    assert resolve_post_game_result("Win", "   ", "ORDER") == ("Win", "ORDER", "ORDER")
+
+
+def test_resolve_post_game_result_keeps_explicit_result_and_winner_when_they_conflict():
+    assert resolve_post_game_result("Win", "CHAOS", "ORDER") == ("Win", "CHAOS", "ORDER")
+
+
+def test_build_post_game_result_does_not_guess_for_explicit_invalid_winning_team():
+    result = build_post_game_result(
+        {"winningTeam": "Unknown", "localPlayer": {"team": "ORDER", "gameResult": "Win"}},
+        player_name="Tester#JP1",
+    )
+
+    assert result.game_result == "Win"
+    assert result.winning_team is None
+    assert result.player_team == "ORDER"
+
+
+def test_build_post_game_result_does_not_guess_for_explicit_invalid_numeric_winning_team():
+    result = build_post_game_result(
+        {"winningTeam": 300, "localPlayer": {"team": "ORDER", "gameResult": "Win"}},
+        player_name="Tester#JP1",
+    )
+
+    assert result.game_result == "Win"
+    assert result.winning_team is None
+    assert result.player_team == "ORDER"

@@ -1131,6 +1131,91 @@ def test_ensure_post_game_result_uses_cached_live_result_without_failure_warning
     riot_client.get_post_game_result.assert_awaited_once()
 
 
+def test_update_result_from_events_derives_winning_team_from_player_team_and_result():
+    tmp_path = runtime_dir("game_end_result_derives_winning_team")
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path),
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.player_team = "ORDER"
+
+    recorder.update_result_from_events(
+        [{"EventName": "GameEnd", "Result": "Lose", "WinningTeam": None}]
+    )
+
+    assert recorder.game_result == "Loss"
+    assert recorder.winning_team == "CHAOS"
+
+
+def test_last_game_data_derives_winning_team_from_player_team_and_result():
+    tmp_path = runtime_dir("last_game_data_derives_winning_team")
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path),
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.player_team = "CHAOS"
+    recorder.last_game_data = {"gameData": {"gameResult": "Win"}}
+
+    assert recorder._apply_result_from_last_game_data() is True
+    assert recorder.game_result == "Win"
+    assert recorder.winning_team == "CHAOS"
+
+
+def test_last_game_data_uses_explicit_player_team_when_recorder_team_is_missing():
+    tmp_path = runtime_dir("last_game_data_explicit_player_team")
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path),
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.last_game_data = {
+        "gameData": {"gameResult": "Loss", "playerTeam": "ORDER"}
+    }
+
+    assert recorder._apply_result_from_last_game_data() is True
+    assert recorder.player_team == "ORDER"
+    assert recorder.winning_team == "CHAOS"
+
+
+def test_last_game_data_team_only_does_not_claim_a_result_source():
+    tmp_path = runtime_dir("last_game_data_team_only")
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path),
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+    recorder.last_game_data = {"gameData": {"playerTeam": "ORDER"}}
+
+    assert recorder._apply_result_from_last_game_data() is True
+    assert recorder.player_team == "ORDER"
+    assert recorder.game_result is None
+    assert recorder.winning_team is None
+    assert "result_source" not in recorder.match_metadata
+
+
+def test_post_game_payload_does_not_guess_for_invalid_explicit_winning_team():
+    tmp_path = runtime_dir("post_game_payload_invalid_winning_team")
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path),
+        obs_client=FakeOBSClient(),
+        riot_api_client=Mock(),
+        auto_setup=False,
+    )
+
+    assert recorder._apply_post_game_result_payload(
+        {"game_result": "Win", "winning_team": 0, "player_team": "ORDER"}
+    ) is True
+    assert recorder.game_result == "Win"
+    assert recorder.winning_team is None
+    assert recorder.player_team == "ORDER"
+
+
 def test_ensure_post_game_result_keeps_game_end_result_without_failure_warning():
     tmp_path = runtime_dir("game_end_result_without_winning_team")
     riot_client = Mock()

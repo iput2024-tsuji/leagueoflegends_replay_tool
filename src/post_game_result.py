@@ -61,6 +61,37 @@ def normalize_game_result_value(value: Any) -> str | None:
     return None
 
 
+def resolve_post_game_result(
+    game_result: Any,
+    winning_team: Any,
+    player_team: Any,
+) -> tuple[str | None, str | None, str | None]:
+    """Normalize result fields and infer only from a valid, unambiguous pair."""
+    normalized_result = normalize_game_result_value(game_result)
+    normalized_winning_team = normalize_lcu_team(winning_team)
+    normalized_player_team = normalize_lcu_team(player_team)
+
+    result_present = game_result not in (None, "")
+    if isinstance(game_result, str):
+        result_present = bool(game_result.strip())
+    if not result_present and normalized_player_team and normalized_winning_team:
+        normalized_result = "Win" if normalized_player_team == normalized_winning_team else "Loss"
+
+    winning_team_present = winning_team not in (None, "")
+    if isinstance(winning_team, str):
+        winning_team_present = bool(winning_team.strip())
+    if not winning_team_present and normalized_winning_team is None and normalized_player_team:
+        if normalized_result == "Win":
+            normalized_winning_team = normalized_player_team
+        elif normalized_result == "Loss":
+            normalized_winning_team = opposing_lcu_team(normalized_player_team)
+
+    result = normalized_result
+    if result is None and isinstance(game_result, str):
+        result = game_result.strip() or None
+    return result, normalized_winning_team, normalized_player_team
+
+
 def build_post_game_result(
     payload: dict[str, Any] | None,
     *,
@@ -75,12 +106,9 @@ def build_post_game_result(
     winning_team = _post_game_winning_team(payload)
     game_result = _post_game_local_result(payload, player_name)
 
-    if game_result is None and normalized_player_team and winning_team:
-        game_result = "Win" if normalized_player_team == winning_team else "Loss"
-    if winning_team is None and normalized_player_team and game_result == "Win":
-        winning_team = normalized_player_team
-    if winning_team is None and normalized_player_team and game_result == "Loss":
-        winning_team = opposing_lcu_team(normalized_player_team)
+    game_result, winning_team, normalized_player_team = resolve_post_game_result(
+        game_result, winning_team, normalized_player_team
+    )
 
     return PostGameResult(
         game_result=game_result,
@@ -164,19 +192,20 @@ def _post_game_player_team(
     return normalize_lcu_team(fallback_team)
 
 
-def _post_game_winning_team(payload: dict[str, Any]) -> str | None:
-    direct = normalize_lcu_team(
-        _first_mapping_value(
-            payload,
-            "winningTeam",
-            "winning_team",
-            "winningTeamId",
-            "winningTeamID",
-            "winning_team_id",
-        )
+def _post_game_winning_team(payload: dict[str, Any]) -> Any:
+    direct_value = _first_mapping_value(
+        payload,
+        "winningTeam",
+        "winning_team",
+        "winningTeamId",
+        "winningTeamID",
+        "winning_team_id",
     )
+    direct = normalize_lcu_team(direct_value)
     if direct:
         return direct
+    if direct_value not in (None, ""):
+        return direct_value
 
     for mapping in _walk_mappings(payload):
         team = _post_game_team_from_mapping(mapping)

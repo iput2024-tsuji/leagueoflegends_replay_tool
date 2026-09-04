@@ -165,6 +165,7 @@ def _configured_toolchain() -> dict:
             "WITH_IPP": "OFF",
             "BUILD_IPP_IW": "OFF",
             "BUILD_opencv_gapi": "OFF",
+            "WITH_ADE": "OFF",
             "WITH_FFMPEG": "ON",
         },
         "compiler": {
@@ -277,15 +278,32 @@ def _mock_build_dependencies(monkeypatch) -> None:
     )
 
 
-def test_policy_requires_exact_ipp_off_flags(tmp_path):
+@pytest.mark.parametrize(
+    ("disabled_flag", "enabled_flag"),
+    [
+        ("-DWITH_IPP=OFF", "-DWITH_IPP=ON"),
+        ("-DWITH_ADE=OFF", "-DWITH_ADE=ON"),
+    ],
+)
+def test_policy_requires_exact_disabled_features(
+    tmp_path, disabled_flag, enabled_flag
+):
     _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
     payload = json.loads(lock_path.read_text(encoding="utf-8"))
-    payload[target.POLICY_KEY]["build_environment"]["cmake_args"] = [
-        "-DWITH_IPP=ON", "-DBUILD_IPP_IW=OFF", "-DBUILD_opencv_gapi=OFF"
-    ]
+    cmake_args = payload[target.POLICY_KEY]["build_environment"]["cmake_args"]
+    cmake_args[cmake_args.index(disabled_flag)] = enabled_flag
     lock_path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(target.OpenCVWheelError, match="disable IPP"):
+    with pytest.raises(target.OpenCVWheelError, match="disable IPP, G-API, and ADE"):
         target._load_lock(lock_path)
+
+
+def test_configured_toolchain_rejects_ade_enabled(tmp_path, monkeypatch):
+    cache = dict(_configured_toolchain()["cmake_cache"])
+    cache["WITH_ADE"] = "ON"
+    monkeypatch.setattr(target, "_read_cmake_cache", lambda source: cache)
+
+    with pytest.raises(target.OpenCVWheelError, match="feature flags differ"):
+        target._capture_configured_toolchain(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -404,7 +422,7 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
     def fake_run(command, *, cwd, env, check, capture_output, text):
         assert env["CMAKE_ARGS"] == (
             "-DWITH_IPP=OFF -DBUILD_IPP_IW=OFF -DBUILD_opencv_gapi=OFF "
-            "-DCMAKE_SYSTEM_VERSION=10.0.26100.0"
+            "-DWITH_ADE=OFF -DCMAKE_SYSTEM_VERSION=10.0.26100.0"
         )
         assert (cwd / "opencv" / "CMakeLists.txt").is_file()
         assert (cwd / "cv2" / "version.py").read_bytes() == target.VERSION_PY_BYTES

@@ -237,6 +237,7 @@
         "-DWITH_IPP=OFF",
         "-DBUILD_IPP_IW=OFF",
         "-DBUILD_opencv_gapi=OFF",
+        "-DWITH_ADE=OFF",
         "-DCMAKE_SYSTEM_VERSION=10.0.26100.0"
       ]
     }

@@ -34,6 +34,7 @@ REQUIRED_CMAKE_ARGS = (
     "-DWITH_IPP=OFF",
     "-DBUILD_IPP_IW=OFF",
     "-DBUILD_opencv_gapi=OFF",
+    "-DWITH_ADE=OFF",
     "-DCMAKE_SYSTEM_VERSION=10.0.26100.0",
 )
 VERSION_PY_BYTES = (
@@ -148,7 +149,9 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
     }:
         raise OpenCVWheelError("OpenCV build environment fields are invalid")
     if environment["cmake_args"] != list(REQUIRED_CMAKE_ARGS):
-        raise OpenCVWheelError("OpenCV CMake flags must disable IPP and IPP IW")
+        raise OpenCVWheelError(
+            "OpenCV CMake flags must disable IPP, G-API, and ADE"
+        )
     if {
         "generator": environment["generator"],
         "msvc_toolset": environment["msvc_toolset"],
@@ -670,6 +673,7 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
         "WITH_IPP": "OFF",
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
+        "WITH_ADE": "OFF",
         "WITH_FFMPEG": "ON",
     }
     observed = {key: cache.get(key) for key in expected}
@@ -1278,6 +1282,7 @@ def _validate_provenance_payload(
         "WITH_IPP": "OFF",
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
+        "WITH_ADE": "OFF",
         "WITH_FFMPEG": "ON",
     }:
         raise OpenCVWheelError("OpenCV configured CMake cache differs")

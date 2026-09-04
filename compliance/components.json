@@ -238,6 +238,7 @@
         "-DBUILD_IPP_IW=OFF",
         "-DBUILD_opencv_gapi=OFF",
         "-DWITH_ADE=OFF",
+        "-DPYTHON3_LIMITED_API=ON",
         "-DCMAKE_SYSTEM_VERSION=10.0.26100.0"
       ]
     }

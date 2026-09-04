@@ -35,6 +35,7 @@ REQUIRED_CMAKE_ARGS = (
     "-DBUILD_IPP_IW=OFF",
     "-DBUILD_opencv_gapi=OFF",
     "-DWITH_ADE=OFF",
+    "-DPYTHON3_LIMITED_API=ON",
     "-DCMAKE_SYSTEM_VERSION=10.0.26100.0",
 )
 VERSION_PY_BYTES = (
@@ -46,14 +47,10 @@ VERSION_PY_BYTES = (
 )
 BUILD_COMMAND = (
     "<build-python>",
-    "-m",
-    "pip",
-    "wheel",
-    ".",
-    "--no-deps",
-    "--no-build-isolation",
-    "--no-index",
-    "--wheel-dir",
+    "setup.py",
+    "bdist_wheel",
+    "--py-limited-api=cp37",
+    "--dist-dir",
     "<output-dir>",
 )
 EXPECTED_FFMPEG = {
@@ -150,7 +147,8 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
         raise OpenCVWheelError("OpenCV build environment fields are invalid")
     if environment["cmake_args"] != list(REQUIRED_CMAKE_ARGS):
         raise OpenCVWheelError(
-            "OpenCV CMake flags must disable IPP, G-API, and ADE"
+            "OpenCV CMake flags must disable IPP, G-API, and ADE and enable "
+            "the CPython Limited API"
         )
     if {
         "generator": environment["generator"],
@@ -674,6 +672,7 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
         "WITH_ADE": "OFF",
+        "PYTHON3_LIMITED_API": "ON",
         "WITH_FFMPEG": "ON",
     }
     observed = {key: cache.get(key) for key in expected}
@@ -907,9 +906,13 @@ def _output_wheel(output_dir: Path, filename: str) -> Path:
     wheels = sorted(output_dir.glob("opencv_python-*.whl"))
     if len(wheels) != 1:
         raise OpenCVWheelError(f"Expected one OpenCV output wheel, found {len(wheels)}")
-    name, observed = _wheel_metadata(wheels[0])
+    name, observed_version = _wheel_metadata(wheels[0])
     if wheels[0].name != filename or name.casefold() != "opencv-python":
-        raise OpenCVWheelError("Generated OpenCV wheel version differs from policy")
+        raise OpenCVWheelError(
+            "Generated OpenCV wheel identity differs from policy: "
+            f"expected {filename}, observed {wheels[0].name} "
+            f"({name} {observed_version})"
+        )
     return wheels[0]
 
 
@@ -1283,6 +1286,7 @@ def _validate_provenance_payload(
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
         "WITH_ADE": "OFF",
+        "PYTHON3_LIMITED_API": "ON",
         "WITH_FFMPEG": "ON",
     }:
         raise OpenCVWheelError("OpenCV configured CMake cache differs")
@@ -1407,14 +1411,10 @@ def _run_once(
         )
     actual_command = [
         str(build_python),
-        "-m",
-        "pip",
-        "wheel",
-        ".",
-        "--no-deps",
-        "--no-build-isolation",
-        "--no-index",
-        "--wheel-dir",
+        "setup.py",
+        "bdist_wheel",
+        "--py-limited-api=cp37",
+        "--dist-dir",
         str(output_dir.resolve()),
     ]
     environment = os.environ.copy()

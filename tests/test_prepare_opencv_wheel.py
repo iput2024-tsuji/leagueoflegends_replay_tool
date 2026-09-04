@@ -166,6 +166,7 @@ def _configured_toolchain() -> dict:
             "BUILD_IPP_IW": "OFF",
             "BUILD_opencv_gapi": "OFF",
             "WITH_ADE": "OFF",
+            "PYTHON3_LIMITED_API": "ON",
             "WITH_FFMPEG": "ON",
         },
         "compiler": {
@@ -283,6 +284,7 @@ def _mock_build_dependencies(monkeypatch) -> None:
     [
         ("-DWITH_IPP=OFF", "-DWITH_IPP=ON"),
         ("-DWITH_ADE=OFF", "-DWITH_ADE=ON"),
+        ("-DPYTHON3_LIMITED_API=ON", "-DPYTHON3_LIMITED_API=OFF"),
     ],
 )
 def test_policy_requires_exact_disabled_features(
@@ -293,13 +295,22 @@ def test_policy_requires_exact_disabled_features(
     cmake_args = payload[target.POLICY_KEY]["build_environment"]["cmake_args"]
     cmake_args[cmake_args.index(disabled_flag)] = enabled_flag
     lock_path.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(target.OpenCVWheelError, match="disable IPP, G-API, and ADE"):
+    with pytest.raises(target.OpenCVWheelError, match="CMake flags"):
         target._load_lock(lock_path)
 
 
 def test_configured_toolchain_rejects_ade_enabled(tmp_path, monkeypatch):
     cache = dict(_configured_toolchain()["cmake_cache"])
     cache["WITH_ADE"] = "ON"
+    monkeypatch.setattr(target, "_read_cmake_cache", lambda source: cache)
+
+    with pytest.raises(target.OpenCVWheelError, match="feature flags differ"):
+        target._capture_configured_toolchain(tmp_path)
+
+
+def test_configured_toolchain_rejects_limited_api_disabled(tmp_path, monkeypatch):
+    cache = dict(_configured_toolchain()["cmake_cache"])
+    cache["PYTHON3_LIMITED_API"] = "OFF"
     monkeypatch.setattr(target, "_read_cmake_cache", lambda source: cache)
 
     with pytest.raises(target.OpenCVWheelError, match="feature flags differ"):
@@ -420,9 +431,16 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
     _mock_build_dependencies(monkeypatch)
 
     def fake_run(command, *, cwd, env, check, capture_output, text):
+        assert command[1:5] == [
+            "setup.py",
+            "bdist_wheel",
+            "--py-limited-api=cp37",
+            "--dist-dir",
+        ]
         assert env["CMAKE_ARGS"] == (
             "-DWITH_IPP=OFF -DBUILD_IPP_IW=OFF -DBUILD_opencv_gapi=OFF "
-            "-DWITH_ADE=OFF -DCMAKE_SYSTEM_VERSION=10.0.26100.0"
+            "-DWITH_ADE=OFF -DPYTHON3_LIMITED_API=ON "
+            "-DCMAKE_SYSTEM_VERSION=10.0.26100.0"
         )
         assert (cwd / "opencv" / "CMakeLists.txt").is_file()
         assert (cwd / "cv2" / "version.py").read_bytes() == target.VERSION_PY_BYTES
@@ -433,6 +451,7 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
     monkeypatch.setattr(target.subprocess, "run", fake_run)
     provenance = target.run(tmp_path, output, lock_path, work)
     assert provenance["wheel"]["filename"].startswith("opencv_python-")
+    assert provenance["command"] == list(target.BUILD_COMMAND)
     assert (output / target.PROVENANCE_NAME).is_file()
     assert provenance["repeatability"]["byte_identical"] is True
     assert provenance["repeatability"]["semantic_equal"] is True
@@ -502,6 +521,18 @@ def test_output_ipp_marker_is_rejected(tmp_path, monkeypatch):
     _wheel(wheel, extra_name="cv2/ippicv.dll", extra_bytes=b"binary")
     with pytest.raises(target.OpenCVWheelError, match="IPP artifact"):
         target._reject_ipp(wheel)
+
+
+def test_output_wheel_rejects_non_limited_api_tag(tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    _wheel(output / "opencv_python-4.13.0.90-cp314-cp314-win_amd64.whl")
+
+    with pytest.raises(target.OpenCVWheelError, match="identity differs"):
+        target._output_wheel(
+            output,
+            "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl",
+        )
 
 
 def test_output_provenance_tampering_is_rejected(tmp_path, monkeypatch):

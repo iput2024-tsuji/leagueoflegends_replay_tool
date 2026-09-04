@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -25,6 +26,7 @@ PROVENANCE_NAME = "opencv-wheel-provenance.json"
 POLICY_KEY = "opencv_source_build_policy"
 REQUIRED_PYTHON = "3.14.6"
 REQUIRED_GENERATOR = "Visual Studio 17 2022"
+REQUIRED_TOOLSET_NAME = "v143"
 REQUIRED_TOOLSET = "v143,version=14.44"
 REQUIRED_TOOLSET_VERSION = "14.44"
 REQUIRED_TOOLSET_VERSION_PREFIX = "14.44."
@@ -631,6 +633,55 @@ def _read_cmake_cache(source_tree: Path) -> dict[str, str]:
     return result
 
 
+def _capture_msbuild_project(source_tree: Path) -> dict[str, Any]:
+    candidates = sorted(
+        source_tree.glob("_skbuild/*/cmake-build/ALL_BUILD.vcxproj"),
+        key=lambda path: path.as_posix().casefold(),
+    )
+    if len(candidates) != 1:
+        raise OpenCVWheelError(
+            f"Expected one OpenCV ALL_BUILD.vcxproj, found {len(candidates)}"
+        )
+    project = candidates[0]
+    _regular(project, "OpenCV ALL_BUILD project")
+    try:
+        root = ET.parse(project).getroot()
+    except (ET.ParseError, OSError) as exc:
+        raise OpenCVWheelError(f"Cannot inspect OpenCV ALL_BUILD project: {exc}") from exc
+
+    def values(name: str) -> list[str]:
+        return sorted(
+            {
+                element.text.strip()
+                for element in root.iter()
+                if element.tag.rsplit("}", 1)[-1] == name
+                and element.text
+                and element.text.strip()
+            }
+        )
+
+    observed = {
+        "platform_toolsets": values("PlatformToolset"),
+        "windows_target_platform_versions": values(
+            "WindowsTargetPlatformVersion"
+        ),
+    }
+    if observed != {
+        "platform_toolsets": [REQUIRED_TOOLSET_NAME],
+        "windows_target_platform_versions": [REQUIRED_WINDOWS_SDK],
+    }:
+        raise OpenCVWheelError(
+            "OpenCV MSBuild project toolchain differs: "
+            + json.dumps(observed, sort_keys=True)
+        )
+    return {
+        "path": project.relative_to(source_tree).as_posix(),
+        "size": project.stat().st_size,
+        "sha256": _sha256(project),
+        **observed,
+    }
+
+
 def _capture_compiler(cache: dict[str, str]) -> dict[str, Any]:
     raw = cache.get("CMAKE_CXX_COMPILER")
     if not raw:
@@ -669,8 +720,8 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
     cache = _read_cmake_cache(source_tree)
     expected = {
         "CMAKE_GENERATOR": REQUIRED_GENERATOR,
-        "CMAKE_GENERATOR_TOOLSET": REQUIRED_TOOLSET,
-        "CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION": REQUIRED_WINDOWS_SDK,
+        "CMAKE_GENERATOR_TOOLSET": REQUIRED_TOOLSET_NAME,
+        "CMAKE_SYSTEM_VERSION": REQUIRED_WINDOWS_SDK,
         "WITH_IPP": "OFF",
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
@@ -692,6 +743,7 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
     return {
         "cmake_cache": expected,
         "compiler": _capture_compiler(cache),
+        "msbuild_project": _capture_msbuild_project(source_tree),
         "selected_msvc_toolset_version": selected,
     }
 
@@ -1278,13 +1330,14 @@ def _validate_provenance_payload(
     if not isinstance(configured, dict) or set(configured) != {
         "cmake_cache",
         "compiler",
+        "msbuild_project",
         "selected_msvc_toolset_version",
     }:
         raise OpenCVWheelError("OpenCV configured toolchain fields are invalid")
     if configured["cmake_cache"] != {
         "CMAKE_GENERATOR": REQUIRED_GENERATOR,
-        "CMAKE_GENERATOR_TOOLSET": REQUIRED_TOOLSET,
-        "CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION": REQUIRED_WINDOWS_SDK,
+        "CMAKE_GENERATOR_TOOLSET": REQUIRED_TOOLSET_NAME,
+        "CMAKE_SYSTEM_VERSION": REQUIRED_WINDOWS_SDK,
         "WITH_IPP": "OFF",
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
@@ -1293,6 +1346,28 @@ def _validate_provenance_payload(
         "WITH_FFMPEG": "ON",
     }:
         raise OpenCVWheelError("OpenCV configured CMake cache differs")
+    msbuild = configured["msbuild_project"]
+    if (
+        not isinstance(msbuild, dict)
+        or set(msbuild) != {
+            "path",
+            "size",
+            "sha256",
+            "platform_toolsets",
+            "windows_target_platform_versions",
+        }
+        or re.fullmatch(
+            r"_skbuild/[^/]+/cmake-build/ALL_BUILD\.vcxproj",
+            str(msbuild["path"]),
+        )
+        is None
+        or msbuild["platform_toolsets"] != [REQUIRED_TOOLSET_NAME]
+        or msbuild["windows_target_platform_versions"] != [REQUIRED_WINDOWS_SDK]
+        or not isinstance(msbuild["size"], int)
+        or msbuild["size"] <= 0
+        or _SHA256.fullmatch(str(msbuild["sha256"])) is None
+    ):
+        raise OpenCVWheelError("OpenCV MSBuild project provenance is invalid")
     compiler = configured["compiler"]
     if (
         not isinstance(compiler, dict)

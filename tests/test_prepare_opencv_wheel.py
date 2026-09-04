@@ -158,10 +158,8 @@ def _configured_toolchain() -> dict:
     return {
         "cmake_cache": {
             "CMAKE_GENERATOR": target.REQUIRED_GENERATOR,
-            "CMAKE_GENERATOR_TOOLSET": target.REQUIRED_TOOLSET,
-            "CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION": (
-                target.REQUIRED_WINDOWS_SDK
-            ),
+            "CMAKE_GENERATOR_TOOLSET": target.REQUIRED_TOOLSET_NAME,
+            "CMAKE_SYSTEM_VERSION": target.REQUIRED_WINDOWS_SDK,
             "WITH_IPP": "OFF",
             "BUILD_IPP_IW": "OFF",
             "BUILD_opencv_gapi": "OFF",
@@ -174,6 +172,13 @@ def _configured_toolchain() -> dict:
             "msvc_toolset_version": "14.44.35211",
             "sha256": "a" * 64,
             "size": 1,
+        },
+        "msbuild_project": {
+            "path": "_skbuild/win-amd64-3.14/cmake-build/ALL_BUILD.vcxproj",
+            "size": 1,
+            "sha256": "b" * 64,
+            "platform_toolsets": [target.REQUIRED_TOOLSET_NAME],
+            "windows_target_platform_versions": [target.REQUIRED_WINDOWS_SDK],
         },
         "selected_msvc_toolset_version": "14.44",
     }
@@ -349,6 +354,110 @@ def test_cmake_cache_rejects_duplicate_quoted_variable_names(tmp_path):
 
     with pytest.raises(target.OpenCVWheelError, match="Duplicate OpenCV CMake"):
         target._read_cmake_cache(tmp_path)
+
+
+def _write_msbuild_project(tmp_path: Path, sdk: str) -> None:
+    project = (
+        tmp_path
+        / "_skbuild"
+        / "win-amd64-3.14"
+        / "cmake-build"
+        / "ALL_BUILD.vcxproj"
+    )
+    project.parent.mkdir(parents=True)
+    project.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Label="Globals">
+    <WindowsTargetPlatformVersion>"""
+        + sdk
+        + """</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'">
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'">
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+</Project>
+""",
+        encoding="utf-8",
+    )
+
+
+def test_msbuild_project_records_selected_sdk_and_toolset(tmp_path):
+    _write_msbuild_project(tmp_path, target.REQUIRED_WINDOWS_SDK)
+
+    observed = target._capture_msbuild_project(tmp_path)
+
+    assert observed["platform_toolsets"] == [target.REQUIRED_TOOLSET_NAME]
+    assert observed["windows_target_platform_versions"] == [
+        target.REQUIRED_WINDOWS_SDK
+    ]
+    assert observed["path"].endswith("/cmake-build/ALL_BUILD.vcxproj")
+    assert len(observed["sha256"]) == 64
+
+
+def test_msbuild_project_rejects_wrong_sdk(tmp_path):
+    _write_msbuild_project(tmp_path, "10.0.22621.0")
+
+    with pytest.raises(target.OpenCVWheelError, match="MSBuild project toolchain"):
+        target._capture_msbuild_project(tmp_path)
+
+
+def test_msbuild_project_rejects_missing_project(tmp_path):
+    with pytest.raises(target.OpenCVWheelError, match="found 0"):
+        target._capture_msbuild_project(tmp_path)
+
+
+def test_msbuild_project_rejects_multiple_projects(tmp_path):
+    _write_msbuild_project(tmp_path, target.REQUIRED_WINDOWS_SDK)
+    first = next(tmp_path.glob("_skbuild/*/cmake-build/ALL_BUILD.vcxproj"))
+    second = tmp_path / "_skbuild" / "other" / "cmake-build" / first.name
+    second.parent.mkdir(parents=True)
+    second.write_text(first.read_text(encoding="utf-8"), encoding="utf-8")
+
+    with pytest.raises(target.OpenCVWheelError, match="found 2"):
+        target._capture_msbuild_project(tmp_path)
+
+
+def test_msbuild_project_rejects_invalid_xml(tmp_path):
+    _write_msbuild_project(tmp_path, target.REQUIRED_WINDOWS_SDK)
+    project = next(tmp_path.glob("_skbuild/*/cmake-build/ALL_BUILD.vcxproj"))
+    project.write_text("<Project>", encoding="utf-8")
+
+    with pytest.raises(target.OpenCVWheelError, match="Cannot inspect"):
+        target._capture_msbuild_project(tmp_path)
+
+
+def test_msbuild_project_rejects_wrong_toolset(tmp_path):
+    _write_msbuild_project(tmp_path, target.REQUIRED_WINDOWS_SDK)
+    project = next(tmp_path.glob("_skbuild/*/cmake-build/ALL_BUILD.vcxproj"))
+    project.write_text(
+        project.read_text(encoding="utf-8").replace("v143", "v142"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(target.OpenCVWheelError, match="MSBuild project toolchain"):
+        target._capture_msbuild_project(tmp_path)
+
+
+def test_msbuild_project_rejects_multiple_sdk_values(tmp_path):
+    _write_msbuild_project(tmp_path, target.REQUIRED_WINDOWS_SDK)
+    project = next(tmp_path.glob("_skbuild/*/cmake-build/ALL_BUILD.vcxproj"))
+    marker = "</WindowsTargetPlatformVersion>"
+    extra = (
+        marker
+        + "\n    <WindowsTargetPlatformVersion>10.0.22621.0"
+        + marker
+    )
+    project.write_text(
+        project.read_text(encoding="utf-8").replace(marker, extra, 1),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(target.OpenCVWheelError, match="MSBuild project toolchain"):
+        target._capture_msbuild_project(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -587,6 +696,29 @@ def test_output_provenance_tampering_is_rejected(tmp_path, monkeypatch):
     provenance["wheel"]["sha256"] = "0" * 64
     (output / target.PROVENANCE_NAME).write_text(json.dumps(provenance), encoding="utf-8")
     with pytest.raises(target.OpenCVWheelError, match="provenance differs"):
+        target.validate_output_directory(output, lock_path)
+
+
+def test_output_msbuild_project_path_tampering_is_rejected(tmp_path, monkeypatch):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    output = tmp_path / "output"
+    _mock_build_dependencies(monkeypatch)
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        wheel_dir = Path(command[-1])
+        _wheel(wheel_dir / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    target.run(tmp_path, output, lock_path, tmp_path / "work")
+    provenance_path = output / target.PROVENANCE_NAME
+    provenance = json.loads(provenance_path.read_text())
+    provenance["observed_build_environment"]["configured_toolchain"][
+        "msbuild_project"
+    ]["path"] = "../cmake-build/ALL_BUILD.vcxproj"
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(target.OpenCVWheelError, match="MSBuild project provenance"):
         target.validate_output_directory(output, lock_path)
 
 

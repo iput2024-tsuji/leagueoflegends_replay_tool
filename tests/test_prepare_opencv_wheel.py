@@ -317,6 +317,40 @@ def test_configured_toolchain_rejects_limited_api_disabled(tmp_path, monkeypatch
         target._capture_configured_toolchain(tmp_path)
 
 
+def test_cmake_cache_keeps_colons_in_quoted_variable_names(tmp_path):
+    cache_dir = tmp_path / "_skbuild" / "win-amd64-3.14" / "cmake-build"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "CMakeCache.txt").write_text(
+        '\n'.join(
+            [
+                '"HAVE_CXX_ARCH:AVX":INTERNAL=1',
+                '"HAVE_CXX_ARCH:AVX2":INTERNAL=1',
+                "WITH_IPP:BOOL=OFF",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert target._read_cmake_cache(tmp_path) == {
+        '"HAVE_CXX_ARCH:AVX"': "1",
+        '"HAVE_CXX_ARCH:AVX2"': "1",
+        "WITH_IPP": "OFF",
+    }
+
+
+def test_cmake_cache_rejects_duplicate_quoted_variable_names(tmp_path):
+    cache_dir = tmp_path / "_skbuild" / "win-amd64-3.14" / "cmake-build"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "CMakeCache.txt").write_text(
+        '"HAVE_CXX_ARCH:AVX2":INTERNAL=1\n'
+        '"HAVE_CXX_ARCH:AVX2":INTERNAL=0\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(target.OpenCVWheelError, match="Duplicate OpenCV CMake"):
+        target._read_cmake_cache(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("version", "expected"),
     [

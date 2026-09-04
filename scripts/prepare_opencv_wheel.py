@@ -621,7 +621,10 @@ def _read_cmake_cache(source_tree: Path) -> dict[str, str]:
         if not line or line.startswith(("#", "//")) or "=" not in line:
             continue
         typed_key, value = line.split("=", 1)
-        key = typed_key.split(":", 1)[0]
+        # CMake quotes cache variable names that themselves contain a colon,
+        # for example "HAVE_CXX_ARCH:AVX2":INTERNAL.  The cache type is the
+        # final colon-separated field, not the first one.
+        key = typed_key.rsplit(":", 1)[0]
         if key in result:
             raise OpenCVWheelError(f"Duplicate OpenCV CMake cache key: {key}")
         result[key] = value

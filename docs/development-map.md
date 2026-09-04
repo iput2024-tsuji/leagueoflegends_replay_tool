@@ -177,6 +177,8 @@ standalone FFmpegは利用者が明示的に入手・配置し、本プロジェ
 
 Windows向け配布はonedir形式で、依存物を `_internal` に配置します。新モジュール、動的import、データファイル、アイコン、ランタイム依存を変更した場合は `scripts/build.ps1` とパッケージ済みexeの `--self-check` を実行します。ビルド成功だけでなく、OBS、mpv DLL、FFmpeg、設定、録画が意図せず同梱されていないことも確認します。
 
+正式なWindows buildでは`compliance/components.json`の`opencv_source_build_policy`と`scripts/prepare_opencv_wheel.py`を使用し、固定した`opencv-python`／OpenCV／OpenCV FFmpeg入力からIPP無効のOpenCV wheelを同じjob内で構築します。build hostはVisual Studio 2022を提供する`windows-2022` runnerへ固定し、製品の対応対象とするWindows 11 x64とは区別します。clean directoryで2回構築して、byte-identicalでない場合もwheel内容、PE import graph、IPP／FFmpeg状態、synthetic動画読込、同期マーカー用primitiveのsemantic manifestが一致しなければ停止します。元のPyPI OpenCV wheelは正式build用binary cacheへ取得せず、生成wheelのSHA256、実際に選択されたMSVC toolset／Windows SDK、固定FFmpeg DLLとの対応をbuild provenanceへ残します。
+
 ### Inno Setup
 
 正式対応OSはWindows 11（build 22000以降）です。配布物はx64版で、installerの`ArchitecturesAllowed=x64compatible`はx64 WindowsとWindows 11 ARM64のx64エミュレーションを許可しますが、ARM64-native版は提供しません。PyQt6-Qt6 6.10.2のQt6Coreが参照するICUはWindows標準のSystem32版を利用し、ICU DLLを配布物へ同梱しません。Windows 10対応はLTSC 2019等の対象環境で同じnativeロードとQt locale／Unicode検証が完了するまで宣言しません。installerの`MinVersion`、`ArchitecturesAllowed`、README日英版を同期してください。最終PyInstaller onedirのICU graph確認には`python -m scripts.pe_runtime_audit <dist> --require-qt-system-icu`を使用します。

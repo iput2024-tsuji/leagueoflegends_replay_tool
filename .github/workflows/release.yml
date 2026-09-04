@@ -21,7 +21,8 @@ env:
 jobs:
   prepare:
     name: Build and verify Windows installer
-    runs-on: windows-latest
+    # windows-2025 moved to Visual Studio 2026; the fixed VS 2022 toolchain lives here.
+    runs-on: windows-2022
     timeout-minutes: 240
     outputs:
       release_commit: ${{ steps.release_inputs.outputs.release_commit }}

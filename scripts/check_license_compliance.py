@@ -387,31 +387,81 @@ def validate_package_manifest(
                         f"{package_name}."
                     )
                 if lock is not None:
-                    try:
-                        binary_source, installed_archive = expected_install_archive(
-                            lock,
-                            expected_component,
-                        )
-                    except BinaryInstallPolicyError as exc:
-                        errors.append(str(exc))
-                    else:
-                        expected_installed = (
-                            {
-                                "source": binary_source,
-                                **{
-                                    key: installed_archive[key]
-                                    for key in ("filename", "sha256", "size")
-                                },
+                    source_build = lock.get("opencv_source_build_policy")
+                    is_source_built_opencv = (
+                        isinstance(source_build, dict)
+                        and expected_component.get("component")
+                        == source_build.get("component")
+                    )
+                    if (
+                        is_source_built_opencv
+                        and package.get("binary_install_verified") is True
+                    ):
+                        installed = package.get("installed_binary_archive")
+                        if (
+                            not isinstance(installed, dict)
+                            or set(installed) != {
+                                "source",
+                                "filename",
+                                "sha256",
+                                "size",
                             }
-                            if binary_source == "external-vc-runtime-wheel"
-                            and package.get("binary_install_verified") is True
-                            else None
-                        )
-                        if package.get("installed_binary_archive") != expected_installed:
+                            or installed["source"] != "source-built-wheel"
+                            or installed["filename"]
+                            != source_build.get("output_filename")
+                            or not isinstance(installed["sha256"], str)
+                            or SHA256_PATTERN.fullmatch(installed["sha256"])
+                            is None
+                            or not isinstance(installed["size"], int)
+                            or isinstance(installed["size"], bool)
+                            or installed["size"] <= 0
+                        ):
                             errors.append(
-                                "Installed binary archive provenance differs for "
-                                f"{package_name}."
+                                "Installed source-built archive provenance differs "
+                                f"for {package_name}."
                             )
+                    elif is_source_built_opencv:
+                        if package.get("installed_binary_archive") is not None:
+                            errors.append(
+                                "Unverified OpenCV package records an installed "
+                                "source-built archive."
+                            )
+                    else:
+                        try:
+                            binary_source, installed_archive = (
+                                expected_install_archive(
+                                    lock,
+                                    expected_component,
+                                )
+                            )
+                        except BinaryInstallPolicyError as exc:
+                            errors.append(str(exc))
+                        else:
+                            expected_installed = (
+                                {
+                                    "source": binary_source,
+                                    **{
+                                        key: installed_archive[key]
+                                        for key in (
+                                            "filename",
+                                            "sha256",
+                                            "size",
+                                        )
+                                    },
+                                }
+                                if binary_source
+                                == "external-vc-runtime-wheel"
+                                and package.get("binary_install_verified") is True
+                                else None
+                            )
+                            if (
+                                package.get("installed_binary_archive")
+                                != expected_installed
+                            ):
+                                errors.append(
+                                    "Installed binary archive provenance differs for "
+                                    f"{package_name}."
+                                )
             elif "binary_archive" in package or "binary_install_verified" in package:
                 errors.append(
                     f"Unexpected binary archive provenance for {package_name}."
@@ -3054,6 +3104,32 @@ def _validate_build_provenance(
             errors.append(
                 f"Build provenance external Runtime record is invalid: {exc}"
             )
+    from scripts.prepare_opencv_wheel import (
+        OpenCVWheelError,
+        source_build_policy,
+        validate_embedded_provenance_record as validate_opencv_record,
+    )
+
+    try:
+        opencv_policy = source_build_policy(lock)
+    except OpenCVWheelError as exc:
+        errors.append(str(exc))
+        opencv_policy = None
+    opencv_record = payload.get("opencv_source_build")
+    opencv_provenance = None
+    if opencv_policy is None:
+        if opencv_record is not None:
+            errors.append("Build provenance has an unexpected OpenCV build.")
+    else:
+        try:
+            opencv_provenance = validate_opencv_record(
+                opencv_record,
+                distribution_root / "licenses" / "components.json",
+            )
+        except (OpenCVWheelError, OSError) as exc:
+            errors.append(
+                f"Build provenance OpenCV source-build record is invalid: {exc}"
+            )
     if set(package_manifest.get("verified_binary_components", [])) != expected_components:
         errors.append("Package manifest verified binary component set differs.")
     records = payload.get("installed_binaries")
@@ -3082,6 +3158,11 @@ def _validate_build_provenance(
         str(component["component"]): component
         for component in _component_entries(lock)
     }
+    package_by_component = {
+        str(package.get("component")): package
+        for package in package_manifest.get("packages", [])
+        if isinstance(package, dict)
+    }
     observed: set[str] = set()
     for record in records:
         if not isinstance(record, dict):
@@ -3102,14 +3183,23 @@ def _validate_build_provenance(
                 f"Build provenance component has no binary lock: {component_name}"
             )
             continue
-        try:
-            source_kind, installed_archive = expected_install_archive(
-                lock,
-                component,
-            )
-        except BinaryInstallPolicyError as exc:
-            errors.append(str(exc))
-            continue
+        if component_name == "opencv-python" and opencv_policy is not None:
+            if opencv_provenance is None:
+                errors.append("OpenCV source-build provenance is missing.")
+                continue
+            source_kind = "source-built-wheel"
+            installed_archive = opencv_provenance["wheel"]
+            expected_source_build_sha256 = opencv_record["provenance_sha256"]
+        else:
+            try:
+                source_kind, installed_archive = expected_install_archive(
+                    lock,
+                    component,
+                )
+            except BinaryInstallPolicyError as exc:
+                errors.append(str(exc))
+                continue
+            expected_source_build_sha256 = None
         for field in ("filename", "sha256", "size"):
             if record.get(field) != installed_archive.get(field):
                 errors.append(
@@ -3117,6 +3207,13 @@ def _validate_build_provenance(
                 )
         if record.get("source") != source_kind:
             errors.append(f"Build provenance source differs for {component_name}.")
+        if (
+            record.get("source_build_provenance_sha256")
+            != expected_source_build_sha256
+        ):
+            errors.append(
+                f"Build provenance source-build seal differs for {component_name}."
+            )
         expected_upstream = (
             {
                 key: archive[key]
@@ -3135,6 +3232,28 @@ def _validate_build_provenance(
             )
         if record.get("version") != component.get("version"):
             errors.append(f"Build provenance version differs for {component_name}.")
+        package = package_by_component.get(component_name)
+        expected_installed_archive = (
+            {
+                "source": source_kind,
+                **{
+                    key: installed_archive[key]
+                    for key in ("filename", "sha256", "size")
+                },
+            }
+            if source_kind
+            in {"external-vc-runtime-wheel", "source-built-wheel"}
+            else None
+        )
+        if (
+            package is None
+            or package.get("binary_install_verified") is not True
+            or package.get("installed_binary_archive")
+            != expected_installed_archive
+        ):
+            errors.append(
+                f"Package manifest installed archive differs for {component_name}."
+            )
         try:
             owned = verify_recorded_install_inventory(
                 str(component["distribution"]),

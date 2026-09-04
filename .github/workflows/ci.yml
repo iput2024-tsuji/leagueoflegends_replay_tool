@@ -163,7 +163,8 @@ jobs:
 
   build-windows:
     name: Build Windows artifact
-    runs-on: windows-latest
+    # windows-2025 moved to Visual Studio 2026; the fixed VS 2022 toolchain lives here.
+    runs-on: windows-2022
     needs: [lint-test, test-windows]
     env:
       PYTHONIOENCODING: utf8
@@ -350,3 +351,23 @@ jobs:
             -DistributionRoot .\dist\LoLReplayTool `
             -TempRoot $env:RUNNER_TEMP `
             -PythonExe $env:WINDOWS_PYTHON
+
+      - name: Stage private validation evidence
+        shell: pwsh
+        run: |
+          $version = (Get-Content .\VERSION -Raw).Trim()
+          New-Item -ItemType Directory -Force -Path .\.ci-evidence | Out-Null
+          Copy-Item `
+            -LiteralPath $env:BUILD_PROVENANCE `
+            -Destination .\.ci-evidence\build-provenance.json
+          Copy-Item `
+            -LiteralPath ".\dist\installer\LoLReplayTool-Setup-$version.exe" `
+            -Destination .\.ci-evidence\
+
+      - name: Preserve private validation evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: opencv-ipp-free-validation-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: .ci-evidence/

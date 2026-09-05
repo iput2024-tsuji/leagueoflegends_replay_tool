@@ -223,6 +223,7 @@
       "windows_sdk": "10.0.26100.0",
       "cmake_version": "3.31.6",
       "cmake_build_parallel_level": "2",
+      "python_hash_seed": "0",
       "build_packages": {
         "cmake": "3.31.6",
         "distro": "1.9.0",
@@ -240,7 +241,8 @@
         "-DBUILD_opencv_gapi=OFF",
         "-DWITH_ADE=OFF",
         "-DPYTHON3_LIMITED_API=ON",
-        "-DCMAKE_SYSTEM_VERSION=10.0.26100.0"
+        "-DCMAKE_SYSTEM_VERSION=10.0.26100.0",
+        "-DBUILD_WITH_STATIC_CRT=OFF"
       ]
     }
   },

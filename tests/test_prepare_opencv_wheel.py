@@ -49,7 +49,7 @@ def _wheel(
         archive.writestr(info, data)
 
     with zipfile.ZipFile(path, "w") as archive:
-        write(archive, "cv2/cv2.cp314-win_amd64.pyd", pe_bytes)
+        write(archive, "cv2/cv2.pyd", pe_bytes)
         write(
             archive,
             "cv2/opencv_videoio_ffmpeg4130_64.dll",
@@ -130,6 +130,7 @@ def _lock(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
                 "wheel": "0.46.1",
             },
             "cmake_args": list(target.REQUIRED_CMAKE_ARGS),
+            "python_hash_seed": "0",
         },
     }
     lock_path = tmp_path / "components.json"
@@ -167,6 +168,8 @@ def _configured_toolchain() -> dict:
             "WITH_ADE": "OFF",
             "PYTHON3_LIMITED_API": "ON",
             "WITH_FFMPEG": "ON",
+            "BUILD_SHARED_LIBS": "OFF",
+            "BUILD_WITH_STATIC_CRT": "OFF",
         },
         "compiler": {
             "filename": "cl.exe",
@@ -188,6 +191,14 @@ def _configured_toolchain() -> dict:
             "windows_target_platform_versions": [target.REQUIRED_WINDOWS_SDK],
         },
         "selected_msvc_toolset_version": "14.44.35207",
+        "compile_projects": [
+            {
+                "path": "_skbuild/win-amd64-3.14/cmake-build/modules/python3/opencv_python3.vcxproj",
+                "size": 1,
+                "sha256": "c" * 64,
+                "runtime_library": "MultiThreadedDLL",
+            }
+        ],
     }
 
 
@@ -228,18 +239,29 @@ def _pe_inventory(wheel: Path) -> dict:
         for item in target._wheel_contents(wheel)
         if str(item["path"]).endswith((".pyd", ".dll"))
     ]
+    files = []
+    for content in contents:
+        imports = (
+            [{"name": "VCRUNTIME140.dll", "type": "normal"}]
+            if str(content["path"]).casefold().endswith("cv2.pyd")
+            else []
+        )
+        files.append({**content, "imports": imports})
+    runtime_reverse = {
+        "vcruntime140.dll": [{"pe": "cv2/cv2.pyd", "import_type": "normal"}]
+    }
     return {
         "schema_version": 2,
         "tool": {
             "name": "pe_runtime_audit",
             "pefile_version": "2024.8.26",
         },
-        "files": [{**content, "imports": []} for content in contents],
-        "runtime_reverse": {},
+        "files": files,
+        "runtime_reverse": runtime_reverse,
         "summary": {
             "pe_files": len(contents),
-            "import_count": 0,
-            "runtime_import_count": 0,
+            "import_count": 1,
+            "runtime_import_count": 1,
             "app_local_runtime_files": [],
             "hashed_imports": [],
             "unknown_runtime_imports": [],
@@ -278,12 +300,19 @@ def _mock_build_dependencies(monkeypatch) -> None:
         return records
 
     monkeypatch.setattr(target, "_preseed_ffmpeg", fake_preseed)
-    monkeypatch.setattr(target, "_probe_wheel", lambda python, wheel: _probes())
-    monkeypatch.setattr(
-        target,
-        "_capture_configured_toolchain",
-        lambda source: _configured_toolchain(),
-    )
+    def fake_probe(python, wheel, diagnostics_file=None):
+        if diagnostics_file is not None:
+            diagnostics_file.write_text("test build information", encoding="utf-8")
+        return _probes()
+    monkeypatch.setattr(target, "_probe_wheel", fake_probe)
+    def fake_configured_toolchain(source):
+        _write_msbuild_project(source, target.REQUIRED_WINDOWS_SDK)
+        _write_dynamic_project(source, "modules/python3/opencv_python3.vcxproj")
+        record = target._capture_dynamic_crt_projects(source)[0]
+        result = _configured_toolchain()
+        result["compile_projects"] = [record]
+        return result
+    monkeypatch.setattr(target, "_capture_configured_toolchain", fake_configured_toolchain)
     monkeypatch.setattr(
         target,
         "_pe_inventory",
@@ -329,6 +358,17 @@ def test_configured_toolchain_rejects_limited_api_disabled(tmp_path, monkeypatch
         target._capture_configured_toolchain(tmp_path)
 
 
+@pytest.mark.parametrize("key", ["BUILD_SHARED_LIBS", "BUILD_WITH_STATIC_CRT"])
+def test_configured_toolchain_rejects_static_runtime_cache(tmp_path, key):
+    _write_configured_toolchain(tmp_path)
+    cache_path = next(tmp_path.glob("_skbuild/*/cmake-build/CMakeCache.txt"))
+    text = cache_path.read_text(encoding="utf-8")
+    cache_path.write_text(text.replace(f"{key}:INTERNAL=OFF", f"{key}:INTERNAL=ON"), encoding="utf-8")
+
+    with pytest.raises(target.OpenCVWheelError, match="feature flags differ"):
+        target._capture_configured_toolchain(tmp_path)
+
+
 def _write_configured_toolchain(tmp_path: Path, *, selected: str | None = None) -> Path:
     build = tmp_path / "_skbuild" / "win-amd64-3.14" / "cmake-build"
     build.mkdir(parents=True)
@@ -345,6 +385,8 @@ def _write_configured_toolchain(tmp_path: Path, *, selected: str | None = None) 
         "WITH_ADE": "OFF",
         "PYTHON3_LIMITED_API": "ON",
         "WITH_FFMPEG": "ON",
+        "BUILD_SHARED_LIBS": "OFF",
+        "BUILD_WITH_STATIC_CRT": "OFF",
         "CMAKE_CXX_COMPILER": str(compiler),
         "CMAKE_C_COMPILER": str(compiler),
     }
@@ -355,6 +397,7 @@ def _write_configured_toolchain(tmp_path: Path, *, selected: str | None = None) 
         encoding="utf-8",
     )
     _write_msbuild_project(tmp_path, target.REQUIRED_WINDOWS_SDK)
+    _write_dynamic_project(tmp_path, "modules/python3/opencv_python3.vcxproj")
     return compiler
 
 
@@ -367,6 +410,7 @@ def test_configured_toolchain_uses_compiler_evidence_when_cache_version_missing(
     assert observed["compiler"]["filename"] == "cl.exe"
     assert observed["compiler"]["size"] == compiler.stat().st_size
     assert observed["c_compiler"] == observed["compiler"]
+    assert "compile_projects" in observed
 
 
 def test_configured_toolchain_rejects_cache_version_mismatch(tmp_path):
@@ -533,6 +577,99 @@ def test_msbuild_project_rejects_wrong_toolset(tmp_path):
         target._capture_msbuild_project(tmp_path)
 
 
+def _write_dynamic_project(
+    root: Path,
+    relative: str,
+    *,
+    runtime: str = "MultiThreadedDLL",
+    include: str | None = "modules/python3/opencv_python3.cpp",
+    item_groups: int = 1,
+    per_file_runtime: str | None = None,
+    additional_options: str | None = None,
+) -> Path:
+    project = root / "_skbuild" / "win-amd64-3.14" / "cmake-build" / relative
+    project.parent.mkdir(parents=True, exist_ok=True)
+    item = ""
+    if include is not None:
+        override = (
+            f"<RuntimeLibrary>{per_file_runtime}</RuntimeLibrary>"
+            if per_file_runtime
+            else ""
+        )
+        item = f"<ClCompile Include=\"{include}\">{override}</ClCompile>"
+    groups = "".join(
+        f"<ItemDefinitionGroup Condition=\"'$(Configuration)|$(Platform)'=='Release|x64'\"><ClCompile><RuntimeLibrary>{runtime}</RuntimeLibrary>{f'<AdditionalOptions>{additional_options}</AdditionalOptions>' if additional_options is not None else ''}</ClCompile></ItemDefinitionGroup>"
+        for _ in range(item_groups)
+    )
+    project.write_text(
+        "<Project xmlns=\"http://schemas.microsoft.com/developer/msbuild/2003\">"
+        + groups
+        + f"<ItemGroup>{item}</ItemGroup></Project>",
+        encoding="utf-8",
+    )
+    return project
+
+
+def test_dynamic_crt_projects_capture_compile_projects(tmp_path):
+    _write_dynamic_project(tmp_path, "modules/python3/opencv_python3.vcxproj")
+    _write_dynamic_project(tmp_path, "modules/core/opencv_core.vcxproj")
+
+    records = target._capture_dynamic_crt_projects(tmp_path)
+
+    assert {record["path"] for record in records} == {
+        "_skbuild/win-amd64-3.14/cmake-build/modules/python3/opencv_python3.vcxproj",
+        "_skbuild/win-amd64-3.14/cmake-build/modules/core/opencv_core.vcxproj",
+    }
+    assert all(record["runtime_library"] == "MultiThreadedDLL" for record in records)
+    assert all(len(record["sha256"]) == 64 for record in records)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"runtime": "MultiThreaded"}, "RuntimeLibrary"),
+        ({"include": None}, "ClCompile"),
+        ({"item_groups": 2}, "RuntimeLibrary"),
+        ({"per_file_runtime": "MultiThreaded"}, "RuntimeLibrary"),
+    ],
+)
+def test_dynamic_crt_projects_reject_invalid_runtime_configuration(tmp_path, kwargs, match):
+    _write_dynamic_project(
+        tmp_path, "modules/python3/opencv_python3.vcxproj", **kwargs
+    )
+    with pytest.raises(target.OpenCVWheelError, match=match):
+        target._capture_dynamic_crt_projects(tmp_path)
+
+
+def test_dynamic_crt_projects_skip_utility_and_compiler_probe_projects(tmp_path):
+    _write_dynamic_project(tmp_path, "modules/python3/opencv_python3.vcxproj")
+    _write_dynamic_project(tmp_path, "ALL_BUILD.vcxproj", include=None)
+    _write_dynamic_project(tmp_path, "ZERO_CHECK.vcxproj", include=None)
+    _write_dynamic_project(tmp_path, "CMakeFiles/3.31.6/CompilerProbe.vcxproj")
+
+    records = target._capture_dynamic_crt_projects(tmp_path)
+    assert [record["path"] for record in records] == [
+        "_skbuild/win-amd64-3.14/cmake-build/modules/python3/opencv_python3.vcxproj"
+    ]
+
+
+def test_dynamic_crt_projects_requires_python3_project(tmp_path):
+    _write_dynamic_project(tmp_path, "modules/core/opencv_core.vcxproj")
+    with pytest.raises(target.OpenCVWheelError, match="python3"):
+        target._capture_dynamic_crt_projects(tmp_path)
+
+
+@pytest.mark.parametrize("options", ["/MT", "/MTd", "-MT", '"/MT"'])
+def test_dynamic_crt_projects_reject_static_crt_additional_options(tmp_path, options):
+    _write_dynamic_project(
+        tmp_path,
+        "modules/python3/opencv_python3.vcxproj",
+        additional_options=options,
+    )
+    with pytest.raises(target.OpenCVWheelError, match="static CRT|/MT"):
+        target._capture_dynamic_crt_projects(tmp_path)
+
+
 def test_msbuild_project_rejects_multiple_sdk_values(tmp_path):
     _write_msbuild_project(tmp_path, target.REQUIRED_WINDOWS_SDK)
     project = next(tmp_path.glob("_skbuild/*/cmake-build/ALL_BUILD.vcxproj"))
@@ -663,6 +800,7 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
     work = tmp_path / "work"
 
     _mock_build_dependencies(monkeypatch)
+    monkeypatch.setenv("PYTHONHASHSEED", "random")
 
     def fake_run(command, *, cwd, env, check, capture_output, text):
         assert command[1:5] == [
@@ -674,9 +812,15 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
         assert env["CMAKE_ARGS"] == (
             "-DWITH_IPP=OFF -DBUILD_IPP_IW=OFF -DBUILD_opencv_gapi=OFF "
             "-DWITH_ADE=OFF -DPYTHON3_LIMITED_API=ON "
-            "-DCMAKE_SYSTEM_VERSION=10.0.26100.0"
+            "-DCMAKE_SYSTEM_VERSION=10.0.26100.0 "
+            "-DBUILD_WITH_STATIC_CRT=OFF"
         )
         assert env["CMAKE_GENERATOR_TOOLSET"] == target.REQUIRED_TOOLSET
+        assert env["PYTHONHASHSEED"] == "0"
+        assert all(
+            flag not in env
+            for flag in ("CL", "_CL_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS")
+        )
         assert "SKBUILD_CONFIGURE_OPTIONS" not in env
         assert (cwd / "opencv" / "CMakeLists.txt").is_file()
         assert (cwd / "cv2" / "version.py").read_bytes() == target.VERSION_PY_BYTES
@@ -691,8 +835,37 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
     assert (output / target.PROVENANCE_NAME).is_file()
     assert provenance["repeatability"]["byte_identical"] is True
     assert provenance["repeatability"]["semantic_equal"] is True
+    assert provenance["observed_build_environment"]["python_hash_seed"] == "0"
     assert target.validate_output_directory(output, lock_path)["version"] == "4.13.0.90"
     assert not work.exists()
+
+
+def test_required_cmake_args_pin_dynamic_crt_and_static_libraries():
+    assert "-DBUILD_WITH_STATIC_CRT=OFF" in target.REQUIRED_CMAKE_ARGS
+    assert len(target.REQUIRED_CMAKE_ARGS) == len(set(target.REQUIRED_CMAKE_ARGS))
+
+
+@pytest.mark.parametrize("name", ["CL", "_CL_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"])
+def test_run_rejects_inherited_compiler_flags_before_build(tmp_path, monkeypatch, name):
+    policy, _lock_path, _source, _opencv = _lock(tmp_path)
+    monkeypatch.setenv(name, " /DTEST ")
+    monkeypatch.setattr(target.subprocess, "run", lambda *args, **kwargs: pytest.fail("build started"))
+    with pytest.raises(target.OpenCVWheelError, match="inherited compiler flags"):
+        target._run_once(tmp_path, tmp_path / "output", policy, tmp_path / "work")
+
+
+@pytest.mark.parametrize("value", [None, "random", 0])
+def test_policy_requires_python_hash_seed_zero(tmp_path, value):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    environment = payload[target.POLICY_KEY]["build_environment"]
+    if value is None:
+        del environment["python_hash_seed"]
+    else:
+        environment["python_hash_seed"] = value
+    lock_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(target.OpenCVWheelError, match="build environment|hash seed|toolchain"):
+        target._load_lock(lock_path)
 
 
 @pytest.mark.parametrize("fail_call", [1, 2])
@@ -795,6 +968,29 @@ def test_output_provenance_tampering_is_rejected(tmp_path, monkeypatch):
         target.validate_output_directory(output, lock_path)
 
 
+@pytest.mark.parametrize("field", ["python_hash_seed", "compile_projects"])
+def test_output_observed_environment_tampering_is_rejected(tmp_path, monkeypatch, field):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    output = tmp_path / "output"
+    _mock_build_dependencies(monkeypatch)
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        wheel_dir = Path(command[-1])
+        _wheel(wheel_dir / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    target.run(tmp_path, output, lock_path, tmp_path / "work")
+    provenance_path = output / target.PROVENANCE_NAME
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    observed = provenance["observed_build_environment"]
+    observed[field] = "random" if field == "python_hash_seed" else []
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    with pytest.raises(target.OpenCVWheelError, match="provenance|environment|toolchain|hash seed"):
+        target.validate_output_directory(output, lock_path)
+
+
 def test_output_msbuild_project_path_tampering_is_rejected(tmp_path, monkeypatch):
     _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
     output = tmp_path / "output"
@@ -860,6 +1056,21 @@ def test_duplicate_pe_inventory_path_is_rejected(tmp_path):
         target._validate_pe_inventory(inventory, contents, "2024.8.26")
 
 
+def test_cv2_requires_normal_vcruntime_or_msvcp_import(tmp_path):
+    wheel = tmp_path / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl"
+    _wheel(wheel)
+    contents = target._wheel_contents(wheel)
+    inventory = _pe_inventory(wheel)
+    cv2_record = next(item for item in inventory["files"] if item["path"] == "cv2/cv2.pyd")
+    cv2_record["imports"] = []
+    inventory["runtime_reverse"] = {}
+    inventory["summary"]["import_count"] = 0
+    inventory["summary"]["runtime_import_count"] = 0
+
+    with pytest.raises(target.OpenCVWheelError, match="dynamic CRT|runtime"):
+        target._validate_pe_inventory(inventory, contents, "2024.8.26")
+
+
 def test_nonempty_ipp_build_information_is_rejected(tmp_path, monkeypatch):
     _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
     output = tmp_path / "output"
@@ -867,7 +1078,9 @@ def test_nonempty_ipp_build_information_is_rejected(tmp_path, monkeypatch):
     _mock_build_dependencies(monkeypatch)
     probes = _probes()
     probes["ipp_build_information_lines"] = ["Intel IPP: disabled"]
-    monkeypatch.setattr(target, "_probe_wheel", lambda python, wheel: probes)
+    monkeypatch.setattr(
+        target, "_probe_wheel", lambda python, wheel, diagnostics_file=None: probes
+    )
 
     def fake_run(command, *, cwd, env, check, capture_output, text):
         wheel_dir = Path(command[-1])
@@ -887,7 +1100,9 @@ def test_unexpected_ffmpeg_build_information_is_rejected(tmp_path, monkeypatch):
     _mock_build_dependencies(monkeypatch)
     probes = _probes()
     probes["ffmpeg_build_information_lines"] = ["FFMPEG: YES"]
-    monkeypatch.setattr(target, "_probe_wheel", lambda python, wheel: probes)
+    monkeypatch.setattr(
+        target, "_probe_wheel", lambda python, wheel, diagnostics_file=None: probes
+    )
 
     def fake_run(command, *, cwd, env, check, capture_output, text):
         wheel_dir = Path(command[-1])
@@ -955,6 +1170,8 @@ def test_two_clean_builds_must_have_same_semantics(tmp_path, monkeypatch):
     assert not (tmp_path / "output").exists()
     assert (tmp_path / "work" / "first-build-evidence.json").is_file()
     assert (tmp_path / "work" / "second-build-evidence.json").is_file()
+    assert next((tmp_path / "work" / "first-build-diagnostics").glob("*.whl")).is_file()
+    assert next((tmp_path / "work" / "2" / "evidence").glob("*.whl")).is_file()
 
 
 def test_two_clean_builds_must_have_identical_pe_payloads(tmp_path, monkeypatch):
@@ -985,6 +1202,8 @@ def test_two_clean_builds_must_have_identical_pe_payloads(tmp_path, monkeypatch)
     assert not (tmp_path / "output").exists()
     assert (tmp_path / "work" / "first-build-evidence.json").is_file()
     assert (tmp_path / "work" / "second-build-evidence.json").is_file()
+    assert next((tmp_path / "work" / "first-build-diagnostics").glob("*.whl")).is_file()
+    assert next((tmp_path / "work" / "2" / "evidence").glob("*.whl")).is_file()
 
 
 def test_missing_source_build_policy_is_not_an_error():

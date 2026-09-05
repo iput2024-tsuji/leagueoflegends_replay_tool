@@ -31,6 +31,7 @@ REQUIRED_TOOLSET = "v143"
 REQUIRED_TOOLSET_VERSION = "14.44.35207"
 REQUIRED_WINDOWS_SDK = "10.0.26100.0"
 REQUIRED_CMAKE = "3.31.6"
+COMPILER_FLAG_ENVIRONMENT = ("CL", "_CL_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS")
 REQUIRED_CMAKE_ARGS = (
     "-DWITH_IPP=OFF",
     "-DBUILD_IPP_IW=OFF",
@@ -38,6 +39,7 @@ REQUIRED_CMAKE_ARGS = (
     "-DWITH_ADE=OFF",
     "-DPYTHON3_LIMITED_API=ON",
     "-DCMAKE_SYSTEM_VERSION=10.0.26100.0",
+    "-DBUILD_WITH_STATIC_CRT=OFF",
 )
 VERSION_PY_BYTES = (
     b'opencv_version = "4.13.0.90"\n'
@@ -143,6 +145,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
         "windows_sdk",
         "cmake_version",
         "cmake_build_parallel_level",
+        "python_hash_seed",
         "build_packages",
         "cmake_args",
     }:
@@ -161,6 +164,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
         "cmake_build_parallel_level": environment[
             "cmake_build_parallel_level"
         ],
+        "python_hash_seed": environment["python_hash_seed"],
     } != {
         "generator": REQUIRED_GENERATOR,
         "msvc_toolset": REQUIRED_TOOLSET,
@@ -168,6 +172,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
         "windows_sdk": REQUIRED_WINDOWS_SDK,
         "cmake_version": REQUIRED_CMAKE,
         "cmake_build_parallel_level": "2",
+        "python_hash_seed": "0",
     }:
         raise OpenCVWheelError("OpenCV toolchain differs from the fixed policy")
     build_packages = environment["build_packages"]
@@ -348,7 +353,9 @@ def _prepare_build_venv(work_dir: Path, artifacts: list[Path]) -> Path:
     return python
 
 
-def _probe_wheel(python: Path, wheel: Path) -> dict[str, Any]:
+def _probe_wheel(
+    python: Path, wheel: Path, diagnostics_file: Path
+) -> dict[str, Any]:
     install = subprocess.run(
         [
             str(python),
@@ -378,6 +385,7 @@ def _probe_wheel(python: Path, wheel: Path) -> dict[str, Any]:
     code = """
 import hashlib
 import json
+import sys
 import tempfile
 from pathlib import Path
 
@@ -385,6 +393,7 @@ import cv2
 import numpy as np
 
 info = cv2.getBuildInformation()
+Path(sys.argv[1]).write_text(info, encoding="utf-8")
 ipp_lines = [
     line.strip()
     for line in info.splitlines()
@@ -441,7 +450,7 @@ print(json.dumps({
 }, sort_keys=True))
 """
     result = subprocess.run(
-        [str(python), "-c", code],
+        [str(python), "-c", code, str(diagnostics_file)],
         check=False,
         capture_output=True,
         text=True,
@@ -731,6 +740,105 @@ def _capture_compiler(
     }
 
 
+def _capture_dynamic_crt_projects(source_tree: Path) -> list[dict[str, Any]]:
+    """Check the effective Release CRT setting in every generated C/C++ target."""
+    records = []
+    for project in sorted(source_tree.glob("_skbuild/*/cmake-build/**/*.vcxproj")):
+        relative = project.relative_to(source_tree).as_posix()
+        if "CMakeFiles" in project.relative_to(source_tree).parts:
+            continue  # Configure-time compiler probes are not wheel build targets.
+        _regular(project, "OpenCV compile project")
+        try:
+            root = ET.parse(project).getroot()
+        except (ET.ParseError, OSError) as exc:
+            raise OpenCVWheelError(f"Cannot inspect OpenCV compile project: {relative}") from exc
+        compile_items = root.findall("{*}ItemGroup/{*}ClCompile[@Include]")
+        if not compile_items:
+            continue  # ALL_BUILD, ZERO_CHECK, and other utility projects.
+        if any(
+            re.search(r'(?:^|[\s"])[/-]MTd?(?=$|[\s"])', node.text or "", re.IGNORECASE)
+            for node in root.findall(".//{*}AdditionalOptions")
+        ):
+            raise OpenCVWheelError(f"OpenCV static CRT AdditionalOptions override: {relative}")
+        if any(item.findall(".//{*}RuntimeLibrary") for item in compile_items):
+            raise OpenCVWheelError(f"OpenCV per-file RuntimeLibrary override: {relative}")
+        groups = [
+            group
+            for group in root.findall("{*}ItemDefinitionGroup")
+            if re.sub(r"\s+", "", group.get("Condition", ""))
+            == "'$(Configuration)|$(Platform)'=='Release|x64'"
+        ]
+        runtime_nodes = (
+            groups[0].findall("{*}ClCompile/{*}RuntimeLibrary")
+            if len(groups) == 1 else []
+        )
+        if (
+            len(runtime_nodes) != 1
+            or runtime_nodes[0].text != "MultiThreadedDLL"
+            or runtime_nodes[0].attrib
+        ):
+            raise OpenCVWheelError(f"OpenCV Release RuntimeLibrary must be MultiThreadedDLL: {relative}")
+        # Only CMake's four unambiguous configuration defaults may coexist;
+        # an unconditional or differently conditioned group could override Release.
+        known_runtime_nodes = []
+        conditions: set[str] = set()
+        for group in root.findall("{*}ItemDefinitionGroup"):
+            nodes = group.findall("{*}ClCompile/{*}RuntimeLibrary")
+            if not nodes:
+                continue
+            condition = re.sub(r"\s+", "", group.get("Condition", ""))
+            if (
+                condition not in {
+                    f"'$(Configuration)|$(Platform)'=='{config}|x64'"
+                    for config in ("Debug", "Release", "MinSizeRel", "RelWithDebInfo")
+                }
+                or condition in conditions
+                or len(nodes) != 1
+                or nodes[0].attrib
+                or any(node.attrib for node in group.findall("{*}ClCompile"))
+            ):
+                raise OpenCVWheelError(f"OpenCV ambiguous RuntimeLibrary override: {relative}")
+            conditions.add(condition)
+            known_runtime_nodes.extend(nodes)
+        if any(
+            node not in known_runtime_nodes
+            for node in root.findall(".//{*}RuntimeLibrary")
+        ):
+            raise OpenCVWheelError(f"OpenCV unexpected RuntimeLibrary override: {relative}")
+        records.append({
+            "path": relative,
+            "size": project.stat().st_size,
+            "sha256": _sha256(project),
+            "runtime_library": "MultiThreadedDLL",
+        })
+    _validate_compile_projects(records)
+    return records
+
+
+def _validate_compile_projects(records: Any) -> None:
+    if not isinstance(records, list) or not records:
+        raise OpenCVWheelError("OpenCV ClCompile project evidence is missing")
+    seen: set[str] = set()
+    for item in records:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"path", "size", "sha256", "runtime_library"}
+            or not isinstance(item["path"], str)
+            or re.fullmatch(r"_skbuild/[^/]+/cmake-build/.+\.vcxproj", item["path"]) is None
+            or _safe_member(item["path"]).as_posix() != item["path"]
+            or item["path"].casefold() in seen
+            or "cmakefiles" in item["path"].casefold().split("/")
+            or type(item["size"]) is not int
+            or item["size"] <= 0
+            or _SHA256.fullmatch(str(item["sha256"])) is None
+            or item["runtime_library"] != "MultiThreadedDLL"
+        ):
+            raise OpenCVWheelError("OpenCV compile project provenance is invalid")
+        seen.add(item["path"].casefold())
+    if not any(path.endswith("/modules/python3/opencv_python3.vcxproj") for path in seen):
+        raise OpenCVWheelError("OpenCV python3 ClCompile project evidence is missing")
+
+
 def _is_required_toolset_version(value: str) -> bool:
     return value == REQUIRED_TOOLSET_VERSION
 
@@ -747,6 +855,8 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
         "WITH_ADE": "OFF",
         "PYTHON3_LIMITED_API": "ON",
         "WITH_FFMPEG": "ON",
+        "BUILD_SHARED_LIBS": "OFF",
+        "BUILD_WITH_STATIC_CRT": "OFF",
     }
     observed = {key: cache.get(key) for key in expected}
     if observed != expected:
@@ -778,6 +888,7 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
         "compiler": compiler,
         "c_compiler": c_compiler,
         "msbuild_project": _capture_msbuild_project(source_tree),
+        "compile_projects": _capture_dynamic_crt_projects(source_tree),
         "selected_msvc_toolset_version": selected,
     }
 
@@ -1097,6 +1208,23 @@ def _validate_pe_inventory(
         or not isinstance(inventory["runtime_reverse"], dict)
     ):
         raise OpenCVWheelError("OpenCV PE inventory does not enforce external Runtime")
+    _require_dynamic_crt_import(inventory)
+
+
+def _require_dynamic_crt_import(inventory: dict[str, Any]) -> None:
+    cv2_files = [
+        item for item in inventory["files"]
+        if item["path"].casefold() == "cv2/cv2.pyd"
+    ]
+    if len(cv2_files) != 1 or not any(
+        item["type"] == "normal"
+        and item["name"].casefold() in {
+            "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll",
+            "msvcp140_1.dll", "msvcp140_2.dll",
+        }
+        for item in cv2_files[0]["imports"]
+    ):
+        raise OpenCVWheelError("OpenCV cv2.pyd has no normal dynamic CRT import")
 
 
 def validate_output_directory(
@@ -1352,8 +1480,11 @@ def _validate_provenance_payload(
         "prebuild",
         "configured_toolchain",
         "runner_image",
+        "python_hash_seed",
     }:
         raise OpenCVWheelError("OpenCV observed build environment is invalid")
+    if observed_environment["python_hash_seed"] != "0":
+        raise OpenCVWheelError("OpenCV observed Python hash seed differs")
     if observed_environment["prebuild"] != {
         "cmake_version": policy["build_environment"]["cmake_version"],
         "build_packages": policy["build_environment"]["build_packages"],
@@ -1366,6 +1497,7 @@ def _validate_provenance_payload(
         "compiler",
         "c_compiler",
         "msbuild_project",
+        "compile_projects",
         "selected_msvc_toolset_version",
     }:
         raise OpenCVWheelError("OpenCV configured toolchain fields are invalid")
@@ -1379,8 +1511,11 @@ def _validate_provenance_payload(
         "WITH_ADE": "OFF",
         "PYTHON3_LIMITED_API": "ON",
         "WITH_FFMPEG": "ON",
+        "BUILD_SHARED_LIBS": "OFF",
+        "BUILD_WITH_STATIC_CRT": "OFF",
     }:
         raise OpenCVWheelError("OpenCV configured CMake cache differs")
+    _validate_compile_projects(configured["compile_projects"])
     msbuild = configured["msbuild_project"]
     if (
         not isinstance(msbuild, dict)
@@ -1491,6 +1626,14 @@ def _validate_provenance_payload(
     return record
 
 
+def _reject_inherited_compiler_flags() -> None:
+    # CL is prepended and _CL_ appended by cl.exe itself, outside the generated
+    # MSBuild RuntimeLibrary setting. Other flags seed CMake's compiler/linker flags.
+    present = [name for name in COMPILER_FLAG_ENVIRONMENT if os.environ.get(name, "").strip()]
+    if present:
+        raise OpenCVWheelError("OpenCV inherited compiler flags are not allowed: " + ", ".join(present))
+
+
 def _run_once(
     source_dir: Path,
     output_dir: Path,
@@ -1498,6 +1641,7 @@ def _run_once(
     work_dir: Path,
 ) -> tuple[dict[str, Any], Path]:
     """Build and inspect one wheel in a clean directory."""
+    _reject_inherited_compiler_flags()
     inputs = _verify_inputs(source_dir, policy)
     if output_dir.exists() or output_dir.is_symlink():
         raise OpenCVWheelError(f"OpenCV output directory already exists: {output_dir}")
@@ -1531,6 +1675,8 @@ def _run_once(
         str(output_dir.resolve()),
     ]
     environment = os.environ.copy()
+    for name in COMPILER_FLAG_ENVIRONMENT:
+        environment.pop(name, None)
     environment["PATH"] = str(build_python.parent) + os.pathsep + environment.get(
         "PATH", ""
     )
@@ -1546,6 +1692,7 @@ def _run_once(
     environment["CMAKE_BUILD_PARALLEL_LEVEL"] = str(
         build_environment["cmake_build_parallel_level"]
     )
+    environment["PYTHONHASHSEED"] = str(build_environment["python_hash_seed"])
     environment["CI_BUILD"] = "1"
     environment["OPENCV_PYTHON_SKIP_GIT_COMMANDS"] = "1"
     for flag in ("ENABLE_CONTRIB", "ENABLE_HEADLESS", "ENABLE_ROLLING"):
@@ -1574,13 +1721,27 @@ def _run_once(
     wheel = _output_wheel(output_dir, str(policy["output_filename"]))
     _reject_ipp(wheel)
     configured_toolchain = _capture_configured_toolchain(source_tree)
-    probes = _probe_wheel(build_python, wheel)
+    evidence = work_dir / "evidence"
+    evidence.mkdir()
+    probes = _probe_wheel(build_python, wheel, evidence / "build-information.txt")
     pe_inventory = _pe_inventory(wheel, work_dir, build_python)
+    _require_dynamic_crt_import(pe_inventory)
     wheel_contents = _wheel_contents(wheel)
     ffmpeg_wheel_binding = _bind_ffmpeg_input(
         wheel_contents,
         ffmpeg_records,
     )
+    # Keep only individually verified wheels as failure diagnostics, never as a
+    # sealed producer artifact until the two-build comparison also passes.
+    shutil.copy2(wheel, evidence / wheel.name)
+    for item in [
+        configured_toolchain["msbuild_project"],
+        *configured_toolchain["compile_projects"],
+    ]:
+        project = source_tree / item["path"]
+        destination = evidence / "msbuild" / item["path"]
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(project, destination)
     provenance = {
         "schema_version": 1,
         "component": "opencv-python",
@@ -1594,6 +1755,7 @@ def _run_once(
             "prebuild": prebuild_environment,
             "configured_toolchain": configured_toolchain,
             "runner_image": runner_image,
+            "python_hash_seed": environment["PYTHONHASHSEED"],
         },
         "version_py_sha256": _sha256(source_tree / "cv2" / "version.py"),
         "opencv_download_path": "<work-dir>/opencv-download",
@@ -1653,6 +1815,7 @@ def run(
     second_output = work_dir / "o2"
     succeeded = False
     try:
+        print("OpenCV: starting clean source build 1/2", file=sys.stderr, flush=True)
         first, _first_python = _run_once(
             source_dir, output_dir, policy, first_work
         )
@@ -1661,7 +1824,9 @@ def run(
             encoding="utf-8",
         )
         shutil.copyfile(first_work / "build.log", work_dir / "first-build.log")
+        shutil.copytree(first_work / "evidence", work_dir / "first-build-diagnostics")
         _remove_clean_build_tree(first_work, work_dir)
+        print("OpenCV: starting clean source build 2/2", file=sys.stderr, flush=True)
         second, second_python = _run_once(
             source_dir, second_output, policy, second_work
         )
@@ -1669,6 +1834,7 @@ def run(
             json.dumps(second, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        print("OpenCV: comparing the two verified source builds", file=sys.stderr, flush=True)
         first_semantic = _semantic_manifest(first)
         second_semantic = _semantic_manifest(second)
         if first_semantic != second_semantic:

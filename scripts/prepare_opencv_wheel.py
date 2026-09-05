@@ -1015,6 +1015,8 @@ def _bind_ffmpeg_input(
 
 
 def _semantic_manifest(provenance: dict[str, Any]) -> dict[str, Any]:
+    from scripts.opencv_pe_comparison import semantic_record
+
     semantic_contents = []
     for item in provenance["wheel_contents"]:
         path = str(item["path"])
@@ -1028,7 +1030,11 @@ def _semantic_manifest(provenance: dict[str, Any]) -> dict[str, Any]:
         {
             "path": item["path"],
             "size": item["size"],
-            "sha256": item["sha256"],
+            "sha256": (
+                provenance["cv2_comparison"]["normalized_sha256"]
+                if item["path"] == "cv2/cv2.pyd"
+                else item["sha256"]
+            ),
             "imports": item["imports"],
         }
         for item in provenance["pe_inventory"]["files"]
@@ -1057,6 +1063,7 @@ def _semantic_manifest(provenance: dict[str, Any]) -> dict[str, Any]:
         "wheel_contents": semantic_contents,
         "ffmpeg_wheel_binding": provenance["ffmpeg_wheel_binding"],
         "pe_files": pe_files,
+        "cv2_comparison": semantic_record(provenance["cv2_comparison"]),
         "probes": probes,
     }
 
@@ -1123,6 +1130,36 @@ def _pe_inventory(wheel: Path, work_dir: Path, python: Path | None = None) -> di
         raise OpenCVWheelError(f"PE audit dependency unavailable: {exc}") from exc
     except Exception as exc:
         raise OpenCVWheelError(f"OpenCV wheel PE audit failed: {exc}") from exc
+
+
+def _cv2_comparison(path: Path, python: Path | None = None) -> dict[str, Any]:
+    """Read cv2 metadata using the same pinned parser as the Runtime audit."""
+    try:
+        from scripts.opencv_pe_comparison import validate_record
+
+        _regular(path, "OpenCV comparison PE")
+        if python is None:
+            from scripts.opencv_pe_comparison import inspect_cv2_pe
+
+            record = inspect_cv2_pe(path)
+        else:
+            result = subprocess.run(
+                [str(python), "-c",
+                 "import json,sys; from pathlib import Path; "
+                 "from scripts.opencv_pe_comparison import inspect_cv2_pe; "
+                 "print(json.dumps(inspect_cv2_pe(Path(sys.argv[1]))))", str(path)],
+                cwd=Path(__file__).resolve().parents[1], check=False,
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                raise OpenCVWheelError(
+                    "OpenCV PE metadata comparison failed: " + result.stderr.strip()
+                )
+            record = json.loads(result.stdout)
+        validate_record(record, raw_sha256=_sha256(path), size=path.stat().st_size)
+        return record
+    except (ImportError, OSError, ValueError) as exc:
+        raise OpenCVWheelError(f"OpenCV PE metadata comparison failed: {exc}") from exc
 
 
 def _output_wheel(output_dir: Path, filename: str) -> Path:
@@ -1301,8 +1338,13 @@ def validate_output_directory(
             Path(temporary),
             audit_python,
         )
+        actual_comparison = _cv2_comparison(
+            Path(temporary) / "pe-audit" / "cv2" / "cv2.pyd", audit_python
+        )
     if provenance.get("pe_inventory") != actual_pe_inventory:
         raise OpenCVWheelError("OpenCV PE inventory differs from wheel")
+    if provenance.get("cv2_comparison") != actual_comparison:
+        raise OpenCVWheelError("OpenCV PE metadata comparison differs from wheel")
     _validate_provenance_payload(provenance, components_file)
     return provenance
 
@@ -1344,6 +1386,7 @@ def _validate_provenance_payload(
         "wheel_contents",
         "probes",
         "pe_inventory",
+        "cv2_comparison",
         "ffmpeg_preseed",
         "ffmpeg_wheel_binding",
         "opencv_download_path",
@@ -1604,6 +1647,22 @@ def _validate_provenance_payload(
         contents,
         policy["build_environment"]["build_packages"]["pefile"],
     )
+    from scripts.opencv_pe_comparison import semantic_record, validate_record
+
+    cv2_files = [
+        item for item in record["pe_inventory"]["files"]
+        if item["path"] == "cv2/cv2.pyd"
+    ]
+    if len(cv2_files) != 1:
+        raise OpenCVWheelError("OpenCV comparison PE identity differs")
+    cv2_file = cv2_files[0]
+    try:
+        validate_record(
+            record["cv2_comparison"], raw_sha256=cv2_file["sha256"],
+            size=cv2_file["size"],
+        )
+    except ValueError as exc:
+        raise OpenCVWheelError(f"OpenCV PE metadata comparison is invalid: {exc}") from exc
     semantic_manifest = _semantic_manifest(record)
     if (
         record["semantic_manifest"] != semantic_manifest
@@ -1620,10 +1679,25 @@ def _validate_provenance_payload(
         "byte_identical",
         "first_wheel_sha256",
         "second_wheel_sha256",
+        "second_cv2_comparison",
         "semantic_equal",
         "semantic_manifest_sha256",
     }:
         raise OpenCVWheelError("OpenCV repeatability record is invalid")
+    second_comparison = repeatability["second_cv2_comparison"]
+    try:
+        validate_record(
+            second_comparison,
+            raw_sha256=(second_comparison.get("raw_sha256")
+                        if isinstance(second_comparison, dict) else ""),
+            size=cv2_file["size"],
+        )
+    except ValueError as exc:
+        raise OpenCVWheelError(f"OpenCV second PE comparison is invalid: {exc}") from exc
+    if semantic_record(second_comparison) != semantic_record(record["cv2_comparison"]):
+        raise OpenCVWheelError("OpenCV second PE comparison differs")
+    if repeatability["byte_identical"] is True and second_comparison != record["cv2_comparison"]:
+        raise OpenCVWheelError("Byte-identical OpenCV builds have different PE metadata")
     if (
         not isinstance(repeatability["byte_identical"], bool)
         or repeatability["first_wheel_sha256"] != wheel["sha256"]
@@ -1759,6 +1833,9 @@ def _run_once(
     probes = _probe_wheel(build_python, wheel, evidence / "build-information.txt")
     pe_inventory = _pe_inventory(wheel, work_dir, build_python)
     _require_dynamic_crt_import(pe_inventory)
+    cv2_comparison = _cv2_comparison(
+        work_dir / "pe-audit" / "cv2" / "cv2.pyd", build_python
+    )
     wheel_contents = _wheel_contents(wheel)
     ffmpeg_wheel_binding = _bind_ffmpeg_input(
         wheel_contents,
@@ -1812,6 +1889,7 @@ def _run_once(
         "wheel_contents": wheel_contents,
         "ffmpeg_wheel_binding": ffmpeg_wheel_binding,
         "pe_inventory": pe_inventory,
+        "cv2_comparison": cv2_comparison,
         "probes": probes,
         "ffmpeg_preseed": ffmpeg_records,
     }
@@ -1917,6 +1995,7 @@ def run(
             "byte_identical": byte_identical,
             "first_wheel_sha256": first_wheel_sha256,
             "second_wheel_sha256": second_wheel_sha256,
+            "second_cv2_comparison": second["cv2_comparison"],
             "semantic_equal": True,
             "semantic_manifest_sha256": semantic_sha256,
         }

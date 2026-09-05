@@ -49,7 +49,7 @@ def _wheel(
         archive.writestr(info, data)
 
     with zipfile.ZipFile(path, "w") as archive:
-        write(archive, "cv2/cv2.pyd", pe_bytes)
+        write(archive, "cv2/cv2.pyd", pe_bytes.ljust(1024, b"\0"))
         write(
             archive,
             "cv2/opencv_videoio_ffmpeg4130_64.dll",
@@ -273,6 +273,31 @@ def _pe_inventory(wheel: Path) -> dict:
     }
 
 
+def _comparison(path: Path, python=None) -> dict:
+    data = path.read_bytes()
+    fields = [
+        ("coff_timestamp", 304, 4),
+        ("debug_timestamp_2", 516, 4),
+        ("debug_timestamp_12", 544, 4),
+        ("debug_timestamp_13", 572, 4),
+        ("codeview_guid", 604, 16),
+    ]
+    normalized = bytearray(data)
+    for _name, offset, size in fields:
+        normalized[offset:offset + size] = b"\0" * size
+    return {
+        "method": "opencv-cv2-coff-debug-metadata-v1",
+        "size": len(data),
+        "raw_sha256": hashlib.sha256(data).hexdigest(),
+        "normalized_sha256": hashlib.sha256(normalized).hexdigest(),
+        "fields": [
+            {"name": name, "offset": offset, "size": size,
+             "hex": data[offset:offset + size].hex()}
+            for name, offset, size in fields
+        ],
+    }
+
+
 def _mock_build_dependencies(monkeypatch) -> None:
     monkeypatch.setenv("ImageOS", "win22")
     monkeypatch.setenv("ImageVersion", "20260831.1")
@@ -317,11 +342,15 @@ def _mock_build_dependencies(monkeypatch) -> None:
         result["compile_projects"] = [record]
         return result
     monkeypatch.setattr(target, "_capture_configured_toolchain", fake_configured_toolchain)
-    monkeypatch.setattr(
-        target,
-        "_pe_inventory",
-        lambda wheel, work_dir, python=None: _pe_inventory(wheel),
-    )
+    def fake_pe_inventory(wheel, work_dir, python=None):
+        cv2 = work_dir / "pe-audit" / "cv2" / "cv2.pyd"
+        cv2.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(wheel) as archive:
+            cv2.write_bytes(archive.read("cv2/cv2.pyd"))
+        return _pe_inventory(wheel)
+
+    monkeypatch.setattr(target, "_pe_inventory", fake_pe_inventory)
+    monkeypatch.setattr(target, "_cv2_comparison", _comparison)
 
 
 @pytest.mark.parametrize(
@@ -855,6 +884,72 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
 def test_required_cmake_args_pin_dynamic_crt_and_static_libraries():
     assert "-DBUILD_WITH_STATIC_CRT=OFF" in target.REQUIRED_CMAKE_ARGS
     assert len(target.REQUIRED_CMAKE_ARGS) == len(set(target.REQUIRED_CMAKE_ARGS))
+
+
+def test_run_accepts_only_metadata_variance_and_preserves_both_raw_hashes(tmp_path, monkeypatch):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    _mock_build_dependencies(monkeypatch)
+    calls = 0
+
+    def fake_run(command, **_kwargs):
+        nonlocal calls
+        calls += 1
+        data = bytearray(b"mock cv2".ljust(1024, b"\0"))
+        for offset in (304, 516, 544, 572):
+            data[offset:offset + 4] = calls.to_bytes(4, "little")
+        data[604:620] = bytes([calls]) * 16
+        _wheel(Path(command[-1]) / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl",
+               pe_bytes=bytes(data))
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    output = tmp_path / "output"
+    record = target.run(tmp_path, output, lock_path, tmp_path / "work")
+    repeatability = record["repeatability"]
+    first = record["cv2_comparison"]
+    second = repeatability["second_cv2_comparison"]
+    assert repeatability["byte_identical"] is False
+    assert repeatability["semantic_equal"] is True
+    assert repeatability["first_wheel_sha256"] != repeatability["second_wheel_sha256"]
+    assert first["raw_sha256"] != second["raw_sha256"]
+    assert first["normalized_sha256"] == second["normalized_sha256"]
+    assert first["fields"][0]["hex"] == "01000000"
+    assert second["fields"][0]["hex"] == "02000000"
+    assert target.validate_output_directory(output, lock_path) == record
+
+    record["cv2_comparison"]["normalized_sha256"] = "f" * 64
+    (output / target.PROVENANCE_NAME).write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(target.OpenCVWheelError, match="comparison differs from wheel"):
+        target.validate_output_directory(output, lock_path)
+
+
+@pytest.mark.parametrize("mode", ["valid", "failed", "invalid-json", "wrong-hash", "wrong-type"])
+def test_cv2_comparison_subprocess_is_bound_to_actual_pe(tmp_path, monkeypatch, mode):
+    pe = tmp_path / "cv2.pyd"
+    pe.write_bytes(b"mock cv2".ljust(1024, b"\0"))
+    record = _comparison(pe)
+    if mode == "wrong-hash":
+        record["raw_sha256"] = "f" * 64
+    payload = [] if mode == "wrong-type" else record
+
+    def fake_run(command, **kwargs):
+        assert command[0] == "fixed-python.exe"
+        assert command[1] == "-c"
+        assert "scripts.opencv_pe_comparison" in command[2]
+        assert command[3] == str(pe)
+        assert kwargs["capture_output"] is True
+        return type("Completed", (), {
+            "returncode": 1 if mode == "failed" else 0,
+            "stdout": "invalid" if mode == "invalid-json" else json.dumps(payload),
+            "stderr": "parser failed" if mode == "failed" else "",
+        })()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    if mode == "valid":
+        assert target._cv2_comparison(pe, Path("fixed-python.exe")) == record
+    else:
+        with pytest.raises(target.OpenCVWheelError, match="comparison"):
+            target._cv2_comparison(pe, Path("fixed-python.exe"))
 
 
 @pytest.mark.parametrize("value", [None, "1", 1767690756])

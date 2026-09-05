@@ -140,9 +140,9 @@
     "python_version": "3.14.6",
     "platform": "win_amd64",
     "output_filename": "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl",
-    "expected_byte_identical": null,
+    "expected_byte_identical": false,
     "expected_wheel_sha256": null,
-    "expected_semantic_manifest_sha256": null,
+    "expected_semantic_manifest_sha256": "7532dfbe5fc6a6679bcf6ced8189839ae3e03a638921e8b7b1ecfa0cb453fa56",
     "source_artifacts": [
       {
         "role": "opencv-python",

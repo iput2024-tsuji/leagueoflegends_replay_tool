@@ -27,9 +27,8 @@ POLICY_KEY = "opencv_source_build_policy"
 REQUIRED_PYTHON = "3.14.6"
 REQUIRED_GENERATOR = "Visual Studio 17 2022"
 REQUIRED_TOOLSET_NAME = "v143"
-REQUIRED_TOOLSET = "v143,version=14.44"
-REQUIRED_TOOLSET_VERSION = "14.44"
-REQUIRED_TOOLSET_VERSION_PREFIX = "14.44."
+REQUIRED_TOOLSET = "v143"
+REQUIRED_TOOLSET_VERSION = "14.44.35207"
 REQUIRED_WINDOWS_SDK = "10.0.26100.0"
 REQUIRED_CMAKE = "3.31.6"
 REQUIRED_CMAKE_ARGS = (
@@ -140,6 +139,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(environment, dict) or set(environment) != {
         "generator",
         "msvc_toolset",
+        "expected_msvc_toolset_version",
         "windows_sdk",
         "cmake_version",
         "cmake_build_parallel_level",
@@ -155,6 +155,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
     if {
         "generator": environment["generator"],
         "msvc_toolset": environment["msvc_toolset"],
+        "expected_msvc_toolset_version": environment["expected_msvc_toolset_version"],
         "windows_sdk": environment["windows_sdk"],
         "cmake_version": environment["cmake_version"],
         "cmake_build_parallel_level": environment[
@@ -163,6 +164,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
     } != {
         "generator": REQUIRED_GENERATOR,
         "msvc_toolset": REQUIRED_TOOLSET,
+        "expected_msvc_toolset_version": REQUIRED_TOOLSET_VERSION,
         "windows_sdk": REQUIRED_WINDOWS_SDK,
         "cmake_version": REQUIRED_CMAKE,
         "cmake_build_parallel_level": "2",
@@ -682,10 +684,26 @@ def _capture_msbuild_project(source_tree: Path) -> dict[str, Any]:
     }
 
 
-def _capture_compiler(cache: dict[str, str]) -> dict[str, Any]:
+def _capture_compiler(
+    cache: dict[str, str], source_tree: Path | None = None
+) -> dict[str, Any]:
     raw = cache.get("CMAKE_CXX_COMPILER")
+    if not raw and source_tree is not None:
+        candidates = sorted(source_tree.glob("_skbuild/*/cmake-build/CMakeFiles/*/CMakeCXXCompiler.cmake"))
+        if len(candidates) != 1:
+            raise OpenCVWheelError(
+                "Expected one OpenCV CMake C++ compiler file, found "
+                f"{len(candidates)}"
+            )
+        _regular(candidates[0], "OpenCV CMake C++ compiler file")
+        match = re.search(
+            r'^set\(CMAKE_CXX_COMPILER\s+"([^"]+)"\)',
+            candidates[0].read_text(encoding="utf-8", errors="strict"),
+            re.MULTILINE,
+        )
+        raw = match.group(1) if match else ""
     if not raw:
-        raise OpenCVWheelError("OpenCV CMake cache has no C++ compiler")
+        raise OpenCVWheelError("OpenCV generated files have no C++ compiler")
     compiler = Path(raw)
     _regular(compiler, "OpenCV C++ compiler")
     parts = compiler.parts
@@ -698,7 +716,7 @@ def _capture_compiler(cache: dict[str, str]) -> dict[str, Any]:
         version = parts[index + 1]
     except (StopIteration, IndexError) as exc:
         raise OpenCVWheelError("OpenCV compiler is not from an MSVC toolset") from exc
-    if not version.startswith(REQUIRED_TOOLSET_VERSION_PREFIX):
+    if version != REQUIRED_TOOLSET_VERSION:
         raise OpenCVWheelError(
             f"OpenCV selected MSVC toolset differs: {version}"
         )
@@ -711,9 +729,7 @@ def _capture_compiler(cache: dict[str, str]) -> dict[str, Any]:
 
 
 def _is_required_toolset_version(value: str) -> bool:
-    return value == REQUIRED_TOOLSET_VERSION or value.startswith(
-        REQUIRED_TOOLSET_VERSION_PREFIX
-    )
+    return value == REQUIRED_TOOLSET_VERSION
 
 
 def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
@@ -735,14 +751,25 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
             "OpenCV configured toolchain or feature flags differ: "
             + json.dumps(observed, sort_keys=True)
         )
-    selected = cache.get("CMAKE_VS_PLATFORM_TOOLSET_VERSION", "")
-    if not _is_required_toolset_version(selected):
-        raise OpenCVWheelError(
-            f"OpenCV selected MSVC toolset differs: {selected or 'missing'}"
+    # scikit-build selects v143; CMake's VS toolset-version variable need not
+    # be cached. Reject any compiler outside the exact locked toolset instead
+    # of relying on the installed runner's default minor version.
+    compiler = _capture_compiler(cache, source_tree)
+    selected = cache.get("CMAKE_VS_PLATFORM_TOOLSET_VERSION")
+    if selected and (
+        not _is_required_toolset_version(selected)
+        or not (
+            compiler["msvc_toolset_version"] == selected
+            or compiler["msvc_toolset_version"].startswith(selected + ".")
         )
+    ):
+        raise OpenCVWheelError(
+            f"OpenCV selected MSVC toolset differs: {selected}"
+        )
+    selected = compiler["msvc_toolset_version"]
     return {
         "cmake_cache": expected,
-        "compiler": _capture_compiler(cache),
+        "compiler": compiler,
         "msbuild_project": _capture_msbuild_project(source_tree),
         "selected_msvc_toolset_version": selected,
     }
@@ -1378,9 +1405,7 @@ def _validate_provenance_payload(
             "size",
         }
         or str(compiler["filename"]).casefold() != "cl.exe"
-        or not str(compiler["msvc_toolset_version"]).startswith(
-            REQUIRED_TOOLSET_VERSION_PREFIX
-        )
+        or not _is_required_toolset_version(str(compiler["msvc_toolset_version"]))
         or not _is_required_toolset_version(
             str(configured["selected_msvc_toolset_version"])
         )
@@ -1500,6 +1525,8 @@ def _run_once(
         "PATH", ""
     )
     environment["CMAKE_ARGS"] = " ".join(REQUIRED_CMAKE_ARGS)
+    # This alternate channel overrides CMAKE_ARGS in scikit-build 0.18.1.
+    environment.pop("SKBUILD_CONFIGURE_OPTIONS", None)
     environment["OPENCV_DOWNLOAD_PATH"] = str(download_path.resolve())
     build_environment = policy["build_environment"]
     environment["CMAKE_GENERATOR"] = str(build_environment["generator"])
@@ -1520,6 +1547,10 @@ def _run_once(
         check=False,
         capture_output=True,
         text=True,
+    )
+    (work_dir / "build.log").write_text(
+        "\n".join(part for part in (completed.stdout, completed.stderr) if part),
+        encoding="utf-8",
     )
     if completed.returncode != 0:
         output = "\n".join(
@@ -1615,9 +1646,18 @@ def run(
         first, _first_python = _run_once(
             source_dir, output_dir, policy, first_work
         )
+        (work_dir / "first-build-evidence.json").write_text(
+            json.dumps(first, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        shutil.copyfile(first_work / "build.log", work_dir / "first-build.log")
         _remove_clean_build_tree(first_work, work_dir)
         second, second_python = _run_once(
             source_dir, second_output, policy, second_work
+        )
+        (work_dir / "second-build-evidence.json").write_text(
+            json.dumps(second, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
         )
         first_semantic = _semantic_manifest(first)
         second_semantic = _semantic_manifest(second)
@@ -1682,7 +1722,7 @@ def run(
         succeeded = True
         return first
     finally:
-        if os.path.lexists(work_dir):
+        if succeeded and os.path.lexists(work_dir):
             _remove_clean_build_tree(work_dir, work_dir.parent)
         if not succeeded and os.path.lexists(output_dir):
             _remove_clean_build_tree(output_dir, output_dir.parent)

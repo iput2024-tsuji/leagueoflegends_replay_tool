@@ -177,7 +177,7 @@ standalone FFmpegは利用者が明示的に入手・配置し、本プロジェ
 
 Windows向け配布はonedir形式で、依存物を `_internal` に配置します。新モジュール、動的import、データファイル、アイコン、ランタイム依存を変更した場合は `scripts/build.ps1` とパッケージ済みexeの `--self-check` を実行します。ビルド成功だけでなく、OBS、mpv DLL、FFmpeg、設定、録画が意図せず同梱されていないことも確認します。
 
-正式なWindows buildでは`compliance/components.json`の`opencv_source_build_policy`と`scripts/prepare_opencv_wheel.py`を使用し、固定した`opencv-python`／OpenCV／OpenCV FFmpeg入力からIPP無効のOpenCV wheelを同じjob内で構築します。build hostはVisual Studio 2022を提供する`windows-2022` runnerへ固定し、製品の対応対象とするWindows 11 x64とは区別します。clean directoryで2回構築して、byte-identicalでない場合もwheel内容、PE import graph、IPP／FFmpeg状態、synthetic動画読込、同期マーカー用primitiveのsemantic manifestが一致しなければ停止します。元のPyPI OpenCV wheelは正式build用binary cacheへ取得せず、生成wheelのSHA256、実際に選択されたMSVC toolset／Windows SDK、固定FFmpeg DLLとの対応をbuild provenanceへ残します。
+正式なWindows buildでは`compliance/components.json`の`opencv_source_build_policy`と`scripts/prepare_opencv_wheel.py`を使用し、固定した`opencv-python`／OpenCV／OpenCV FFmpeg入力からIPP無効のOpenCV wheelを構築します。CIとReleaseは共通の`build-opencv.yml`を呼び、Visual Studio 2022を提供する`windows-2022`で2回のclean buildを行います。scikit-build標準の`v143`指定を使い、生成されたcompilerのtoolset directoryが固定版`14.44.35207`以外なら拒否します。アプリbuild・self-check・installer監査は`windows-2025`で行い、同じworkflow runのartifact ID、checkout commit、provenance SHA256を照合してwheelを再監査します。Server 2022上のbuild成功をWindows 11実機検証の代わりにはしません。byte-identicalでない場合もwheel内容、PE import graph、IPP／FFmpeg状態、synthetic動画読込、同期マーカー用primitiveのsemantic manifestが一致しなければ停止します。元のPyPI OpenCV wheelは正式build用binary cacheへ取得せず、生成wheelのSHA256、実際に選択されたMSVC toolset／Windows SDK、固定FFmpeg DLLとの対応をbuild provenanceへ残します。失敗したsource buildのログと2回分の診断JSONは7日間のActions artifactとして保持します。
 
 ### Inno Setup
 

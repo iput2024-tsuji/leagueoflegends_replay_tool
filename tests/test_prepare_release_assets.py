@@ -278,6 +278,100 @@ def test_verified_binary_manifest_omits_source_built_opencv_wheel():
     assert not any(record["component"] == "opencv-python" for record in records)
 
 
+def _workflow_opencv_artifact(tmp_path):
+    lock_path = Path(__file__).resolve().parents[1] / "compliance" / "components.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    source = tmp_path / "artifact"
+    source.mkdir()
+    provenance = source / "opencv-wheel-provenance.json"
+    provenance.write_bytes(b'{"producer":"same-run"}\n')
+    wheel_name = lock["opencv_source_build_policy"]["output_filename"]
+    (source / wheel_name).write_bytes(b"source-built-wheel")
+    return lock_path, lock, source, _sha(provenance.read_bytes())
+
+
+def test_opencv_workflow_artifact_is_sealed_and_reaudited(tmp_path, monkeypatch):
+    from scripts import prepare_opencv_wheel
+
+    lock_path, lock, source, digest = _workflow_opencv_artifact(tmp_path)
+    audited = []
+
+    def audit(directory, components):
+        assert components == lock_path
+        assert (directory / lock["opencv_source_build_policy"]["output_filename"]).read_bytes() == b"source-built-wheel"
+        audited.append(directory)
+        return {"verified": True}
+
+    monkeypatch.setattr(prepare_opencv_wheel, "validate_output_directory", audit)
+    monkeypatch.setattr(prepare_opencv_wheel, "run", lambda *args: pytest.fail("must not rebuild artifact"))
+    result = release_assets._prepare_opencv_source_wheel(
+        components_file=lock_path, lock=lock, cache_dir=tmp_path / "cache",
+        opener=lambda *args: pytest.fail("must not download artifact"),
+        prepared_directory=source, expected_provenance_sha256=digest,
+    )
+    assert audited == [source, tmp_path / "cache" / "opencv-source-built-wheel"]
+    assert result["provenance_sha256"] == digest
+    assert result["payload"] == {"verified": True}
+
+
+@pytest.mark.parametrize("directory,digest", [(True, None), (False, "a" * 64), (True, "b" * 64)])
+def test_opencv_workflow_artifact_rejects_missing_or_wrong_seal(tmp_path, monkeypatch, directory, digest):
+    from scripts import prepare_opencv_wheel
+
+    lock_path, lock, source, _digest = _workflow_opencv_artifact(tmp_path)
+    monkeypatch.setattr(prepare_opencv_wheel, "validate_output_directory", lambda *args: pytest.fail("seal must be checked first"))
+    with pytest.raises(ReleaseAssetError, match="SHA256"):
+        release_assets._prepare_opencv_source_wheel(
+            components_file=lock_path, lock=lock, cache_dir=tmp_path / "cache",
+            opener=lambda *args: pytest.fail("must not download"),
+            prepared_directory=source if directory else None,
+            expected_provenance_sha256=digest,
+        )
+    assert not (tmp_path / "cache").exists()
+
+
+def test_opencv_workflow_artifact_rejects_changed_provenance_during_copy(tmp_path, monkeypatch):
+    from scripts import prepare_opencv_wheel
+
+    lock_path, lock, source, digest = _workflow_opencv_artifact(tmp_path)
+    original_copy = shutil.copyfile
+    monkeypatch.setattr(prepare_opencv_wheel, "validate_output_directory", lambda *args: {})
+
+    def changed_copy(origin, destination):
+        result = original_copy(origin, destination)
+        if destination.name == prepare_opencv_wheel.PROVENANCE_NAME:
+            destination.write_bytes(b"changed after seal")
+        return result
+
+    monkeypatch.setattr(shutil, "copyfile", changed_copy)
+    with pytest.raises(ReleaseAssetError, match="changed during import"):
+        release_assets._prepare_opencv_source_wheel(
+            components_file=lock_path, lock=lock, cache_dir=tmp_path / "cache",
+            opener=lambda *args: pytest.fail("must not download"),
+            prepared_directory=source, expected_provenance_sha256=digest,
+        )
+
+
+def test_opencv_workflow_build_and_packaging_share_commit_artifact_and_seal():
+    workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    source = (workflows / "build-opencv.yml").read_text(encoding="utf-8")
+    assert "runs-on: windows-2022" in source
+    assert "build-opencv-wheel" in source
+    assert "steps.upload.outputs.artifact-id" in source
+    assert "provenance-sha256=$($record.provenance_sha256)" in source
+    assert "if: failure()" in source
+    assert "**/build.log" in source
+    for name in ("ci.yml", "release.yml"):
+        consumer = (workflows / name).read_text(encoding="utf-8")
+        assert "uses: ./.github/workflows/build-opencv.yml" in consumer
+        assert "runs-on: windows-2025" in consumer
+        assert "artifact-ids: ${{ needs.opencv.outputs.artifact-id }}" in consumer
+        assert "OPENCV_SOURCE_COMMIT: ${{ needs.opencv.outputs.source-commit }}" in consumer
+        assert "-cne $env:OPENCV_SOURCE_COMMIT" in consumer
+        assert "--opencv-provenance-sha256 $env:OPENCV_PROVENANCE_SHA256" in consumer
+        assert '--opencv-wheel-directory "$env:RUNNER_TEMP\\opencv-source-artifact"' in consumer
+
+
 def test_binary_install_selects_source_built_opencv_wheel(tmp_path):
     lock = json.loads(
         release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
@@ -2646,7 +2740,7 @@ def test_ci_windows_build_uses_external_runtime_wheels_and_provenance() -> None:
     install = build_job.index("name: Install build dependencies")
     inno = build_job.index("name: Prepare verified Inno Setup")
     build = build_job.index("name: Build application")
-    assert "runs-on: windows-2022" in build_job[:install]
+    assert "runs-on: windows-2025" in build_job[:install]
     assert "prepare-binary-install" in build_job[install:build]
     assert "attest-binary-install" in build_job[install:build]
     assert "--no-index" in build_job[install:build]
@@ -2668,7 +2762,7 @@ def test_release_workflow_requires_manual_approval_and_remote_verification():
 
     assert "workflow_dispatch:" in workflow
     prepare_job = workflow[workflow.index("  prepare:"):workflow.index("  publish:")]
-    assert "runs-on: windows-2022" in prepare_job
+    assert "runs-on: windows-2025" in prepare_job
     assert "publish_confirmation:" in workflow
     assert "name: release" in workflow
     assert "gh release create $tag" in workflow

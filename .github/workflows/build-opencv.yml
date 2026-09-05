@@ -1,0 +1,97 @@
+name: Build locked OpenCV wheel
+
+on:
+  workflow_call:
+    inputs:
+      source-ref:
+        required: true
+        type: string
+    outputs:
+      artifact-id:
+        value: ${{ jobs.opencv.outputs.artifact-id }}
+      provenance-sha256:
+        value: ${{ jobs.opencv.outputs.provenance-sha256 }}
+      source-commit:
+        value: ${{ jobs.opencv.outputs.source-commit }}
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  opencv:
+    name: Build IPP-free OpenCV wheel
+    # VS 2022 / MSVC 14.44 is available here. App validation runs on Windows 2025.
+    runs-on: windows-2022
+    timeout-minutes: 120
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      provenance-sha256: ${{ steps.build.outputs.provenance-sha256 }}
+      source-commit: ${{ steps.build.outputs.source-commit }}
+    env:
+      PYTHONIOENCODING: utf8
+    steps:
+      - name: Checkout requested source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source-ref }}
+          persist-credentials: false
+
+      - name: Set up bootstrap Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6 post-6.0.0; Windows pip cache fix (#1040)
+        with:
+          python-version: "3.14.6"
+
+      - name: Build and verify source wheel
+        id: build
+        shell: pwsh
+        run: |
+          $runtimeRoot = Join-Path $env:RUNNER_TEMP "opencv-python-runtime"
+          $runtimeCache = Join-Path $env:RUNNER_TEMP "opencv-python-runtime-cache"
+          $basePython = Join-Path $runtimeRoot "python.exe"
+          $binaryCache = Join-Path $env:RUNNER_TEMP "LoLReplayTool-binary-cache"
+          python -m scripts.prepare_release_assets prepare-python-runtime `
+            --components .\compliance\components.json `
+            --cache-dir $runtimeCache --output-dir $runtimeRoot
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $basePython -m scripts.prepare_release_assets verify-python-runtime `
+            --components .\compliance\components.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $result = & $basePython -m scripts.prepare_release_assets build-opencv-wheel `
+            --components .\compliance\components.json --cache-dir $binaryCache
+          if ($LASTEXITCODE -ne 0) {
+            $result | Write-Output
+            exit $LASTEXITCODE
+          }
+          $record = $result | ConvertFrom-Json
+          $sourceCommit = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "provenance-sha256=$($record.provenance_sha256)" >> $env:GITHUB_OUTPUT
+          "source-commit=$sourceCommit" >> $env:GITHUB_OUTPUT
+
+      - name: Preserve source wheel for this workflow run
+        id: upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: opencv-source-wheel-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: ${{ runner.temp }}/LoLReplayTool-binary-cache/opencv-source-built-wheel/
+
+      - name: Preserve failed OpenCV build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: opencv-build-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/build.log
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/*-build.log
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/CMakeCache.txt
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/CMakeSystem.cmake
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/CMakeCXXCompiler.cmake
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/ALL_BUILD.vcxproj
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/*-build-evidence.json

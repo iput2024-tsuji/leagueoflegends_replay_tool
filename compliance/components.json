@@ -218,7 +218,8 @@
     ],
     "build_environment": {
       "generator": "Visual Studio 17 2022",
-      "msvc_toolset": "v143,version=14.44",
+      "msvc_toolset": "v143",
+      "expected_msvc_toolset_version": "14.44.35207",
       "windows_sdk": "10.0.26100.0",
       "cmake_version": "3.31.6",
       "cmake_build_parallel_level": "2",

@@ -114,6 +114,7 @@ def _lock(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
         "build_environment": {
             "generator": "Visual Studio 17 2022",
             "msvc_toolset": target.REQUIRED_TOOLSET,
+            "expected_msvc_toolset_version": target.REQUIRED_TOOLSET_VERSION,
             "windows_sdk": "10.0.26100.0",
             "cmake_version": "3.31.6",
             "cmake_build_parallel_level": "2",
@@ -169,7 +170,7 @@ def _configured_toolchain() -> dict:
         },
         "compiler": {
             "filename": "cl.exe",
-            "msvc_toolset_version": "14.44.35211",
+            "msvc_toolset_version": "14.44.35207",
             "sha256": "a" * 64,
             "size": 1,
         },
@@ -180,7 +181,7 @@ def _configured_toolchain() -> dict:
             "platform_toolsets": [target.REQUIRED_TOOLSET_NAME],
             "windows_target_platform_versions": [target.REQUIRED_WINDOWS_SDK],
         },
-        "selected_msvc_toolset_version": "14.44",
+        "selected_msvc_toolset_version": "14.44.35207",
     }
 
 
@@ -322,6 +323,72 @@ def test_configured_toolchain_rejects_limited_api_disabled(tmp_path, monkeypatch
         target._capture_configured_toolchain(tmp_path)
 
 
+def _write_configured_toolchain(tmp_path: Path, *, selected: str | None = None) -> Path:
+    build = tmp_path / "_skbuild" / "win-amd64-3.14" / "cmake-build"
+    build.mkdir(parents=True)
+    compiler = tmp_path / "MSVC" / "14.44.35207" / "bin" / "Hostx64" / "x64" / "cl.exe"
+    compiler.parent.mkdir(parents=True)
+    compiler.write_bytes(b"cl")
+    cache = {
+        "CMAKE_GENERATOR": target.REQUIRED_GENERATOR,
+        "CMAKE_GENERATOR_TOOLSET": target.REQUIRED_TOOLSET_NAME,
+        "CMAKE_SYSTEM_VERSION": target.REQUIRED_WINDOWS_SDK,
+        "WITH_IPP": "OFF",
+        "BUILD_IPP_IW": "OFF",
+        "BUILD_opencv_gapi": "OFF",
+        "WITH_ADE": "OFF",
+        "PYTHON3_LIMITED_API": "ON",
+        "WITH_FFMPEG": "ON",
+        "CMAKE_CXX_COMPILER": str(compiler),
+    }
+    if selected is not None:
+        cache["CMAKE_VS_PLATFORM_TOOLSET_VERSION"] = selected
+    (build / "CMakeCache.txt").write_text(
+        "\n".join(f"{key}:INTERNAL={value}" for key, value in cache.items()),
+        encoding="utf-8",
+    )
+    _write_msbuild_project(tmp_path, target.REQUIRED_WINDOWS_SDK)
+    return compiler
+
+
+def test_configured_toolchain_uses_compiler_evidence_when_cache_version_missing(tmp_path):
+    compiler = _write_configured_toolchain(tmp_path)
+
+    observed = target._capture_configured_toolchain(tmp_path)
+
+    assert observed["selected_msvc_toolset_version"] == "14.44.35207"
+    assert observed["compiler"]["filename"] == "cl.exe"
+    assert observed["compiler"]["size"] == compiler.stat().st_size
+
+
+def test_configured_toolchain_rejects_cache_version_mismatch(tmp_path):
+    _write_configured_toolchain(tmp_path, selected="14.45")
+
+    with pytest.raises(target.OpenCVWheelError, match="selected MSVC toolset differs"):
+        target._capture_configured_toolchain(tmp_path)
+
+
+def test_configured_toolchain_uses_generated_compiler_file_when_cache_missing(tmp_path):
+    compiler = _write_configured_toolchain(tmp_path)
+    cache_path = next(tmp_path.glob("_skbuild/*/cmake-build/CMakeCache.txt"))
+    cache_path.write_text(
+        "\n".join(
+            line for line in cache_path.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("CMAKE_CXX_COMPILER:")
+        ),
+        encoding="utf-8",
+    )
+    generated = cache_path.parent / "CMakeFiles" / "3.31.6" / "CMakeCXXCompiler.cmake"
+    generated.parent.mkdir(parents=True)
+    generated.write_text(
+        f'set(CMAKE_CXX_COMPILER "{compiler}")\n', encoding="utf-8"
+    )
+
+    observed = target._capture_configured_toolchain(tmp_path)
+
+    assert observed["compiler"]["filename"] == "cl.exe"
+
+
 def test_cmake_cache_keeps_colons_in_quoted_variable_names(tmp_path):
     cache_dir = tmp_path / "_skbuild" / "win-amd64-3.14" / "cmake-build"
     cache_dir.mkdir(parents=True)
@@ -364,7 +431,7 @@ def _write_msbuild_project(tmp_path: Path, sdk: str) -> None:
         / "cmake-build"
         / "ALL_BUILD.vcxproj"
     )
-    project.parent.mkdir(parents=True)
+    project.parent.mkdir(parents=True, exist_ok=True)
     project.write_text(
         """<?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
@@ -463,14 +530,14 @@ def test_msbuild_project_rejects_multiple_sdk_values(tmp_path):
 @pytest.mark.parametrize(
     ("version", "expected"),
     [
-        ("14.44", True),
-        ("14.44.35211", True),
+        ("14.44", False),
+        ("14.44.35207", True),
         ("14.4", False),
         ("14.45", False),
         ("", False),
     ],
 )
-def test_toolset_version_requires_14_44_family(version, expected):
+def test_toolset_version_requires_exact_locked_version(version, expected):
     assert target._is_required_toolset_version(version) is expected
 
 
@@ -585,6 +652,8 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
             "-DWITH_ADE=OFF -DPYTHON3_LIMITED_API=ON "
             "-DCMAKE_SYSTEM_VERSION=10.0.26100.0"
         )
+        assert env["CMAKE_GENERATOR_TOOLSET"] == target.REQUIRED_TOOLSET
+        assert "SKBUILD_CONFIGURE_OPTIONS" not in env
         assert (cwd / "opencv" / "CMakeLists.txt").is_file()
         assert (cwd / "cv2" / "version.py").read_bytes() == target.VERSION_PY_BYTES
         wheel_dir = Path(command[-1])
@@ -636,7 +705,9 @@ def test_run_build_failure_removes_unsealed_output_and_work(
     with pytest.raises(target.OpenCVWheelError, match="build failed"):
         target.run(tmp_path, output, lock_path, work)
     assert not output.exists()
-    assert not work.exists()
+    assert (work / str(fail_call) / "build.log").read_text() == "out\nbuild failed"
+    if fail_call == 2:
+        assert (work / "first-build-evidence.json").is_file()
 
 
 def test_formal_build_requires_runner_image_identity(tmp_path, monkeypatch):
@@ -653,7 +724,8 @@ def test_formal_build_requires_runner_image_identity(tmp_path, monkeypatch):
             tmp_path / "work",
         )
     assert not (tmp_path / "output").exists()
-    assert not (tmp_path / "work").exists()
+    assert (tmp_path / "work").is_dir()
+    assert not (tmp_path / "work" / "first-build-evidence.json").exists()
 
 
 def test_output_ipp_marker_is_rejected(tmp_path, monkeypatch):
@@ -857,7 +929,8 @@ def test_two_clean_builds_must_have_same_semantics(tmp_path, monkeypatch):
             tmp_path / "work",
         )
     assert not (tmp_path / "output").exists()
-    assert not (tmp_path / "work").exists()
+    assert (tmp_path / "work" / "first-build-evidence.json").is_file()
+    assert (tmp_path / "work" / "second-build-evidence.json").is_file()
 
 
 def test_two_clean_builds_must_have_identical_pe_payloads(tmp_path, monkeypatch):
@@ -886,7 +959,8 @@ def test_two_clean_builds_must_have_identical_pe_payloads(tmp_path, monkeypatch)
             tmp_path / "work",
         )
     assert not (tmp_path / "output").exists()
-    assert not (tmp_path / "work").exists()
+    assert (tmp_path / "work" / "first-build-evidence.json").is_file()
+    assert (tmp_path / "work" / "second-build-evidence.json").is_file()
 
 
 def test_missing_source_build_policy_is_not_an_error():

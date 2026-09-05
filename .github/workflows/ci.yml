@@ -161,13 +161,20 @@ jobs:
             --basetemp="$env:PYTEST_BASETEMP" `
             tests
 
+  opencv:
+    needs: [lint-test, test-windows]
+    uses: ./.github/workflows/build-opencv.yml
+    with:
+      source-ref: ${{ github.sha }}
+
   build-windows:
     name: Build Windows artifact
-    # windows-2025 moved to Visual Studio 2026; the fixed VS 2022 toolchain lives here.
-    runs-on: windows-2022
-    needs: [lint-test, test-windows]
+    runs-on: windows-2025
+    needs: [lint-test, test-windows, opencv]
     env:
       PYTHONIOENCODING: utf8
+      OPENCV_SOURCE_COMMIT: ${{ needs.opencv.outputs.source-commit }}
+      OPENCV_PROVENANCE_SHA256: ${{ needs.opencv.outputs.provenance-sha256 }}
 
     steps:
       - name: Checkout repository
@@ -217,9 +224,19 @@ jobs:
             -Encoding utf8 `
             -Append
 
+      - name: Download verified OpenCV wheel from this run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ needs.opencv.outputs.artifact-id }}
+          path: ${{ runner.temp }}/opencv-source-artifact
+          merge-multiple: true
+
       - name: Install build dependencies
         shell: pwsh
         run: |
+          if ((git rev-parse HEAD).Trim() -cne $env:OPENCV_SOURCE_COMMIT) {
+            throw "OpenCV producer and application checkout commits differ."
+          }
           $binaryCache = Join-Path $env:RUNNER_TEMP "LoLReplayTool-binary-cache"
           $generatedRequirements = Join-Path $env:RUNNER_TEMP "build-requirements.txt"
           $installPlan = Join-Path $env:RUNNER_TEMP "build-install-plan.json"
@@ -232,7 +249,9 @@ jobs:
             --requirements .\requirements-dev.txt `
             --cache-dir $binaryCache `
             --output-requirements $generatedRequirements `
-            --output-plan $installPlan
+            --output-plan $installPlan `
+            --opencv-wheel-directory "$env:RUNNER_TEMP\opencv-source-artifact" `
+            --opencv-provenance-sha256 $env:OPENCV_PROVENANCE_SHA256
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           & $env:WINDOWS_PYTHON -m pip `

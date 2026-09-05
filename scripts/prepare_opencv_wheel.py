@@ -31,7 +31,10 @@ REQUIRED_TOOLSET = "v143"
 REQUIRED_TOOLSET_VERSION = "14.44.35207"
 REQUIRED_WINDOWS_SDK = "10.0.26100.0"
 REQUIRED_CMAKE = "3.31.6"
-COMPILER_FLAG_ENVIRONMENT = ("CL", "_CL_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS")
+COMPILER_FLAG_ENVIRONMENT = (
+    "CL", "_CL_", "LINK", "_LINK_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
+    "SKBUILD_BUILD_OPTIONS", "CMAKE_TOOLCHAIN_FILE", "OPENCV_CMAKE_HOOKS_DIR",
+)
 REQUIRED_CMAKE_ARGS = (
     "-DWITH_IPP=OFF",
     "-DBUILD_IPP_IW=OFF",
@@ -1628,7 +1631,8 @@ def _validate_provenance_payload(
 
 def _reject_inherited_compiler_flags() -> None:
     # CL is prepended and _CL_ appended by cl.exe itself, outside the generated
-    # MSBuild RuntimeLibrary setting. Other flags seed CMake's compiler/linker flags.
+    # MSBuild RuntimeLibrary setting. LINK/_LINK_ do the same for link.exe;
+    # other flags seed CMake's compiler/linker flags or inject build-time hooks.
     present = [name for name in COMPILER_FLAG_ENVIRONMENT if os.environ.get(name, "").strip()]
     if present:
         raise OpenCVWheelError("OpenCV inherited compiler flags are not allowed: " + ", ".join(present))

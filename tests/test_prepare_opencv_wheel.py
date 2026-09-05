@@ -801,6 +801,8 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
 
     _mock_build_dependencies(monkeypatch)
     monkeypatch.setenv("PYTHONHASHSEED", "random")
+    for name in target.COMPILER_FLAG_ENVIRONMENT:
+        monkeypatch.setenv(name, " \t")
 
     def fake_run(command, *, cwd, env, check, capture_output, text):
         assert command[1:5] == [
@@ -819,7 +821,10 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
         assert env["PYTHONHASHSEED"] == "0"
         assert all(
             flag not in env
-            for flag in ("CL", "_CL_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS")
+            for flag in (
+                "CL", "_CL_", "LINK", "_LINK_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
+                "SKBUILD_BUILD_OPTIONS", "CMAKE_TOOLCHAIN_FILE", "OPENCV_CMAKE_HOOKS_DIR",
+            )
         )
         assert "SKBUILD_CONFIGURE_OPTIONS" not in env
         assert (cwd / "opencv" / "CMakeLists.txt").is_file()
@@ -845,7 +850,10 @@ def test_required_cmake_args_pin_dynamic_crt_and_static_libraries():
     assert len(target.REQUIRED_CMAKE_ARGS) == len(set(target.REQUIRED_CMAKE_ARGS))
 
 
-@pytest.mark.parametrize("name", ["CL", "_CL_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS"])
+@pytest.mark.parametrize("name", [
+    "CL", "_CL_", "LINK", "_LINK_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
+    "SKBUILD_BUILD_OPTIONS", "CMAKE_TOOLCHAIN_FILE", "OPENCV_CMAKE_HOOKS_DIR",
+])
 def test_run_rejects_inherited_compiler_flags_before_build(tmp_path, monkeypatch, name):
     policy, _lock_path, _source, _opencv = _lock(tmp_path)
     monkeypatch.setenv(name, " /DTEST ")

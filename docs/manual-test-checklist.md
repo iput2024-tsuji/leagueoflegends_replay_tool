@@ -190,6 +190,7 @@ Linuxでmount権限のある破棄可能な環境では、source rootとsource�
 
 - [ ] 利用者管理のOBS、standalone FFmpeg、mpv DLLを含まない通常成果物で`pwsh -NoProfile -File .\scripts\build.ps1`が成功する
 - [ ] `.\dist\LoLReplayTool\LoLReplayTool.exe --self-check` が終了コード0になる
+- [ ] packaged self-checkのnative_modulesにsynthetic sync marker成功が記録される。一時MJPG動画をOpenCVのFFmpeg backendで生成・読込し、実際の同期探索処理がマーカーを1秒で検出、マーカーなしを未検出とする。実録画・設定を試験素材に使用しない
 - [ ] OBS、mpv、FFmpeg未配置の警告が想定どおりで、必須診断は成功する
 - [ ] ビルド成果物へOBSまたはstandalone FFmpegが混入した場合は検査が失敗する
 - [ ] ビルド成果物のrootまたは下位directoryへ`libmpv-*.dll`／`mpv-*.dll`が混入した場合は、対象pathと`%LOCALAPPDATA%\LoLReplayTool\bin`への利用者配置方針を表示して検査が失敗する

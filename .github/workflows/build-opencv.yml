@@ -93,5 +93,6 @@ jobs:
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/CMakeCache.txt
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/CMakeSystem.cmake
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/CMakeCXXCompiler.cmake
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/CMakeCCompiler.cmake
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/ALL_BUILD.vcxproj
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/*-build-evidence.json

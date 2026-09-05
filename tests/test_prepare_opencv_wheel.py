@@ -174,6 +174,12 @@ def _configured_toolchain() -> dict:
             "sha256": "a" * 64,
             "size": 1,
         },
+        "c_compiler": {
+            "filename": "cl.exe",
+            "msvc_toolset_version": "14.44.35207",
+            "sha256": "a" * 64,
+            "size": 1,
+        },
         "msbuild_project": {
             "path": "_skbuild/win-amd64-3.14/cmake-build/ALL_BUILD.vcxproj",
             "size": 1,
@@ -340,6 +346,7 @@ def _write_configured_toolchain(tmp_path: Path, *, selected: str | None = None) 
         "PYTHON3_LIMITED_API": "ON",
         "WITH_FFMPEG": "ON",
         "CMAKE_CXX_COMPILER": str(compiler),
+        "CMAKE_C_COMPILER": str(compiler),
     }
     if selected is not None:
         cache["CMAKE_VS_PLATFORM_TOOLSET_VERSION"] = selected
@@ -359,6 +366,7 @@ def test_configured_toolchain_uses_compiler_evidence_when_cache_version_missing(
     assert observed["selected_msvc_toolset_version"] == "14.44.35207"
     assert observed["compiler"]["filename"] == "cl.exe"
     assert observed["compiler"]["size"] == compiler.stat().st_size
+    assert observed["c_compiler"] == observed["compiler"]
 
 
 def test_configured_toolchain_rejects_cache_version_mismatch(tmp_path):
@@ -368,25 +376,41 @@ def test_configured_toolchain_rejects_cache_version_mismatch(tmp_path):
         target._capture_configured_toolchain(tmp_path)
 
 
-def test_configured_toolchain_uses_generated_compiler_file_when_cache_missing(tmp_path):
+@pytest.mark.parametrize("language", ["C", "CXX"])
+def test_configured_toolchain_uses_generated_compiler_file_when_cache_missing(tmp_path, language):
     compiler = _write_configured_toolchain(tmp_path)
     cache_path = next(tmp_path.glob("_skbuild/*/cmake-build/CMakeCache.txt"))
     cache_path.write_text(
         "\n".join(
             line for line in cache_path.read_text(encoding="utf-8").splitlines()
-            if not line.startswith("CMAKE_CXX_COMPILER:")
+            if not line.startswith(f"CMAKE_{language}_COMPILER:")
         ),
         encoding="utf-8",
     )
-    generated = cache_path.parent / "CMakeFiles" / "3.31.6" / "CMakeCXXCompiler.cmake"
+    generated = cache_path.parent / "CMakeFiles" / "3.31.6" / f"CMake{language}Compiler.cmake"
     generated.parent.mkdir(parents=True)
     generated.write_text(
-        f'set(CMAKE_CXX_COMPILER "{compiler}")\n', encoding="utf-8"
+        f'set(CMAKE_{language}_COMPILER "{compiler}")\n', encoding="utf-8"
     )
 
     observed = target._capture_configured_toolchain(tmp_path)
 
     assert observed["compiler"]["filename"] == "cl.exe"
+    assert observed["c_compiler"] == observed["compiler"]
+
+
+def test_configured_toolchain_rejects_different_c_compiler(tmp_path):
+    compiler = _write_configured_toolchain(tmp_path)
+    other = tmp_path / "other" / "MSVC" / "14.44.35207" / "bin" / "cl.exe"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"different compiler")
+    cache_path = next(tmp_path.glob("_skbuild/*/cmake-build/CMakeCache.txt"))
+    cache_path.write_text(cache_path.read_text(encoding="utf-8").replace(
+        f"CMAKE_C_COMPILER:INTERNAL={compiler}",
+        f"CMAKE_C_COMPILER:INTERNAL={other}",
+    ), encoding="utf-8")
+    with pytest.raises(target.OpenCVWheelError, match=r"C and C\+\+ compilers differ"):
+        target._capture_configured_toolchain(tmp_path)
 
 
 def test_cmake_cache_keeps_colons_in_quoted_variable_names(tmp_path):

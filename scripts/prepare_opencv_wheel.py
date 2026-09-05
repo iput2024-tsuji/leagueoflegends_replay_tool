@@ -685,27 +685,30 @@ def _capture_msbuild_project(source_tree: Path) -> dict[str, Any]:
 
 
 def _capture_compiler(
-    cache: dict[str, str], source_tree: Path | None = None
+    cache: dict[str, str], source_tree: Path | None = None, *, language: str = "CXX"
 ) -> dict[str, Any]:
-    raw = cache.get("CMAKE_CXX_COMPILER")
+    variable = f"CMAKE_{language}_COMPILER"
+    raw = cache.get(variable)
     if not raw and source_tree is not None:
-        candidates = sorted(source_tree.glob("_skbuild/*/cmake-build/CMakeFiles/*/CMakeCXXCompiler.cmake"))
+        candidates = sorted(source_tree.glob(f"_skbuild/*/cmake-build/CMakeFiles/*/CMake{language}Compiler.cmake"))
         if len(candidates) != 1:
             raise OpenCVWheelError(
-                "Expected one OpenCV CMake C++ compiler file, found "
+                f"Expected one OpenCV CMake {language} compiler file, found "
                 f"{len(candidates)}"
             )
-        _regular(candidates[0], "OpenCV CMake C++ compiler file")
-        match = re.search(
-            r'^set\(CMAKE_CXX_COMPILER\s+"([^"]+)"\)',
+        _regular(candidates[0], f"OpenCV CMake {language} compiler file")
+        matches = re.findall(
+            rf'^set\({variable}\s+"([^"]+)"\)',
             candidates[0].read_text(encoding="utf-8", errors="strict"),
             re.MULTILINE,
         )
-        raw = match.group(1) if match else ""
+        if len(matches) != 1:
+            raise OpenCVWheelError(f"OpenCV {variable} must be declared exactly once")
+        raw = matches[0]
     if not raw:
-        raise OpenCVWheelError("OpenCV generated files have no C++ compiler")
+        raise OpenCVWheelError(f"OpenCV generated files have no {language} compiler")
     compiler = Path(raw)
-    _regular(compiler, "OpenCV C++ compiler")
+    _regular(compiler, f"OpenCV {language} compiler")
     parts = compiler.parts
     try:
         index = next(
@@ -755,6 +758,9 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
     # be cached. Reject any compiler outside the exact locked toolset instead
     # of relying on the installed runner's default minor version.
     compiler = _capture_compiler(cache, source_tree)
+    c_compiler = _capture_compiler(cache, source_tree, language="C")
+    if c_compiler != compiler:
+        raise OpenCVWheelError("OpenCV C and C++ compilers differ")
     selected = cache.get("CMAKE_VS_PLATFORM_TOOLSET_VERSION")
     if selected and (
         not _is_required_toolset_version(selected)
@@ -770,6 +776,7 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
     return {
         "cmake_cache": expected,
         "compiler": compiler,
+        "c_compiler": c_compiler,
         "msbuild_project": _capture_msbuild_project(source_tree),
         "selected_msvc_toolset_version": selected,
     }
@@ -1357,6 +1364,7 @@ def _validate_provenance_payload(
     if not isinstance(configured, dict) or set(configured) != {
         "cmake_cache",
         "compiler",
+        "c_compiler",
         "msbuild_project",
         "selected_msvc_toolset_version",
     }:
@@ -1421,6 +1429,8 @@ def _validate_provenance_payload(
         or _SHA256.fullmatch(str(compiler["sha256"])) is None
     ):
         raise OpenCVWheelError("OpenCV compiler provenance is invalid")
+    if configured["c_compiler"] != compiler:
+        raise OpenCVWheelError("OpenCV C compiler provenance differs from C++ compiler")
     runner = observed_environment["runner_image"]
     if not isinstance(runner, dict) or set(runner) != {"os", "version"} or not all(
         isinstance(value, str) and value for value in runner.values()

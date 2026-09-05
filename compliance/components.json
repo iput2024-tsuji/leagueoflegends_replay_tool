@@ -224,6 +224,7 @@
       "cmake_version": "3.31.6",
       "cmake_build_parallel_level": "2",
       "python_hash_seed": "0",
+      "source_date_epoch": "1767690756",
       "build_packages": {
         "cmake": "3.31.6",
         "distro": "1.9.0",

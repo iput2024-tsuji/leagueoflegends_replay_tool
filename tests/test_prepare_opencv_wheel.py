@@ -131,6 +131,7 @@ def _lock(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
             },
             "cmake_args": list(target.REQUIRED_CMAKE_ARGS),
             "python_hash_seed": "0",
+            "source_date_epoch": "1767690756",
         },
     }
     lock_path = tmp_path / "components.json"
@@ -213,6 +214,7 @@ def _probes() -> dict:
         "opencv_version": "4.13.0.90",
         "video_reader_backend": "FFMPEG",
         "video_writer_backend": "FFMPEG",
+        "build_timestamp": "2026-01-06T09:12:36Z",
     }
 
 
@@ -302,7 +304,9 @@ def _mock_build_dependencies(monkeypatch) -> None:
     monkeypatch.setattr(target, "_preseed_ffmpeg", fake_preseed)
     def fake_probe(python, wheel, diagnostics_file=None):
         if diagnostics_file is not None:
-            diagnostics_file.write_text("test build information", encoding="utf-8")
+            diagnostics_file.write_text(
+                "Timestamp: 2026-01-06T09:12:36Z\n", encoding="utf-8"
+            )
         return _probes()
     monkeypatch.setattr(target, "_probe_wheel", fake_probe)
     def fake_configured_toolchain(source):
@@ -801,6 +805,7 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
 
     _mock_build_dependencies(monkeypatch)
     monkeypatch.setenv("PYTHONHASHSEED", "random")
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "1")
     for name in target.COMPILER_FLAG_ENVIRONMENT:
         monkeypatch.setenv(name, " \t")
 
@@ -819,6 +824,7 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
         )
         assert env["CMAKE_GENERATOR_TOOLSET"] == target.REQUIRED_TOOLSET
         assert env["PYTHONHASHSEED"] == "0"
+        assert env["SOURCE_DATE_EPOCH"] == "1767690756"
         assert all(
             flag not in env
             for flag in (
@@ -841,6 +847,7 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
     assert provenance["repeatability"]["byte_identical"] is True
     assert provenance["repeatability"]["semantic_equal"] is True
     assert provenance["observed_build_environment"]["python_hash_seed"] == "0"
+    assert provenance["observed_build_environment"]["source_date_epoch"] == "1767690756"
     assert target.validate_output_directory(output, lock_path)["version"] == "4.13.0.90"
     assert not work.exists()
 
@@ -848,6 +855,20 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
 def test_required_cmake_args_pin_dynamic_crt_and_static_libraries():
     assert "-DBUILD_WITH_STATIC_CRT=OFF" in target.REQUIRED_CMAKE_ARGS
     assert len(target.REQUIRED_CMAKE_ARGS) == len(set(target.REQUIRED_CMAKE_ARGS))
+
+
+@pytest.mark.parametrize("value", [None, "1", 1767690756])
+def test_policy_requires_fixed_source_date_epoch(tmp_path, value):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    environment = payload[target.POLICY_KEY]["build_environment"]
+    if value is None:
+        del environment["source_date_epoch"]
+    else:
+        environment["source_date_epoch"] = value
+    lock_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(target.OpenCVWheelError, match="build environment|epoch|toolchain"):
+        target._load_lock(lock_path)
 
 
 @pytest.mark.parametrize("name", [
@@ -910,7 +931,7 @@ def test_run_build_failure_removes_unsealed_output_and_work(
     with pytest.raises(target.OpenCVWheelError, match="build failed"):
         target.run(tmp_path, output, lock_path, work)
     assert not output.exists()
-    assert (work / str(fail_call) / "build.log").read_text() == "out\nbuild failed"
+    assert (work / "b" / "build.log").read_text() == "out\nbuild failed"
     if fail_call == 2:
         assert (work / "first-build-evidence.json").is_file()
 
@@ -976,7 +997,7 @@ def test_output_provenance_tampering_is_rejected(tmp_path, monkeypatch):
         target.validate_output_directory(output, lock_path)
 
 
-@pytest.mark.parametrize("field", ["python_hash_seed", "compile_projects"])
+@pytest.mark.parametrize("field", ["python_hash_seed", "source_date_epoch", "compile_projects"])
 def test_output_observed_environment_tampering_is_rejected(tmp_path, monkeypatch, field):
     _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
     output = tmp_path / "output"
@@ -992,10 +1013,14 @@ def test_output_observed_environment_tampering_is_rejected(tmp_path, monkeypatch
     provenance_path = output / target.PROVENANCE_NAME
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     observed = provenance["observed_build_environment"]
-    observed[field] = "random" if field == "python_hash_seed" else []
+    observed[field] = (
+        "random"
+        if field in {"python_hash_seed", "source_date_epoch"}
+        else []
+    )
     provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
 
-    with pytest.raises(target.OpenCVWheelError, match="provenance|environment|toolchain|hash seed"):
+    with pytest.raises(target.OpenCVWheelError, match="provenance|environment|toolchain|hash seed|source date"):
         target.validate_output_directory(output, lock_path)
 
 
@@ -1123,6 +1148,50 @@ def test_unexpected_ffmpeg_build_information_is_rejected(tmp_path, monkeypatch):
     assert not output.exists()
 
 
+def test_wrong_build_timestamp_is_rejected(tmp_path, monkeypatch):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    _mock_build_dependencies(monkeypatch)
+    probes = _probes()
+    probes["build_timestamp"] = "2026-01-06T09:12:37Z"
+    monkeypatch.setattr(
+        target, "_probe_wheel", lambda python, wheel, diagnostics_file=None: probes
+    )
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        wheel_dir = Path(command[-1])
+        _wheel(wheel_dir / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    with pytest.raises(target.OpenCVWheelError, match="timestamp|native probes"):
+        target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
+
+
+def test_repeatability_reuses_active_path_but_not_first_build_tree(tmp_path, monkeypatch):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    _mock_build_dependencies(monkeypatch)
+    calls = 0
+    cwd_values = []
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        nonlocal calls
+        calls += 1
+        cwd_values.append(cwd)
+        marker = cwd / "first-build-sentinel"
+        if calls == 1:
+            marker.write_text("stale", encoding="utf-8")
+        else:
+            assert not marker.exists()
+        wheel_dir = Path(command[-1])
+        _wheel(wheel_dir / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
+    assert calls == 2
+    assert cwd_values[0] == cwd_values[1]
+
+
 def test_embedded_provenance_wrapper_is_sealed(tmp_path, monkeypatch):
     _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
     output = tmp_path / "output"
@@ -1179,7 +1248,7 @@ def test_two_clean_builds_must_have_same_semantics(tmp_path, monkeypatch):
     assert (tmp_path / "work" / "first-build-evidence.json").is_file()
     assert (tmp_path / "work" / "second-build-evidence.json").is_file()
     assert next((tmp_path / "work" / "first-build-diagnostics").glob("*.whl")).is_file()
-    assert next((tmp_path / "work" / "2" / "evidence").glob("*.whl")).is_file()
+    assert next((tmp_path / "work" / "b" / "evidence").glob("*.whl")).is_file()
 
 
 def test_two_clean_builds_must_have_identical_pe_payloads(tmp_path, monkeypatch):
@@ -1211,7 +1280,7 @@ def test_two_clean_builds_must_have_identical_pe_payloads(tmp_path, monkeypatch)
     assert (tmp_path / "work" / "first-build-evidence.json").is_file()
     assert (tmp_path / "work" / "second-build-evidence.json").is_file()
     assert next((tmp_path / "work" / "first-build-diagnostics").glob("*.whl")).is_file()
-    assert next((tmp_path / "work" / "2" / "evidence").glob("*.whl")).is_file()
+    assert next((tmp_path / "work" / "b" / "evidence").glob("*.whl")).is_file()
 
 
 def test_missing_source_build_policy_is_not_an_error():

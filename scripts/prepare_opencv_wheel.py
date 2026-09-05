@@ -31,6 +31,9 @@ REQUIRED_TOOLSET = "v143"
 REQUIRED_TOOLSET_VERSION = "14.44.35207"
 REQUIRED_WINDOWS_SDK = "10.0.26100.0"
 REQUIRED_CMAKE = "3.31.6"
+# Committer date of locked OpenCV b4c5ec4042f097e2a5b386b9d413ec7333d0a184.
+REQUIRED_SOURCE_DATE_EPOCH = "1767690756"
+REQUIRED_BUILD_TIMESTAMP = "2026-01-06T09:12:36Z"
 COMPILER_FLAG_ENVIRONMENT = (
     "CL", "_CL_", "LINK", "_LINK_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
     "SKBUILD_BUILD_OPTIONS", "CMAKE_TOOLCHAIN_FILE", "OPENCV_CMAKE_HOOKS_DIR",
@@ -149,6 +152,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
         "cmake_version",
         "cmake_build_parallel_level",
         "python_hash_seed",
+        "source_date_epoch",
         "build_packages",
         "cmake_args",
     }:
@@ -168,6 +172,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
             "cmake_build_parallel_level"
         ],
         "python_hash_seed": environment["python_hash_seed"],
+        "source_date_epoch": environment["source_date_epoch"],
     } != {
         "generator": REQUIRED_GENERATOR,
         "msvc_toolset": REQUIRED_TOOLSET,
@@ -176,6 +181,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
         "cmake_version": REQUIRED_CMAKE,
         "cmake_build_parallel_level": "2",
         "python_hash_seed": "0",
+        "source_date_epoch": REQUIRED_SOURCE_DATE_EPOCH,
     }:
         raise OpenCVWheelError("OpenCV toolchain differs from the fixed policy")
     build_packages = environment["build_packages"]
@@ -397,6 +403,13 @@ import numpy as np
 
 info = cv2.getBuildInformation()
 Path(sys.argv[1]).write_text(info, encoding="utf-8")
+timestamps = [
+    line.split(":", 1)[1].strip()
+    for line in info.splitlines()
+    if line.strip().startswith("Timestamp:")
+]
+if timestamps != [sys.argv[2]]:
+    raise SystemExit("OpenCV build timestamp differs from the fixed source epoch")
 ipp_lines = [
     line.strip()
     for line in info.splitlines()
@@ -443,6 +456,7 @@ if cv2.countNonZero(mask) == 0:
 print(json.dumps({
     "api": "ok",
     "build_information_sha256": hashlib.sha256(info.encode("utf-8")).hexdigest(),
+    "build_timestamp": timestamps[0],
     "ffmpeg": "enabled",
     "ffmpeg_build_information_lines": ffmpeg_lines,
     "ipp": "disabled",
@@ -453,7 +467,7 @@ print(json.dumps({
 }, sort_keys=True))
 """
     result = subprocess.run(
-        [str(python), "-c", code, str(diagnostics_file)],
+        [str(python), "-c", code, str(diagnostics_file), REQUIRED_BUILD_TIMESTAMP],
         check=False,
         capture_output=True,
         text=True,
@@ -1018,6 +1032,7 @@ def _semantic_manifest(provenance: dict[str, Any]) -> dict[str, Any]:
         key: provenance["probes"][key]
         for key in (
             "api",
+            "build_timestamp",
             "ffmpeg",
             "ffmpeg_build_information_lines",
             "ipp",
@@ -1396,6 +1411,7 @@ def _validate_provenance_payload(
     if not isinstance(probes, dict) or set(probes) != {
         "api",
         "build_information_sha256",
+        "build_timestamp",
         "ffmpeg",
         "ffmpeg_build_information_lines",
         "ipp",
@@ -1407,6 +1423,7 @@ def _validate_provenance_payload(
         raise OpenCVWheelError("OpenCV native probe fields are incomplete")
     if (
         probes["api"] != "ok"
+        or probes["build_timestamp"] != REQUIRED_BUILD_TIMESTAMP
         or probes["ipp"] != "disabled"
         or probes["ffmpeg"] != "enabled"
         or probes["ffmpeg_build_information_lines"]
@@ -1484,10 +1501,13 @@ def _validate_provenance_payload(
         "configured_toolchain",
         "runner_image",
         "python_hash_seed",
+        "source_date_epoch",
     }:
         raise OpenCVWheelError("OpenCV observed build environment is invalid")
     if observed_environment["python_hash_seed"] != "0":
         raise OpenCVWheelError("OpenCV observed Python hash seed differs")
+    if observed_environment["source_date_epoch"] != REQUIRED_SOURCE_DATE_EPOCH:
+        raise OpenCVWheelError("OpenCV observed source date epoch differs")
     if observed_environment["prebuild"] != {
         "cmake_version": policy["build_environment"]["cmake_version"],
         "build_packages": policy["build_environment"]["build_packages"],
@@ -1697,6 +1717,7 @@ def _run_once(
         build_environment["cmake_build_parallel_level"]
     )
     environment["PYTHONHASHSEED"] = str(build_environment["python_hash_seed"])
+    environment["SOURCE_DATE_EPOCH"] = str(build_environment["source_date_epoch"])
     environment["CI_BUILD"] = "1"
     environment["OPENCV_PYTHON_SKIP_GIT_COMMANDS"] = "1"
     for flag in ("ENABLE_CONTRIB", "ENABLE_HEADLESS", "ENABLE_ROLLING"):
@@ -1727,6 +1748,9 @@ def _run_once(
     configured_toolchain = _capture_configured_toolchain(source_tree)
     evidence = work_dir / "evidence"
     evidence.mkdir()
+    for generated in source_tree.glob("_skbuild/*/cmake-build/modules/core/version_string.inc"):
+        _regular(generated, "OpenCV generated build information")
+        shutil.copy2(generated, evidence / "version_string.inc")
     probes = _probe_wheel(build_python, wheel, evidence / "build-information.txt")
     pe_inventory = _pe_inventory(wheel, work_dir, build_python)
     _require_dynamic_crt_import(pe_inventory)
@@ -1760,6 +1784,7 @@ def _run_once(
             "configured_toolchain": configured_toolchain,
             "runner_image": runner_image,
             "python_hash_seed": environment["PYTHONHASHSEED"],
+            "source_date_epoch": environment["SOURCE_DATE_EPOCH"],
         },
         "version_py_sha256": _sha256(source_tree / "cv2" / "version.py"),
         "opencv_download_path": "<work-dir>/opencv-download",
@@ -1814,25 +1839,26 @@ def run(
     if work_dir.exists() or work_dir.is_symlink():
         raise OpenCVWheelError(f"OpenCV work directory already exists: {work_dir}")
     work_dir.mkdir(parents=True)
-    first_work = work_dir / "1"
-    second_work = work_dir / "2"
+    # OpenCV embeds source/venv/install paths. Recreate the same absolute tree
+    # from verified archives, without reusing any first-build intermediates.
+    active_work = work_dir / "b"
     second_output = work_dir / "o2"
     succeeded = False
     try:
         print("OpenCV: starting clean source build 1/2", file=sys.stderr, flush=True)
         first, _first_python = _run_once(
-            source_dir, output_dir, policy, first_work
+            source_dir, output_dir, policy, active_work
         )
         (work_dir / "first-build-evidence.json").write_text(
             json.dumps(first, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
-        shutil.copyfile(first_work / "build.log", work_dir / "first-build.log")
-        shutil.copytree(first_work / "evidence", work_dir / "first-build-diagnostics")
-        _remove_clean_build_tree(first_work, work_dir)
+        shutil.copyfile(active_work / "build.log", work_dir / "first-build.log")
+        shutil.copytree(active_work / "evidence", work_dir / "first-build-diagnostics")
+        _remove_clean_build_tree(active_work, work_dir)
         print("OpenCV: starting clean source build 2/2", file=sys.stderr, flush=True)
         second, second_python = _run_once(
-            source_dir, second_output, policy, second_work
+            source_dir, second_output, policy, active_work
         )
         (work_dir / "second-build-evidence.json").write_text(
             json.dumps(second, ensure_ascii=False, indent=2) + "\n",

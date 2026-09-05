@@ -74,6 +74,9 @@ function Assert-BuildProvenance {
 }
 
 Assert-BuildProvenance
+if (-not $resolvedBuildProvenance) {
+  Write-Warning "ローカルの未検証開発ビルドです。IPP無効のソースビルド版OpenCVを使用した証明はありません。ReleaseやVMの正式な検証証拠には使用しないでください。"
+}
 
 $resolvedInnoSetupRoot = $null
 $resolvedInnoSetupProvenance = $null

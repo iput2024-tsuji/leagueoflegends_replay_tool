@@ -268,6 +268,243 @@ def _binary_lock(wheel: bytes) -> dict[str, object]:
     return lock
 
 
+def test_verified_binary_manifest_omits_source_built_opencv_wheel():
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+
+    records = binary_archive_records(lock)
+
+    assert not any(record["component"] == "opencv-python" for record in records)
+
+
+def _workflow_opencv_artifact(tmp_path):
+    lock_path = Path(__file__).resolve().parents[1] / "compliance" / "components.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    source = tmp_path / "artifact"
+    source.mkdir()
+    provenance = source / "opencv-wheel-provenance.json"
+    provenance.write_bytes(b'{"producer":"same-run"}\n')
+    wheel_name = lock["opencv_source_build_policy"]["output_filename"]
+    (source / wheel_name).write_bytes(b"source-built-wheel")
+    return lock_path, lock, source, _sha(provenance.read_bytes())
+
+
+def test_opencv_workflow_artifact_is_sealed_and_reaudited(tmp_path, monkeypatch):
+    from scripts import prepare_opencv_wheel
+
+    lock_path, lock, source, digest = _workflow_opencv_artifact(tmp_path)
+    audited = []
+
+    def audit(directory, components):
+        assert components == lock_path
+        assert (directory / lock["opencv_source_build_policy"]["output_filename"]).read_bytes() == b"source-built-wheel"
+        audited.append(directory)
+        return {"verified": True}
+
+    monkeypatch.setattr(prepare_opencv_wheel, "validate_output_directory", audit)
+    monkeypatch.setattr(prepare_opencv_wheel, "run", lambda *args: pytest.fail("must not rebuild artifact"))
+    result = release_assets._prepare_opencv_source_wheel(
+        components_file=lock_path, lock=lock, cache_dir=tmp_path / "cache",
+        opener=lambda *args: pytest.fail("must not download artifact"),
+        prepared_directory=source, expected_provenance_sha256=digest,
+    )
+    assert audited == [source, tmp_path / "cache" / "opencv-source-built-wheel"]
+    assert result["provenance_sha256"] == digest
+    assert result["payload"] == {"verified": True}
+
+
+@pytest.mark.parametrize("directory,digest", [(True, None), (False, "a" * 64), (True, "b" * 64)])
+def test_opencv_workflow_artifact_rejects_missing_or_wrong_seal(tmp_path, monkeypatch, directory, digest):
+    from scripts import prepare_opencv_wheel
+
+    lock_path, lock, source, _digest = _workflow_opencv_artifact(tmp_path)
+    monkeypatch.setattr(prepare_opencv_wheel, "validate_output_directory", lambda *args: pytest.fail("seal must be checked first"))
+    with pytest.raises(ReleaseAssetError, match="SHA256"):
+        release_assets._prepare_opencv_source_wheel(
+            components_file=lock_path, lock=lock, cache_dir=tmp_path / "cache",
+            opener=lambda *args: pytest.fail("must not download"),
+            prepared_directory=source if directory else None,
+            expected_provenance_sha256=digest,
+        )
+    assert not (tmp_path / "cache").exists()
+
+
+def test_opencv_workflow_artifact_rejects_changed_provenance_during_copy(tmp_path, monkeypatch):
+    from scripts import prepare_opencv_wheel
+
+    lock_path, lock, source, digest = _workflow_opencv_artifact(tmp_path)
+    original_copy = shutil.copyfile
+    monkeypatch.setattr(prepare_opencv_wheel, "validate_output_directory", lambda *args: {})
+
+    def changed_copy(origin, destination):
+        result = original_copy(origin, destination)
+        if destination.name == prepare_opencv_wheel.PROVENANCE_NAME:
+            destination.write_bytes(b"changed after seal")
+        return result
+
+    monkeypatch.setattr(shutil, "copyfile", changed_copy)
+    with pytest.raises(ReleaseAssetError, match="changed during import"):
+        release_assets._prepare_opencv_source_wheel(
+            components_file=lock_path, lock=lock, cache_dir=tmp_path / "cache",
+            opener=lambda *args: pytest.fail("must not download"),
+            prepared_directory=source, expected_provenance_sha256=digest,
+        )
+
+
+def test_opencv_workflow_build_and_packaging_share_commit_artifact_and_seal():
+    workflows = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+    source = (workflows / "build-opencv.yml").read_text(encoding="utf-8")
+    assert "runs-on: windows-2022" in source
+    assert "build-opencv-wheel" in source
+    assert "steps.upload.outputs.artifact-id" in source
+    assert "provenance-sha256=$($record.provenance_sha256)" in source
+    assert "if: failure()" in source
+    assert "**/build.log" in source
+    for name in ("ci.yml", "release.yml"):
+        consumer = (workflows / name).read_text(encoding="utf-8")
+        assert "uses: ./.github/workflows/build-opencv.yml" in consumer
+        assert "runs-on: windows-2025" in consumer
+        assert "artifact-ids: ${{ needs.opencv.outputs.artifact-id }}" in consumer
+        assert "OPENCV_SOURCE_COMMIT: ${{ needs.opencv.outputs.source-commit }}" in consumer
+        assert "-cne $env:OPENCV_SOURCE_COMMIT" in consumer
+        assert "--opencv-provenance-sha256 $env:OPENCV_PROVENANCE_SHA256" in consumer
+        assert '--opencv-wheel-directory "$env:RUNNER_TEMP\\opencv-source-artifact"' in consumer
+
+
+def test_binary_install_selects_source_built_opencv_wheel(tmp_path):
+    lock = json.loads(
+        release_assets.COMPONENTS_FILE.read_text(encoding="utf-8")
+    )
+    wheel = {
+        "filename": lock["opencv_source_build_policy"]["output_filename"],
+        "sha256": "a" * 64,
+        "size": 123,
+        "distribution": "opencv-python",
+        "version": "4.13.0.90",
+    }
+
+    requirements = release_assets._binary_install_requirements(
+        lock=lock,
+        pins=[
+            {
+                "name": "opencv-python",
+                "canonical_name": "opencv-python",
+                "version": "4.13.0.90",
+            }
+        ],
+        binary_by_name={},
+        binary_cache_dir=tmp_path / "binary",
+        external_dir=None,
+        opencv_dir=tmp_path / "opencv",
+        opencv_payload={"wheel": wheel},
+        opencv_plan={"provenance_sha256": "b" * 64},
+    )
+
+    record, path = requirements[0]
+    assert record["source"] == "source-built-wheel"
+    assert record["sha256"] == "a" * 64
+    assert record["source_build_provenance_sha256"] == "b" * 64
+    assert path == tmp_path / "opencv" / wheel["filename"]
+
+
+def test_binary_install_plan_uses_generated_opencv_wheel_hash(
+    monkeypatch,
+    tmp_path,
+):
+    upstream_wheel = _wheel_bytes(name="opencv_python", version="4.13.0.90")
+    generated_wheel = _wheel_with_comment(
+        upstream_wheel,
+        b"IPP-free source build",
+    )
+    lock = _binary_lock(upstream_wheel)
+    component = lock["runtime_components"][0]
+    component.update(
+        {
+            "component": "opencv-python",
+            "distribution": "opencv-python",
+            "version": "4.13.0.90",
+        }
+    )
+    lock["release_binary_policy"]["required_components"] = ["opencv-python"]
+    lock["opencv_source_build_policy"] = {
+        "component": "opencv-python",
+        "output_filename": (
+            "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl"
+        ),
+    }
+    monkeypatch.setattr(
+        release_assets,
+        "REQUIRED_RELEASE_BINARY_COMPONENTS",
+        frozenset({"opencv-python"}),
+    )
+
+    def fake_binary_manifest(_components, _cache, output, *, opener):
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text('{"archives": []}\n', encoding="utf-8")
+        return {"archives": []}
+
+    monkeypatch.setattr(
+        release_assets,
+        "create_verified_binary_manifest",
+        fake_binary_manifest,
+    )
+
+    def fake_prepare_opencv(**kwargs):
+        directory = kwargs["cache_dir"] / "opencv-source-built-wheel"
+        directory.mkdir()
+        wheel_path = directory / lock["opencv_source_build_policy"][
+            "output_filename"
+        ]
+        wheel_path.write_bytes(generated_wheel)
+        provenance = directory / "opencv-wheel-provenance.json"
+        provenance.write_text('{"fixture": true}\n', encoding="utf-8")
+        return {
+            "directory": str(directory.resolve()),
+            "provenance": str(provenance.resolve()),
+            "provenance_sha256": release_assets.sha256_file(provenance),
+            "payload": {
+                "wheel": {
+                    "filename": wheel_path.name,
+                    "sha256": release_assets.sha256_file(wheel_path),
+                    "size": wheel_path.stat().st_size,
+                    "distribution": "opencv-python",
+                    "version": "4.13.0.90",
+                }
+            },
+        }
+
+    monkeypatch.setattr(
+        release_assets,
+        "_prepare_opencv_source_wheel",
+        fake_prepare_opencv,
+    )
+    lock_path = tmp_path / "components.json"
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    requirements = tmp_path / "requirements.txt"
+    requirements.write_text("opencv-python==4.13.0.90\n", encoding="utf-8")
+    generated = tmp_path / "generated-requirements.txt"
+    plan_path = tmp_path / "install-plan.json"
+
+    plan = release_assets.prepare_binary_install(
+        components_file=lock_path,
+        requirements_file=requirements,
+        cache_dir=tmp_path / "binary-cache",
+        output_requirements=generated,
+        output_plan=plan_path,
+        opener=lambda _request, *, timeout: pytest.fail(
+            "publisher wheel must not be downloaded"
+        ),
+    )
+
+    generated_sha256 = _sha(generated_wheel)
+    assert plan["requirements"][0]["sha256"] == generated_sha256
+    assert plan["requirements"][0]["sha256"] != _sha(upstream_wheel)
+    assert generated.read_text(encoding="utf-8").splitlines()[-1].endswith(
+        f"#sha256={generated_sha256}"
+    )
+
+
 def _write_source_zip(path: Path, version: str = "1.2.3") -> None:
     files = {
         "VERSION": (version + "\n").encode(),
@@ -2503,6 +2740,7 @@ def test_ci_windows_build_uses_external_runtime_wheels_and_provenance() -> None:
     install = build_job.index("name: Install build dependencies")
     inno = build_job.index("name: Prepare verified Inno Setup")
     build = build_job.index("name: Build application")
+    assert "runs-on: windows-2025" in build_job[:install]
     assert "prepare-binary-install" in build_job[install:build]
     assert "attest-binary-install" in build_job[install:build]
     assert "--no-index" in build_job[install:build]
@@ -2523,6 +2761,8 @@ def test_release_workflow_requires_manual_approval_and_remote_verification():
     )
 
     assert "workflow_dispatch:" in workflow
+    prepare_job = workflow[workflow.index("  prepare:"):workflow.index("  publish:")]
+    assert "runs-on: windows-2025" in prepare_job
     assert "publish_confirmation:" in workflow
     assert "name: release" in workflow
     assert "gh release create $tag" in workflow
@@ -2647,7 +2887,7 @@ def test_release_workflow_requires_manual_approval_and_remote_verification():
     assert workflow.count("git merge-base --is-ancestor") == 2
 
 
-def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
+def test_normal_ci_preserves_private_windows_validation_evidence():
     workflow = (
         Path(__file__).resolve().parents[1]
         / ".github"
@@ -2698,7 +2938,14 @@ def test_normal_ci_verifies_windows_outputs_without_distributing_artifacts():
     assert "-SkipSelfCheck" not in Path(".github/workflows/release.yml").read_text(
         encoding="utf-8"
     )
-    assert "actions/upload-artifact@" not in workflow
+    assert (
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+        in workflow
+    )
+    assert "name: opencv-ipp-free-validation-${{ github.sha }}" in workflow
+    assert "retention-days: 7" in workflow
+    assert ".ci-evidence/build-provenance.json" not in workflow
+    assert ".\\.ci-evidence\\build-provenance.json" in workflow
     assert "Compress-Archive" not in workflow
     assert "LoLReplayTool-installer" not in workflow
 

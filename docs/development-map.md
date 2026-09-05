@@ -177,6 +177,14 @@ standalone FFmpegは利用者が明示的に入手・配置し、本プロジェ
 
 Windows向け配布はonedir形式で、依存物を `_internal` に配置します。新モジュール、動的import、データファイル、アイコン、ランタイム依存を変更した場合は `scripts/build.ps1` とパッケージ済みexeの `--self-check` を実行します。ビルド成功だけでなく、OBS、mpv DLL、FFmpeg、設定、録画が意図せず同梱されていないことも確認します。
 
+正式なWindows buildでは`compliance/components.json`の`opencv_source_build_policy`と`scripts/prepare_opencv_wheel.py`を使用し、固定した`opencv-python`／OpenCV／OpenCV FFmpeg入力からIPP無効のOpenCV wheelを構築します。CIとReleaseは共通の`build-opencv.yml`を呼び、Visual Studio 2022を提供する`windows-2022`で2回のclean buildを行います。scikit-build標準の`v143`指定を使い、生成されたC/C++ compilerのtoolset directoryが固定版`14.44.35207`以外なら拒否します。`BUILD_WITH_STATIC_CRT=OFF`を指定し、CMake cache、各C/C++ targetのRelease用`RuntimeLibrary=MultiThreadedDLL`、`cv2.pyd`の通常名Runtime importを検査します。型情報生成の順序を固定するため`PYTHONHASHSEED=0`をbuild recipeへ固定します。アプリbuild・self-check・installer監査は`windows-2025`で行い、同じworkflow runのartifact ID、checkout commit、provenance SHA256を照合してwheelを再監査します。Server 2022上のbuild成功をWindows 11実機検証の代わりにはしません。byte-identicalでない場合もwheel内容、PE import graph、IPP／FFmpeg状態、synthetic動画読込、同期マーカー用primitiveのsemantic manifestが一致しなければ停止します。元のPyPI OpenCV wheelは正式build用binary cacheへ取得せず、生成wheelのSHA256、実際に選択されたMSVC toolset／Windows SDK、固定FFmpeg DLLとの対応をbuild provenanceへ残します。失敗したsource buildのログ、2回分の診断JSON、個別検査を通過したwheel、build情報、MSBuild projectは7日間の診断用Actions artifactとして保持します。これらは検証完了した配布候補ではありません。
+
+2回のsource buildは同じ絶対作業パスを使いますが、1回目の診断証拠を外へ保存してからsource、venv、中間生成物を含む作業tree全体を削除し、2回目も固定archiveから再作成します。`SOURCE_DATE_EPOCH=1767690756`（固定OpenCV commitのcommitter日時、2026-01-06T09:12:36Z）をrecipeへ固定し、実`getBuildInformation()`のTimestampも照合します。継承したcompiler/linker flags、scikit-buildのbuild override、CMake toolchain file、OpenCV hook directoryは拒否します。
+
+`scripts/opencv_pe_comparison.py`は、実測で説明できた`cv2/cv2.pyd`のCOFF timestamp、debug type 2/12/13のtimestamp、RSDS GUIDだけを比較用コピー上で0化します。元のwheelやPEは書き換えません。署名なしAMD64 DLL、厳密なdebug構造と範囲・重複検査を必須とし、実行コード、通常データ、PDB path/age、import、その他のPE byteは除外しません。未知の構造や比較用SHA256の不一致は停止条件です。FFmpeg DLLその他のPEは元SHA256で比較します。provenanceの`cv2_comparison`と`repeatability.second_cv2_comparison`に両方の元PE hash・field値・比較用hashを保存し、wheel受け渡し時には実ファイルから再計算します。PE以外はRECORDを除いて内容を厳格比較し、元wheelのSHA256も2回分保存します。これはbyte-identicalを保証する方式ではなく、限定したmetadata差を説明するための比較です。
+
+provenanceを指定しない`build.ps1`と`build_installer.ps1`は未検証のローカル開発ビルドとして警告します。既存distを使う`-SkipBuild`でも同じ警告を出し、ReleaseやVMの正式な検証証拠として使用しません。正式workflowの固定入力・provenance・配布監査はこの警告の有無によらず必須です。
+
 ### Inno Setup
 
 正式対応OSはWindows 11（build 22000以降）です。配布物はx64版で、installerの`ArchitecturesAllowed=x64compatible`はx64 WindowsとWindows 11 ARM64のx64エミュレーションを許可しますが、ARM64-native版は提供しません。PyQt6-Qt6 6.10.2のQt6Coreが参照するICUはWindows標準のSystem32版を利用し、ICU DLLを配布物へ同梱しません。Windows 10対応はLTSC 2019等の対象環境で同じnativeロードとQt locale／Unicode検証が完了するまで宣言しません。installerの`MinVersion`、`ArchitecturesAllowed`、README日英版を同期してください。最終PyInstaller onedirのICU graph確認には`python -m scripts.pe_runtime_audit <dist> --require-qt-system-icu`を使用します。

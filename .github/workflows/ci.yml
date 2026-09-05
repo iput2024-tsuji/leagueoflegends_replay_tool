@@ -161,12 +161,20 @@ jobs:
             --basetemp="$env:PYTEST_BASETEMP" `
             tests
 
+  opencv:
+    needs: [lint-test, test-windows]
+    uses: ./.github/workflows/build-opencv.yml
+    with:
+      source-ref: ${{ github.sha }}
+
   build-windows:
     name: Build Windows artifact
-    runs-on: windows-latest
-    needs: [lint-test, test-windows]
+    runs-on: windows-2025
+    needs: [lint-test, test-windows, opencv]
     env:
       PYTHONIOENCODING: utf8
+      OPENCV_SOURCE_COMMIT: ${{ needs.opencv.outputs.source-commit }}
+      OPENCV_PROVENANCE_SHA256: ${{ needs.opencv.outputs.provenance-sha256 }}
 
     steps:
       - name: Checkout repository
@@ -216,9 +224,19 @@ jobs:
             -Encoding utf8 `
             -Append
 
+      - name: Download verified OpenCV wheel from this run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ needs.opencv.outputs.artifact-id }}
+          path: ${{ runner.temp }}/opencv-source-artifact
+          merge-multiple: true
+
       - name: Install build dependencies
         shell: pwsh
         run: |
+          if ((git rev-parse HEAD).Trim() -cne $env:OPENCV_SOURCE_COMMIT) {
+            throw "OpenCV producer and application checkout commits differ."
+          }
           $binaryCache = Join-Path $env:RUNNER_TEMP "LoLReplayTool-binary-cache"
           $generatedRequirements = Join-Path $env:RUNNER_TEMP "build-requirements.txt"
           $installPlan = Join-Path $env:RUNNER_TEMP "build-install-plan.json"
@@ -231,7 +249,9 @@ jobs:
             --requirements .\requirements-dev.txt `
             --cache-dir $binaryCache `
             --output-requirements $generatedRequirements `
-            --output-plan $installPlan
+            --output-plan $installPlan `
+            --opencv-wheel-directory "$env:RUNNER_TEMP\opencv-source-artifact" `
+            --opencv-provenance-sha256 $env:OPENCV_PROVENANCE_SHA256
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           & $env:WINDOWS_PYTHON -m pip `
@@ -350,3 +370,23 @@ jobs:
             -DistributionRoot .\dist\LoLReplayTool `
             -TempRoot $env:RUNNER_TEMP `
             -PythonExe $env:WINDOWS_PYTHON
+
+      - name: Stage private validation evidence
+        shell: pwsh
+        run: |
+          $version = (Get-Content .\VERSION -Raw).Trim()
+          New-Item -ItemType Directory -Force -Path .\.ci-evidence | Out-Null
+          Copy-Item `
+            -LiteralPath $env:BUILD_PROVENANCE `
+            -Destination .\.ci-evidence\build-provenance.json
+          Copy-Item `
+            -LiteralPath ".\dist\installer\LoLReplayTool-Setup-$version.exe" `
+            -Destination .\.ci-evidence\
+
+      - name: Preserve private validation evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: opencv-ipp-free-validation-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: .ci-evidence/

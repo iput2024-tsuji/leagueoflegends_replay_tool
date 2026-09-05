@@ -7,7 +7,8 @@ import main as app_entrypoint
 from src import self_check
 
 
-def test_self_check_passes_with_missing_optional_binaries(monkeypatch, tmp_path):
+@pytest.fixture
+def isolated_self_check(monkeypatch, tmp_path):
     config_path = tmp_path / "config" / "setting.json"
     sample_path = tmp_path / "install" / "config" / "setting.sample.json"
     sample_path.parent.mkdir(parents=True)
@@ -27,6 +28,11 @@ def test_self_check_passes_with_missing_optional_binaries(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(self_check, "CONFIG_PATH", config_path)
     monkeypatch.setattr(self_check, "SAMPLE_CONFIG_PATH", sample_path)
+    monkeypatch.setattr(self_check, "get_user_data_root", lambda: tmp_path / "userdata")
+    return tmp_path
+
+
+def test_self_check_passes_with_missing_optional_binaries(isolated_self_check, monkeypatch):
     monkeypatch.setattr(self_check, "has_mpv_dll", lambda _bin_dir, _app_root: False)
 
     report = self_check.run_self_check()
@@ -52,6 +58,63 @@ def test_native_runtime_summary_exercises_locked_native_modules():
     if self_check.os.name == "nt":
         assert "Windows build" in summary
         assert "icuuc.dll=" in summary
+
+
+def test_synthetic_sync_probe_finds_marker_and_rejects_absent_marker():
+    import cv2
+    import numpy as np
+
+    found_time, absent_time = self_check._synthetic_sync_probe(cv2, np)
+
+    assert found_time == pytest.approx(1.0, abs=0.05)
+    assert absent_time == -1.0
+
+
+@pytest.mark.parametrize("factory", ["VideoWriter", "VideoCapture"])
+def test_synthetic_sync_probe_rejects_unexpected_backend(monkeypatch, factory):
+    import cv2
+    import numpy as np
+
+    released = []
+
+    class UnexpectedBackend:
+        def isOpened(self):
+            return True
+
+        def getBackendName(self):
+            return "MSMF"
+
+        def release(self):
+            released.append(True)
+
+    monkeypatch.setattr(cv2, factory, lambda *args, **kwargs: UnexpectedBackend())
+
+    with pytest.raises(RuntimeError, match="expected FFMPEG"):
+        self_check._synthetic_sync_probe(cv2, np)
+    assert released == [True]
+
+
+@pytest.mark.parametrize("result", [(float("nan"), -1.0), (0.0, -1.0), (1.0, 0.0)])
+def test_native_runtime_summary_rejects_invalid_sync_result(monkeypatch, result):
+    monkeypatch.setattr(self_check, "_synthetic_sync_probe", lambda *_args: result)
+    with pytest.raises(RuntimeError, match="Synthetic"):
+        self_check._native_runtime_summary()
+
+
+def test_native_runtime_failure_is_fatal(isolated_self_check, monkeypatch):
+    monkeypatch.setattr(
+        self_check,
+        "_native_runtime_summary",
+        lambda: (_ for _ in ()).throw(RuntimeError("native probe failed")),
+    )
+
+    report = self_check.run_self_check()
+
+    native_check = next(check for check in report["checks"] if check["name"] == "native_modules")
+    assert report["ok"] is False
+    assert native_check["fatal"] is True
+    assert native_check["status"] == "error"
+    assert "native probe failed" in native_check["message"]
 
 
 def test_windows_system_icu_summary_accepts_loaded_system_copy(

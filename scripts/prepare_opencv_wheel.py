@@ -31,6 +31,8 @@ REQUIRED_TOOLSET = "v143"
 REQUIRED_TOOLSET_VERSION = "14.44.35207"
 REQUIRED_WINDOWS_SDK = "10.0.26100.0"
 REQUIRED_CMAKE = "3.31.6"
+# Native OpenCV reports the core version, not the opencv-python wheel revision.
+REQUIRED_OPENCV_VERSION = "4.13.0"
 # Committer date of locked OpenCV b4c5ec4042f097e2a5b386b9d413ec7333d0a184.
 REQUIRED_SOURCE_DATE_EPOCH = "1767690756"
 REQUIRED_BUILD_TIMESTAMP = "2026-01-06T09:12:36Z"
@@ -403,6 +405,8 @@ import numpy as np
 
 info = cv2.getBuildInformation()
 Path(sys.argv[1]).write_text(info, encoding="utf-8")
+if cv2.__version__ != sys.argv[3]:
+    raise SystemExit("OpenCV native version differs from the fixed core source")
 timestamps = [
     line.split(":", 1)[1].strip()
     for line in info.splitlines()
@@ -467,7 +471,8 @@ print(json.dumps({
 }, sort_keys=True))
 """
     result = subprocess.run(
-        [str(python), "-c", code, str(diagnostics_file), REQUIRED_BUILD_TIMESTAMP],
+        [str(python), "-c", code, str(diagnostics_file), REQUIRED_BUILD_TIMESTAMP,
+         REQUIRED_OPENCV_VERSION],
         check=False,
         capture_output=True,
         text=True,
@@ -1428,7 +1433,7 @@ def _validate_provenance_payload(
         or probes["ffmpeg"] != "enabled"
         or probes["ffmpeg_build_information_lines"]
         != ["FFMPEG: YES (prebuilt binaries)"]
-        or probes["opencv_version"] != expected_version.group("version")
+        or probes["opencv_version"] != REQUIRED_OPENCV_VERSION
         or probes["video_reader_backend"] != "FFMPEG"
         or probes["video_writer_backend"] != "FFMPEG"
         or probes["ipp_build_information_lines"] != []

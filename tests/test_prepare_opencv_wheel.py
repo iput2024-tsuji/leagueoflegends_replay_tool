@@ -211,7 +211,7 @@ def _probes() -> dict:
         "ffmpeg_build_information_lines": ["FFMPEG: YES (prebuilt binaries)"],
         "ipp": "disabled",
         "ipp_build_information_lines": [],
-        "opencv_version": "4.13.0.90",
+        "opencv_version": "4.13.0",
         "video_reader_backend": "FFMPEG",
         "video_writer_backend": "FFMPEG",
         "build_timestamp": "2026-01-06T09:12:36Z",
@@ -1164,6 +1164,26 @@ def test_wrong_build_timestamp_is_rejected(tmp_path, monkeypatch):
 
     monkeypatch.setattr(target.subprocess, "run", fake_run)
     with pytest.raises(target.OpenCVWheelError, match="timestamp|native probes"):
+        target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
+
+
+@pytest.mark.parametrize("version", ["4.13.0.90", "4.12.0"])
+def test_wrong_native_opencv_version_is_rejected(tmp_path, monkeypatch, version):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    _mock_build_dependencies(monkeypatch)
+    probes = _probes()
+    probes["opencv_version"] = version
+    monkeypatch.setattr(
+        target, "_probe_wheel", lambda python, wheel, diagnostics_file=None: probes
+    )
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        wheel_dir = Path(command[-1])
+        _wheel(wheel_dir / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    with pytest.raises(target.OpenCVWheelError, match="native probes|version"):
         target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
 
 

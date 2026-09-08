@@ -2003,6 +2003,7 @@ def run(
         provenance_path.write_text(
             json.dumps(first, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
         validate_output_directory(
             output_dir,

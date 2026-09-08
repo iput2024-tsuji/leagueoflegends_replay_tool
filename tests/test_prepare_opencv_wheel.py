@@ -1321,12 +1321,14 @@ def test_embedded_provenance_wrapper_is_sealed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(target.subprocess, "run", fake_run)
     payload = target.run(tmp_path, output, lock_path, tmp_path / "work")
-    canonical = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    raw = (output / target.PROVENANCE_NAME).read_bytes()
+    assert b"\r" not in raw
+    assert raw == (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode()
     wrapper = {
-        "provenance_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        "provenance": payload,
+        "provenance_sha256": hashlib.sha256(raw).hexdigest(),
+        "provenance": json.loads(raw),
     }
-    assert target.validate_embedded_provenance_record(wrapper, lock_path) == payload
+    assert target.validate_embedded_provenance_record(wrapper, lock_path) == json.loads(raw)
     wrapper["provenance_sha256"] = "0" * 64
     with pytest.raises(target.OpenCVWheelError, match="wrapper SHA256 differs"):
         target.validate_embedded_provenance_record(wrapper, lock_path)

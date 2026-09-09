@@ -142,7 +142,16 @@
     "output_filename": "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl",
     "expected_byte_identical": false,
     "expected_wheel_sha256": null,
-    "expected_semantic_manifest_sha256": "7532dfbe5fc6a6679bcf6ced8189839ae3e03a638921e8b7b1ecfa0cb453fa56",
+    "expected_semantic_manifest_sha256": "2826ea102992dd29be108df17d0d95c0a8a81733df49b9b6cb02378ec51972ff",
+    "license_notice_normalization": {
+      "source_path": "LICENSE-3RD-PARTY.txt",
+      "source_size": 174432,
+      "source_sha256": "6b5966035d16c82b012e120aebff3346c8f0d3e15af1bc5ad9e8be930d8850bf",
+      "operation": "lf-to-crlf",
+      "output_size": 177945,
+      "output_sha256": "d8ec888320fcb9d99317a77af4a4a3a91208676067ec1fa9bc1967a522411730",
+      "wheel_paths": ["cv2/LICENSE-3RD-PARTY.txt", "opencv_python-4.13.0.90.dist-info/licenses/LICENSE-3RD-PARTY.txt"]
+    },
     "source_artifacts": [
       {
         "role": "opencv-python",

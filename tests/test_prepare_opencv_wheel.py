@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import io
 import json
@@ -57,6 +58,12 @@ def _wheel(
         )
         if extra_name is not None:
             write(archive, extra_name, extra_bytes)
+        write(archive, "cv2/LICENSE-3RD-PARTY.txt", b"source\r\n")
+        write(
+            archive,
+            "opencv_python-4.13.0.90.dist-info/licenses/LICENSE-3RD-PARTY.txt",
+            b"source\r\n",
+        )
         write(archive, "opencv_python-4.13.0.90.dist-info/METADATA", metadata)
         write(
             archive,
@@ -73,7 +80,7 @@ def _lock(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
     _archive(
         source,
         "opencv-python-root",
-        {"setup.py": b"# setup"},
+        {"setup.py": b"# setup", "LICENSE-3RD-PARTY.txt": b"source\n"},
         directories=("opencv",),
     )
     _archive(opencv, "opencv-root", {"CMakeLists.txt": b"# cmake"})
@@ -99,6 +106,15 @@ def _lock(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
         "expected_byte_identical": None,
         "expected_wheel_sha256": None,
         "expected_semantic_manifest_sha256": None,
+        "license_notice_normalization": {
+            "source_path": target.NOTICE_SOURCE_PATH,
+            "source_size": 7,
+            "source_sha256": hashlib.sha256(b"source\n").hexdigest(),
+            "operation": "lf-to-crlf",
+            "output_size": 8,
+            "output_sha256": hashlib.sha256(b"source\r\n").hexdigest(),
+            "wheel_paths": list(target.NOTICE_WHEEL_PATHS),
+        },
         "source_artifacts": [
             record(source, "opencv-python"),
             record(opencv, "opencv"),
@@ -791,6 +807,99 @@ def test_composed_source_tree_uses_short_active_paths(tmp_path):
     assert not (work / "x").exists()
 
 
+@pytest.mark.parametrize("contents", [None, b"source\r\n", b"changed\n"])
+def test_license_notice_normalization_rejects_wrong_source(tmp_path, contents):
+    _policy_data, _lock_path, _source, _opencv = _lock(tmp_path)
+    source_tree = tmp_path / "source"
+    source_tree.mkdir()
+    if contents is not None:
+        (source_tree / target.NOTICE_SOURCE_PATH).write_bytes(contents)
+    with pytest.raises(target.OpenCVWheelError, match="license notice source"):
+        target._normalize_license_notice(source_tree, _policy_data)
+
+
+@pytest.mark.parametrize("change", [
+    lambda n: n.pop("operation"),
+    lambda n: n.update(operation="copy"),
+    lambda n: n.update(source_path="renamed.txt"),
+    lambda n: n.update(wheel_paths=[target.NOTICE_WHEEL_PATHS[0]]),
+    lambda n: n.update(source_size=True),
+])
+def test_policy_rejects_invalid_license_notice_mapping(tmp_path, change):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    change(payload[target.POLICY_KEY]["license_notice_normalization"])
+    lock_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(target.OpenCVWheelError, match="license notice mapping"):
+        target._load_lock(lock_path)
+
+
+def test_provenance_notice_inventory_rejects_missing_entry(tmp_path, monkeypatch):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    output = tmp_path / "output"
+    _mock_build_dependencies(monkeypatch)
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        wheel_dir = Path(command[-1])
+        _wheel(wheel_dir / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    target.run(tmp_path, output, lock_path, tmp_path / "work")
+    provenance_path = output / target.PROVENANCE_NAME
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    provenance["wheel_contents"] = [
+        item for item in provenance["wheel_contents"]
+        if item["path"] != target.NOTICE_WHEEL_PATHS[0]
+    ]
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+    with pytest.raises(target.OpenCVWheelError, match="provenance differs for wheel_contents"):
+        target.validate_output_directory(output, lock_path)
+
+
+@pytest.mark.parametrize("change", [
+    lambda p: p["license_notice_normalization"].update(output_size=7),
+    lambda p: p["license_notice_normalization"].update(output_sha256="0" * 64),
+    lambda p: p["license_notice_normalization"].update(operation="copy"),
+    lambda p: p["license_notice_normalization"].update(wheel_paths=[target.NOTICE_WHEEL_PATHS[0]]),
+])
+def test_provenance_notice_specific_validation_rejects_tampering(tmp_path, monkeypatch, change):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    _mock_build_dependencies(monkeypatch)
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        _wheel(Path(command[-1]) / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    payload = target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
+    change(payload)
+    with pytest.raises(target.OpenCVWheelError, match="license notice"):
+        target._validate_provenance_payload(payload, lock_path)
+
+
+@pytest.mark.parametrize("change", [
+    lambda p: p["wheel_contents"].append({"path": "other/LICENSE-3RD-PARTY.txt", "size": 8, "sha256": hashlib.sha256(b"source\r\n").hexdigest()}),
+    lambda p: next(x for x in p["wheel_contents"] if x["path"] == target.NOTICE_WHEEL_PATHS[0]).update(size=7),
+    lambda p: next(x for x in p["wheel_contents"] if x["path"] == target.NOTICE_WHEEL_PATHS[0]).update(sha256="0" * 64),
+    lambda p: next(x for x in p["wheel_contents"] if x["path"] == target.NOTICE_WHEEL_PATHS[0]).update(path="cv2/renamed.txt"),
+])
+def test_provenance_notice_inventory_specific_validation_rejects_tampering(tmp_path, monkeypatch, change):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    _mock_build_dependencies(monkeypatch)
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        _wheel(Path(command[-1]) / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    payload = target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
+    tampered = copy.deepcopy(payload)
+    change(tampered)
+    with pytest.raises(target.OpenCVWheelError, match="license notice"):
+        target._validate_provenance_payload(tampered, lock_path)
+
+
 def test_unexpected_build_download_is_rejected(tmp_path):
     download_path = tmp_path / "download"
     ffmpeg_path = download_path / "ffmpeg"
@@ -863,6 +972,7 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
         )
         assert "SKBUILD_CONFIGURE_OPTIONS" not in env
         assert (cwd / "opencv" / "CMakeLists.txt").is_file()
+        assert (cwd / target.NOTICE_SOURCE_PATH).read_bytes() == b"source\r\n"
         assert (cwd / "cv2" / "version.py").read_bytes() == target.VERSION_PY_BYTES
         wheel_dir = Path(command[-1])
         _wheel(wheel_dir / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")

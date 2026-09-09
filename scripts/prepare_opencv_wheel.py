@@ -75,6 +75,11 @@ _WHEEL = re.compile(
     r"^opencv_python-(?P<version>[A-Za-z0-9_.+!-]+?)-(?P<tags>[^/]+)\.whl$",
     re.IGNORECASE,
 )
+NOTICE_SOURCE_PATH = "LICENSE-3RD-PARTY.txt"
+NOTICE_WHEEL_PATHS = (
+    "cv2/LICENSE-3RD-PARTY.txt",
+    "opencv_python-4.13.0.90.dist-info/licenses/LICENSE-3RD-PARTY.txt",
+)
 
 
 class OpenCVWheelError(ValueError):
@@ -107,7 +112,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
         "schema_version", "component", "recipe", "python_version", "platform",
         "output_filename", "expected_byte_identical", "expected_wheel_sha256",
         "expected_semantic_manifest_sha256", "source_artifacts",
-        "build_artifacts", "build_environment",
+        "build_artifacts", "build_environment", "license_notice_normalization",
     }
     if set(raw) != required:
         raise OpenCVWheelError(f"{POLICY_KEY} fields differ from the required schema")
@@ -235,6 +240,28 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
             "source_archives must contain exactly opencv-python, opencv, "
             "and opencv-3rdparty roles"
         )
+    notice = raw["license_notice_normalization"]
+    if not isinstance(notice, dict) or set(notice) != {
+        "source_path", "source_size", "source_sha256", "operation",
+        "output_size", "output_sha256", "wheel_paths",
+    }:
+        raise OpenCVWheelError("OpenCV license notice mapping is invalid")
+    if (
+        notice["source_path"] != NOTICE_SOURCE_PATH
+        or notice["operation"] != "lf-to-crlf"
+        or notice["wheel_paths"] != list(NOTICE_WHEEL_PATHS)
+        or not isinstance(notice["source_size"], int)
+        or isinstance(notice["source_size"], bool)
+        or notice["source_size"] <= 0
+        or not isinstance(notice["output_size"], int)
+        or isinstance(notice["output_size"], bool)
+        or notice["output_size"] <= notice["source_size"]
+        or not isinstance(notice["source_sha256"], str)
+        or not isinstance(notice["output_sha256"], str)
+        or _SHA256.fullmatch(notice["source_sha256"]) is None
+        or _SHA256.fullmatch(notice["output_sha256"]) is None
+    ):
+        raise OpenCVWheelError("OpenCV license notice mapping is invalid")
     return raw
 
 
@@ -637,6 +664,35 @@ def _compose_source_tree(
         raise OpenCVWheelError("opencv-python source has an unexpected version.py")
     version_file.write_bytes(VERSION_PY_BYTES)
     return python_root, roots["opencv-3rdparty"]
+
+
+def _normalize_license_notice(
+    source_tree: Path, policy: dict[str, Any]
+) -> dict[str, Any]:
+    mapping = policy["license_notice_normalization"]
+    source = source_tree / str(mapping["source_path"])
+    _regular(source, "OpenCV license notice source")
+    original = source.read_bytes()
+    if (
+        len(original) != mapping["source_size"]
+        or hashlib.sha256(original).hexdigest() != mapping["source_sha256"]
+        or b"\r" in original
+    ):
+        raise OpenCVWheelError("OpenCV license notice source differs from policy")
+    normalized = original.replace(b"\n", b"\r\n")
+    if (
+        len(normalized) != mapping["output_size"]
+        or hashlib.sha256(normalized).hexdigest() != mapping["output_sha256"]
+    ):
+        raise OpenCVWheelError("OpenCV license notice normalization differs from policy")
+    source.write_bytes(normalized)
+    return {
+        **mapping,
+        "source_size": len(original),
+        "source_sha256": hashlib.sha256(original).hexdigest(),
+        "output_size": len(normalized),
+        "output_sha256": hashlib.sha256(normalized).hexdigest(),
+    }
 
 
 def _read_cmake_cache(source_tree: Path) -> dict[str, str]:
@@ -1388,6 +1444,7 @@ def _validate_provenance_payload(
         "pe_inventory",
         "cv2_comparison",
         "ffmpeg_preseed",
+        "license_notice_normalization",
         "ffmpeg_wheel_binding",
         "opencv_download_path",
         "version_py_sha256",
@@ -1455,6 +1512,20 @@ def _validate_provenance_payload(
     paths = [str(item["path"]).casefold() for item in contents]
     if len(paths) != len(set(paths)):
         raise OpenCVWheelError("OpenCV wheel content inventory has duplicates")
+    notice = record["license_notice_normalization"]
+    if notice != policy["license_notice_normalization"]:
+        raise OpenCVWheelError("OpenCV license notice provenance differs")
+    notice_records = {
+        str(item["path"]): item
+        for item in contents
+        if PurePosixPath(str(item["path"])).name.casefold()
+        == PurePosixPath(NOTICE_SOURCE_PATH).name.casefold()
+    }
+    if set(notice_records) != set(NOTICE_WHEEL_PATHS) or len(notice_records) != 2:
+        raise OpenCVWheelError("OpenCV license notice wheel paths differ")
+    for item in notice_records.values():
+        if item["size"] != notice["output_size"] or item["sha256"] != notice["output_sha256"]:
+            raise OpenCVWheelError("OpenCV license notice wheel bytes differ")
     probes = record["probes"]
     if not isinstance(probes, dict) or set(probes) != {
         "api",
@@ -1753,6 +1824,7 @@ def _run_once(
     source_tree, thirdparty_root = _compose_source_tree(
         source_dir, policy, work_dir / "s"
     )
+    license_notice = _normalize_license_notice(source_tree, policy)
     download_path = work_dir / "opencv-download"
     ffmpeg_records = _preseed_ffmpeg(thirdparty_root, download_path / "ffmpeg")
     build_artifacts = [
@@ -1892,6 +1964,7 @@ def _run_once(
         "cv2_comparison": cv2_comparison,
         "probes": probes,
         "ffmpeg_preseed": ffmpeg_records,
+        "license_notice_normalization": license_notice,
     }
     return provenance, build_python
 

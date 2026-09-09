@@ -183,6 +183,8 @@ Windows向け配布はonedir形式で、依存物を `_internal` に配置しま
 
 `scripts/opencv_pe_comparison.py`は、実測で説明できた`cv2/cv2.pyd`のCOFF timestamp、debug type 2/12/13のtimestamp、RSDS GUIDだけを比較用コピー上で0化します。元のwheelやPEは書き換えません。署名なしAMD64 DLL、厳密なdebug構造と範囲・重複検査を必須とし、実行コード、通常データ、PDB path/age、import、その他のPE byteは除外しません。未知の構造や比較用SHA256の不一致は停止条件です。FFmpeg DLLその他のPEは元SHA256で比較します。provenanceの`cv2_comparison`と`repeatability.second_cv2_comparison`に両方の元PE hash・field値・比較用hashを保存し、wheel受け渡し時には実ファイルから再計算します。PE以外はRECORDを除いて内容を厳格比較し、元wheelのSHA256も2回分保存します。これはbyte-identicalを保証する方式ではなく、限定したmetadata差を説明するための比較です。
 
+各clean buildでは、一時展開した`opencv-python` sourceの`LICENSE-3RD-PARTY.txt`だけを、固定policyのLF bytes（174432bytes、SHA256 `6b5966035d16c82b012e120aebff3346c8f0d3e15af1bc5ad9e8be930d8850bf`）からCRLF bytes（177945bytes、SHA256 `d8ec888320fcb9d99317a77af4a4a3a91208676067ec1fa9bc1967a522411730`）へ変換します。元archiveと完成wheelを後加工せず、変換前後のsize/hash、限定path、操作を検証・記録します。wheelの`cv2`とdist-infoに入る通知2ファイルはproducer/consumerの双方で固定bytesと照合します。これは既存PyPI wheelと通知本文が完全一致する改行差への限定対応であり、欠損、余分な通知path、改変された本文・改行は拒否します。通知収集は引き続き実環境のbytesをそのままコピーし、packaged license hashを改行無視や複数hash許容へ変更しません。既存のsource/legal gateも維持します。
+
 provenanceを指定しない`build.ps1`と`build_installer.ps1`は未検証のローカル開発ビルドとして警告します。既存distを使う`-SkipBuild`でも同じ警告を出し、ReleaseやVMの正式な検証証拠として使用しません。正式workflowの固定入力・provenance・配布監査はこの警告の有無によらず必須です。
 
 ### Inno Setup

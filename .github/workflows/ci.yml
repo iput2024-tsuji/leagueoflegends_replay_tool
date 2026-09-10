@@ -375,13 +375,13 @@ jobs:
         shell: pwsh
         run: |
           $version = (Get-Content .\VERSION -Raw).Trim()
-          New-Item -ItemType Directory -Force -Path .\.ci-evidence | Out-Null
+          New-Item -ItemType Directory -Force -Path .\ci-evidence | Out-Null
           Copy-Item `
             -LiteralPath $env:BUILD_PROVENANCE `
-            -Destination .\.ci-evidence\build-provenance.json
+            -Destination .\ci-evidence\build-provenance.json
           Copy-Item `
             -LiteralPath ".\dist\installer\LoLReplayTool-Setup-$version.exe" `
-            -Destination .\.ci-evidence\
+            -Destination .\ci-evidence\
 
       - name: Preserve private validation evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -389,4 +389,4 @@ jobs:
           name: opencv-ipp-free-validation-${{ github.sha }}
           if-no-files-found: error
           retention-days: 7
-          path: .ci-evidence/
+          path: ci-evidence/

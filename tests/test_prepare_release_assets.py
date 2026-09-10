@@ -2944,8 +2944,24 @@ def test_normal_ci_preserves_private_windows_validation_evidence():
     )
     assert "name: opencv-ipp-free-validation-${{ github.sha }}" in workflow
     assert "retention-days: 7" in workflow
-    assert ".ci-evidence/build-provenance.json" not in workflow
-    assert ".\\.ci-evidence\\build-provenance.json" in workflow
+    assert ".ci-evidence" not in workflow
+    stage_evidence = windows_workflow.split(
+        "      - name: Stage private validation evidence", maxsplit=1
+    )[1].split("      - name: Preserve private validation evidence", maxsplit=1)[0]
+    upload_evidence = windows_workflow.split(
+        "      - name: Preserve private validation evidence", maxsplit=1
+    )[1]
+    assert "-Path .\\ci-evidence" in stage_evidence
+    assert "-Destination .\\ci-evidence\\build-provenance.json" in stage_evidence
+    assert (
+        '            -LiteralPath ".\\dist\\installer\\LoLReplayTool-Setup-$version.exe" `\n'
+        "            -Destination .\\ci-evidence\\"
+        in stage_evidence
+    )
+    assert "path: ci-evidence/" in upload_evidence
+    assert stage_evidence.index("New-Item") < stage_evidence.index("Copy-Item")
+    assert "if-no-files-found: error" in upload_evidence
+    assert "retention-days: 7" in upload_evidence
     assert "Compress-Archive" not in workflow
     assert "LoLReplayTool-installer" not in workflow
 

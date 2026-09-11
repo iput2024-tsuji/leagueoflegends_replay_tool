@@ -108,7 +108,7 @@ SHA256をlocal configへ固定します。
     `sfc /verifyfile` exit 0を確認した証拠が揃った場合だけWindows/.NET componentとして許可します。
     欠損、追加、署名・hardlink・SFC不成立はfail closedです。
 13. powered-off root snapshot `A0-runtime-absent`を1個だけ作成します。
-14. configのidentity値を一度`capture`にして`Capture`を実行し、返された
+14. 次節のVMSD統合状態の条件を確認してから、configのidentity値を一度`capture`にして`Capture`を実行し、返された
     `replacement_values`をconfigへ固定します。その後、`Plan`を実行します。
 
 bootstrapはguestを`192.168.20.10/24`、hostを`192.168.20.1`として設定し、default routeを
@@ -126,6 +126,23 @@ local規則だけが無効のまま残る場合があります。原因解消後
 再度`ActiveStore`全体に対して行います。
 local administratorをWinRMで使用するため`LocalAccountTokenFilterPolicy=1`をtest VM内だけで
 設定します。このVMをhost-only以外へ接続してはいけません。
+
+## VMSDの統合状態
+
+`Capture`、`Plan`、`Doctor`、`Run`の共通snapshot検査では、VMSDの
+`snapshot.needConsolidate`が明示的な`FALSE`の場合だけ続行します（値の大小文字は区別しません）。
+`TRUE`は統合待ちとして拒否し、欠損・空文字・その他の値は「統合状態を確認できない」として
+拒否します。snapshot fingerprintの取得・照合より前に検査するため、`Capture`し直しても回避できません。
+`Doctor`は`ready_for_run=false`となり、`Run`はcredential読込やVM操作へ進みません。
+
+これはこのlabが受け入れる証拠の条件です。正常なVMwareが常に明示的な`FALSE`を出力するという
+保証や、欠損したVMが破損しているという判断ではありません。項目が省略される環境は未検証のため
+停止します。別の受入条件を採用するには、対象Workstation版の証拠と回帰テストが必要です。
+
+拒否された場合は元VMと復旧可能なbackupを保持し、VMwareで状態と統合方法を確認してください。
+VMSDの値を手書きで`FALSE`へ変更したり、項目を削除したりして検査を回避してはいけません。
+snapshot整理・復元・cloneなどのVM変更は、対象と影響の確認・承認後に別途実施します。
+この事前検査の成功だけでは、統合・guest起動・Environment A/Bの成功を証明しません。
 
 ## Host credential
 
@@ -250,6 +267,7 @@ evidenceへ出力しません。
 
 - VM暗号化passwordを`vmrun`で検証できない
 - VMX UUID/MAC/encryption/vTPM/NIC/ISO/isolationまたはsnapshot UID/fingerprintが一致しない
+- VMSDの`snapshot.needConsolidate`が明示的な`FALSE`ではない（大小文字を除く）
 - VMX、VMSD、VMSN、VMDK chain、payload ISOのpathにreparse pointがある
 - VMware Tools、default route、既存Runtime、canonical/hashed/unknownなSystem32 DLLをEnvironment Aで検出する
 - CLR0400の3ファイルについて、Microsoft署名・OriginalFilename・System32/WinSxS hardlink・SFC exit 0の全証拠を確認できない

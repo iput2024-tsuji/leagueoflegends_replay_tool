@@ -160,6 +160,7 @@ def _config(external_temp: Path, **overrides: object) -> tuple[Path, dict[str, o
             (
                 'snapshot.numSnapshots = "1"',
                 'snapshot.current = "1"',
+                'snapshot.needConsolidate = "FALSE"',
                 'snapshot0.uid = "1"',
                 'snapshot0.displayName = "A0-runtime-absent"',
                 'snapshot0.parent = ""',
@@ -841,6 +842,141 @@ def test_plan_rejects_snapshot_state_fingerprint_change(external_temp: Path):
     output = result.stdout + "\n" + result.stderr
     assert result.returncode != 0
     assert "snapshot UID/fingerprint" in output
+
+
+@pytest.mark.parametrize("value", ["TRUE", "true", "TrUe"])
+def test_capture_refuses_snapshot_that_needs_consolidation(
+    external_temp: Path, value: str
+):
+    config, values = _config(external_temp)
+    vmsd = Path(str(values["vmx_path"])).with_suffix(".vmsd")
+    vmsd.write_text(
+        vmsd.read_text(encoding="utf-8").replace(
+            'snapshot.needConsolidate = "FALSE"',
+            f'snapshot.needConsolidate = "{value}"',
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_lab(config, "Capture")
+
+    output = result.stdout + "\n" + result.stderr
+    assert result.returncode != 0
+    assert "snapshot consolidation" in output
+    assert "snapshot.needConsolidate" in output
+
+
+@pytest.mark.parametrize("value", ["FALSE", "false", "FaLsE"])
+def test_explicit_false_snapshot_consolidation_state_proceeds(
+    external_temp: Path, value: str
+):
+    config, values = _config(external_temp)
+    vmsd = Path(str(values["vmx_path"])).with_suffix(".vmsd")
+    vmsd.write_text(
+        vmsd.read_text(encoding="utf-8").replace(
+            'snapshot.needConsolidate = "FALSE"',
+            f'snapshot.needConsolidate = "{value}"',
+        ),
+        encoding="utf-8",
+    )
+    capture = _json_output(_run_lab(config, "Capture"))
+    values.update(capture["replacement_values"])
+    config.write_text(json.dumps(values), encoding="utf-8")
+
+    result = _run_lab(config, "Plan")
+
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("replacement", "expected"),
+    [
+        ("", "状態を確認できません"),
+        ('snapshot.needConsolidate = ""', "状態を確認できません"),
+        ('snapshot.needConsolidate = " "', "状態を確認できません"),
+        ('snapshot.needConsolidate = "unknown"', "状態を確認できません"),
+    ],
+)
+def test_capture_refuses_unverified_snapshot_consolidation_state(
+    external_temp: Path, replacement: str, expected: str
+):
+    config, values = _config(external_temp)
+    vmsd = Path(str(values["vmx_path"])).with_suffix(".vmsd")
+    vmsd.write_text(
+        vmsd.read_text(encoding="utf-8").replace(
+            'snapshot.needConsolidate = "FALSE"', replacement
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run_lab(config, "Capture")
+
+    output = result.stdout + "\n" + result.stderr
+    assert result.returncode != 0
+    assert expected in output
+    assert "snapshot.needConsolidate" in output
+    assert "corruption" not in output.lower()
+
+
+def test_plan_refuses_consolidation_before_snapshot_fingerprint_validation(
+    external_temp: Path,
+):
+    config, values = _config(external_temp)
+    vmsd = Path(str(values["vmx_path"])).with_suffix(".vmsd")
+    vmsd.write_text(
+        vmsd.read_text(encoding="utf-8").replace(
+            'snapshot.needConsolidate = "FALSE"',
+            'snapshot.needConsolidate = "TRUE"',
+        ),
+        encoding="utf-8",
+    )
+    values["snapshot_fingerprint_sha256"] = "0" * 64
+    config.write_text(json.dumps(values), encoding="utf-8")
+
+    result = _run_lab(config, "Plan")
+
+    output = result.stdout + "\n" + result.stderr
+    assert result.returncode != 0
+    assert "snapshot consolidation" in output
+    assert "fingerprint" not in output
+
+
+def test_doctor_and_confirmed_run_stop_before_credentials_or_vm_mutation(
+    external_temp: Path,
+):
+    config, values = _config(external_temp)
+    vmsd = Path(str(values["vmx_path"])).with_suffix(".vmsd")
+    vmsd.write_text(
+        vmsd.read_text(encoding="utf-8").replace(
+            'snapshot.needConsolidate = "FALSE"',
+            'snapshot.needConsolidate = "TRUE"',
+        ),
+        encoding="utf-8",
+    )
+    Path(str(values["vm_encryption_credential_path"])).write_text(
+        "not a credential", encoding="utf-8"
+    )
+    Path(str(values["guest_credential_path"])).write_text(
+        "not a credential", encoding="utf-8"
+    )
+
+    doctor = _json_output(_run_lab(config, "Doctor"))
+    run = _run_lab(
+        config,
+        "Run",
+        "-ConfirmSnapshotRestore",
+        "-ConfirmRuntimeInstall",
+        "-ConfirmVmPasswordProcessExposure",
+    )
+
+    output = run.stdout + "\n" + run.stderr
+    assert doctor["ready_for_run"] is False
+    assert "snapshot consolidation" in doctor["validation_error"]
+    assert run.returncode != 0
+    assert "snapshot consolidation" in output
+    assert "credentialは" not in output
+    assert "vmrun command failed" not in output
+    assert not Path(str(values["artifact_root"])).exists()
 
 
 def test_plan_rejects_snapshot_vmdk_content_change(external_temp: Path):

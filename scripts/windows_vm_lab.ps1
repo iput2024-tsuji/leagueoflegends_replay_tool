@@ -955,6 +955,19 @@ function Get-SnapshotDefinition {
 
   $vmsdPath = [IO.Path]::ChangeExtension($Config.vmx_path, ".vmsd")
   $values = Get-VmwareKeyValueFile -Path $vmsdPath
+  $needConsolidate = Get-VmwareValue `
+    -Values $values `
+    -Key "snapshot.needConsolidate" `
+    -Optional
+  if ($null -eq $needConsolidate -or [string]::IsNullOrWhiteSpace($needConsolidate)) {
+    throw "VMSDのsnapshot.needConsolidate状態を確認できません。VMwareで状態を確認してください。"
+  }
+  if ($needConsolidate.Equals("true", [StringComparison]::OrdinalIgnoreCase)) {
+    throw "VMware snapshot consolidationが必要です: snapshot.needConsolidate=$needConsolidate。VMwareで状態を確認してください。"
+  }
+  if (-not $needConsolidate.Equals("false", [StringComparison]::OrdinalIgnoreCase)) {
+    throw "VMSDのsnapshot.needConsolidate状態を確認できません。VMwareで状態を確認してください。"
+  }
   $vmsdFileSha256 = Get-Sha256 -Path $vmsdPath
   $matches = @(
     foreach ($key in @($values.Keys)) {

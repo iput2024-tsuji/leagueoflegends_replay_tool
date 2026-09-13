@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import textwrap
 import zipfile
 from pathlib import Path
 
@@ -2958,12 +2959,95 @@ def test_normal_ci_preserves_private_windows_validation_evidence():
         "            -Destination .\\ci-evidence\\"
         in stage_evidence
     )
+    assert (
+        "            -LiteralPath .\\dist\\LoLReplayTool `\n"
+        "            -Destination .\\ci-evidence\\LoLReplayTool `\n"
+        "            -Recurse `\n"
+        "            -ErrorAction Stop"
+        in stage_evidence
+    )
+    assert windows_workflow.index("Audit finished installer contents") < (
+        windows_workflow.index("Stage private validation evidence")
+    )
+    assert windows_workflow.index("Test installer audit failure isolation") < (
+        windows_workflow.index("Stage private validation evidence")
+    )
     assert "path: ci-evidence/" in upload_evidence
     assert stage_evidence.index("New-Item") < stage_evidence.index("Copy-Item")
     assert "if-no-files-found: error" in upload_evidence
+    assert "include-hidden-files: true" in upload_evidence
     assert "retention-days: 7" in upload_evidence
     assert "Compress-Archive" not in workflow
     assert "LoLReplayTool-installer" not in workflow
+
+
+@pytest.mark.parametrize("missing", [None, "app", "installer", "provenance"])
+def test_private_validation_evidence_stages_only_complete_payload(tmp_path, missing):
+    powershell = shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell 7 is required to execute the CI staging step")
+    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+    stage = workflow.split(
+        "      - name: Stage private validation evidence", maxsplit=1
+    )[1].split("      - name: Preserve private validation evidence", maxsplit=1)[0]
+    command = textwrap.dedent(stage.split("        run: |\n", maxsplit=1)[1])
+    repository = tmp_path / "repository with spaces"
+    repository.mkdir()
+    (repository / "VERSION").write_text("0.5.2\n", encoding="utf-8")
+    inputs = {
+        "app": {
+            "dist/LoLReplayTool/LoLReplayTool.exe": b"app fixture",
+            "dist/LoLReplayTool/_internal/cv2/cv2.pyd": b"native fixture",
+            "dist/LoLReplayTool/_internal/numpy.libs/.load-order": b"load order fixture",
+            "dist/LoLReplayTool/licenses/build-provenance.json": b"provenance fixture",
+        },
+        "installer": {
+            "dist/installer/LoLReplayTool-Setup-0.5.2.exe": b"installer fixture",
+        },
+        "provenance": {"build provenance.json": b"provenance fixture"},
+    }
+    for group, files in inputs.items():
+        if group != missing:
+            for relative, content in files.items():
+                path = repository / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+    for relative in (
+        "dist/unrelated/vc_redist.x64.exe",
+        "build/intermediate.bin",
+        "tool-cache/compiler.exe",
+    ):
+        path = repository / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"not validation evidence")
+
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-Command",
+         "$ErrorActionPreference = 'Stop'\n" + command],
+        cwd=repository,
+        env={**os.environ, "BUILD_PROVENANCE": str(repository / "build provenance.json")},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    if missing is not None:
+        assert result.returncode != 0, result.stdout + result.stderr
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    staged = {
+        path.relative_to(repository / "ci-evidence").as_posix(): path.read_bytes()
+        for path in (repository / "ci-evidence").rglob("*")
+        if path.is_file()
+    }
+    assert staged == {
+        "LoLReplayTool/LoLReplayTool.exe": b"app fixture",
+        "LoLReplayTool/_internal/cv2/cv2.pyd": b"native fixture",
+        "LoLReplayTool/_internal/numpy.libs/.load-order": b"load order fixture",
+        "LoLReplayTool/licenses/build-provenance.json": b"provenance fixture",
+        "LoLReplayTool-Setup-0.5.2.exe": b"installer fixture",
+        "build-provenance.json": b"provenance fixture",
+    }
 
 
 def test_build_scripts_accept_verified_python_and_provenance():

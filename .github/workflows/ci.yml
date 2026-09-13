@@ -382,11 +382,17 @@ jobs:
           Copy-Item `
             -LiteralPath ".\dist\installer\LoLReplayTool-Setup-$version.exe" `
             -Destination .\ci-evidence\
+          Copy-Item `
+            -LiteralPath .\dist\LoLReplayTool `
+            -Destination .\ci-evidence\LoLReplayTool `
+            -Recurse `
+            -ErrorAction Stop
 
       - name: Preserve private validation evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: opencv-ipp-free-validation-${{ github.sha }}
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 7
           path: ci-evidence/

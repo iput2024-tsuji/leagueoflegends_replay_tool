@@ -96,5 +96,15 @@ jobs:
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/CMakeCCompiler.cmake
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/*.vcxproj
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/*-build-evidence.json
+
+      - name: Preserve selected OpenCV build intermediates
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: opencv-build-diagnostics-intermediates-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 7
+          include-hidden-files: true
+          path: |
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/first-build-diagnostics/**
-            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/**/evidence/**
+            ${{ runner.temp }}/LoLReplayTool-binary-cache/w/b/evidence/**

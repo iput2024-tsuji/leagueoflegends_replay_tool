@@ -1163,16 +1163,24 @@ def test_build_diagnostics_capture_only_selected_static_evidence(tmp_path, monke
     build = source / "_skbuild" / "win-amd64-3.14" / "cmake-build"
     selected = {
         "modules/imgproc/opencv_imgproc.dir/Release/CL.command.1.tlog": b"/O2 /MD morph.dispatch.cpp",
+        "modules/imgproc/opencv_imgproc.dir/Release/.firstpass/CL.command.1.tlog": b"first compile",
         "modules/imgproc/opencv_imgproc.dir/Release/morph.dispatch.cpp.obj": b"object data",
         "modules/python3/opencv_python3.dir/Release/cv2.obj": b"binding object",
         "modules/python3/link.rsp": b"link arguments",
         "lib/Release/opencv_imgproc4130.pdb": b"symbols",
+        "lib/python3/Release/cv2.pdb": b"binding symbols",
     }
     excluded = {
         "build.binlog": b"private token",
         "environment.json": b"private token",
         "modules/core/unrelated.obj": b"private token",
         "lib/Release/unrelated.pdb": b"private token",
+        "lib/python3/Release/unrelated.pdb": b"private token",
+        "lib/python3/Release/opencv_imgproc4130.pdb": b"private token",
+        "lib/python3/Debug/cv2.pdb": b"private token",
+        "lib/python2/Release/cv2.pdb": b"private token",
+        "bin/python3/Release/cv2.pdb": b"private token",
+        "lib/python3/Release/nested/cv2.pdb": b"private token",
         "cv2.pyd": b"private token",
     }
     for relative, data in (selected | excluded).items():

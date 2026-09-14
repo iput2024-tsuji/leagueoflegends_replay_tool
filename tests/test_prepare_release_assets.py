@@ -362,6 +362,19 @@ def test_opencv_workflow_build_and_packaging_share_commit_artifact_and_seal():
     assert "provenance-sha256=$($record.provenance_sha256)" in source
     assert "if: failure()" in source
     assert "**/build.log" in source
+    selected_upload = source.split(
+        "      - name: Preserve selected OpenCV build intermediates", maxsplit=1
+    )[1]
+    assert "if: failure()" in selected_upload
+    assert "include-hidden-files: true" in selected_upload
+    assert "include-hidden-files: true" not in source.split(
+        "      - name: Preserve selected OpenCV build intermediates", maxsplit=1
+    )[0]
+    selected_paths = selected_upload.split("          path: |\n", maxsplit=1)[1]
+    assert {line.strip() for line in selected_paths.splitlines() if line.strip()} == {
+        "${{ runner.temp }}/LoLReplayTool-binary-cache/w/first-build-diagnostics/**",
+        "${{ runner.temp }}/LoLReplayTool-binary-cache/w/b/evidence/**",
+    }
     for name in ("ci.yml", "release.yml"):
         consumer = (workflows / name).read_text(encoding="utf-8")
         assert "uses: ./.github/workflows/build-opencv.yml" in consumer

@@ -1925,7 +1925,7 @@ def _capture_build_diagnostics(
                 selected_pdb = re.fullmatch(
                     r"(?:lib|bin)/release/(?:opencv_imgproc[0-9]*|opencv_python3[0-9]*|cv2)\.pdb",
                     relative,
-                ) is not None
+                ) is not None or relative == "lib/python3/release/cv2.pdb"
                 if path.suffix.casefold() not in {".tlog", ".rsp"} and not selected_object and not selected_pdb:
                     continue
                 if len(report["files"]) >= DIAGNOSTIC_FILE_COUNT_LIMIT:

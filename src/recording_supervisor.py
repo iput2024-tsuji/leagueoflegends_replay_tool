@@ -89,6 +89,7 @@ class RecordingSupervisor:
                         outcome = await self.recorder.record_until_end_async()
                     except Exception as e:
                         should_continue = not stop_event.is_set()
+                        failure_message = self._notification_error_message(e)
                         if self._has_session_data():
                             self._mark_failed_partial(e)
                             result = self._finalize_current_session(RecordingOutcome.FAILED_PARTIAL, e)
@@ -97,10 +98,15 @@ class RecordingSupervisor:
                             else:
                                 self._emit(f"⚠️ 部分保存に失敗しました: {self._finalize_error(result)}")
                                 should_continue = False
+                        if getattr(self.recorder, "recording_started", False) is not False:
+                            should_continue = False
+                            reason = getattr(self.recorder, "failure_reason", None) or str(e)
+                            failure_message = f"録画停止を確認できないため、試合監視を終了しました: {reason}"
+                            self._emit(f"⚠️ {failure_message}")
                         self._notify(
                             NotificationEvent.RECORDING_FAILED,
                             "録画に失敗しました",
-                            self._notification_error_message(e),
+                            failure_message,
                         )
                         if should_continue:
                             self._defer_current_game_after_failure()
@@ -118,7 +124,6 @@ class RecordingSupervisor:
                         else:
                             self._emit("⏹️ 録画セッションを中断しました。")
                         break
-                    self.session_completed = True
                     result = self._finalize_current_session(RecordingOutcome.COMPLETED)
                     if not self._finalize_success(result):
                         self._emit(f"⚠️ セッション保存に失敗しました: {self._finalize_error(result)}")
@@ -128,6 +133,20 @@ class RecordingSupervisor:
                             f"録画セッションを保存できませんでした: {self._finalize_error(result)}",
                         )
                         break
+                    if getattr(result, "outcome", RecordingOutcome.COMPLETED) != RecordingOutcome.COMPLETED:
+                        reason = str(
+                            getattr(self.recorder, "failure_reason", None)
+                            or getattr(result, "error", None)
+                            or "録画の正常終了を確認できませんでした。"
+                        )
+                        self._emit(f"⚠️ 録画の完了に失敗しました: {reason}")
+                        self._notify(
+                            NotificationEvent.RECORDING_FAILED,
+                            "録画の完了に失敗しました",
+                            reason,
+                        )
+                        break
+                    self.session_completed = True
                     self._emit("✅ 試合記録完了。次の試合を待機します。")
                 finally:
                     self._finish_recording()
@@ -279,10 +298,23 @@ class RecordingSupervisor:
         if callable(marker):
             marker(reason)
         result = self._finalize_current_session(RecordingOutcome.ABORTED, reason)
-        if self._finalize_success(result):
-            self._emit("⏹️ 録画セッションを中断ログとして保存しました。")
+        if not self._finalize_success(result):
+            message = f"中断ログの保存に失敗しました: {self._finalize_error(result)}"
+        elif (
+            getattr(result, "outcome", RecordingOutcome.ABORTED) != RecordingOutcome.ABORTED
+            or getattr(self.recorder, "recording_started", False) is not False
+        ):
+            detail = (
+                getattr(self.recorder, "failure_reason", None)
+                or getattr(result, "error", None)
+                or "録画停止を確認できませんでした。"
+            )
+            message = f"録画の中断処理に失敗しました: {detail}"
         else:
-            self._emit(f"⚠️ 中断ログの保存に失敗しました: {self._finalize_error(result)}")
+            self._emit("⏹️ 録画セッションを中断ログとして保存しました。")
+            return result
+        self._emit(f"⚠️ {message}")
+        self._notify(NotificationEvent.RECORDING_FAILED, "録画の中断処理に失敗しました", message)
         return result
 
     def _finalize_current_session(self, outcome: RecordingOutcome, reason: Any | None = None) -> Any:

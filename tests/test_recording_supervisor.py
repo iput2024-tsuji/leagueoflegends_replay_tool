@@ -1,10 +1,11 @@
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from src import recordtest
-from src.recording_state import RecordingOutcome
+from src.recording_state import FinalizeResult, RecordingOutcome
 from src.recording_supervisor import RecordingSupervisor
 
 
@@ -561,6 +562,169 @@ def test_recording_supervisor_notifies_completion_after_game_process_clears():
     assert completed[1].index("wait_for_previous_game_clear_async") > completed[1].index("save_json")
 
 
+@pytest.mark.parametrize("legacy_none", [False, True])
+def test_recording_supervisor_marks_completed_only_after_successful_finalization(legacy_none):
+    class CompletingRecorder(FakeRecorder):
+        def finalize_session(self, outcome=None, failure_reason=None):
+            assert supervisor.session_completed is False
+            super().finalize_session(outcome=outcome, failure_reason=failure_reason)
+            if not legacy_none:
+                return FinalizeResult(success=True, outcome=outcome, saved=True)
+            return None
+
+    recorder = CompletingRecorder()
+    notifications = []
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=FakeRecordingController(recorder),
+        notification_cb=lambda event, *_args: notifications.append((event, supervisor.session_completed)),
+    )
+
+    run(run_supervisor(supervisor))
+
+    assert notifications == [("recording_started", False), ("recording_completed", True)]
+    assert recorder.finalize_outcomes == [RecordingOutcome.COMPLETED]
+    assert recorder.wait_count == 2
+
+
+@pytest.mark.parametrize("status_error", [False, True])
+@pytest.mark.parametrize("recording_exit", ["game_end", "event_error", "cancelled"])
+def test_recording_supervisor_reports_unconfirmed_stop_without_starting_next_session(
+    monkeypatch, tmp_path, status_error, recording_exit
+):
+    obs_client = SimpleNamespace(
+        raw_client=object(),
+        apply_audio_profile=Mock(return_value=True),
+        is_recording_active=Mock(return_value=True, side_effect=OSError("OBS socket closed") if status_error else None),
+        stop_recording=Mock(side_effect=OSError("OBS socket closed")),
+    )
+    riot_client = SimpleNamespace(
+        get_all_game_data_result=AsyncMock(
+            return_value=recordtest.RiotPollResult(
+                recordtest.RiotPollStatus.IN_GAME,
+                payload={"gameData": {"gameTime": 20.0}, "allPlayers": []},
+            )
+        ),
+        get_gameflow_phase_result=AsyncMock(
+            return_value=recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"phase": "InProgress"})
+        ),
+        get_event_data=AsyncMock(
+            return_value={"Events": [{"EventID": 1, "EventName": "GameEnd", "EventTime": 20.0}]}
+        ),
+    )
+    if recording_exit == "event_error":
+        riot_client.get_event_data.side_effect = RuntimeError("event poll failed")
+    recorder = recordtest.LoLAutoRecorder(
+        obs_client=obs_client, riot_api_client=riot_client, auto_setup=False, game_process_checker=lambda: True
+    )
+    if recording_exit == "cancelled":
+        def cancel_event_poll():
+            recorder.request_stop()
+            return None
+
+        riot_client.get_event_data.side_effect = cancel_event_poll
+    recorder.calls = []
+    recorder.wait_for_game_start_async = AsyncMock(side_effect=[True, False])
+    recorder.wait_for_previous_game_clear_async = AsyncMock(return_value=True)
+    recorder.ensure_post_game_result_async = AsyncMock(return_value=None)
+
+    async def start_fixture_recording():
+        recorder.my_name = "fixture-player"
+        recorder.session_started = True
+        recorder.recording_started = True
+
+    recorder.start_recording_async = AsyncMock(side_effect=start_fixture_recording)
+    original_finalize = recorder.finalize_session
+    finalized = []
+
+    def capture_finalize(*args, **kwargs):
+        assert supervisor.session_completed is False
+        result = original_finalize(*args, **kwargs)
+        finalized.append(result)
+        return result
+
+    recorder.finalize_session = Mock(side_effect=capture_finalize)
+    save_payload = Mock()
+    monkeypatch.setattr(recordtest, "build_output_path", lambda _config: tmp_path / "fixture.json")
+    monkeypatch.setattr(recordtest, "save_payload", save_payload)
+    monkeypatch.setattr(recordtest, "enforce_storage_limit", Mock())
+    statuses = []
+    notifications = []
+    recording_controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+        status_cb=statuses.append,
+        notification_cb=lambda event, _title, message: notifications.append(
+            (event, message, supervisor.session_completed)
+        ),
+    )
+
+    run(asyncio.wait_for(run_supervisor(supervisor), timeout=5))
+
+    assert finalized == [FinalizeResult(success=True, outcome=RecordingOutcome.FAILED_PARTIAL, saved=True)]
+    save_payload.assert_called_once()
+    payload = save_payload.call_args.args[1]
+    if recording_exit == "game_end":
+        assert payload["match"]["recording_end_reason"] == "game_end_event"
+    assert payload["session_status"] == "failed_partial"
+    assert payload["obs_record_path"] is None
+    assert "OBS socket closed" in payload["failure_reason"]
+    assert [item[0] for item in notifications] == ["recording_started", "recording_failed"]
+    assert payload["failure_reason"] in notifications[-1][1]
+    assert notifications[-1][2] is False
+    assert any(payload["failure_reason"] in message for message in statuses)
+    assert "✅ 試合記録完了。次の試合を待機します。" not in statuses
+    recorder.wait_for_game_start_async.assert_awaited_once()
+    recorder.start_recording_async.assert_awaited_once()
+    recorder.wait_for_previous_game_clear_async.assert_not_awaited()
+    if status_error:
+        obs_client.stop_recording.assert_not_called()
+    else:
+        obs_client.stop_recording.assert_called_once()
+    assert recording_controller.runtime.close_calls == [False]
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("recording_started_after_finalize", [False, True, None])
+def test_recording_supervisor_continues_after_partial_save_only_when_stop_is_confirmed(
+    recording_started_after_finalize,
+):
+    class FailingRecorder(FakeRecorder):
+        async def record_until_end_async(self):
+            self.recording_started = True
+            raise RuntimeError("event poll failed")
+
+        def finalize_session(self, outcome=None, failure_reason=None):
+            result = super().finalize_session(outcome=outcome, failure_reason=failure_reason)
+            self.recording_started = recording_started_after_finalize
+            return result
+
+    recorder = FailingRecorder()
+    notifications = []
+    statuses = []
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=FakeRecordingController(recorder),
+        status_cb=statuses.append,
+        notification_cb=lambda *args: notifications.append(args),
+    )
+
+    run(run_supervisor(supervisor))
+
+    assert recorder.finalize_outcomes == [RecordingOutcome.FAILED_PARTIAL]
+    assert [item[0] for item in notifications] == ["recording_started", "recording_failed"]
+    if recording_started_after_finalize is False:
+        assert recorder.wait_count == 2
+        assert "wait_for_previous_game_clear_async" in recorder.calls
+        assert "⚠️ 録画エラー後も次の試合監視を継続します。" in statuses
+    else:
+        assert recorder.wait_count == 1
+        assert "wait_for_previous_game_clear_async" not in recorder.calls
+        assert "defer_current_game_until_clear" not in recorder.calls
+        assert "録画停止を確認できないため、試合監視を終了しました" in notifications[-1][2]
+
+
 def test_recording_supervisor_raises_preflight_errors_without_creating_recorder():
     report = {"config": {}, "changed": False, "notes": [], "warnings": [], "errors": ["OBS missing"]}
     recorder = FakeRecorder()
@@ -578,19 +742,30 @@ def test_recording_supervisor_raises_preflight_errors_without_creating_recorder(
     assert recording_controller.runtime.close_calls == []
 
 
-def test_recording_supervisor_does_not_finalize_cancelled_session():
+@pytest.mark.parametrize("finalize_result", ["legacy", "none", "typed"])
+def test_recording_supervisor_does_not_finalize_cancelled_session(finalize_result):
     class CancelledRecorder(FakeRecorder):
         async def record_until_end_async(self):
             self.calls.append("record_until_end_async")
             return RecordingOutcome.CANCELLED
 
+        def finalize_session(self, outcome=None, failure_reason=None):
+            result = super().finalize_session(outcome=outcome, failure_reason=failure_reason)
+            if finalize_result == "none":
+                return None
+            if finalize_result == "typed":
+                return FinalizeResult(success=True, outcome=outcome, saved=True)
+            return result
+
     statuses = []
+    notifications = []
     recorder = CancelledRecorder()
     recording_controller = FakeRecordingController(recorder)
     supervisor = RecordingSupervisor(
         config_controller=FakeConfigController(),
         recording_controller=recording_controller,
         status_cb=statuses.append,
+        notification_cb=lambda *args: notifications.append(args),
     )
 
     run(run_supervisor(supervisor))
@@ -599,7 +774,40 @@ def test_recording_supervisor_does_not_finalize_cancelled_session():
     assert "save_json" in recorder.calls
     assert recorder.finalize_outcomes == [RecordingOutcome.ABORTED]
     assert recorder.failure_reason == "recording was cancelled"
+    assert [item[0] for item in notifications] == ["recording_started"]
     assert recorder.calls[-2:] == ["request_stop", "runtime_close"]
+    assert recording_controller.runtime.close_calls == [False]
+
+
+def test_recording_supervisor_reports_cancelled_session_save_failure_once():
+    class SaveFailingRecorder(FakeRecorder):
+        async def record_until_end_async(self):
+            return RecordingOutcome.CANCELLED
+
+        def finalize_session(self, outcome=None, failure_reason=None):
+            self.calls.append("finalize_session")
+            self.finalize_outcomes.append(outcome)
+            return FinalizeResult(success=False, outcome=outcome, error="disk full")
+
+    statuses = []
+    notifications = []
+    recorder = SaveFailingRecorder()
+    recording_controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(),
+        recording_controller=recording_controller,
+        status_cb=statuses.append,
+        notification_cb=lambda *args: notifications.append(args),
+    )
+
+    run(run_supervisor(supervisor))
+
+    assert recorder.finalize_outcomes == [RecordingOutcome.ABORTED]
+    assert recorder.wait_count == 1
+    assert [item[0] for item in notifications] == ["recording_started", "recording_failed"]
+    assert "disk full" in notifications[-1][2]
+    assert "⚠️ 中断ログの保存に失敗しました: disk full" in statuses
+    assert "⏹️ 録画セッションを中断ログとして保存しました。" not in statuses
     assert recording_controller.runtime.close_calls == [False]
 
 
@@ -663,6 +871,7 @@ def test_recording_supervisor_does_not_emit_started_notification_when_start_fail
 def test_recording_supervisor_does_not_finalize_twice_when_save_fails():
     class SaveFailingRecorder(FakeRecorder):
         def finalize_session(self, outcome=None, failure_reason=None):
+            assert supervisor.session_completed is False
             self.calls.append("finalize_session")
             self.finalize_outcomes.append(outcome)
             return SimpleNamespace(success=False, error="disk full")

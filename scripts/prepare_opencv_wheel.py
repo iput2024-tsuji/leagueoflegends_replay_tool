@@ -64,6 +64,15 @@ BUILD_COMMAND = (
     "--dist-dir",
     "<output-dir>",
 )
+# Logging only: never accept inherited SKBUILD_BUILD_OPTIONS or compiler flags.
+DIAGNOSTIC_BUILD_OPTIONS = "/clp:ShowCommandLine;NoItemAndPropertyList"
+DIAGNOSTIC_TOOL_NAMES = (
+    "cl.exe", "c1.dll", "c1xx.dll", "c2.dll", "link.exe", "lib.exe",
+    "mspdbcore.dll", "mspdbsrv.exe",
+)
+DIAGNOSTIC_FILE_LIMIT = 64 * 1024 * 1024
+DIAGNOSTIC_TOTAL_LIMIT = 256 * 1024 * 1024
+DIAGNOSTIC_FILE_COUNT_LIMIT = 512
 EXPECTED_FFMPEG = {
     "opencv_videoio_ffmpeg.dll": "47730de2286110b0d1250ff9cf50ce56",
     "opencv_videoio_ffmpeg_64.dll": "3248b4663ffef770cdb54ec8b9d16a28",
@@ -771,9 +780,9 @@ def _capture_msbuild_project(source_tree: Path) -> dict[str, Any]:
     }
 
 
-def _capture_compiler(
+def _configured_compiler_path(
     cache: dict[str, str], source_tree: Path | None = None, *, language: str = "CXX"
-) -> dict[str, Any]:
+) -> Path:
     variable = f"CMAKE_{language}_COMPILER"
     raw = cache.get(variable)
     if not raw and source_tree is not None:
@@ -796,6 +805,13 @@ def _capture_compiler(
         raise OpenCVWheelError(f"OpenCV generated files have no {language} compiler")
     compiler = Path(raw)
     _regular(compiler, f"OpenCV {language} compiler")
+    return compiler
+
+
+def _capture_compiler(
+    cache: dict[str, str], source_tree: Path | None = None, *, language: str = "CXX"
+) -> dict[str, Any]:
+    compiler = _configured_compiler_path(cache, source_tree, language=language)
     parts = compiler.parts
     try:
         index = next(
@@ -1808,6 +1824,142 @@ def _reject_inherited_compiler_flags() -> None:
         raise OpenCVWheelError("OpenCV inherited compiler flags are not allowed: " + ", ".join(present))
 
 
+def _diagnostic_bytes(path: Path, limit: int) -> bytes:
+    _regular(path, "OpenCV diagnostic input")
+    size = path.stat().st_size
+    if size > limit:
+        raise OpenCVWheelError("size limit exceeded")
+    with path.open("rb") as stream:
+        data = stream.read(limit + 1)
+    if len(data) != size:
+        raise OpenCVWheelError("diagnostic input changed while reading")
+    return data
+
+
+def _capture_build_diagnostics(
+    source_tree: Path, evidence: Path, command: list[str], *, returncode: int | None
+) -> None:
+    """Save bounded static diagnostics, outside the accepted provenance schema."""
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "purpose": "diagnostics_only_not_release_provenance",
+        "build_command": command,
+        "build_cwd": str(source_tree.absolute()),
+        "build_cwd_resolved": str(source_tree.resolve()),
+        "compiler_process_cwd": None,
+        "compiler_process_cwd_status": "not_observed",
+        "tool_process_paths_status": "not_observed_configured_or_inferred_only",
+        "build_tool_options": DIAGNOSTIC_BUILD_OPTIONS,
+        "build_returncode": returncode,
+        "limits": {
+            "per_file_bytes": DIAGNOSTIC_FILE_LIMIT,
+            "copied_total_bytes": DIAGNOSTIC_TOTAL_LIMIT,
+            "file_count": DIAGNOSTIC_FILE_COUNT_LIMIT,
+        },
+        "tools": [],
+        "files": [],
+        "errors": [],
+    }
+    try:
+        cache = _read_cmake_cache(source_tree)
+        compiler = _configured_compiler_path(cache, source_tree)
+        variables = {"cl.exe": "CMAKE_CXX_COMPILER", "link.exe": "CMAKE_LINKER", "lib.exe": "CMAKE_AR"}
+        configured_paths = {
+            name: (Path(cache[variable]), f"cmake_cache:{variable}")
+            for name, variable in variables.items() if cache.get(variable)
+        }
+        generated = sorted(source_tree.glob("_skbuild/*/cmake-build/CMakeFiles/*/CMakeCXXCompiler.cmake"))
+        if len(generated) == 1:
+            text = _diagnostic_bytes(generated[0], DIAGNOSTIC_FILE_LIMIT).decode("utf-8")
+            for name, variable in variables.items():
+                if name in configured_paths:
+                    continue
+                matches = re.findall(rf'^set\({variable}\s+"([^"]+)"\)', text, re.MULTILINE)
+                if len(matches) == 1:
+                    configured_paths[name] = (Path(matches[0]), f"cmake_compiler_file:{variable}")
+                elif len(matches) > 1:
+                    report["errors"].append(f"ambiguous generated tool path: {variable}")
+        elif len(generated) > 1:
+            report["errors"].append("multiple generated CMake CXX compiler files")
+        for name in DIAGNOSTIC_TOOL_NAMES:
+            tool, origin = configured_paths.get(
+                name, (compiler.parent / name, "inferred_configured_compiler_sibling")
+            )
+            record = {"name": name, "path": str(tool.absolute()), "path_origin": origin}
+            try:
+                data = _diagnostic_bytes(tool, DIAGNOSTIC_FILE_LIMIT)
+                record.update(
+                    resolved_path=str(tool.resolve()), size=len(data),
+                    sha256=hashlib.sha256(data).hexdigest(),
+                )
+            except (OSError, ValueError) as exc:
+                record["error"] = str(exc)
+            report["tools"].append(record)
+    except (OSError, ValueError) as exc:
+        report["errors"].append(f"compiler location unavailable: {exc}")
+
+    copied_bytes = 0
+    for build_root in sorted(source_tree.glob("_skbuild/*/cmake-build")):
+        # Refuse redirected build trees before walking or copying any contents.
+        parents = [build_root, *build_root.parents]
+        if any(path.is_symlink() or path.is_junction() for path in parents[:parents.index(source_tree) + 1]):
+            report["errors"].append("redirected CMake build directory")
+            continue
+        for directory, subdirs, filenames in os.walk(build_root, followlinks=False):
+            directory_path = Path(directory)
+            for name in list(subdirs):
+                child = directory_path / name
+                if child.is_symlink() or child.is_junction():
+                    subdirs.remove(name)
+                    report["errors"].append(f"redirected directory: {child.relative_to(source_tree).as_posix()}")
+            subdirs.sort()
+            for name in sorted(filenames):
+                path = directory_path / name
+                relative = path.relative_to(build_root).as_posix().casefold()
+                selected_object = (
+                    relative.startswith("modules/python3/") and path.suffix.casefold() == ".obj"
+                ) or (
+                    relative.startswith("modules/imgproc/")
+                    and re.fullmatch(r"morph\.dispatch.*\.obj", name, re.IGNORECASE) is not None
+                )
+                selected_pdb = re.fullmatch(
+                    r"(?:lib|bin)/release/(?:opencv_imgproc[0-9]*|opencv_python3[0-9]*|cv2)\.pdb",
+                    relative,
+                ) is not None
+                if path.suffix.casefold() not in {".tlog", ".rsp"} and not selected_object and not selected_pdb:
+                    continue
+                if len(report["files"]) >= DIAGNOSTIC_FILE_COUNT_LIMIT:
+                    report["errors"].append("diagnostic file count limit reached")
+                    break
+                record = {
+                    "path": path.relative_to(source_tree).as_posix(),
+                    "kind": "object" if selected_object else "pdb" if selected_pdb else "compiler_log",
+                }
+                try:
+                    data = _diagnostic_bytes(
+                        path, min(DIAGNOSTIC_FILE_LIMIT, DIAGNOSTIC_TOTAL_LIMIT - copied_bytes)
+                    )
+                    destination = evidence / "intermediates" / record["path"]
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with destination.open("xb") as stream:
+                        stream.write(data)
+                    copied_bytes += len(data)
+                    record.update(size=len(data), sha256=hashlib.sha256(data).hexdigest())
+                except (OSError, ValueError) as exc:
+                    record["error"] = str(exc)
+                report["files"].append(record)
+            if len(report["files"]) >= DIAGNOSTIC_FILE_COUNT_LIMIT:
+                break
+    report["copied_bytes"] = copied_bytes
+    captured_kinds = {item["kind"] for item in report["files"] if "sha256" in item}
+    report["missing_categories"] = sorted({"compiler_log", "object", "pdb"} - captured_kinds)
+    if not report["files"]:
+        report["errors"].append("no matching compiler logs or intermediates were found")
+    (evidence / "build-diagnostics.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def _run_once(
     source_dir: Path,
     output_dir: Path,
@@ -1873,18 +2025,33 @@ def _run_once(
     environment["OPENCV_PYTHON_SKIP_GIT_COMMANDS"] = "1"
     for flag in ("ENABLE_CONTRIB", "ENABLE_HEADLESS", "ENABLE_ROLLING"):
         environment[flag] = "0"
-    completed = subprocess.run(
-        actual_command,
-        cwd=source_tree,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    (work_dir / "build.log").write_text(
-        "\n".join(part for part in (completed.stdout, completed.stderr) if part),
-        encoding="utf-8",
-    )
+    environment["SKBUILD_BUILD_OPTIONS"] = DIAGNOSTIC_BUILD_OPTIONS
+    evidence = work_dir / "evidence"
+    evidence.mkdir()
+    completed = None
+    try:
+        completed = subprocess.run(
+            actual_command,
+            cwd=source_tree,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        (work_dir / "build.log").write_text(
+            "\n".join(part for part in (completed.stdout, completed.stderr) if part),
+            encoding="utf-8",
+        )
+    finally:
+        try:
+            _capture_build_diagnostics(
+                source_tree, evidence, actual_command,
+                returncode=completed.returncode if completed is not None else None,
+            )
+        except Exception as exc:
+            # Diagnostics must not replace the original build failure or relax
+            # any existing validation, including failures later in the probes.
+            print(f"OpenCV diagnostic collection failed ({type(exc).__name__})", file=sys.stderr)
     if completed.returncode != 0:
         output = "\n".join(
             part for part in (completed.stdout, completed.stderr) if part
@@ -1897,8 +2064,6 @@ def _run_once(
     wheel = _output_wheel(output_dir, str(policy["output_filename"]))
     _reject_ipp(wheel)
     configured_toolchain = _capture_configured_toolchain(source_tree)
-    evidence = work_dir / "evidence"
-    evidence.mkdir()
     for generated in source_tree.glob("_skbuild/*/cmake-build/modules/core/version_string.inc"):
         _regular(generated, "OpenCV generated build information")
         shutil.copy2(generated, evidence / "version_string.inc")

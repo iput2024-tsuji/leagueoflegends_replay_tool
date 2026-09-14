@@ -967,9 +967,10 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
             flag not in env
             for flag in (
                 "CL", "_CL_", "LINK", "_LINK_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
-                "SKBUILD_BUILD_OPTIONS", "CMAKE_TOOLCHAIN_FILE", "OPENCV_CMAKE_HOOKS_DIR",
+                "CMAKE_TOOLCHAIN_FILE", "OPENCV_CMAKE_HOOKS_DIR",
             )
         )
+        assert env["SKBUILD_BUILD_OPTIONS"] == "/clp:ShowCommandLine;NoItemAndPropertyList"
         assert "SKBUILD_CONFIGURE_OPTIONS" not in env
         assert (cwd / "opencv" / "CMakeLists.txt").is_file()
         assert (cwd / target.NOTICE_SOURCE_PATH).read_bytes() == b"source\r\n"
@@ -1118,6 +1119,9 @@ def test_run_build_failure_removes_unsealed_output_and_work(
     def fake_run(command, *, cwd, env, check, capture_output, text):
         nonlocal calls
         calls += 1
+        tlog = cwd / "_skbuild" / "win-amd64-3.14" / "cmake-build" / "CL.command.1.tlog"
+        tlog.parent.mkdir(parents=True, exist_ok=True)
+        tlog.write_text(f"command for build {calls}", encoding="utf-8")
         if calls == fail_call:
             return type(
                 "Completed",
@@ -1137,8 +1141,180 @@ def test_run_build_failure_removes_unsealed_output_and_work(
         target.run(tmp_path, output, lock_path, work)
     assert not output.exists()
     assert (work / "b" / "build.log").read_text() == "out\nbuild failed"
+    current_evidence = work / "b" / "evidence"
+    current = json.loads((current_evidence / "build-diagnostics.json").read_text(encoding="utf-8"))
+    assert current["build_returncode"] == 1
+    assert (current_evidence / "intermediates" / current["files"][0]["path"]).read_text() == (
+        f"command for build {fail_call}"
+    )
     if fail_call == 2:
         assert (work / "first-build-evidence.json").is_file()
+        first_evidence = work / "first-build-diagnostics"
+        first = json.loads((first_evidence / "build-diagnostics.json").read_text(encoding="utf-8"))
+        assert first["build_returncode"] == 0
+        assert (first_evidence / "intermediates" / first["files"][0]["path"]).read_text() == "command for build 1"
+
+
+def test_build_diagnostics_capture_only_selected_static_evidence(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    compiler = _write_configured_toolchain(source)
+    for name in target.DIAGNOSTIC_TOOL_NAMES:
+        (compiler.parent / name).write_bytes(name.encode())
+    build = source / "_skbuild" / "win-amd64-3.14" / "cmake-build"
+    selected = {
+        "modules/imgproc/opencv_imgproc.dir/Release/CL.command.1.tlog": b"/O2 /MD morph.dispatch.cpp",
+        "modules/imgproc/opencv_imgproc.dir/Release/morph.dispatch.cpp.obj": b"object data",
+        "modules/python3/opencv_python3.dir/Release/cv2.obj": b"binding object",
+        "modules/python3/link.rsp": b"link arguments",
+        "lib/Release/opencv_imgproc4130.pdb": b"symbols",
+    }
+    excluded = {
+        "build.binlog": b"private token",
+        "environment.json": b"private token",
+        "modules/core/unrelated.obj": b"private token",
+        "lib/Release/unrelated.pdb": b"private token",
+        "cv2.pyd": b"private token",
+    }
+    for relative, data in (selected | excluded).items():
+        path = build / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    monkeypatch.setenv("ACTIONS_RUNTIME_TOKEN", "private token")
+
+    target._capture_build_diagnostics(source, evidence, ["python.exe", "setup.py"], returncode=0)
+
+    raw = (evidence / "build-diagnostics.json").read_text(encoding="utf-8")
+    report = json.loads(raw)
+    assert "private token" not in raw
+    assert report["build_cwd"] == str(source.absolute())
+    assert report["build_cwd_resolved"] == str(source.resolve())
+    assert report["compiler_process_cwd"] is None
+    assert report["compiler_process_cwd_status"] == "not_observed"
+    assert report["tool_process_paths_status"] == "not_observed_configured_or_inferred_only"
+    assert report["errors"] == []
+    assert report["missing_categories"] == []
+    assert report["copied_bytes"] == sum(map(len, selected.values()))
+    assert {item["name"] for item in report["tools"]} == set(target.DIAGNOSTIC_TOOL_NAMES)
+    for item in report["tools"]:
+        assert item["sha256"] == hashlib.sha256(item["name"].encode()).hexdigest()
+        assert item["path_origin"] == (
+            "cmake_cache:CMAKE_CXX_COMPILER" if item["name"] == "cl.exe"
+            else "inferred_configured_compiler_sibling"
+        )
+    copied = {
+        path.relative_to(evidence / "intermediates" / build.relative_to(source)).as_posix(): path.read_bytes()
+        for path in (evidence / "intermediates").rglob("*") if path.is_file()
+    }
+    assert copied == selected
+    assert not any(path.name in target.DIAGNOSTIC_TOOL_NAMES for path in evidence.rglob("*"))
+
+
+@pytest.mark.parametrize("configuration_source", ["cmake_cache", "cmake_compiler_file"])
+def test_build_diagnostics_use_configured_linker_and_archiver(tmp_path, configuration_source):
+    source = tmp_path / "source"
+    compiler = _write_configured_toolchain(source)
+    cache_path = next(source.glob("_skbuild/*/cmake-build/CMakeCache.txt"))
+    configured = {"CMAKE_CXX_COMPILER": compiler}
+    for variable, name in {"CMAKE_LINKER": "link.exe", "CMAKE_AR": "lib.exe"}.items():
+        (compiler.parent / name).write_bytes(b"inferred tool must not be selected")
+        tool = tmp_path / "configured-tools" / name
+        tool.parent.mkdir(exist_ok=True)
+        tool.write_bytes(f"configured {name}".encode())
+        configured[variable] = tool
+    if configuration_source == "cmake_cache":
+        with cache_path.open("a", encoding="utf-8") as stream:
+            stream.write("\n" + "\n".join(
+                f"{key}:FILEPATH={configured[key]}" for key in ("CMAKE_LINKER", "CMAKE_AR")
+            ))
+    else:
+        cache_path.write_text("\n".join(
+            line for line in cache_path.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("CMAKE_CXX_COMPILER:")
+        ), encoding="utf-8")
+        generated = cache_path.parent / "CMakeFiles" / "3.31.6" / "CMakeCXXCompiler.cmake"
+        generated.parent.mkdir(parents=True)
+        generated.write_text("\n".join(
+            f'set({key} "{value}")' for key, value in configured.items()
+        ), encoding="utf-8")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+
+    target._capture_build_diagnostics(source, evidence, ["python.exe"], returncode=0)
+
+    report = json.loads((evidence / "build-diagnostics.json").read_text(encoding="utf-8"))
+    records = {item["name"]: item for item in report["tools"]}
+    for variable, name in {
+        "CMAKE_CXX_COMPILER": "cl.exe", "CMAKE_LINKER": "link.exe", "CMAKE_AR": "lib.exe",
+    }.items():
+        assert records[name]["path"] == str(configured[variable].absolute())
+        assert records[name]["sha256"] == hashlib.sha256(configured[variable].read_bytes()).hexdigest()
+        assert records[name]["path_origin"] == f"{configuration_source}:{variable}"
+    assert records["c1xx.dll"]["path_origin"] == "inferred_configured_compiler_sibling"
+    assert report["tool_process_paths_status"] == "not_observed_configured_or_inferred_only"
+
+
+@pytest.mark.parametrize("count_limit", [1, 512])
+def test_build_diagnostics_enforce_byte_and_count_limits(tmp_path, monkeypatch, count_limit):
+    source = tmp_path / "source"
+    _write_configured_toolchain(source)
+    build = source / "_skbuild" / "win-amd64-3.14" / "cmake-build"
+    for name, content in {"a.tlog": b"one", "b.tlog": b"two", "c.rsp": b"oversized"}.items():
+        (build / name).write_bytes(content)
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    monkeypatch.setattr(target, "DIAGNOSTIC_FILE_LIMIT", 4)
+    monkeypatch.setattr(target, "DIAGNOSTIC_TOTAL_LIMIT", 5)
+    monkeypatch.setattr(target, "DIAGNOSTIC_FILE_COUNT_LIMIT", count_limit)
+
+    target._capture_build_diagnostics(source, evidence, ["python.exe"], returncode=1)
+
+    report = json.loads((evidence / "build-diagnostics.json").read_text(encoding="utf-8"))
+    copied = [path for path in (evidence / "intermediates").rglob("*") if path.is_file()]
+    assert sum(path.stat().st_size for path in copied) == report["copied_bytes"] == 3
+    assert len(report["files"]) <= count_limit
+    assert report["missing_categories"] == ["object", "pdb"]
+    if count_limit == 1:
+        assert "diagnostic file count limit reached" in report["errors"]
+    else:
+        assert all("size limit" in item["error"] for item in report["files"][1:])
+
+
+def test_build_diagnostics_do_not_walk_redirected_directory(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    _write_configured_toolchain(source)
+    redirected = source / "_skbuild" / "win-amd64-3.14" / "cmake-build" / "external"
+    redirected.mkdir()
+    (redirected / "private.tlog").write_text("must not be captured", encoding="utf-8")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    is_junction = Path.is_junction
+    monkeypatch.setattr(Path, "is_junction", lambda path: path == redirected or is_junction(path))
+
+    target._capture_build_diagnostics(source, evidence, ["python.exe"], returncode=1)
+
+    report = json.loads((evidence / "build-diagnostics.json").read_text(encoding="utf-8"))
+    assert report["files"] == []
+    assert any("redirected directory" in error for error in report["errors"])
+    assert not (evidence / "intermediates").exists()
+
+
+def test_diagnostic_failure_preserves_original_build_failure(tmp_path, monkeypatch, capsys):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    _mock_build_dependencies(monkeypatch)
+    monkeypatch.setattr(target.subprocess, "run", lambda *args, **kwargs: type(
+        "Completed", (), {"returncode": 1, "stdout": "", "stderr": "compiler failed"}
+    )())
+
+    def fail_diagnostics(*args, **kwargs):
+        raise OSError("diagnostic storage unavailable")
+
+    monkeypatch.setattr(target, "_capture_build_diagnostics", fail_diagnostics)
+    with pytest.raises(target.OpenCVWheelError, match="OpenCV wheel build failed: compiler failed"):
+        target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
+    assert "diagnostic collection failed (OSError)" in capsys.readouterr().err
+    assert not (tmp_path / "output").exists()
 
 
 def test_formal_build_requires_runner_image_identity(tmp_path, monkeypatch):

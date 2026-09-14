@@ -331,6 +331,25 @@ def test_reset_during_debounce_restores_navigation(live_audio_page, monkeypatch,
     assert not HeldAudioWorker.instances
 
 
+def test_reset_button_click_cancels_debounce_and_restores_saved_mute(live_audio_page, monkeypatch, qtbot):
+    page = live_audio_page
+    load = Mock(return_value={"audio": {"mic": {"mute": False}}})
+    monkeypatch.setattr(app.CONFIG_CONTROLLER.repository, "load", load)
+    page.show()
+    page.audio_mic_mute.setChecked(True)
+    assert page._audio_apply_timer.isActive()
+    assert not page.back_btn.isEnabled()
+    reset = page.settings_buttons.button(app.QDialogButtonBox.StandardButton.Reset)
+
+    qtbot.mouseClick(reset, Qt.MouseButton.LeftButton)
+
+    load.assert_called_once_with(create_if_missing=False)
+    assert not page.audio_mic_mute.isChecked()
+    assert not page._audio_apply_timer.isActive()
+    assert page.back_btn.isEnabled()
+    assert not HeldAudioWorker.instances
+
+
 def test_audio_prepare_failure_restores_navigation(live_audio_page):
     page = live_audio_page
     page.audio_mic_mute.setChecked(True)

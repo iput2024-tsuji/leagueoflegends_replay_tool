@@ -1019,7 +1019,7 @@ class SettingsPage(QWidget):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Reset)
         self.settings_buttons = buttons
         buttons.accepted.connect(self.save_settings)
-        buttons.rejected.connect(self.reset_settings)
+        buttons.button(QDialogButtonBox.StandardButton.Reset).clicked.connect(self.reset_settings)
         root_layout.addWidget(buttons)
 
         self.audio_mic_device.currentIndexChanged.connect(self.queue_audio_auto_apply)

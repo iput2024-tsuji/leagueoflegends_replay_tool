@@ -2,6 +2,28 @@
 
 LoL Replay Tool is licensed under `GPL-3.0-only`.
 
+Under the [September 4 maintainer decision](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910),
+external legal review remains unperformed. Unavailable historical artifacts,
+unverified publisher-internal artifact chains and byte-for-byte rebuilding
+limits are disclosed rather than treated as automatic Release blockers.
+This does not establish legal compliance or complete any missing source,
+license, notice, native-binary, Runtime, clean-VM or independent-review evidence.
+
+[9月4日の管理者決定](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910)により、
+外部法務レビューは未実施と明記し、取得不能な履歴成果物、未確認のpublisher内部
+artifact chain、byte単位の再buildの限界は自動停止条件ではなく開示事項とします。
+法的適合を断定せず、source、license、notice、native binary、Runtime、clean VM、
+独立レビューの技術証拠不足は引き続き公開を止めます。
+
+`release_disclosure` records only the decision's approved classifications.
+The old review-required flags and reasons, and unverified fact flags, are
+retained as history; only records with a validated disclosure are treated
+under that limited classification. They are not marked as reviewed or verified.
+
+`release_disclosure`は9月4日決定による限定した分類変更を記録します。旧review-required
+flag・reasonと未確認の事実flagは履歴として保持し、認定を検証できた項目だけを
+開示扱いにします。レビューや検証が完了したことにはしません。
+
 ## Release source assets
 
 Every future binary Release must provide the source and license materials for
@@ -22,8 +44,10 @@ The numbered third-party source archives contain only source archives whose
 URL and SHA256 are locked and verified for the packaged components. They may be
 split into multiple assets, each smaller than 2 GiB. The Release workflow
 refuses publication unless every packaged runtime component has verified source
-coverage, including wheel-vendored native code, or a documented system-library
-exception has completed legal review. The license-materials archive contains
+coverage, including wheel-vendored native code. The two excluded Microsoft
+Runtime records (`microsoft-vc-runtime-python` and `microsoft-vc-runtime`) are
+documented external prerequisites under the decision above, not claimed to
+have verified source or completed legal review. The license-materials archive contains
 the project license, notices, source information, Qt replacement instructions,
 component lock, copied license texts and generated build inventory.
 `SHA256SUMS.txt` identifies every published asset.
@@ -31,8 +55,12 @@ component lock, copied license texts and generated build inventory.
 今後のバイナリReleaseでは、上記の固定した資産名で、検証できたsourceと
 ライセンス資料を提供します。プロジェクトsource archiveは実際にビルドした
 commitから生成し、番号付き第三者source archiveは2 GiB未満の複数資産へ
-分割できます。全runtime componentとwheel内native codeのsource coverageが
-検証済みになるまでRelease workflowは公開を拒否します。
+分割できます。配布に含む全runtime componentとwheel内native codeのsource coverageが
+検証済みになるまでRelease workflowは公開を拒否します。非同梱のMicrosoft Runtime
+2記録（`microsoft-vc-runtime-python`、`microsoft-vc-runtime`）は上記決定による
+外部前提であり、source検証や法務レビューが完了したとは扱いません。ライセンス
+資料には本体license、notice、source情報、Qt置換手順、component lock、個別license
+本文と生成した配布inventoryを含めます。
 `SHA256SUMS.txt`には公開する全資産を記録します。
 
 ## Build inventory and source lock
@@ -70,8 +98,8 @@ reproducible source-build or repair recipe with pinned wheel/source/tool
 inputs, SHA256 values, PE import inventories, and build provenance. The recipe
 must show that hashed Microsoft Runtime imports and app-local Runtime files
 are absent from the dist, expanded installer, and Release assets; these checks
-remain fail-closed. This document does not mark the legal or source-provenance
-review complete, and no public Release is authorized while those gates remain
+remain fail-closed. External legal review remains unperformed and disclosed;
+no public Release is authorized while the mandatory technical gates remain
 open.
 
 Windows x64バイナリ配布物は、利用者が導入するMicrosoft Visual C++
@@ -114,14 +142,15 @@ official module SBOMs identify the build configuration and source revisions,
 and their substantive source inventories match the three locked official
 submodule source archives. The referenced third-party license texts are also
 packaged. The PyQt6-Qt6 wheel publisher's complete repackaging provenance is
-still unverified and remains a Release gate. The unused Mesa `opengl32sw.dll`
+still unverified and is disclosed under the decision above. The unused Mesa `opengl32sw.dll`
 is excluded from the application distribution. Microsoft Visual C++ runtime
-files are classified separately; their remaining source, redistribution or
-exception evidence must be completed independently.
+files are classified separately as excluded external prerequisites; their
+absence from the application, installer and Release assets remains mandatory.
 The NumPy and SciPy records pin the exact MacPython `openblas-libs` tags,
 OpenBLAS commit, Windows workflow and applied patch, but not the complete
-Rtools/GCC/Strawberry toolchain manifests or publisher artifact chains; those
-records therefore remain Release gates.
+Rtools/GCC toolchain manifests or publisher artifact chains; those
+limits are disclosed. The records' incomplete native source coverage remains
+a Release gate independently of the publisher-internal chain.
 Package-specific license texts and the Qt SBOMs are copied under
 `licenses/python-packages/`.
 
@@ -132,14 +161,14 @@ opencv-python内FFmpeg codec libraryについて検証済みの候補を記録�
 MSVC 2022 archive memberとbyte単位で一致します。公式module SBOMからbuild設定と
 source revisionを確認し、実質的なsource inventoryを固定した3つの公式submodule
 source archiveと照合し、参照される第三者ライセンス本文も同梱します。
-PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceは未確認のため、
-Release gateとして残します。未使用のMesa `opengl32sw.dll`はアプリ配布物から
-除外します。Microsoft Visual C++ runtimeは別componentとして分類し、残るsource、
-再配布、例外根拠を個別に完了する必要があります。
+PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceは未確認のまま開示します。
+未使用のMesa `opengl32sw.dll`はアプリ配布物から除外します。Microsoft Visual C++
+Runtimeは非同梱の外部前提として別componentに分類し、app、installer、Release
+assetのRuntime不存在検査を維持します。
 NumPyとSciPyについては、MacPython `openblas-libs`のexact tag、OpenBLAS commit、
-Windows workflow、適用patchを固定しましたが、Rtools/GCC/Strawberry toolchainの
-完全なmanifestと公開wheelまでのartifact chainは未確認のため、Release gateを
-維持します。
+Windows workflow、適用patchを固定しましたが、Rtools/GCC toolchainの
+完全なmanifestと公開wheelまでのartifact chainは未確認のまま開示します。
+これとは別に、未完了のnative source coverageのRelease gateを維持します。
 
 If a listed source asset becomes unavailable, request the matching source
 through the project's Issue tracker. Maintainers must provide an equivalent
@@ -203,10 +232,10 @@ build reference is Actions run `28287427901` at commit
 `c88ded675accf403f4d5e2bfee1bc53247c14af7`. No binary will be restored,
 replaced, or overwritten. The maintainer has recorded acceptance of this audit
 limitation and the associated residual risk while keeping the installer
-withdrawn. That maintainer decision does not by itself mark the recorded
-historical-remediation compliance gate complete. Every technical, source,
-provenance, historical, and licensing gate for a new distribution remains in
-force until its explicit completion criteria are satisfied.
+withdrawn. The September 4 decision treats the unavailable original artifact
+as a disclosed limitation, without claiming a completed historical or external
+legal review. The source, license, notice and technical checks for a new
+distribution remain mandatory.
 
 v0.5.2インストーラーは撤回され、現在ダウンロードできません。元の
 GitHub Actions成果物は保持されていないため、後から追加する履歴資料だけでは
@@ -216,9 +245,9 @@ GitHub Actions成果物は保持されていないため、後から追加する
 `28287427901`、commit `c88ded675accf403f4d5e2bfee1bc53247c14af7`です。
 バイナリの復元・差し替え・上書きは行いません。管理者はこの監査上の制約と
 残余リスクを認識して受け入れ、インストーラーの撤回を維持する決定を記録しています。
-ただし、この管理者決定だけで記録済みの履歴是正compliance gateを完了扱いには
-しません。新しい配布物の技術、source、provenance、履歴、ライセンスに関する
-各gateは、それぞれの完了条件が明示的に満たされるまで維持します。
+9月4日の決定に従い、取得不能な元artifactは開示事項とし、履歴監査や外部法務
+レビューが完了したとは扱いません。新しい配布物のsource、license、noticeと
+技術検査は維持します。
 
 ## Future OBS bundling
 

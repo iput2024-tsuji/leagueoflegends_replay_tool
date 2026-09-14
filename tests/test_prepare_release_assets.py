@@ -1,4 +1,5 @@
 import base64
+import copy
 import hashlib
 import importlib.metadata
 import io
@@ -373,6 +374,7 @@ def _create_asset_set(
     provenance_seal: str | None = "actual",
     runtime_downloads: list[dict[str, object]] | None = None,
     enforce_release_gates: bool = False,
+    external_runtime: dict[str, object] | None = None,
 ) -> tuple[dict[str, object], Path]:
     inno_identity = "b" * 64
     monkeypatch.setattr(
@@ -391,6 +393,8 @@ def _create_asset_set(
     lock = _lock(first, second)
     if runtime_downloads is not None:
         lock["runtime_downloads"] = runtime_downloads
+    if external_runtime is not None:
+        lock["runtime_components"].append(external_runtime)
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
     monkeypatch.setattr(release_assets, "COMPONENTS_FILE", lock_path)
     cache = tmp_path / "cache"
@@ -437,6 +441,10 @@ def _create_asset_set(
     monkeypatch.setattr(release_assets, "_git_output", fake_git_output)
     distribution = tmp_path / "distribution"
     _write_distribution(distribution)
+    if external_runtime is not None:
+        (distribution / "licenses" / "components.json").write_text(
+            json.dumps(lock), encoding="utf-8"
+        )
     build_provenance_sha256 = release_assets.sha256_file(
         distribution / "licenses" / "build-provenance.json"
     )
@@ -1113,6 +1121,150 @@ def test_historical_remediation_requires_complete_review_evidence():
         error.startswith("v0.5.2-historical-remediation:")
         for error in release_gate_errors(lock)
     )
+
+
+@pytest.fixture
+def disclosed_lock():
+    return json.loads(
+        (Path(__file__).resolve().parents[1] / "compliance/components.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("decision_url", ""),
+        ("decision_url", "https://example.invalid/approval"),
+        ("category", "unknown"),
+        ("category", "external-runtime-prerequisite"),
+        ("limitation", ""),
+        ("ignore_source", True),
+    ],
+)
+def test_disclosure_requires_the_approved_category_and_decision(disclosed_lock, field, value):
+    qt = next(item for item in disclosed_lock["runtime_components"] if item["component"] == "qt")
+    qt["release_disclosure"][field] = value
+    assert "qt: invalid or unapproved release disclosure" in release_gate_errors(disclosed_lock)
+    with pytest.raises(ReleaseAssetError, match="unapproved release disclosure"):
+        source_archive_records(disclosed_lock)
+
+
+@pytest.mark.parametrize(
+    "subject", ["microsoft-vc-runtime-python", "microsoft-vc-runtime", "numpy", "scipy", "qt"],
+)
+def test_missing_disclosure_does_not_waive_the_recorded_gate(disclosed_lock, subject):
+    component = next(item for item in disclosed_lock["runtime_components"] if item["component"] == subject)
+    del component["release_disclosure"]
+    assert any(error.startswith(f"{subject}: ") for error in release_gate_errors(disclosed_lock))
+
+
+@pytest.mark.parametrize("subject", ["unknown-native", "opencv-python"])
+def test_disclosure_cannot_be_transferred_to_an_unapproved_component(disclosed_lock, subject):
+    qt = next(item for item in disclosed_lock["runtime_components"] if item["component"] == "qt")
+    if subject == "opencv-python":
+        target = next(item for item in disclosed_lock["runtime_components"] if item["component"] == subject)
+        target["release_disclosure"] = copy.deepcopy(qt["release_disclosure"])
+    else:
+        qt["component"] = subject
+    errors = release_gate_errors(disclosed_lock)
+    assert any("unapproved release disclosure" in error for error in errors)
+    if subject == "opencv-python":
+        assert "opencv-python: native_source_coverage_verified is not verified" in errors
+
+
+@pytest.mark.parametrize("first", [False, True])
+def test_duplicate_runtime_record_cannot_reuse_a_disclosure(disclosed_lock, first):
+    component = next(
+        item for item in disclosed_lock["runtime_components"]
+        if item["component"] == "microsoft-vc-runtime"
+    )
+    changed = copy.deepcopy(component)
+    changed["artifact_patterns"] = ["_internal/rogue.dll"]
+    changed["corresponding_source_required"] = True
+    disclosed_lock["runtime_components"].insert(0 if first else len(disclosed_lock["runtime_components"]), changed)
+    errors = release_gate_errors(disclosed_lock)
+    assert "microsoft-vc-runtime: duplicate release component" in errors
+    assert "microsoft-vc-runtime: no verified exact source archive is locked" in errors
+    with pytest.raises(ReleaseAssetError, match="excluded external Runtime boundary"):
+        source_archive_records(disclosed_lock)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("artifact_patterns", ["*.dll"]), ("corresponding_source_required", True),
+     ("distribution", "other-wheel"), ("excluded_upstream_runtime_artifacts", []),
+     ("excluded_upstream_runtime_artifacts", "not an inventory"),
+     ("source_exception", {}), ("license_materials_exception", {})],
+)
+def test_external_disclosure_requires_the_non_bundled_boundary(disclosed_lock, field, value):
+    component = next(
+        item for item in disclosed_lock["runtime_components"]
+        if item["component"] == "microsoft-vc-runtime"
+    )
+    component[field] = value
+    errors = release_gate_errors(disclosed_lock)
+    assert any("excluded external Runtime boundary" in error for error in errors)
+    with pytest.raises(ReleaseAssetError, match="excluded external Runtime boundary"):
+        source_archive_records(disclosed_lock)
+
+
+@pytest.mark.parametrize("subject", ["numpy", "scipy", "qt"])
+def test_disclosure_preserves_missing_source_native_and_notice_gates(disclosed_lock, subject):
+    component = next(item for item in disclosed_lock["runtime_components"] if item["component"] == subject)
+    component["source_archives"] = []
+    component["source_status"] = "incomplete_corresponding_source"
+    component["native_source_coverage_verified"] = False
+    component["license_materials"] = []
+    if subject == "qt":
+        component["qt_plugin_third_party_notices_verified"] = False
+    errors = release_gate_errors(disclosed_lock)
+    for reason in (
+        "no verified exact source archive is locked",
+        "source_status is not verified_corresponding_source",
+        "native_source_coverage_verified is not verified",
+        "license_materials must be a non-empty list",
+    ):
+        assert f"{subject}: {reason}" in errors
+    if subject == "qt":
+        assert "qt: Qt third-party notices are not verified" in errors
+    with pytest.raises(ReleaseAssetError, match="no verified exact source archive"):
+        source_archive_records(disclosed_lock)
+
+
+def test_historical_disclosure_preserves_withdrawal_and_unreviewed_facts(disclosed_lock):
+    historical = disclosed_lock["historical_remediation"]
+    assert historical["review_completed"] is False
+    historical["installer_withdrawn"] = False
+    assert any("historical disclosure differs" in error for error in release_gate_errors(disclosed_lock))
+
+
+def test_external_disclosure_survives_source_assets_and_revalidation(disclosed_lock, tmp_path, monkeypatch):
+    external = next(
+        item for item in disclosed_lock["runtime_components"]
+        if item["component"] == "microsoft-vc-runtime"
+    )
+    # Keep the source/disclosure/license gates real; this synthetic fixture has no native build.
+    monkeypatch.setattr(release_assets, "_release_binary_policy_errors", lambda _lock: [])
+    monkeypatch.setattr(release_assets, "_python_native_profile_errors", lambda _lock: [])
+    payload, output = _create_asset_set(
+        tmp_path, monkeypatch, external_runtime=external, enforce_release_gates=True,
+    )
+    verify_release_asset_list(Path(payload["asset_list"]))
+    with zipfile.ZipFile(output / "LoLReplayTool-third-party-sources-1.2.3-01.zip") as archive:
+        index = json.loads(archive.read("SOURCE_INDEX.json"))
+        assert {item["component"] for item in index["sources"]} == {"python", "demo"}
+    with zipfile.ZipFile(output / "LoLReplayTool-license-materials-1.2.3.zip") as archive:
+        packaged = json.loads(archive.read("licenses/components.json"))["runtime_components"][-1]
+        assert packaged["release_disclosure"] == external["release_disclosure"]
+        assert packaged["source_exception"]["review_completed"] is False
+    lock_path = tmp_path / "components.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["runtime_components"][-1]["release_disclosure"]["decision_url"] = ""
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    with pytest.raises(ReleaseAssetError, match="unapproved release disclosure"):
+        verify_release_asset_list(Path(payload["asset_list"]))
 
 
 def test_native_wheel_metadata_is_required_and_tampering_fails(

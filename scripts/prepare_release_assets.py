@@ -71,6 +71,18 @@ LICENSE_ROOT_FILES = (
     "VERSION",
 )
 PYTHON_RUNTIME_SOURCE = "official_binary_archive"
+RELEASE_DISCLOSURE_DECISION = (
+    "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/"
+    "issues/54#issuecomment-5538215910"
+)
+RELEASE_DISCLOSURE_CATEGORIES = {
+    "v0.5.2-historical-remediation": "unavailable-historical-artifact",
+    "microsoft-vc-runtime-python": "external-runtime-prerequisite",
+    "microsoft-vc-runtime": "external-runtime-prerequisite",
+    "numpy": "unverified-publisher-artifact-chain",
+    "scipy": "unverified-publisher-artifact-chain",
+    "qt": "unverified-publisher-repackaging",
+}
 REQUIRED_RELEASE_BINARY_COMPONENTS = frozenset(
     {
         "aiohappyeyeballs",
@@ -329,6 +341,51 @@ def _completed_review(component: dict[str, Any], field: str) -> bool:
             for required in ("evidence", "scope", "reviewer", "date")
         )
     )
+
+
+def _release_disclosure_category(
+    record: dict[str, Any], subject: str | None = None,
+) -> str | None:
+    """Recognize only the recorded September 4 decision, without verifying facts."""
+    if not isinstance(record, dict):
+        raise ReleaseAssetError(f"{subject}: invalid release disclosure record")
+    disclosure = record.get("release_disclosure")
+    if disclosure is None:
+        return None
+    subject = subject or str(record.get("component", ""))
+    expected = RELEASE_DISCLOSURE_CATEGORIES.get(subject)
+    if (
+        not isinstance(disclosure, dict)
+        or set(disclosure) != {"category", "decision_url", "limitation"}
+        or expected is None
+        or disclosure.get("category") != expected
+        or disclosure.get("decision_url") != RELEASE_DISCLOSURE_DECISION
+        or not isinstance(disclosure.get("limitation"), str)
+        or not disclosure["limitation"].strip()
+    ):
+        raise ReleaseAssetError(f"{subject}: invalid or unapproved release disclosure")
+    if expected == "unavailable-historical-artifact" and (
+        record.get("release") != "v0.5.2"
+        or record.get("original_actions_artifact_retained") is not False
+        or record.get("installer_withdrawn") is not True
+        or record.get("binary_replacement_prohibited") is not True
+        or record.get("review_completed") is not False
+    ):
+        raise ReleaseAssetError(f"{subject}: historical disclosure differs from the decision")
+    if expected == "external-runtime-prerequisite" and (
+        record.get("artifact_patterns") != []
+        or record.get("corresponding_source_required") is not False
+        or record.get("distribution") is not None
+        or not isinstance(record.get("excluded_upstream_runtime_artifacts"), list)
+        or not record.get("excluded_upstream_runtime_artifacts")
+        or not isinstance(record.get("source_exception"), dict)
+        or record["source_exception"].get("kind") != "external-runtime-prerequisite-review"
+        or record["source_exception"].get("review_completed") is not False
+        or not isinstance(record.get("license_materials_exception"), dict)
+        or record["license_materials_exception"].get("review_completed") is not False
+    ):
+        raise ReleaseAssetError(f"{subject}: disclosure requires the excluded external Runtime boundary")
+    return expected
 
 
 def _runtime_download_policy_errors(lock: dict[str, Any]) -> list[str]:
@@ -590,11 +647,12 @@ def _license_material_lock_errors(
     component: dict[str, Any],
     *,
     release_python_version: str,
+    external_prerequisite: bool = False,
 ) -> list[str]:
     component_name = str(component.get("component", "<unknown>"))
     materials = component.get("license_materials")
     if materials is None:
-        if _license_materials_exception_reviewed(component):
+        if _license_materials_exception_reviewed(component) or external_prerequisite:
             return []
         return [
             f"{component_name}: exact license materials or a completed reviewed "
@@ -890,18 +948,38 @@ def _python_native_profile_errors(lock: dict[str, Any]) -> list[str]:
 
 def release_gate_errors(lock: dict[str, Any]) -> list[str]:
     errors = _runtime_download_policy_errors(lock)
+    disclosures: dict[str, str | None] = {}
+    for subject, record in [
+        ("v0.5.2-historical-remediation", lock.get("historical_remediation", {})),
+        *[(str(item["component"]), item) for item in _component_entries(lock)],
+    ]:
+        if subject in disclosures:
+            errors.append(f"{subject}: duplicate release component")
+            disclosures[subject] = None
+            continue
+        try:
+            disclosures[subject] = _release_disclosure_category(record, subject)
+        except ReleaseAssetError as exc:
+            disclosures[subject] = None
+            errors.append(str(exc))
     try:
         validate_inno_component_lock(lock)
     except InnoSetupProvenanceError as exc:
         errors.append(f"inno-setup: {exc}")
-    if not _completed_review(lock, "historical_remediation"):
+    if (
+        not _completed_review(lock, "historical_remediation")
+        and disclosures["v0.5.2-historical-remediation"] is None
+    ):
         errors.append(
             "v0.5.2-historical-remediation: review evidence is incomplete"
         )
     errors.extend(_release_binary_policy_errors(lock))
     errors.extend(_python_native_profile_errors(lock))
     for component in _component_entries(lock):
-        if component.get("release_legal_review_required"):
+        if (
+            component.get("release_legal_review_required")
+            and disclosures[str(component["component"])] is None
+        ):
             errors.append(
                 f"{component['component']}: {component.get('release_gate_reason', 'expert legal review is required')}"
             )
@@ -913,7 +991,10 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
     ]
     for component in source_required_components:
         archives = component.get("source_archives")
-        exception_reviewed = _source_exception_reviewed(component)
+        exception_reviewed = (
+            _source_exception_reviewed(component)
+            or disclosures[str(component["component"])] == "external-runtime-prerequisite"
+        )
         if not archives and not exception_reviewed:
             errors.append(f"{component['component']}: no verified exact source archive is locked")
         if (
@@ -938,6 +1019,11 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
             "build_provenance_verified",
             "native_source_coverage_verified",
         ):
+            if (
+                provenance_field == "wheel_build_provenance_verified"
+                and disclosures[str(component["component"])] == "unverified-publisher-repackaging"
+            ):
+                continue
             if component.get(provenance_field) is not None and component.get(provenance_field) is not True:
                 errors.append(f"{component['component']}: {provenance_field} is not verified")
         qt_notices_verified = component.get(
@@ -951,6 +1037,9 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
             _license_material_lock_errors(
                 component,
                 release_python_version=str(lock["python"]["release_version"]),
+                external_prerequisite=(
+                    disclosures[str(component["component"])] == "external-runtime-prerequisite"
+                ),
             )
         )
         if _binary_archive_required(component):
@@ -990,9 +1079,13 @@ def source_archive_records(lock: dict[str, Any]) -> list[dict[str, Any]]:
         ]
     }
     for component in _component_entries(lock):
+        disclosure = _release_disclosure_category(component)
         archives = component.get("source_archives", [])
         if id(component) in source_required_ids and not archives:
-            exception_reviewed = _source_exception_reviewed(component)
+            exception_reviewed = (
+                _source_exception_reviewed(component)
+                or disclosure == "external-runtime-prerequisite"
+            )
             if not exception_reviewed:
                 raise ReleaseAssetError(
                     f"Runtime component has no verified exact source archive: {component['component']}"

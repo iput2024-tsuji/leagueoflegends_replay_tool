@@ -53,7 +53,7 @@ public-Release gates remain open until their explicit criteria are met.
 | OpenCV FFmpeg DLL | Video I/O used by OpenCV | LGPL-2.1-or-later for the locked build, with the notices shipped for that wheel |
 | NumPy, pandas, SciPy, scikit-learn | Numerical and analytics libraries | Primarily BSD-3-Clause, with component-specific bundled notices |
 | OpenBLAS and other numerical binaries | Numerical runtime used by wheels | OpenBLAS and LAPACK use BSD-style terms; statically linked GCC runtime portions are covered by GPL-3.0-or-later with GCC Runtime Library Exception 3.1, with the full notices included in the wheels |
-| Microsoft Visual C++ runtime files | Native runtime used by CPython, Qt and numerical wheels | Microsoft Visual C++ Redistributable terms; redistribution/source-exception evidence remains a Release gate |
+| Microsoft Visual C++ runtime prerequisite | External runtime used by CPython, Qt and numerical wheels; not bundled | External legal review remains unperformed; packaging checks verify the excluded external-runtime boundary |
 | aiohttp, Requests and supporting packages | Network clients | Component-specific permissive licenses included with the packages |
 | PyInstaller bootloader | Executable packaging bootloader | GPL-2.0-or-later with the PyInstaller bootloader exception |
 | Inno Setup 6.7.3 | Setup/Uninstall stubs and LZMA decompression code embedded in the public installer; LZMA compression tools are build-only inputs | Inno Setup License; the pinned license text is copied with the distribution materials |
@@ -63,9 +63,10 @@ hashes where verified, are recorded in `licenses/components.json`. The 20 Qt
 artifacts shipped by this application are byte-identical to members of the
 official Qt 6.10.2 archives. Their official module SBOMs, corresponding
 submodule source archives and referenced license texts are locked. The
-PyQt6-Qt6 wheel publisher's complete repackaging provenance remains a Release
-gate, as do the Microsoft runtime records and any other gate
-listed in the component lock. The generated `licenses/distribution-manifest.json`
+PyQt6-Qt6 wheel publisher's complete repackaging provenance remains unverified
+and disclosed under the September 4 decision linked below. Microsoft Runtime
+records describe excluded external prerequisites. Source, license, notice and
+native-binary checks remain mandatory. The generated `licenses/distribution-manifest.json`
 records relative paths, hashes and component classifications observed in the
 completed build. It is a technical inventory, not a controlling legal record.
 Copied package license texts and the Qt SBOMs are under
@@ -77,16 +78,17 @@ wheel is removed by the packaging policy and is not distributed.
 
 For NumPy and SciPy, the locked records pin the exact MacPython
 `openblas-libs` tags, OpenBLAS commit, Windows workflow and applied patch. The
-exact Rtools/GCC/Strawberry toolchain manifests and the publisher artifact
-chains are not verified, so both records remain Release gates.
+exact Rtools/GCC toolchain manifests and the publisher artifact
+chains remain unverified and disclosed. Both records still have incomplete
+native source coverage, which remains a Release gate.
 
 正確なcomponentバージョンと成果物pattern、および検証できたsource URL/hashは
 `licenses/components.json`に記録します。このアプリが同梱する20個のQt成果物は
 公式Qt 6.10.2 archiveのmemberとbyte単位で一致し、公式module SBOM、対応する
 submodule source archive、参照されるライセンス本文を固定しています。
-PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceはRelease gateとして
-残し、Microsoft runtime、およびcomponent lockに列挙した
-その他のgateも公開前に解消します。生成される
+PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceは未確認のまま開示し、
+Microsoft Runtimeは非同梱の外部前提として記録します。source、license、noticeと
+native binaryの技術検査は維持します。生成される
 `licenses/distribution-manifest.json`は、完成したbuildで確認した相対path、hash、
 component分類の技術的なinventoryであり、法的に支配的な記録ではありません。
 パッケージのライセンス本文とQt SBOMは`licenses/python-packages/`、固定した
@@ -96,9 +98,9 @@ Qt wheelが提供する未使用のMesa software OpenGL fallback `opengl32sw.dll
 packaging policyで除外し、配布しません。
 
 NumPyとSciPyについては、MacPython `openblas-libs`のexact tag、OpenBLAS commit、
-Windows workflow、適用patchを固定しました。Rtools/GCC/Strawberry toolchainの
-正確なmanifestと公開wheelまでのartifact chainは未確認のため、両componentの
-Release gateを維持します。
+Windows workflow、適用patchを固定しました。Rtools/GCC toolchainの
+正確なmanifestと公開wheelまでのartifact chainは未確認のまま開示します。
+両componentの未完了native source coverageは引き続きRelease gateです。
 
 Inno Setup 6.7.3 contributes the Setup/Uninstall stubs and LZMA decompression
 code embedded in the public installer; these are not files in the installed
@@ -150,16 +152,17 @@ redistribute them:
 利用者が押した場合に限って上流の案内ページをブラウザーで開きます。
 OBSは専用`obs-portable`だけを管理し、通常版OBSのインストール先は利用しません。
 
-The maintainer has recorded acceptance of the audit limitation and residual
-risk associated with the withdrawn v0.5.2 installer. That decision does not by
-itself mark the historical-remediation compliance gate complete. All recorded
-source, provenance, historical, and distribution gates remain in force until
-their explicit completion criteria are satisfied.
+The [September 4 maintainer decision](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910)
+treats unavailable v0.5.2 artifacts and unverified publisher-internal chains as
+disclosed limitations. External legal review remains unperformed; this fact
+alone does not block a Release. Source, license, notice, native-binary, Runtime,
+clean-VM and independent-review requirements remain mandatory.
 
-管理者は、撤回済みv0.5.2インストーラーに関する監査上の制約と残余リスクを
-認識し、受け入れる決定を記録しています。ただし、この決定だけで履歴是正の
-compliance gateを完了扱いにはしません。source、provenance、履歴、配布条件に
-関する各gateは、それぞれの完了条件が明示的に満たされるまで維持します。
+[9月4日の管理者決定](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910)により、
+取得不能なv0.5.2元artifactと未確認のpublisher内部chainは開示事項とします。
+外部法務レビューは未実施であり、それ自体を公開停止条件にはしません。
+source、license、notice、native binary、Runtime、clean VM、独立レビューの
+技術条件は維持します。
 
 ## Upstream license information / 一次情報
 

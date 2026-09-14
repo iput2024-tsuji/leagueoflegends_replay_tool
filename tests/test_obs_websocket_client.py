@@ -178,6 +178,9 @@ class SceneClient:
     def get_input_list(self):
         return SimpleNamespace(inputs=self.inputs)
 
+    def get_input_kind_list(self, unversioned):
+        return SimpleNamespace(input_kinds=["wasapi_process_output_capture"])
+
     def create_input(self, scene_name, input_name, input_kind, settings, enabled):
         self.inputs.append({"inputName": input_name, "inputKind": input_kind})
         self.created_inputs.append((scene_name, input_name, input_kind, dict(settings), enabled))
@@ -202,6 +205,18 @@ class SceneClient:
     def set_input_settings(self, input_name, settings, overlay=True):
         return None
 
+    def set_input_mute(self, input_name, muted):
+        return None
+
+    def set_input_volume(self, input_name, *, vol_db):
+        return None
+
+    def set_input_audio_monitor_type(self, input_name, monitor_type):
+        return None
+
+    def set_input_audio_tracks(self, input_name, tracks):
+        return None
+
     def set_scene_item_transform(self, scene_name, item_id, transform):
         return None
 
@@ -220,7 +235,7 @@ def test_setup_sync_elements_handles_scene_and_input_crud() -> None:
     client.setup_sync_elements()
 
     created_kinds = [item[2] for item in raw_client.created_inputs]
-    assert created_kinds == ["window_capture", "color_source_v3"]
+    assert created_kinds == ["window_capture", "wasapi_process_output_capture", "color_source_v3"]
     assert raw_client.current_scene == recordtest.DEFAULT_OBS_SCENE_NAME
     assert raw_client.removed_inputs == [recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME]
     assert raw_client.removed_scenes == ["Scene"]
@@ -288,10 +303,11 @@ class RecordingClient:
         self.marker_calls.append((scene_name, item_id, enabled))
 
 
-def test_recording_status_and_sync_marker_requests() -> None:
+def test_recording_status_and_sync_marker_requests(monkeypatch) -> None:
     raw_client = RecordingClient()
     client = obs_websocket_client.ObsWebSocketClient(config=app_config())
     client.client = raw_client
+    monkeypatch.setattr(client, "_ensure_game_audio_capture", lambda: None)
 
     client.start_recording()
     assert client.stop_recording() == "C:/recordings/game.mkv"

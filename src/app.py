@@ -951,7 +951,7 @@ class SettingsPage(QWidget):
         self.audio_mic_mute = QCheckBox("ミュート")
 
         audio_description = QLabel(
-            "LoLの音声はウィンドウキャプチャから取得します。ここではマイクのみ設定します。"
+            "LoLの音声は専用のアプリケーション音声キャプチャから取得します。ここではマイクのみ設定します。"
         )
         audio_description.setWordWrap(True)
         audio_form.addRow(audio_description)

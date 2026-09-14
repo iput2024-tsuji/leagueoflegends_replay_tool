@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -20,8 +21,9 @@ class FakeRecorder:
         self.open_error = None
         self.shutdown_error = None
 
-    def open(self):
+    def open(self, *, configure_output=True):
         self.open_called += 1
+        self.configure_output = configure_output
         if self.open_error is not None:
             raise self.open_error
 
@@ -106,6 +108,77 @@ def test_runtime_closes_borrowed_obs_connection_with_disconnect(monkeypatch):
     assert recorder.finalize_called == 0
     assert recorder.shutdown_called == 0
     assert recorder.disconnect_called == 1
+
+
+def test_live_audio_runtime_borrows_owned_obs_without_launch_or_output(monkeypatch):
+    recorder = FakeRecorder()
+    launch = Mock(side_effect=AssertionError("live audio must not launch OBS"))
+    probe = Mock(side_effect=AssertionError("live audio must not auto-launch probe"))
+    owned = Mock(return_value=True)
+    monkeypatch.setattr(recordtest, "launch_obs", launch)
+    monkeypatch.setattr(recordtest, "test_obs_connection", probe)
+    monkeypatch.setattr(OBSRuntimeManager, "_has_owned_process", owned)
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda *args, **kwargs: recorder)
+
+    runtime = OBSRuntimeManager().open_recorder(
+        recordtest.AppConfig.from_dict({}), auto_launch=False, auto_setup=False, configure_output=False,
+    )
+    runtime.close()
+
+    assert not runtime.owns_process
+    assert not runtime.owns_existing_process
+    assert recorder.configure_output is False
+    assert owned.call_count == 2
+    assert recorder.disconnect_called == 1
+    assert recorder.shutdown_called == 0
+    launch.assert_not_called()
+    probe.assert_not_called()
+
+
+def test_live_audio_runtime_rejects_missing_owner_even_when_port_is_closed(monkeypatch):
+    client_factory = Mock(side_effect=AssertionError("unowned connection"))
+    launch = Mock(side_effect=AssertionError("live audio launch"))
+    monkeypatch.setattr(OBSRuntimeManager, "_has_owned_process", lambda *_args: False)
+    monkeypatch.setattr(recordtest, "is_tcp_port_open", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", client_factory)
+    monkeypatch.setattr(recordtest, "launch_obs", launch)
+
+    with pytest.raises(recordtest.RecorderError, match="管理対象OBSではありません"):
+        OBSRuntimeManager().open_recorder(recordtest.AppConfig.from_dict({}), configure_output=False)
+    client_factory.assert_not_called()
+    launch.assert_not_called()
+
+
+def test_live_audio_runtime_rechecks_owner_after_connect_and_disconnects_on_loss(monkeypatch):
+    client = Mock()
+    client.obs_process = None
+    client.shutdown.side_effect = client.disconnect
+    monkeypatch.setattr(OBSRuntimeManager, "_has_owned_process", Mock(side_effect=[True, False]))
+    monkeypatch.setattr(recordtest, "ObsWebSocketClient", Mock(return_value=client))
+    monkeypatch.setattr(recordtest, "launch_obs", Mock(side_effect=AssertionError("live audio launch")))
+
+    with pytest.raises(recordtest.RecorderError, match="所有権"):
+        OBSRuntimeManager().open_recorder(recordtest.AppConfig.from_dict({}), configure_output=False)
+    client.connect.assert_called_once_with()
+    client.setup_record_output.assert_not_called()
+    client.setup_sync_elements.assert_not_called()
+    client.disconnect.assert_called_once_with()
+
+
+@pytest.mark.parametrize("configure_output", [False, True])
+def test_recorder_open_skips_output_only_when_requested(configure_output):
+    client = Mock()
+    client.obs_process = None
+    recorder = recordtest.LoLAutoRecorder(
+        config=recordtest.AppConfig.from_dict({}), obs_client=client, auto_setup=False,
+    )
+    recorder.open(configure_output=configure_output)
+    client.connect.assert_called_once_with()
+    assert client.setup_record_output.call_count == int(configure_output)
+    client.setup_sync_elements.assert_not_called()
+    assert recorder.opened
+    recorder.disconnect_obs()
 
 
 def test_runtime_waits_for_starting_owned_obs_before_auto_launch(monkeypatch):

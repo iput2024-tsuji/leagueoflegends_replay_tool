@@ -3304,12 +3304,13 @@ class LoLAutoRecorder(RecordingSessionManager):
         self._open_cleanup_attempted = False
         self.reset_session()
 
-    def open(self) -> None:
+    def open(self, *, configure_output: bool = True) -> None:
         if self.opened:
             return
         try:
             self.connect_obs()
-            self.ensure_record_output_setup()
+            if configure_output:
+                self.ensure_record_output_setup()
             if self.auto_setup:
                 self.ensure_sync_setup()
             self.opened = True

@@ -10,7 +10,7 @@ import sys
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 import pytest
@@ -2854,6 +2854,63 @@ def test_recorder_disconnect_cleans_state_when_client_disconnect_fails(tmp_path)
     assert captured.value is disconnect_error
     assert recorder.opened is False
     assert recorder._status_handler is None
+
+
+@pytest.mark.parametrize("live_available", [False, True])
+def test_cli_skips_tft_before_cancellation_without_recording_or_saving(monkeypatch, tmp_path, live_available):
+    settings = _preflight_config(tmp_path / "obs-portable", tmp_path)
+    connection = LCUConnectionInfo(port=54321, password="test-password")
+    routes = {
+        f"{connection.base_url}{recordtest.LCU_GAMEFLOW_PHASE_PATH}": "InProgress",
+        f"{connection.base_url}{recordtest.LCU_GAMEFLOW_SESSION_PATH}": {
+            "phase": "InProgress", "gameData": {"gameId": "tft-1", "queue": {"id": 1090}},
+        },
+        f"{connection.base_url}{recordtest.LCU_GAME_QUEUES_PATH}": [],
+        f"{connection.base_url}{recordtest.LCU_CHAMP_SELECT_PATH}": {
+            "actions": [[{"id": 1, "type": "pick", "championId": 103, "completed": True}]],
+        },
+        f"{connection.base_url}{recordtest.LCU_CHAMPION_SUMMARY_PATH}": [{"id": 103, "name": "Ahri"}],
+        recordtest.ALL_GAME_URL: {"gameData": {"gameTime": 0}} if live_available else None,
+    }
+    riot_client = recordtest.LiveClientRiotAPIClient(
+        session_factory=FakeSessionFactory(routes),
+        lcu_connection_provider=SimpleNamespace(get_connection_info=lambda: connection, invalidate=lambda: None),
+    )
+    obs_client = Mock(obs_process=None, raw_client=object())
+    recorder = recordtest.LoLAutoRecorder(
+        config=recordtest.AppConfig.from_dict(settings), obs_client=obs_client,
+        riot_api_client=riot_client, auto_setup=False,
+    )
+
+    async def cancel_wait(*args, **kwargs):
+        recorder.request_stop()
+        return False
+
+    recorder.wait_with_stop_async = AsyncMock(side_effect=cancel_wait)
+    recorder.log = Mock(wraps=recorder.log)
+    recorder.save_json = Mock(wraps=recorder.save_json)
+    monkeypatch.setattr(recordtest, "load_settings", lambda: settings)
+    monkeypatch.setattr(recordtest, "run_preflight_checks", lambda *args, **kwargs: {
+        "config": settings, "changed": False, "warnings": [], "errors": [],
+    })
+    monkeypatch.setattr(recordtest, "setup_environment", lambda config: None)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: None)
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda **kwargs: recorder)
+
+    run(recordtest.run_cli_recorder())
+
+    messages = [call.args[0] for call in recorder.log.call_args_list]
+    assert any("TFTは録画対象外" in message for message in messages)
+    assert "🎥 録画を開始します..." not in messages
+    assert recorder.session_phase == recordtest.RecordingPhase.CANCELLED
+    assert recorder.session_started is False
+    assert recorder.has_session_data() is False
+    assert recorder.output_file is None
+    obs_client.start_recording.assert_not_called()
+    obs_client.toggle_recording.assert_not_called()
+    recorder.save_json.assert_not_called()
+    assert list(tmp_path.rglob("*.json")) == []
+    obs_client.shutdown.assert_called_once_with()
 
 
 def test_cli_recorder_keeps_body_primary_when_shutdown_fails(monkeypatch):

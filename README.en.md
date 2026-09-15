@@ -47,6 +47,7 @@ Ban/Pick capture uses the League Client API (LCU). LCU is not an officially supp
 - Recording video and JSON event-log storage
 - Ban/Pick order, champion, team, and position capture
 - Queue information such as Ranked, Normal, and ARAM
+- Matches identified as TFT are skipped while monitoring continues for the next LoL match
 - mpv-based replay playback
 - Seeking from events categorized as kills, deaths, assists, objectives, and buildings
 - Ban/Pick order and final team composition in the replay view, with locally available champion icons

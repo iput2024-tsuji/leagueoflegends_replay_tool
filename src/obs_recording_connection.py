@@ -48,7 +48,7 @@ def _verify_listener(manager: OBSProcessManager, peer: tuple[str, int], pid: int
         text=True,
         encoding="utf-8",
         errors="strict",
-        timeout=2.0,
+        timeout=5.0,  # Bound shell startup plus listener enumeration; two seconds expired during real-game startup.
     )
     if completed.returncode != 0 or completed.stderr.strip():
         raise ValueError("OBS listener query failed")

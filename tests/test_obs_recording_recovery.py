@@ -308,7 +308,7 @@ def test_listener_query_failure_is_fail_closed(recovery, result):
     r = recovery
     def query(_command, **_kwargs):
         if result == "timeout":
-            raise subprocess.TimeoutExpired("powershell", 2)
+            raise subprocess.TimeoutExpired("powershell", 5)
         return subprocess.CompletedProcess(
             [], 1 if result == "exit" else 0,
             "x" * 65537 if result == "oversized" else "{" if result == "json" else json.dumps(r.manager.rows),
@@ -317,6 +317,53 @@ def test_listener_query_failure_is_fail_closed(recovery, result):
     r.manager._run_hidden = query
     r.wrapper.prepare_recording_start()
     assert r.wrapper._recording_connection is None
+    r.wrapper.start_recording()
+    assert r.wrapper.is_recording_active() is True
+    assert r.wrapper.raw_client is r.old
+    error = OBSSDKTimeoutError("later status failure")
+    r.old.errors["get_record_status"] = error
+    with pytest.raises(OBSSDKTimeoutError) as caught:
+        r.wrapper.is_recording_active()
+    assert caught.value is error
+    assert r.created == []
+    assert r.wrapper.raw_client is None
+
+
+@pytest.mark.parametrize("timeout_at", [1, 2], ids=["before_connect", "after_connect"])
+def test_listener_timeout_during_recovery_preserves_error_and_disposes_clients(recovery, timeout_at):
+    r = recovery
+    r.wrapper.prepare_recording_start()
+    r.calls.clear()
+    original = OBSSDKTimeoutError("original status failure")
+    r.old.errors["get_record_status"] = original
+    listener_error = subprocess.TimeoutExpired("powershell", 5)
+    original_query = r.manager._run_hidden
+    query_count = 0
+
+    def query(command, **kwargs):
+        nonlocal query_count
+        query_count += 1
+        assert kwargs["timeout"] == 5.0
+        if query_count == timeout_at:
+            raise listener_error
+        return original_query(command, **kwargs)
+
+    r.manager._run_hidden = query
+    with pytest.raises(OBSSDKTimeoutError) as caught:
+        r.wrapper.is_recording_active()
+    assert caught.value is original
+    assert caught.value.__cause__ is listener_error
+    assert r.wrapper.raw_client is None
+    assert r.wrapper.obs_process is r.process_handle
+    assert r.wrapper._recording_recovery_attempted is True
+    expected_calls = [("old", "get_record_status"), ("old", "disconnect")]
+    if timeout_at == 2:
+        expected_calls += [("candidate", "get_version"), ("candidate", "get_record_status"), ("candidate", "disconnect")]
+    assert r.calls == expected_calls
+    with pytest.raises(AttributeError):
+        r.wrapper.is_recording_active()
+    assert query_count == timeout_at
+    assert len(r.created) == timeout_at - 1
 
 
 def test_listener_command_is_hidden_bounded_and_contains_no_connection_secret(recovery):
@@ -326,7 +373,7 @@ def test_listener_command_is_hidden_bounded_and_contains_no_connection_secret(re
     assert command[:4] == ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
     assert "Get-NetTCPConnection -State Listen -LocalPort 4455" in command[4]
     assert "test-password" not in command[4]
-    assert kwargs["timeout"] == 2.0
+    assert kwargs["timeout"] == 5.0
     assert kwargs["encoding"] == "utf-8"
 
 

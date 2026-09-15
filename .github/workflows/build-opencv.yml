@@ -80,6 +80,14 @@ jobs:
           retention-days: 7
           path: ${{ runner.temp }}/LoLReplayTool-binary-cache/opencv-source-built-wheel/
 
+      - name: Probe one CL translation unit decoder
+        id: cl-probe
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        run: python -m scripts.probe_opencv_cl_decode
+
       - name: Preserve failed OpenCV build diagnostics
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -98,7 +106,7 @@ jobs:
             ${{ runner.temp }}/LoLReplayTool-binary-cache/w/*-build-evidence.json
 
       - name: Preserve selected OpenCV build intermediates
-        if: failure()
+        if: ${{ !cancelled() && (failure() || steps.cl-probe.outcome == 'success' || steps.cl-probe.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: opencv-build-diagnostics-intermediates-${{ github.run_id }}-${{ github.run_attempt }}

@@ -362,10 +362,17 @@ def test_opencv_workflow_build_and_packaging_share_commit_artifact_and_seal():
     assert "provenance-sha256=$($record.provenance_sha256)" in source
     assert "if: failure()" in source
     assert "**/build.log" in source
+    assert source.index("id: upload") < source.index("id: cl-probe")
+    probe = source.split("      - name: Probe one CL translation unit decoder", maxsplit=1)[1].split("      - name:", maxsplit=1)[0]
+    assert "!cancelled() && github.event_name == 'pull_request'" in probe
+    assert "continue-on-error: true" in probe
+    assert "timeout-minutes: 5" in probe
+    assert "python -m scripts.probe_opencv_cl_decode" in probe
     selected_upload = source.split(
         "      - name: Preserve selected OpenCV build intermediates", maxsplit=1
     )[1]
-    assert "if: failure()" in selected_upload
+    assert "failure() || steps.cl-probe.outcome == 'success' || steps.cl-probe.outcome == 'failure'" in selected_upload
+    assert "!cancelled()" in selected_upload
     assert "include-hidden-files: true" in selected_upload
     assert "include-hidden-files: true" not in source.split(
         "      - name: Preserve selected OpenCV build intermediates", maxsplit=1

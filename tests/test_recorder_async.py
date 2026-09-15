@@ -1849,6 +1849,94 @@ def test_finalize_aborted_session_marks_json_status(monkeypatch):
     assert saved_payloads[0][1]["failure_reason"] == "user stopped recording"
 
 
+@pytest.mark.parametrize(
+    "condition",
+    ["no_client", "unknown_status", "status_error", "already_stopped", "stop_error", "no_path", "completed"],
+)
+def test_finalize_reports_recording_result_separately_from_json_save(tmp_path, monkeypatch, condition):
+    obs_client = FakeOBSClient()
+    if condition == "no_client":
+        obs_client._raw_client = None
+    elif condition == "unknown_status":
+        obs_client.is_recording_active.return_value = None
+    elif condition == "status_error":
+        obs_client.is_recording_active.side_effect = OSError("socket unavailable")
+    elif condition == "already_stopped":
+        obs_client.is_recording_active.return_value = False
+    elif condition == "stop_error":
+        obs_client.stop_recording.side_effect = OSError("stop response lost")
+    elif condition == "no_path":
+        obs_client.stop_recording.return_value = None
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path), obs_client=obs_client, riot_api_client=Mock(), auto_setup=False,
+    )
+    recorder.recording_started = True
+    recorder.all_events = [{"EventID": 1, "EventName": "GameEnd", "EventTime": 20.0}]
+    save_payload = Mock()
+    monkeypatch.setattr(recordtest, "save_payload", save_payload)
+    monkeypatch.setattr(recordtest, "enforce_storage_limit", lambda *args, **kwargs: None)
+
+    result = recorder.finalize_session(outcome=recordtest.RecordingOutcome.COMPLETED)
+
+    assert result.success is True  # The JSON save succeeded, independently of recording completion.
+    assert result.saved is True
+    payload = save_payload.call_args.args[1]
+    if condition == "completed":
+        assert result.outcome is recordtest.RecordingOutcome.COMPLETED
+        assert payload["session_status"] == "completed"
+        assert payload["failure_reason"] is None
+        assert payload["obs_record_path"] == "game.mp4"
+    else:
+        assert result.outcome is recordtest.RecordingOutcome.FAILED_PARTIAL
+        assert payload["session_status"] == "failed_partial"
+        assert payload["session_phase"] == "failed"
+        assert payload["failure_reason"]
+        assert payload["obs_record_path"] is None
+    if condition in {"no_client", "unknown_status", "status_error", "already_stopped"}:
+        obs_client.stop_recording.assert_not_called()
+    else:
+        obs_client.stop_recording.assert_called_once()
+    calls_before = obs_client.stop_recording.call_count
+    repeated = recorder.finalize_session(outcome=recordtest.RecordingOutcome.COMPLETED)
+    assert repeated.saved is False
+    assert repeated.outcome is result.outcome
+    assert obs_client.stop_recording.call_count == calls_before
+    save_payload.assert_called_once()
+    if condition == "stop_error":
+        # CLI cleanup may call stop directly, bypassing the finalized JSON guard.
+        recorder.stop_recording()
+        with pytest.raises(recordtest.RecorderError, match="stop response lost"):
+            recordtest._cleanup_cli_recorder(recorder, None)
+        obs_client.stop_recording.assert_called_once()
+        obs_client.shutdown.assert_called_once()
+        assert "stop response lost" in recorder.failure_reason
+        assert recorder.session_outcome is recordtest.RecordingOutcome.FAILED_PARTIAL
+
+
+def test_cancelled_recording_without_connection_keeps_stop_failure_in_json(tmp_path, monkeypatch):
+    obs_client = FakeOBSClient()
+    obs_client._raw_client = None
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path), obs_client=obs_client, riot_api_client=Mock(), auto_setup=False,
+    )
+    recorder.recording_started = True
+    recorder.all_events = [{"EventID": 1, "EventName": "GameStart", "EventTime": 0.0}]
+    save_payload = Mock()
+    monkeypatch.setattr(recordtest, "save_payload", save_payload)
+    monkeypatch.setattr(recordtest, "enforce_storage_limit", lambda *args, **kwargs: None)
+
+    result = recorder.finalize_session(
+        outcome=recordtest.RecordingOutcome.ABORTED, failure_reason="recording was cancelled",
+    )
+
+    assert result.outcome is recordtest.RecordingOutcome.FAILED_PARTIAL
+    payload = save_payload.call_args.args[1]
+    assert "OBS接続が失われた" in payload["failure_reason"]
+    assert payload["session_status"] == "failed_partial"
+    assert payload["obs_record_path"] is None
+    obs_client.stop_recording.assert_not_called()
+
+
 def test_finalize_writes_pending_session_when_atomic_save_fails(monkeypatch):
     tmp_path = runtime_dir("pending_after_save_failure")
     config = config_for(tmp_path)

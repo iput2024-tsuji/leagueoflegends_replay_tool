@@ -12,11 +12,23 @@ from dataclasses import dataclass
 from typing import Any
 
 import obsws_python as obs
+from obsws_python.error import OBSSDKTimeoutError
+from websocket import WebSocketConnectionClosedException, WebSocketTimeoutException
 
 try:
+    from .obs_recording_connection import RecordingConnection, capture_recording_connection
     from .recorder_config import AppConfig
 except ImportError:
+    from obs_recording_connection import RecordingConnection, capture_recording_connection
     from recorder_config import AppConfig
+
+
+_RECORDING_TRANSPORT_ERRORS = (
+    OSError,
+    OBSSDKTimeoutError,
+    WebSocketConnectionClosedException,
+    WebSocketTimeoutException,
+)
 
 
 @dataclass(frozen=True)
@@ -305,6 +317,8 @@ class ObsWebSocketClient(OBSClient):
         handler_type = _compat("StatusCallbackLogHandler")
         self._status_handler = handler_type(status_cb) if status_cb else None
         self.last_recording_encoder_selection: OBSRecordingEncoderSelection | None = None
+        self._recording_connection: RecordingConnection | None = None
+        self._recording_recovery_attempted = False
         if self._status_handler:
             self.logger.addHandler(self._status_handler)
         self.logger.propagate = True
@@ -346,6 +360,7 @@ class ObsWebSocketClient(OBSClient):
         )
 
     def disconnect(self) -> None:
+        self._recording_connection = None
         try:
             if self.client is not None:
                 try:
@@ -745,8 +760,17 @@ class ObsWebSocketClient(OBSClient):
         _raise_for_obs_request_status(response, "ToggleRecord")
 
     def prepare_recording_start(self) -> None:
+        self._recording_connection = None
+        self._recording_recovery_attempted = False
         self._apply_record_output_basics()
         self._apply_recording_quality_settings()
+        try:
+            self._recording_connection = capture_recording_connection(self.client, self.config.obs)
+        except Exception as exc:
+            self.logger.info(
+                "OBS録画の接続復旧を無効化しました（所有接続を確認できません: %s）。",
+                type(exc).__name__,
+            )
 
     def set_recording_encoder(self, recording_encoder: str) -> OBSRecordingEncoderSelection:
         selected_encoder = self._apply_recording_quality_settings(
@@ -762,15 +786,67 @@ class ObsWebSocketClient(OBSClient):
         return selected_encoder
 
     def stop_recording(self) -> str | None:
-        response = self.client.stop_record()
+        # A lost StopRecord response cannot establish which recording is now active.
+        self._recording_connection = None
+        self._recording_recovery_attempted = True
+        try:
+            response = self.client.stop_record()
+        except _RECORDING_TRANSPORT_ERRORS as exc:
+            self._discard_recording_client(exc)
+            raise
         return getattr(response, "output_path", None)
 
+    def _close_recording_client(self, client: Any, error: BaseException) -> None:
+        try:
+            client.disconnect()
+        except Exception as cleanup_error:
+            error.add_note(f"OBS接続の破棄にも失敗しました: {type(cleanup_error).__name__}")
+            self.logger.warning("OBS接続の破棄に失敗しました: %s", type(cleanup_error).__name__)
+
+    def _discard_recording_client(self, error: BaseException) -> None:
+        failed_client, self.client = self.client, None
+        if failed_client is not None:
+            self._close_recording_client(failed_client, error)
+
+    def _get_record_status(self) -> Any:
+        try:
+            return self.client.get_record_status()
+        except _RECORDING_TRANSPORT_ERRORS as original_error:
+            # Never reuse a socket that may still receive a previous request's response.
+            self._discard_recording_client(original_error)
+            context = self._recording_connection
+            if context is None or self._recording_recovery_attempted:
+                raise
+            self._recording_recovery_attempted = True
+            candidate = None
+            try:
+                context.verify()
+                peer_host = context.peer[0]
+                candidate = obs.ReqClient(
+                    host=f"[{peer_host}]" if ":" in peer_host else peer_host,
+                    port=context.peer[1],
+                    password=self.config.obs.password,
+                    timeout=2.5,
+                )
+                candidate.get_version()
+                status = candidate.get_record_status()
+                context.verify(candidate)
+                self.client, candidate = candidate, None
+                self.log("OBS録画状態の接続を復旧しました。")
+                return status
+            except Exception as recovery_error:
+                original_error.add_note(f"OBS接続復旧に失敗しました: {type(recovery_error).__name__}")
+                raise original_error from recovery_error
+            finally:
+                if candidate is not None:
+                    self._close_recording_client(candidate, original_error)
+
     def is_recording_active(self) -> bool | None:
-        status = self.client.get_record_status()
+        status = self._get_record_status()
         return getattr(status, "output_active", None)
 
     def get_record_status_details(self) -> dict[str, Any]:
-        status = self.client.get_record_status()
+        status = self._get_record_status()
         details = {
             "output_active": getattr(status, "output_active", None),
             "output_paused": getattr(status, "output_paused", None),

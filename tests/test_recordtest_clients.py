@@ -1244,7 +1244,7 @@ def test_record_status_details_include_obs_profile_and_output_diagnostics():
     assert details["simple_file_output.path"] == "C:/recordings/game.mkv"
 
 
-def test_start_recording_raises_when_raw_obs_response_reports_failure():
+def test_start_recording_raises_when_raw_obs_response_reports_failure(monkeypatch):
     class RawClient:
         def send(self, request_type, payload, raw=True):
             assert request_type == "StartRecord"
@@ -1258,6 +1258,7 @@ def test_start_recording_raises_when_raw_obs_response_reports_failure():
 
     obs_client = recordtest.ObsWebSocketClient(config=app_config())
     obs_client.client = RawClient()
+    monkeypatch.setattr(obs_client, "_ensure_game_audio_capture", lambda: None)
 
     with pytest.raises(recordtest.RecorderError, match="Output start failed"):
         obs_client.start_recording()
@@ -3442,6 +3443,9 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
         def get_input_list(self):
             return SimpleNamespace(inputs=self.inputs)
 
+        def get_input_kind_list(self, unversioned):
+            return SimpleNamespace(input_kinds=["wasapi_process_output_capture"])
+
         def remove_input(self, input_name):
             self.removed_inputs.append(input_name)
             self.inputs = [item for item in self.inputs if item.get("inputName") != input_name]
@@ -3484,6 +3488,18 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
         def set_input_settings(self, input_name, settings, overlay=True):
             return None
 
+        def set_input_mute(self, input_name, muted):
+            return None
+
+        def set_input_volume(self, input_name, *, vol_db):
+            return None
+
+        def set_input_audio_monitor_type(self, input_name, monitor_type):
+            return None
+
+        def set_input_audio_tracks(self, input_name, tracks):
+            return None
+
         def set_scene_item_transform(self, scene_name, item_id, transform):
             self.transform_calls.append((scene_name, item_id, dict(transform)))
 
@@ -3506,7 +3522,8 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     client.setup_sync_elements()
 
     window_capture = raw_client.created_inputs[0]
-    sync_marker = raw_client.created_inputs[1]
+    game_audio = raw_client.created_inputs[1]
+    sync_marker = raw_client.created_inputs[2]
     assert raw_client.current_scene == recordtest.DEFAULT_OBS_SCENE_NAME
     assert raw_client.removed_scenes == ["Scene"]
     assert raw_client.removed_inputs == [recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME]
@@ -3516,13 +3533,15 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     assert window_capture["settings"]["window"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
     assert window_capture["settings"]["client_area"] is True
     assert window_capture["settings"]["capture_audio"] is False
+    assert game_audio["kind"] == "wasapi_process_output_capture"
+    assert game_audio["name"] == "lol_game_audio"
     assert sync_marker["name"] == recordtest.DEFAULT_OBS_SOURCE_NAME
 
     scene_items = raw_client.scene_items_by_scene[recordtest.DEFAULT_OBS_SCENE_NAME]
     window_item_id = scene_items[0]["sceneItemId"]
-    sync_item_id = scene_items[1]["sceneItemId"]
+    sync_item_id = scene_items[2]["sceneItemId"]
     assert (recordtest.DEFAULT_OBS_SCENE_NAME, window_item_id, 0) in raw_client.index_calls
-    assert (recordtest.DEFAULT_OBS_SCENE_NAME, sync_item_id, 1) in raw_client.index_calls
+    assert (recordtest.DEFAULT_OBS_SCENE_NAME, sync_item_id, 2) in raw_client.index_calls
     assert (
         recordtest.DEFAULT_OBS_SCENE_NAME,
         window_item_id,

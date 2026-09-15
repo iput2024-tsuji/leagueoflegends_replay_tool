@@ -20,6 +20,17 @@ QUEUE_DISPLAY_NAMES = {
     1700: "Arena",
 }
 
+# Riot Data Dragon 16.18.1 / 13.24.1 tft-queues.json and the official LoL
+# queues.json (1111). See docs/tft-recording-filter.md for the source boundary.
+TFT_QUEUE_IDS = frozenset({1090, 1100, 1110, 1111, 1130, 1160, 1170, 1180, 1190, 1210, 1220, 6000, 6100, 6120, 6130})
+
+
+def is_tft_match(metadata: dict[str, Any]) -> bool:
+    """Recognize explicit TFT metadata; missing data is not evidence of TFT."""
+    mode = str(metadata.get("game_mode") or "").strip().upper()
+    queue_type = str(metadata.get("queue_type") or "").strip().upper()
+    return mode == "TFT" or "TFT" in queue_type.split("_") or _optional_int(metadata.get("queue_id")) in TFT_QUEUE_IDS
+
 
 def build_match_metadata(
     gameflow_payload: dict[str, Any] | None,
@@ -61,8 +72,11 @@ def build_match_metadata(
     if not display_name and queue_id is not None:
         display_name = QUEUE_DISPLAY_NAMES.get(queue_id, f"Unknown ({queue_id})")
 
-    game_mode = _first_mapping_value(game_data, "gameMode", "game_mode") or _first_mapping_value(
-        payload, "gameMode", "game_mode"
+    game_mode = (
+        _first_mapping_value(game_data, "gameMode", "game_mode")
+        or _first_mapping_value(payload, "gameMode", "game_mode")
+        or _first_mapping_value(queue, "gameMode", "game_mode")
+        or _first_mapping_value(queue_definition, "gameMode", "game_mode")
     )
     game_type = _first_mapping_value(game_data, "gameType", "game_type") or _first_mapping_value(
         payload, "gameType", "game_type"
@@ -76,9 +90,7 @@ def build_match_metadata(
     map_name = _first_mapping_value(map_data, "name", "mapString") or _first_mapping_value(
         game_data, "mapName", "map_name"
     )
-    game_id = _first_mapping_value(game_data, "gameId", "game_id") or _first_mapping_value(
-        payload, "gameId", "game_id"
-    )
+    game_id = _first_mapping_value(game_data, "gameId", "game_id") or _first_mapping_value(payload, "gameId", "game_id")
     gameflow_phase = _first_mapping_value(payload, "phase", "gameflowPhase", "gameflow_phase")
 
     metadata = {

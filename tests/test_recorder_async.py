@@ -73,6 +73,246 @@ def test_live_game_time_accepts_only_finite_nonnegative_numbers():
         assert recordtest.LoLAutoRecorder._live_game_time({"gameData": {"gameTime": value}}) is None
 
 
+@pytest.fixture
+def tft_recorder(tmp_path):
+    client = Mock()
+    client.get_match_metadata = AsyncMock(return_value={
+        "queue_id": 1090, "game_id": "tft-1", "source": "lcu",
+    })
+    client.get_gameflow_phase_result = AsyncMock(return_value=recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.IN_GAME, payload={"phase": "InProgress"},
+    ))
+    client.get_all_game_data_result = AsyncMock(return_value=recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.TEMPORARY_FAILURE,
+    ))
+    client.get_champ_select_session_result = AsyncMock(return_value=recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.NOT_IN_GAME,
+    ))
+    client.get_active_player_name = AsyncMock(return_value=None)
+    recorder = recordtest.LoLAutoRecorder(
+        config=config_for(tmp_path), obs_client=FakeOBSClient(), riot_api_client=client, auto_setup=False,
+    )
+    recorder.wait_with_stop_async = AsyncMock(return_value=False)
+    return recorder
+
+
+@pytest.mark.parametrize("phase", ["GameStart", "InProgress", "Reconnect"])
+@pytest.mark.parametrize("has_live_data", [False, True])
+def test_tft_never_starts_or_leaves_session_data(tft_recorder, phase, has_live_data):
+    recorder = tft_recorder
+    client = recorder.riot_api_client
+    client.get_gameflow_phase_result.return_value = recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.IN_GAME, payload={"phase": phase},
+    )
+    if has_live_data:
+        client.get_all_game_data_result.return_value = recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameTime": 0}},
+        )
+    recorder.champ_select_tracker.observe({"actions": [[{
+        "id": 1, "type": "pick", "championId": 103, "completed": True,
+    }]]})
+    assert recorder.has_session_data()
+
+    assert run(recorder.wait_for_game_start_async()) is False
+
+    assert recorder.session_phase == recordtest.RecordingPhase.CANCELLED
+    assert recorder.session_started is False
+    assert recorder.has_session_data() is False
+    assert recorder.output_file is None
+    recorder.obs_client.start_recording.assert_not_called()
+    recorder.obs_client.toggle_recording.assert_not_called()
+    client.get_active_player_name.assert_not_awaited()
+
+
+def test_confirmed_tft_stays_excluded_when_metadata_temporarily_disappears(tft_recorder):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.side_effect = [
+        {"queue_id": 1090, "game_id": "1", "source": "lcu"}, {},
+    ]
+    recorder.riot_api_client.get_all_game_data_result.return_value = recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameTime": 12}},
+    )
+    recorder.wait_with_stop_async.side_effect = [True, False]
+
+    assert run(recorder.wait_for_game_start_async()) is False
+    assert recorder.riot_api_client.get_match_metadata.await_count == 2
+    assert recorder.output_file is None
+
+
+def test_tft_to_lol_with_no_intermediate_phase_does_not_stop_monitoring(tft_recorder):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.side_effect = [
+        {"queue_id": 1090, "game_mode": "TFT", "game_id": "1", "source": "lcu"},
+        {"queue_id": 420, "game_id": "2", "source": "lcu"},
+    ]
+    recorder.riot_api_client.get_all_game_data_result.return_value = recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameTime": 12}},
+    )
+    recorder.wait_with_stop_async.return_value = True
+
+    assert run(recorder.wait_for_game_start_async()) is True
+    assert recorder.match_metadata["game_id"] == "2"
+    assert recorder.match_metadata["queue_id"] == 420
+    assert "game_mode" not in recorder.match_metadata
+    assert recorder.match_metadata["source"] == "lcu"
+    assert recorder.game_start_detection_source == "live_client"
+
+
+@pytest.mark.parametrize("with_game_ids", [False, True])
+def test_live_client_only_tft_to_lol_does_not_retain_tft_mode(tft_recorder, with_game_ids):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.return_value = {}
+    recorder.riot_api_client.get_gameflow_phase_result.return_value = recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.TEMPORARY_FAILURE,
+    )
+    games = [{"gameMode": "TFT", "gameTime": 20}, {"gameMode": "CLASSIC", "gameTime": 0}]
+    if with_game_ids:
+        games[0]["gameId"], games[1]["gameId"] = "1", "2"
+    recorder.riot_api_client.get_all_game_data_result.side_effect = [
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"gameData": game})
+        for game in games
+    ]
+    recorder.wait_with_stop_async.return_value = True
+
+    assert run(recorder.wait_for_game_start_async()) is True
+    assert recorder.match_metadata["game_mode"] == "CLASSIC"
+    assert recorder.game_start_anchor_game_time == 0
+
+
+@pytest.mark.parametrize("second_id", ["1", None])
+def test_same_or_missing_game_id_with_conflicting_mode_keeps_confirmed_tft(tft_recorder, second_id):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.side_effect = [
+        {"queue_id": 1090, "game_mode": "TFT", "game_id": "1", "source": "lcu"},
+        {"game_mode": "CLASSIC", "game_id": second_id, "source": "lcu"},
+    ]
+    recorder.riot_api_client.get_all_game_data_result.return_value = recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameTime": 12}},
+    )
+    recorder.wait_with_stop_async.side_effect = [True, False]
+
+    assert run(recorder.wait_for_game_start_async()) is False
+    assert recorder.match_metadata["queue_id"] == 1090
+    assert recorder.output_file is None
+
+
+def test_live_tft_remains_excluded_after_conflicting_lcu_metadata_disappears(tft_recorder):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.side_effect = [
+        {"game_mode": "CLASSIC", "game_id": "1", "source": "lcu"}, {},
+    ]
+    recorder.riot_api_client.get_all_game_data_result.side_effect = [
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={
+            "gameData": {"gameMode": "TFT", "gameId": "1", "gameTime": 2},
+        }),
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={
+            "gameData": {"gameTime": 3},
+        }),
+    ]
+    recorder.wait_with_stop_async.side_effect = [True, False]
+
+    assert run(recorder.wait_for_game_start_async()) is False
+    assert recorder.match_metadata["game_mode"] == "TFT"
+
+
+def test_live_tft_without_id_is_not_overwritten_by_stale_lcu_mode(tft_recorder):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.return_value = {"game_mode": "CLASSIC", "source": "lcu"}
+    recorder.riot_api_client.get_all_game_data_result.side_effect = [
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={
+            "gameData": {"gameMode": "TFT", "gameTime": 0},
+        }),
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameTime": 1}}),
+    ]
+    recorder.wait_with_stop_async.side_effect = [True, False]
+
+    assert run(recorder.wait_for_game_start_async()) is False
+    assert recorder.match_metadata["game_mode"] == "TFT"
+
+
+def test_repeated_lobby_phase_does_not_erase_tft_on_partial_reply(tft_recorder):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_gameflow_phase_result.return_value = recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.IN_GAME, payload={"phase": "Lobby"},
+    )
+    recorder.riot_api_client.get_match_metadata.side_effect = [{"queue_id": 1090, "source": "lcu"}, {}]
+    recorder.riot_api_client.get_all_game_data_result.return_value = recordtest.RiotPollResult(
+        recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameTime": 0}},
+    )
+    recorder.wait_with_stop_async.side_effect = [True, False]
+
+    assert run(recorder.wait_for_game_start_async()) is False
+    assert recorder.match_metadata["queue_id"] == 1090
+
+
+@pytest.mark.parametrize("phase_from_session", [False, True])
+def test_lobby_transition_clears_tft_when_next_game_has_no_classification(tft_recorder, phase_from_session):
+    recorder = tft_recorder
+    client = recorder.riot_api_client
+    client.get_match_metadata.side_effect = [
+        {"queue_id": 1090, "source": "lcu"},
+        {"gameflow_phase": "Lobby", "source": "lcu"} if phase_from_session else {},
+        {},
+    ]
+    client.get_gameflow_phase_result.side_effect = [
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"phase": "InProgress"}),
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE) if phase_from_session else
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"phase": "Lobby"}),
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE),
+    ]
+    client.get_all_game_data_result.side_effect = [
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE),
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE),
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameTime": 0}}),
+    ]
+    recorder.wait_with_stop_async.return_value = True
+
+    assert run(recorder.wait_for_game_start_async()) is True
+    assert "queue_id" not in recorder.match_metadata
+    assert client.get_all_game_data_result.await_count == 3
+
+
+@pytest.mark.parametrize("live_after_grace", [None, ({"gameData": {"gameTime": 0}}, 0.0)])
+def test_tft_classification_arriving_during_lcu_grace_prevents_start(tft_recorder, live_after_grace):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.side_effect = [
+        {}, {"queue_id": 1210, "queue_type": "CHONCC_TREASURE", "source": "lcu"},
+    ]
+    recorder.wait_for_live_client_after_lcu_start_async = AsyncMock(return_value=live_after_grace)
+
+    assert run(recorder.wait_for_game_start_async()) is False
+    recorder.wait_for_live_client_after_lcu_start_async.assert_awaited_once()
+    assert recorder.output_file is None
+
+
+def test_lcu_grace_rechecks_phase_before_fallback_start(tft_recorder):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.return_value = {}
+    recorder.riot_api_client.get_gameflow_phase_result.side_effect = [
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"phase": phase})
+        for phase in ("GameStart", "Lobby")
+    ]
+    recorder.wait_for_live_client_after_lcu_start_async = AsyncMock(return_value=None)
+
+    assert run(recorder.wait_for_game_start_async()) is False
+    assert recorder.output_file is None
+
+
+def test_lcu_grace_remembers_tft_before_game_time_arrives(tft_recorder):
+    recorder = tft_recorder
+    recorder.riot_api_client.get_match_metadata.return_value = {}
+    recorder.riot_api_client.get_all_game_data_result.side_effect = [
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.TEMPORARY_FAILURE),
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameMode": "TFT"}}),
+        recordtest.RiotPollResult(recordtest.RiotPollStatus.IN_GAME, payload={"gameData": {"gameTime": 0}}),
+    ]
+    recorder.wait_with_stop_async.side_effect = [True, False]
+
+    assert run(recorder.wait_for_game_start_async()) is False
+    assert recorder.match_metadata["game_mode"] == "TFT"
+    assert recorder.riot_api_client.get_all_game_data_result.await_count == 2
+
+
 def test_wait_for_game_start_retries_after_timeout_without_real_sleep():
     tmp_path = runtime_dir("retry")
     config = config_for(tmp_path)
@@ -200,7 +440,7 @@ def test_wait_for_game_start_uses_dedicated_lcu_game_start_phase():
     assert recorder.match_metadata["gameflow_phase"] == "game_start"
     assert recorder.session_started is True
     riot_client.get_all_game_data_result.assert_awaited()
-    riot_client.get_match_metadata.assert_awaited_once()
+    assert riot_client.get_match_metadata.await_count == 2
 
 
 def test_lcu_game_start_waits_for_live_client_before_starting():

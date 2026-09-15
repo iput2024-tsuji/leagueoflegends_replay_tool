@@ -890,6 +890,25 @@ def _python_native_profile_errors(lock: dict[str, Any]) -> list[str]:
 
 def release_gate_errors(lock: dict[str, Any]) -> list[str]:
     errors = _runtime_download_policy_errors(lock)
+    from scripts.prepare_opencv_wheel import (
+        OpenCVWheelError,
+        source_build_policy as opencv_source_build_policy,
+    )
+
+    try:
+        opencv_policy = opencv_source_build_policy(lock)
+    except OpenCVWheelError as exc:
+        errors.append(f"opencv-python-source-build: {exc}")
+        opencv_policy = None
+    if opencv_policy is not None:
+        if opencv_policy["expected_byte_identical"] is None:
+            errors.append(
+                "opencv-python-source-build: byte reproducibility is not fixed"
+            )
+        if opencv_policy["expected_semantic_manifest_sha256"] is None:
+            errors.append(
+                "opencv-python-source-build: semantic manifest SHA256 is not fixed"
+            )
     try:
         validate_inno_component_lock(lock)
     except InnoSetupProvenanceError as exc:
@@ -1052,6 +1071,10 @@ def binary_archive_records(lock: dict[str, Any]) -> list[dict[str, Any]]:
     if policy_errors:
         raise ReleaseAssetError(" | ".join(policy_errors))
     seen_components: set[str] = set()
+    source_build = lock.get("opencv_source_build_policy")
+    source_build_component = (
+        source_build.get("component") if isinstance(source_build, dict) else None
+    )
     for component in _component_entries(lock):
         component_name = str(component.get("component"))
         if component_name in seen_components:
@@ -1059,6 +1082,8 @@ def binary_archive_records(lock: dict[str, Any]) -> list[dict[str, Any]]:
                 f"Duplicate component in binary archive lock: {component_name}"
             )
         seen_components.add(component_name)
+        if component_name == source_build_component:
+            continue
         archive = component.get("binary_archive")
         if (
             archive is None
@@ -1547,6 +1572,82 @@ def _prepare_external_vc_runtime_wheels(
     }
 
 
+def _prepare_opencv_source_wheel(
+    *,
+    components_file: Path,
+    lock: dict[str, Any],
+    cache_dir: Path,
+    opener: Callable[..., BinaryIO],
+    prepared_directory: Path | None = None,
+    expected_provenance_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    from scripts import prepare_opencv_wheel as opencv_wheel
+
+    try:
+        policy = opencv_wheel.source_build_policy(lock)
+    except opencv_wheel.OpenCVWheelError as exc:
+        raise ReleaseAssetError(str(exc)) from exc
+    if (prepared_directory is None) != (expected_provenance_sha256 is None):
+        raise ReleaseAssetError("OpenCV artifact directory and provenance SHA256 must be supplied together.")
+    if policy is None:
+        if prepared_directory is not None:
+            raise ReleaseAssetError("OpenCV artifact supplied without a source-build policy.")
+        return None
+    output_dir = cache_dir / "opencv-source-built-wheel"
+    # MSBuild FileTracker is not long-path aware; keep the private build root short.
+    work_dir = cache_dir / "w"
+    if any(os.path.lexists(path) for path in (output_dir, work_dir)):
+        raise ReleaseAssetError("OpenCV source-build path already exists.")
+    try:
+        if prepared_directory is not None:
+            _require_directory(prepared_directory, label="OpenCV workflow artifact")
+            provenance_path = prepared_directory / opencv_wheel.PROVENANCE_NAME
+            _require_regular_file(provenance_path, label="OpenCV artifact provenance")
+            if (
+                re.fullmatch(r"[0-9a-f]{64}", str(expected_provenance_sha256)) is None
+                or sha256_file(provenance_path) != expected_provenance_sha256
+            ):
+                raise ReleaseAssetError("OpenCV workflow artifact provenance SHA256 differs.")
+            # The caller binds this digest to the producer job in the same run.
+            # Re-audit the actual wheel before and after copying into our cache.
+            opencv_wheel.validate_output_directory(prepared_directory, components_file)
+            output_dir.mkdir(parents=True)
+            for name in (str(policy["output_filename"]), opencv_wheel.PROVENANCE_NAME):
+                shutil.copyfile(prepared_directory / name, output_dir / name)
+            if sha256_file(output_dir / opencv_wheel.PROVENANCE_NAME) != expected_provenance_sha256:
+                raise ReleaseAssetError("OpenCV workflow artifact changed during import.")
+            provenance = opencv_wheel.validate_output_directory(output_dir, components_file)
+        else:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="i-", dir=cache_dir) as temporary:
+                input_dir = Path(temporary)
+                fetch_verified_sources(
+                    [*policy["source_artifacts"], *policy["build_artifacts"]],
+                    input_dir,
+                    opener=opener,
+                )
+                provenance = opencv_wheel.run(
+                    input_dir,
+                    output_dir,
+                    components_file,
+                    work_dir,
+                )
+    except (
+        opencv_wheel.OpenCVWheelError,
+        OSError,
+        subprocess.CalledProcessError,
+        zipfile.BadZipFile,
+    ) as exc:
+        raise ReleaseAssetError(f"OpenCV source build failed: {exc}") from exc
+    provenance_path = output_dir / opencv_wheel.PROVENANCE_NAME
+    return {
+        "directory": str(output_dir.resolve()),
+        "provenance": str(provenance_path.resolve()),
+        "provenance_sha256": sha256_file(provenance_path),
+        "payload": provenance,
+    }
+
+
 def _resolve_external_vc_runtime_plan(
     *,
     components_file: Path,
@@ -1606,6 +1707,47 @@ def _resolve_external_vc_runtime_plan(
     return directory, payload, raw
 
 
+def _resolve_opencv_source_build_plan(
+    *,
+    components_file: Path,
+    lock: dict[str, Any],
+    plan: dict[str, Any],
+    plan_path: Path,
+) -> tuple[Path | None, dict[str, Any] | None, dict[str, Any] | None]:
+    from scripts import prepare_opencv_wheel as opencv_wheel
+
+    try:
+        policy = opencv_wheel.source_build_policy(lock)
+    except opencv_wheel.OpenCVWheelError as exc:
+        raise ReleaseAssetError(str(exc)) from exc
+    raw = plan.get("opencv_source_build")
+    if policy is None:
+        if raw is not None:
+            raise ReleaseAssetError("Binary install plan has an unexpected OpenCV build.")
+        return None, None, None
+    if not isinstance(raw, dict) or set(raw) != {
+        "directory",
+        "provenance",
+        "provenance_sha256",
+    }:
+        raise ReleaseAssetError("Binary install plan OpenCV provenance is invalid.")
+    directory = Path(str(raw["directory"]))
+    provenance_path = Path(str(raw["provenance"]))
+    if (
+        not _is_within_directory(plan_path.parent, directory)
+        or provenance_path.parent.resolve() != directory.resolve()
+    ):
+        raise ReleaseAssetError("OpenCV source build escapes the install plan directory.")
+    _require_regular_file(provenance_path, label="OpenCV source-build provenance")
+    if raw["provenance_sha256"] != sha256_file(provenance_path):
+        raise ReleaseAssetError("OpenCV source-build provenance SHA256 differs.")
+    try:
+        payload = opencv_wheel.validate_output_directory(directory, components_file)
+    except (opencv_wheel.OpenCVWheelError, OSError) as exc:
+        raise ReleaseAssetError(f"OpenCV source-build validation failed: {exc}") from exc
+    return directory, payload, raw
+
+
 def _binary_install_requirements(
     *,
     lock: dict[str, Any],
@@ -1613,6 +1755,9 @@ def _binary_install_requirements(
     binary_by_name: dict[str, dict[str, Any]],
     binary_cache_dir: Path,
     external_dir: Path | None,
+    opencv_dir: Path | None,
+    opencv_payload: dict[str, Any] | None,
+    opencv_plan: dict[str, Any] | None,
 ) -> list[tuple[dict[str, Any], Path]]:
     components = {
         canonicalize_distribution_name(str(item["distribution"])): item
@@ -1623,34 +1768,69 @@ def _binary_install_requirements(
     for pin in pins:
         binary = binary_by_name.get(pin["canonical_name"])
         component = components.get(pin["canonical_name"])
-        if binary is None or component is None:
+        if component is None:
             raise ReleaseAssetError(
                 f"Release requirement has no locked wheel: {pin['name']}"
             )
-        try:
-            source_kind, archive = expected_install_archive(lock, component)
-        except BinaryInstallPolicyError as exc:
-            raise ReleaseAssetError(str(exc)) from exc
+        source_built_opencv = (
+            component.get("component") == "opencv-python"
+            and lock.get("opencv_source_build_policy") is not None
+        )
+        if binary is None and not source_built_opencv:
+            raise ReleaseAssetError(
+                f"Release requirement has no locked wheel: {pin['name']}"
+            )
+        if source_built_opencv:
+            if opencv_dir is None or opencv_payload is None or opencv_plan is None:
+                raise ReleaseAssetError("Verified OpenCV source-built wheel is missing.")
+            wheel = opencv_payload.get("wheel")
+            if not isinstance(wheel, dict):
+                raise ReleaseAssetError("OpenCV source-build wheel record is missing.")
+            archive = {
+                key: wheel.get(key) for key in ("filename", "sha256", "size")
+            }
+            if (
+                wheel.get("distribution") != component.get("distribution")
+                or wheel.get("version") != component.get("version")
+                or not isinstance(archive["filename"], str)
+                or not isinstance(archive["sha256"], str)
+                or SHA256_PATTERN.fullmatch(archive["sha256"]) is None
+                or not isinstance(archive["size"], int)
+                or isinstance(archive["size"], bool)
+                or archive["size"] <= 0
+            ):
+                raise ReleaseAssetError("OpenCV source-build wheel record differs.")
+            source_kind = "source-built-wheel"
+            path = opencv_dir / archive["filename"]
+        else:
+            try:
+                source_kind, archive = expected_install_archive(lock, component)
+            except BinaryInstallPolicyError as exc:
+                raise ReleaseAssetError(str(exc)) from exc
+            path = binary_cache_dir / str(archive["filename"])
         if source_kind == "external-vc-runtime-wheel":
             if external_dir is None:
                 raise ReleaseAssetError(
                     f"External Runtime wheel is missing: {pin['name']}"
                 )
             path = external_dir / str(archive["filename"])
-        else:
-            path = binary_cache_dir / str(archive["filename"])
         record: dict[str, Any] = {
             **pin,
             "source": source_kind,
-            "component": binary["component"],
-            "distribution": binary["distribution"],
+            "component": component["component"],
+            "distribution": component["distribution"],
             **archive,
         }
         if source_kind == "external-vc-runtime-wheel":
+            assert binary is not None
             record["upstream_archive"] = {
                 key: binary[key]
                 for key in ("filename", "url", "sha256", "size")
             }
+        elif source_kind == "source-built-wheel":
+            record["source_build_provenance_sha256"] = opencv_plan[
+                "provenance_sha256"
+            ]
         result.append((record, path))
     return result
 
@@ -1663,6 +1843,8 @@ def prepare_binary_install(
     output_requirements: Path,
     output_plan: Path,
     opener: Callable[..., BinaryIO] = urllib.request.urlopen,
+    opencv_wheel_directory: Path | None = None,
+    opencv_provenance_sha256: str | None = None,
 ) -> dict[str, Any]:
     lock = _load_lock(components_file)
     if not _is_within_directory(output_plan.parent, cache_dir):
@@ -1713,12 +1895,27 @@ def prepare_binary_install(
         opener=opener,
     )
     external_dir = Path(external["directory"]) if external is not None else None
+    # The required external-Runtime preparation above loads pe_runtime_audit
+    # from the hash-verified pefile wheel into this interpreter. The OpenCV
+    # artifact audit below reuses that locked parser before application pip install.
+    opencv = _prepare_opencv_source_wheel(
+        components_file=components_file,
+        lock=lock,
+        cache_dir=cache_dir,
+        opener=opener,
+        prepared_directory=opencv_wheel_directory,
+        expected_provenance_sha256=opencv_provenance_sha256,
+    )
+    opencv_dir = Path(opencv["directory"]) if opencv is not None else None
     install_requirements = _binary_install_requirements(
         lock=lock,
         pins=pins,
         binary_by_name=binary_by_name,
         binary_cache_dir=cache_dir,
         external_dir=external_dir,
+        opencv_dir=opencv_dir,
+        opencv_payload=opencv["payload"] if opencv is not None else None,
+        opencv_plan=opencv,
     )
     lines = [
         "# Generated from exact repository pins and verified locked wheels.",
@@ -1769,6 +1966,14 @@ def prepare_binary_install(
                 for key in ("directory", "provenance", "provenance_sha256")
             }
             if external is not None
+            else None
+        ),
+        "opencv_source_build": (
+            {
+                key: opencv[key]
+                for key in ("directory", "provenance", "provenance_sha256")
+            }
+            if opencv is not None
             else None
         ),
         "requirements": plan_requirements,
@@ -2521,12 +2726,21 @@ def attest_binary_install(
             plan_path=plan_path,
         )
     )
+    opencv_dir, opencv_payload, opencv_plan = _resolve_opencv_source_build_plan(
+        components_file=components_file,
+        lock=lock,
+        plan=plan,
+        plan_path=plan_path,
+    )
     expected_install_requirements = _binary_install_requirements(
         lock=lock,
         pins=live_pins,
         binary_by_name=binary_by_name,
         binary_cache_dir=binary_manifest_path.parent,
         external_dir=external_dir,
+        opencv_dir=opencv_dir,
+        opencv_payload=opencv_payload,
+        opencv_plan=opencv_plan,
     )
     expected_plan_requirements = [
         requirement for requirement, _path in expected_install_requirements
@@ -2644,6 +2858,15 @@ def attest_binary_install(
                     if "upstream_archive" in expected
                     else {}
                 ),
+                **(
+                    {
+                        "source_build_provenance_sha256": expected[
+                            "source_build_provenance_sha256"
+                        ]
+                    }
+                    if "source_build_provenance_sha256" in expected
+                    else {}
+                ),
                 "installed_files_sha256": installed_inventory["inventory_sha256"],
                 "installed_files": installed_inventory["files"],
             }
@@ -2667,6 +2890,14 @@ def attest_binary_install(
                 "provenance": external_payload,
             }
             if external_plan is not None and external_payload is not None
+            else None
+        ),
+        "opencv_source_build": (
+            {
+                "provenance_sha256": opencv_plan["provenance_sha256"],
+                "provenance": opencv_payload,
+            }
+            if opencv_plan is not None and opencv_payload is not None
             else None
         ),
         "python_implementation": sys.implementation.name,
@@ -3766,6 +3997,15 @@ def _create_parser() -> argparse.ArgumentParser:
     prepare_install.add_argument("--cache-dir", required=True, type=Path)
     prepare_install.add_argument("--output-requirements", required=True, type=Path)
     prepare_install.add_argument("--output-plan", required=True, type=Path)
+    prepare_install.add_argument("--opencv-wheel-directory", type=Path)
+    prepare_install.add_argument("--opencv-provenance-sha256")
+
+    build_opencv = commands.add_parser(
+        "build-opencv-wheel",
+        help="Build and verify the locked OpenCV wheel twice for this workflow run.",
+    )
+    build_opencv.add_argument("--components", type=Path, default=COMPONENTS_FILE)
+    build_opencv.add_argument("--cache-dir", required=True, type=Path)
 
     attest_install = commands.add_parser(
         "attest-binary-install",
@@ -3855,8 +4095,23 @@ def main(argv: list[str] | None = None) -> int:
                 cache_dir=args.cache_dir,
                 output_requirements=args.output_requirements,
                 output_plan=args.output_plan,
+                opencv_wheel_directory=args.opencv_wheel_directory,
+                opencv_provenance_sha256=args.opencv_provenance_sha256,
             )
             print(f"Binary install plan created: {args.output_plan}")
+            return 0
+        if args.command == "build-opencv-wheel":
+            result = _prepare_opencv_source_wheel(
+                components_file=args.components,
+                lock=_load_lock(args.components),
+                cache_dir=args.cache_dir,
+                opener=urllib.request.urlopen,
+            )
+            if result is None:
+                raise ReleaseAssetError("OpenCV source-build policy is required.")
+            print(json.dumps({key: result[key] for key in (
+                "directory", "provenance", "provenance_sha256"
+            )}))
             return 0
         if args.command == "attest-binary-install":
             attest_binary_install(

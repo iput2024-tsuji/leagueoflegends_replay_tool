@@ -95,7 +95,7 @@ def _command(args: list[str], private: Path, stage: str, timeout: float, report:
             deadline = time.monotonic() + timeout
             while process.poll() is None:
                 # An already oversized trace must not prevent stopping our session.
-                if stage != "stop":
+                if stage not in {"stop", "sampling_stop"}:
                     _check_private_size(private)
                 if time.monotonic() >= deadline:
                     raise ProbeError("command_timeout")
@@ -501,6 +501,52 @@ def _write_report(temp: Path, report: dict) -> None:
         stream.write(content)
 
 
+def _capture(private: Path, tools: dict, rsp: Path, report: dict, *, cpu_sampling: bool) -> Path:
+    prefix = "sampling_" if cpu_sampling else ""
+    session = "issue139-cl-probe-" + uuid.uuid4().hex
+    report["session"] = session
+    raw = private / f"{prefix}raw.etl"
+    start = [str(tools["vcperf.exe"]), "/start"]
+    if not cpu_sampling:
+        start.append("/nocpusampling")
+    primary = None
+    try:
+        _command([*start, "/level1", session], private, f"{prefix}start", 15, report)
+        child = _command([str(tools["cl.exe"]), "@" + str(rsp)], private, f"{prefix}compile", 30, report)
+        report["independent_child_pid"] = child["pid"]
+    except Exception as error:
+        primary = error
+    finally:
+        # Also stop our unique session after an ambiguous start failure.
+        try:
+            _command([str(tools["vcperf.exe"]), "/stopnoanalyze", session, str(raw)], private, f"{prefix}stop", 30, report)
+        except Exception as error:
+            report["cleanup_error"] = _error(error)
+            if primary is None:
+                primary = error
+    if primary is not None:
+        raise primary
+    report["stop_statistics"] = _stop_statistics(private / f"{prefix}stop.log")
+    return raw
+
+
+def _sampling_summary(path: Path, child_pid: int) -> dict:
+    schema = {}
+    matched = {guid: 0 for guid in (BI_PROVIDER, PROCESS_PROVIDER, IMAGE_PROVIDER)}
+    for event in _events(path, child_pid, schema):
+        matched[event["provider"]] += 1
+    return {
+        "scope": "strict_decoded_xml_only_not_provider_absence_or_trace_completeness",
+        **{key: schema[key] for key in (
+            "event_count", "missing_system_events", "missing_provider_events",
+            "missing_provider_guid_events", "malformed_provider_guid_events",
+            "unsupported_namespace_events", "target_pid_events",
+        )},
+        "known_provider_counts": {guid: schema["known_provider_counts"].get(guid, 0) for guid in matched},
+        "child_matches_by_provider": matched,
+    }
+
+
 def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
     report = {
         "schema_version": 1, "purpose": "synthetic_one_tu_decoder_probe_only",
@@ -534,27 +580,8 @@ def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
         if not re.fullmatch(r"[0-9a-f]{40}", checkout_sha):
             raise ProbeError("checkout_sha_unavailable")
         report["checkout_sha"] = checkout_sha
-        session = "issue139-cl-probe-" + uuid.uuid4().hex
-        report["session"] = session
         report["build_cwd"] = str(private)
-        primary = None
-        try:
-            _command([str(tools["vcperf.exe"]), "/start", "/nocpusampling", "/level1", session], private, "start", 15, report)
-            child = _command([str(tools["cl.exe"]), "@" + str(rsp)], private, "compile", 30, report)
-            report["independent_child_pid"] = child["pid"]
-        except Exception as error:
-            primary = error
-        finally:
-            # Also stop our unique session after an ambiguous start failure.
-            try:
-                _command([str(tools["vcperf.exe"]), "/stopnoanalyze", session, str(private / "raw.etl")], private, "stop", 30, report)
-            except Exception as error:
-                report["cleanup_error"] = _error(error)
-                if primary is None:
-                    primary = error
-        if primary is not None:
-            raise primary
-        report["stop_statistics"] = _stop_statistics(private / "stop.log")
+        _capture(private, tools, rsp, report, cpu_sampling=False)
         _command([str(tools["vcperf.exe"]), "/analyze", str(private / "raw.etl"), str(private / "relogged.etl")], private, "relog", 60, report)
         _command([str(tracerpt), str(private / "raw.etl"), "-of", "XML", "-rts", "-o", str(private / "raw.xml")], private, "decode_raw", 30, report)
         _command([str(tracerpt), str(private / "relogged.etl"), "-import", str(tools["CppBuildInsightsEtw.xml"]), "-of", "XML", "-rts", "-o", str(private / "relogged.xml")], private, "decode_relogged", 30, report)
@@ -571,6 +598,22 @@ def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
             "summary": _decoder_document(private / "summary.txt", xml=False),
             "interpreted": _decoder_document(private / "interpreted.xml", xml=True),
         }
+        report["inputs_unchanged_before_cpu_sampling"] = False
+        report["inputs_unchanged_before_cpu_sampling"] = report["inputs"] == [_fingerprint(path) for path in inputs]
+        if not report["inputs_unchanged_before_cpu_sampling"]:
+            raise ProbeError("input_changed_before_cpu_sampling")
+        _check_private_size(private)
+        comparison = {"condition": "cpu_sampling_enabled", "status": "incomplete", "commands": [], "cleanup_error": None}
+        report["cpu_sampling_comparison"] = comparison
+        try:
+            raw = _capture(private, tools, rsp, comparison, cpu_sampling=True)
+            xml = private / "sampling_raw.xml"
+            _command([str(tracerpt), str(raw), "-of", "XML", "-rts", "-o", str(xml)], private, "sampling_decode_raw", 30, comparison)
+            comparison["raw_summary"] = _sampling_summary(xml, comparison["independent_child_pid"])
+        except Exception as error:
+            comparison["status"] = "failed"
+            comparison["error"] = _error(error)
+            raise
     except Exception as error:
         report["status"] = "failed"
         report["error"] = _error(error)
@@ -582,6 +625,9 @@ def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
                 report["inputs_unchanged"] = False
             if not report["inputs_unchanged"]:
                 report["status"] = "failed"
+                if "cpu_sampling_comparison" in report:
+                    comparison["status"] = "failed"
+                    comparison.setdefault("error", _error(ProbeError("input_changed_during_comparison")))
         _write_report(temp, report)
     return report
 

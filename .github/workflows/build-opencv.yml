@@ -84,7 +84,7 @@ jobs:
         id: cl-probe
         if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         continue-on-error: true
-        timeout-minutes: 5
+        timeout-minutes: 8
         shell: pwsh
         run: python -m scripts.probe_opencv_cl_decode
 

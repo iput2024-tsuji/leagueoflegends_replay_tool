@@ -38,13 +38,14 @@ def probe(tmp_path, monkeypatch):
 
     def command(args, private, stage, timeout, report):
         calls.append(stage)
-        entry = {"stage": stage, "status": "success", "pid": 42, "returncode": 0}
+        entry = {"stage": stage, "status": "success", "pid": 43 if stage.startswith("sampling_") else 42, "returncode": 0}
         report["commands"].append(entry)
         if stage == "checkout":
             (private / "checkout.log").write_text("b" * 40 + "\n", encoding="ascii")
-        if stage == "stop":
-            (private / "raw.etl").write_bytes(b"private trace")
-            (private / "stop.log").write_bytes(
+        if stage in {"stop", "sampling_stop"}:
+            prefix = "sampling_" if stage == "sampling_stop" else ""
+            (private / f"{prefix}raw.etl").write_bytes(b"private trace")
+            (private / f"{prefix}stop.log").write_bytes(
                 b"Dropped MSVC events: 0\r\nDropped MSVC buffers: 0\r\n"
                 b"Dropped system events: 0\r\nDropped system buffers: 0\r\n"
             )
@@ -53,6 +54,11 @@ def probe(tmp_path, monkeypatch):
         if stage == "decode_raw":
             (private / "raw.xml").write_bytes(_xml([
                 (target.PROCESS_PROVIDER, 999, {"ProcessId": 42, "ParentId": 10}),
+            ]))
+        if stage == "sampling_decode_raw":
+            (private / "sampling_raw.xml").write_bytes(_xml([
+                (target.PROCESS_PROVIDER, 999, {"ProcessId": 43, "ParentId": 10, "CommandLine": "sampling-private-command"}),
+                (target.IMAGE_PROVIDER, 43, {"ProcessId": 666, "FileName": "sampling-private-path"}),
             ]))
         if stage == "decode_relogged":
             expected = " ".join((private / "probe.rsp").read_text().splitlines())
@@ -81,7 +87,9 @@ def probe(tmp_path, monkeypatch):
 def test_probe_collects_fixture_fields_without_claiming_verified_trace(probe):
     temp, tools, tracerpt, calls, _ = probe
     report = target.run_probe(temp, tools, tracerpt)
-    assert calls == ["checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged", "inspect_raw"]
+    assert calls == ["checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged", "inspect_raw",
+                     "sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw"]
+    assert len(report["commands"]) == 8
     assert report["status"] == "incomplete"
     assert report["product_build_evidence"] is False
     assert report["inputs_unchanged"] is True
@@ -94,12 +102,24 @@ def test_probe_collects_fixture_fields_without_claiming_verified_trace(probe):
     assert report["decoder_documents"]["interpreted"]["xml_status"] == "well_formed"
     assert report["inspection_schema_observation"]["known_provider_counts"] == {target.PROCESS_PROVIDER: 1}
     assert report["inspection_schema_observation"]["target_pid_events"] == 1
+    comparison = report["cpu_sampling_comparison"]
+    assert len(report["inputs"]) == 11 and report["inputs_unchanged_before_cpu_sampling"] is True
+    assert len(comparison["commands"]) == 4 and comparison["status"] == "incomplete"
+    assert comparison["session"] != report["session"]
+    assert comparison["independent_child_pid"] == 43
+    assert comparison["raw_summary"]["known_provider_counts"][target.IMAGE_PROVIDER] == 1
+    assert comparison["raw_summary"]["child_matches_by_provider"] == {
+        target.BI_PROVIDER: 0, target.PROCESS_PROVIDER: 1, target.IMAGE_PROVIDER: 0,
+    }
+    assert "not_provider_absence" in comparison["raw_summary"]["scope"]
+    assert not ({"inputs", "observations", "build_cwd", "schema_observation"} & comparison.keys())
     public = temp / "LoLReplayTool-binary-cache/w/b/evidence"
     assert [path.name for path in public.iterdir()] == ["cl-decode-probe.json"]
     text = (public / "cl-decode-probe.json").read_text()
     assert "other-process-secret" not in text
     assert "raw.etl" not in text and "relogged.xml" not in text
     assert not any(value in text for value in ("private summary text", "private-root", "private-value"))
+    assert "sampling-private" not in text
 
 
 @pytest.mark.parametrize("failure", ["checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged", "inspect_raw"])
@@ -116,6 +136,8 @@ def test_stage_failure_stops_only_own_session_and_records_failure(probe, monkeyp
     report = target.run_probe(temp, tools, tracerpt)
     assert report["status"] == "failed"
     assert report["error"]["code"] == "injected_stage_failure"
+    assert not any(stage.startswith("sampling_") for stage in calls)
+    assert "cpu_sampling_comparison" not in report
     assert calls.count("start") == calls.count("stop") == (0 if failure == "checkout" else 1)
     if failure in {"checkout", "start"}:
         assert "compile" not in calls
@@ -168,7 +190,7 @@ def test_missing_actual_checkout_sha_is_not_replaced_with_context_sha(probe, mon
 
 
 def test_changed_input_invalidates_probe(probe, monkeypatch):
-    temp, tools, tracerpt, _, original = probe
+    temp, tools, tracerpt, calls, original = probe
 
     def change(args, private, stage, timeout, report):
         result = original(args, private, stage, timeout, report)
@@ -179,6 +201,155 @@ def test_changed_input_invalidates_probe(probe, monkeypatch):
     monkeypatch.setattr(target, "_command", change)
     report = target.run_probe(temp, tools, tracerpt)
     assert report["status"] == "failed" and report["inputs_unchanged"] is False
+    assert report["inputs_unchanged_before_cpu_sampling"] is False
+    assert "sampling_start" not in calls and "cpu_sampling_comparison" not in report
+
+
+def test_sampling_capture_reuses_inputs_arguments_and_cwd_after_a_stops(probe, monkeypatch):
+    temp, tools, tracerpt, _, original = probe
+    recorded = {}
+    fingerprints = []
+    fingerprint = target._fingerprint
+
+    def observe_fingerprint(path):
+        fingerprints.append(path.name)
+        return fingerprint(path)
+
+    def observe(args, private, stage, timeout, report):
+        recorded[stage] = (args, private, timeout)
+        if stage == "sampling_start":
+            assert "inspect_raw" in recorded and "stop" in recorded
+            assert set(fingerprints[-11:]) == {
+                "cl.exe", "c1xx.dll", "c2.dll", "vcperf.exe", "CppBuildInsights.dll",
+                "KernelTraceControl.dll", "CppBuildInsightsEtw.xml", "tracerpt.exe",
+                "probe_opencv_cl_decode.py", "probe.cpp", "probe.rsp",
+            }
+        return original(args, private, stage, timeout, report)
+
+    monkeypatch.setattr(target, "_fingerprint", observe_fingerprint)
+    monkeypatch.setattr(target, "_command", observe)
+    report = target.run_probe(temp, tools, tracerpt)
+    assert report["status"] == "incomplete"
+    assert recorded["compile"] == recorded["sampling_compile"]
+    a, b = recorded["start"][0], recorded["sampling_start"][0]
+    assert [arg for arg in a[:-1] if arg != "/nocpusampling"] == b[:-1]
+    assert a[-1] != b[-1]
+    assert recorded["stop"][0][2] == a[-1]
+    assert recorded["sampling_stop"][0][2] == b[-1]
+    assert recorded["stop"][0][3] != recorded["sampling_stop"][0][3]
+    assert all(item[1] == recorded["start"][1] for item in recorded.values())
+    # 340 seconds of command budgets + at most 5 seconds per owned-child cleanup.
+    assert sum(item[2] for item in recorded.values()) == 340
+    workflow = Path(".github/workflows/build-opencv.yml").read_text(encoding="utf-8")
+    diagnostic_step = workflow.split("- name: Probe one CL translation unit decoder", 1)[1].split("\n      - name:", 1)[0]
+    assert "timeout-minutes: 8" in diagnostic_step
+    assert "continue-on-error: true" in diagnostic_step and "pull_request" in diagnostic_step
+    assert sum(item[2] for item in recorded.values()) + 5 * len(recorded) < 8 * 60
+
+
+@pytest.mark.parametrize("name", [
+    "cl.exe", "c1xx.dll", "c2.dll", "vcperf.exe", "CppBuildInsights.dll",
+    "KernelTraceControl.dll", "CppBuildInsightsEtw.xml", "tracerpt.exe",
+    "probe_opencv_cl_decode.py", "probe.cpp", "probe.rsp",
+])
+def test_each_changed_input_prevents_sampling_capture(probe, monkeypatch, name):
+    temp, tools, tracerpt, calls, original = probe
+    fingerprint = target._fingerprint
+    changed = False
+
+    def observe(args, private, stage, timeout, report):
+        nonlocal changed
+        entry = original(args, private, stage, timeout, report)
+        if stage == "inspect_raw":
+            changed = True
+        return entry
+
+    def changed_fingerprint(path):
+        record = fingerprint(path)
+        if changed and path.name == name:
+            record["sha256"] = "0" * 64
+        return record
+
+    monkeypatch.setattr(target, "_command", observe)
+    monkeypatch.setattr(target, "_fingerprint", changed_fingerprint)
+    report = target.run_probe(temp, tools, tracerpt)
+    assert report["status"] == "failed"
+    assert report["error"]["code"] == "input_changed_before_cpu_sampling"
+    assert report["inputs_unchanged_before_cpu_sampling"] is False
+    assert "sampling_start" not in calls
+    assert report["observations"]["cl_properties"]
+
+
+@pytest.mark.parametrize("failure", ["sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw"])
+def test_sampling_failure_preserves_a_and_stops_only_b_once(probe, monkeypatch, failure):
+    temp, tools, tracerpt, calls, original = probe
+
+    def fail(args, private, stage, timeout, report):
+        if stage == failure:
+            calls.append(stage)
+            raise target.ProbeError("sampling_stage_failure")
+        return original(args, private, stage, timeout, report)
+
+    monkeypatch.setattr(target, "_command", fail)
+    report = target.run_probe(temp, tools, tracerpt)
+    comparison = report["cpu_sampling_comparison"]
+    assert report["status"] == comparison["status"] == "failed"
+    assert report["error"] == comparison["error"] == {"type": "ProbeError", "code": "sampling_stage_failure"}
+    assert report["observations"]["cl_properties"] and report["decoder_documents"]
+    assert report["cleanup_error"] is None
+    assert calls.count("stop") == calls.count("sampling_stop") == 1
+    if failure == "sampling_start":
+        assert "sampling_compile" not in calls
+    if failure != "sampling_decode_raw":
+        assert "sampling_decode_raw" not in calls
+
+
+def test_sampling_stop_failure_retains_primary_and_private_errors(probe, monkeypatch):
+    temp, tools, tracerpt, calls, original = probe
+
+    def fail(args, private, stage, timeout, report):
+        if stage in {"sampling_compile", "sampling_stop"}:
+            calls.append(stage)
+            if stage == "sampling_compile":
+                raise target.ProbeError("sampling_compile_failure")
+            raise RuntimeError("private-cleanup-error")
+        return original(args, private, stage, timeout, report)
+
+    monkeypatch.setattr(target, "_command", fail)
+    report = target.run_probe(temp, tools, tracerpt)
+    comparison = report["cpu_sampling_comparison"]
+    assert report["error"]["code"] == comparison["error"]["code"] == "sampling_compile_failure"
+    assert comparison["cleanup_error"] == {"type": "RuntimeError", "code": "operation_failed"}
+    assert report["observations"]["cl_properties"] and calls.count("sampling_stop") == 1
+    assert "private-cleanup-error" not in json.dumps(report)
+
+
+def test_input_change_during_sampling_invalidates_comparison(probe, monkeypatch):
+    temp, tools, tracerpt, _, original = probe
+
+    def change(args, private, stage, timeout, report):
+        entry = original(args, private, stage, timeout, report)
+        if stage == "sampling_decode_raw":
+            (tools / "cl.exe").write_bytes(b"changed after second capture")
+        return entry
+
+    monkeypatch.setattr(target, "_command", change)
+    report = target.run_probe(temp, tools, tracerpt)
+    assert report["inputs_unchanged_before_cpu_sampling"] is True
+    assert report["inputs_unchanged"] is False and report["status"] == "failed"
+    assert report["cpu_sampling_comparison"]["status"] == "failed"
+    assert report["observations"]["cl_properties"]
+
+
+def test_sampling_summary_does_not_infer_unknown_schema_or_publish_values(tmp_path):
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(b'<private-root><Event secret="private-value"/></private-root>')
+    result = target._sampling_summary(path, 43)
+    assert result["unsupported_namespace_events"] == 1
+    assert all(value == 0 for value in result["known_provider_counts"].values())
+    assert all(value == 0 for value in result["child_matches_by_provider"].values())
+    assert "not_provider_absence" in result["scope"]
+    assert "private" not in json.dumps(result)
 
 
 def test_unknown_schema_and_unexpected_command_are_not_invented_or_exposed(tmp_path):
@@ -703,7 +874,36 @@ def test_command_size_limit_stops_owned_child_without_masking_cleanup_failure(tm
     assert report["commands"][0]["child_cleanup"] == "failed"
 
 
-def test_stop_is_attempted_even_if_private_data_is_already_oversized(tmp_path, monkeypatch):
+def test_sampling_command_enforces_combined_a_and_b_private_size(tmp_path, monkeypatch):
+    class Process:
+        pid = 123
+        returncode = None
+        killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.killed = True
+            self.returncode = 1
+
+        def wait(self, timeout):
+            return self.returncode
+
+    process = Process()
+    monkeypatch.setattr(target.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(target, "FILE_LIMIT", 10)
+    monkeypatch.setattr(target, "TOTAL_LIMIT", 15)
+    (tmp_path / "raw.etl").write_bytes(b"a" * 8)
+    (tmp_path / "sampling_raw.etl").write_bytes(b"b" * 8)
+    report = {"commands": []}
+    with pytest.raises(target.ProbeError, match="private_total_limit"):
+        target._command(["must-not-execute"], tmp_path, "sampling_compile", 30, report)
+    assert process.killed and report["commands"][0]["status"] == "failed"
+
+
+@pytest.mark.parametrize("stage", ["stop", "sampling_stop"])
+def test_stop_is_attempted_even_if_private_data_is_already_oversized(tmp_path, monkeypatch, stage):
     class Process:
         pid = 123
         returncode = 0
@@ -720,7 +920,7 @@ def test_stop_is_attempted_even_if_private_data_is_already_oversized(tmp_path, m
     (tmp_path / "oversized.etl").write_bytes(b"oversize")
     report = {"commands": []}
     with pytest.raises(target.ProbeError, match="private_file_limit"):
-        target._command(["must-not-execute"], tmp_path, "stop", 5, report)
+        target._command(["must-not-execute"], tmp_path, stage, 5, report)
     assert report["commands"][0]["returncode"] == 0
 
 

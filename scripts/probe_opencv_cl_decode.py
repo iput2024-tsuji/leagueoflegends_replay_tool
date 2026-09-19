@@ -26,6 +26,7 @@ FILE_LIMIT = 64 * 1024 * 1024
 TOTAL_LIMIT = 256 * 1024 * 1024
 JSON_LIMIT = 64 * 1024
 EVENT_LIMIT = 32
+SCHEMA_GROUP_LIMIT = 8
 BI_PROVIDER = "f78a07b0-796a-5da4-5c20-61aa526e77af"
 PROCESS_PROVIDER = "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c"
 IMAGE_PROVIDER = "2cb15d1d-5fc1-11d2-abe1-00a0c911f518"
@@ -151,6 +152,68 @@ def _time_created_shape(timestamp: ET.Element | None) -> dict:
     }
 
 
+def _missing_guid_observation(event: ET.Element, system: ET.Element, child_pid: int) -> tuple[dict, dict]:
+    def number(value):
+        return _integer(value) if value is not None and len(value) <= 64 else None
+
+    def field(nodes):
+        value = (nodes[0].text or "") if len(nodes) == 1 and not len(nodes[0]) else None
+        shape = _value_shape(value)
+        return {"count": len(nodes), "nested_elements": sum(len(node) for node in nodes),
+                "form": shape["form"], "surrounding_whitespace": shape["surrounding_whitespace"]}, shape, value
+
+    provider = system.find(f"{NS}Provider")
+    provider_names = {"Name", "EventSourceName"}
+    provider_shapes = {name: _value_shape(provider.get(name)) for name in sorted(provider_names)}
+    structure = {
+        "provider_attributes": {name: shape["form"] for name, shape in provider_shapes.items()},
+        "other_provider_attribute_count": len(provider.attrib.keys() - provider_names),
+        "system_count": len(event.findall(f"{NS}System")),
+        "provider_count": len(system.findall(f"{NS}Provider")),
+        "other_system_element_count": sum(node.tag not in {
+            f"{NS}{name}" for name in ("Provider", "Execution", "TimeCreated", "EventID", "Version", "Task", "Opcode")
+        } for node in system),
+        "system_fields": {}, "payload_fields": {},
+    }
+    sample = {"provider_attributes": provider_shapes, "system_fields": {}, "payload_fields": {}}
+    for name in ("EventID", "Version", "Task", "Opcode"):
+        nodes = system.findall(f"{NS}{name}")
+        if nodes:
+            info, shape, value = field(nodes)
+            info["uint32"] = number(value)
+            structure["system_fields"][name] = info
+            sample["system_fields"][name] = shape
+    executions = system.findall(f"{NS}Execution")
+    header = executions[0].get("ProcessID") if len(executions) == 1 and not len(executions[0]) else None
+    header_pid = number(header) if structure["system_count"] == 1 else None
+    sample["execution_pid"] = _value_shape(header)
+    structure["execution_count"] = len(executions)
+    structure["execution_pid_form"] = sample["execution_pid"]["form"]
+    structure["header_matches_child"] = header_pid == child_pid if header_pid is not None else None
+    event_data = event.findall(f"{NS}EventData")
+    payload = event.findall(f"{NS}EventData/{NS}Data")
+    user_data = event.findall(f"{NS}UserData")
+    names = {"ProcessId", "ParentId", "ImageFileName", "FileName", "ImageBase", "UniqueProcessKey", "CommandLine"}
+    structure.update(
+        event_data_count=len(event_data), data_count=len(payload),
+        other_event_data_element_count=sum(len(node) for node in event_data) - len(payload),
+        user_data_count=len(user_data), user_data_child_count=sum(len(node) for node in user_data),
+        other_payload_field_count=sum(node.get("Name") not in names for node in payload),
+        other_payload_attribute_count=sum(len(node.attrib.keys() - {"Name"}) for node in payload),
+        payload_matches_child=None,
+    )
+    for name in sorted(names):
+        nodes = [node for node in payload if node.get("Name") == name]
+        if nodes:
+            info, shape, value = field(nodes)
+            structure["payload_fields"][name] = info
+            sample["payload_fields"][name] = shape
+            if name == "ProcessId" and len(event_data) == 1:
+                payload_pid = number(value)
+                structure["payload_matches_child"] = payload_pid == child_pid if payload_pid is not None else None
+    return structure, sample
+
+
 def _events(path: Path, child_pid: int, schema: dict):
     _fingerprint(path)
     # A bounded local tool output, not a remotely supplied document. No DTD/entity
@@ -167,6 +230,10 @@ def _events(path: Path, child_pid: int, schema: dict):
                   missing_system_events=0, missing_provider_events=0,
                   missing_provider_guid_events=0, malformed_provider_guid_events=0,
                   target_pid_events=0, unsupported_namespace_events=0, target_field_shapes={})
+    missing_guid = {"groups": [], "overflow_events": 0, "truncated": False,
+                    "header_child_matches": 0, "payload_child_matches": 0}
+    schema["missing_guid_schema"] = missing_guid
+    groups = {}
     for event in root.iter():
         if event.tag.rsplit("}", 1)[-1] != "Event":
             continue
@@ -185,6 +252,20 @@ def _events(path: Path, child_pid: int, schema: dict):
         raw_guid = provider.get("Guid")
         if raw_guid is None:
             schema["missing_provider_guid_events"] += 1
+            structure, sample = _missing_guid_observation(event, system, child_pid)
+            missing_guid["header_child_matches"] += structure["header_matches_child"] is True
+            missing_guid["payload_child_matches"] += structure["payload_matches_child"] is True
+            # Group only by structure and fixed System numbers, never payload hashes/values.
+            key = json.dumps(structure, sort_keys=True, separators=(",", ":"))
+            if key in groups:
+                groups[key]["count"] += 1
+            elif len(groups) < SCHEMA_GROUP_LIMIT:
+                group = {"count": 1, "structure": structure, "first_sample": sample}
+                groups[key] = group
+                missing_guid["groups"].append(group)
+            else:
+                missing_guid["overflow_events"] += 1
+                missing_guid["truncated"] = True
             continue
         unwrapped = raw_guid[1:-1] if raw_guid.startswith("{") and raw_guid.endswith("}") else raw_guid
         if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", unwrapped):

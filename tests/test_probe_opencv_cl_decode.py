@@ -210,6 +210,98 @@ def test_provider_histogram_is_bounded(tmp_path, monkeypatch):
         list(target._events(path, 42, {}))
 
 
+def test_missing_guid_schema_groups_structure_without_exposing_dynamic_values(tmp_path):
+    secrets = ("private-provider", "private-source", "private-attribute", "private-field",
+               "private-path", "private-command", "private-sid", "private-element")
+    root = ET.fromstring(_xml([
+        (target.BI_PROVIDER, 999, {"ProcessId": 42, "FileName": "private-path" + suffix,
+                                  "CommandLine": "private-command" + suffix, "UserSID": "private-sid",
+                                  "private-field": "private-value"})
+        for suffix in ("-one", "-different-two")
+    ]))
+    for index, event in enumerate(root):
+        system = event.find(f"{target.NS}System")
+        provider = system.find(f"{target.NS}Provider")
+        provider.attrib.clear()
+        provider.attrib.update(Name="private-provider" + str(index), EventSourceName="private-source",
+                               **{"private-attribute": "private-value"})
+        ET.SubElement(system, f"{target.NS}EventID").text = "1"
+        ET.SubElement(system, f"{target.NS}private-element").text = "private-value"
+        user_data = ET.SubElement(event, f"{target.NS}UserData")
+        ET.SubElement(user_data, "private-element").text = "private-sid"
+    (tmp_path / "raw.xml").write_bytes(ET.tostring(root))
+    (tmp_path / "relogged.xml").write_bytes(_xml([]))
+    result = target._decode(tmp_path, tmp_path / "cl.exe", 42, "fixture")
+    assert result["process_events"] == result["backend_events"] == []
+    schema = result["schema_observation"]["raw"]["missing_guid_schema"]
+    assert len(schema["groups"]) == 1 and schema["groups"][0]["count"] == 2
+    assert schema["header_child_matches"] == 0 and schema["payload_child_matches"] == 2
+    structure = schema["groups"][0]["structure"]
+    sample = schema["groups"][0]["first_sample"]
+    assert structure["system_fields"]["EventID"]["uint32"] == 1
+    assert structure["other_provider_attribute_count"] == structure["other_system_element_count"] == 1
+    assert structure["other_payload_field_count"] == 2
+    assert structure["user_data_count"] == structure["user_data_child_count"] == 1
+    assert sample["payload_fields"]["FileName"]["sha256"] == hashlib.sha256(b"private-path-one").hexdigest()
+    public = json.dumps(result)
+    assert not any(secret in public for secret in secrets)
+    assert hashlib.sha256(b"private-sid").hexdigest() not in public
+
+
+def test_missing_guid_child_matches_require_unique_leaf_fields_and_strict_numbers(tmp_path):
+    pids = [(" 42 ", "0x2a"), ("0x2a", " 42 "), (43, 43), (42, 42),
+            (42, 42), (42, 42), ("9" * 5000, "9" * 5000), (42, 42)]
+    root = ET.fromstring(_xml([(target.BI_PROVIDER, header, {"ProcessId": payload}) for header, payload in pids]))
+    for event in root:
+        event.find(f"{target.NS}System/{target.NS}Provider").attrib.clear()
+        event.find(f"{target.NS}System/{target.NS}Opcode").text = " 1 "
+    ET.SubElement(root[3].find(f"{target.NS}System"), f"{target.NS}Execution", ProcessID="42")
+    ET.SubElement(root[4].find(f"{target.NS}EventData"), f"{target.NS}Data", Name="ProcessId").text = "42"
+    ET.SubElement(root[5].find(f"{target.NS}EventData/{target.NS}Data"), "private-nested").text = "private-value"
+    ET.SubElement(root[6].find(f"{target.NS}System"), f"{target.NS}EventID").text = "9" * 5000
+    root[7].append(ET.fromstring(ET.tostring(root[7].find(f"{target.NS}System"))))
+    path = tmp_path / "raw.xml"
+    path.write_bytes(ET.tostring(root))
+    schema = {}
+    assert list(target._events(path, 42, schema)) == []
+    groups = schema["missing_guid_schema"]["groups"]
+    assert [(group["structure"]["header_matches_child"], group["structure"]["payload_matches_child"])
+            for group in groups] == [(None, True), (True, None), (False, False), (None, True),
+                                     (True, None), (True, None), (None, None), (None, True)]
+    assert all(group["structure"]["system_fields"]["Opcode"]["uint32"] is None for group in groups)
+    assert groups[6]["structure"]["system_fields"]["EventID"]["uint32"] is None
+    assert groups[6]["first_sample"]["payload_fields"]["ProcessId"]["length"] == 5000
+    assert "private-nested" not in json.dumps(schema) and "9" * 65 not in json.dumps(schema)
+
+
+def test_missing_guid_schema_caps_groups_but_counts_overflow_and_keeps_normal_decode(tmp_path):
+    root = ET.fromstring(_xml([
+        (target.BI_PROVIDER, 42, {"ProcessId": 42, "FileName": "private-path"}) for _ in range(11)
+    ]))
+    for event, event_id in zip(root, [*range(9), 0, 8], strict=True):
+        system = event.find(f"{target.NS}System")
+        system.find(f"{target.NS}Provider").attrib.clear()
+        ET.SubElement(system, f"{target.NS}EventID").text = str(event_id)
+    root.append(ET.fromstring(_xml([
+        (target.BI_PROVIDER, 42, {"Tool": "CL", "InvocationId": " 7 ", "Name": "CommandLine", "Value": "fixture"}),
+    ]))[0])
+    (tmp_path / "relogged.xml").write_bytes(ET.tostring(root))
+    (tmp_path / "raw.xml").write_bytes(_xml([]))
+    result = target._decode(tmp_path, tmp_path / "cl.exe", 42, "fixture")
+    observed = result["schema_observation"]["relogged"]
+    schema = observed["missing_guid_schema"]
+    assert observed["missing_provider_guid_events"] == 11 and observed["target_pid_events"] == 1
+    assert len(schema["groups"]) == 8 and schema["groups"][0]["count"] == 2
+    assert schema["overflow_events"] == 2 and schema["truncated"] is True
+    assert schema["header_child_matches"] == schema["payload_child_matches"] == 11
+    assert result["command_matches_fixture_in_xml_order"] is True
+    assert result["cl_properties"][0]["invocation_id"] == 7
+    target._write_report(tmp_path, result)
+    public = tmp_path / "LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
+    assert public.stat().st_size <= target.JSON_LIMIT
+    assert "private-path" not in public.read_text()
+
+
 def test_target_value_shapes_preserve_raw_metadata_after_invocation_trim(tmp_path):
     invocations = [None, "", " 17 ", "0x00000007", "invocation-secret", " \t "]
     root = ET.fromstring(_xml([

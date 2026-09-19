@@ -37,7 +37,7 @@ try:
         champion_kill_role,
         normalize_summoner_name,
     )
-    from .match_metadata import merge_live_game_metadata
+    from .match_metadata import is_tft_match, merge_live_game_metadata
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
         OBSBootstrapApplyPlan,
@@ -122,7 +122,7 @@ except ImportError:
         champion_kill_role,
         normalize_summoner_name,
     )
-    from match_metadata import merge_live_game_metadata
+    from match_metadata import is_tft_match, merge_live_game_metadata
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
         OBSBootstrapApplyPlan,
@@ -3384,6 +3384,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.player_team = None
         self.enemy_champions = []
         self.match_metadata: dict[str, Any] = {}
+        self._tft_classification_source: str | None = None
         self.game_start_detection_source: str | None = None
         self.game_start_anchor_game_time: float | None = None
         self.sync_time_source: str | None = None
@@ -3528,7 +3529,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             return
 
         previous_name = self.match_metadata.get("display_name")
-        self.match_metadata.update(metadata)
+        self._update_waiting_match_metadata(metadata)
         current_name = self.match_metadata.get("display_name")
         if current_name and current_name != previous_name:
             self.log(f"マッチ種類を検出: {current_name}")
@@ -3539,6 +3540,53 @@ class LoLAutoRecorder(RecordingSessionManager):
             return None
         normalized = re.sub(r"[\s_-]+", "", str(value)).casefold()
         return normalized or None
+
+    def _update_waiting_match_metadata(self, metadata: dict[str, Any], *, live_client: bool = False) -> None:
+        """Keep confirmed TFT classification until a new match or lobby is observed."""
+        metadata = {key: value for key, value in metadata.items() if value not in (None, "")}
+        previous_id = self.match_metadata.get("game_id")
+        current_id = metadata.get("game_id")
+        has_both_ids = previous_id not in (None, "") and current_id not in (None, "")
+        has_neither_id = previous_id in (None, "") and current_id in (None, "")
+        source = "live_client" if live_client else metadata.get("source")
+        previous_source = self._tft_classification_source or self.match_metadata.get("source")
+        new_match = (
+            str(previous_id) != str(current_id)
+            if has_both_ids
+            else (
+                has_neither_id
+                and source == previous_source
+                and any(
+                    metadata.get(key) not in (None, "")
+                    and self.match_metadata.get(key) not in (None, "")
+                    and metadata[key] != self.match_metadata[key]
+                    for key in ("queue_id", "game_mode")
+                )
+            )
+        )
+        phase = self._normalize_gameflow_phase(metadata.get("gameflow_phase"))
+        previous_phase = self._normalize_gameflow_phase(self.match_metadata.get("gameflow_phase"))
+        outside_game = phase != previous_phase and phase in {
+            "none", "lobby", "matchmaking", "readycheck", "champselect",
+        }
+        if not self.session_started and (new_match or outside_game):
+            phase = self.match_metadata.get("gameflow_phase")
+            self.match_metadata = {"gameflow_phase": phase} if phase else {}
+            self._tft_classification_source = None
+        explicit_tft = is_tft_match(metadata)
+        if explicit_tft:
+            self._tft_classification_source = source
+        if not self.session_started and is_tft_match(self.match_metadata) and not is_tft_match(metadata):
+            # Partial/conflicting replies from the same game must not undo an exclusion.
+            metadata = {
+                key: value for key, value in metadata.items()
+                if key not in {"queue_id", "queue_type", "game_mode"}
+            }
+        if live_client:
+            metadata = {key: value for key, value in metadata.items() if key not in self.match_metadata}
+        self.match_metadata.update(metadata)
+        if explicit_tft and live_client:
+            self.match_metadata["game_mode"] = "TFT"
 
     async def poll_gameflow_phase(self) -> RiotPollResult:
         get_phase = getattr(self.riot_api_client, "get_gameflow_phase_result", None)
@@ -3558,7 +3606,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         if result.status == RiotPollStatus.IN_GAME and isinstance(result.payload, dict):
             phase = _first_mapping_value(result.payload, "phase", "value")
             if phase not in (None, ""):
-                self.match_metadata["gameflow_phase"] = str(phase)
+                self._update_waiting_match_metadata({"gameflow_phase": str(phase)})
         return result
 
     async def is_lol_game_process_running_async(self) -> bool | None:
@@ -3939,6 +3987,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.log("⚔️  LoLの試合開始を待機中 (API監視)...")
         loop = asyncio.get_running_loop()
         next_diagnostic_at = loop.time() + DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC
+        skipping_tft = False
         while True:
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
@@ -3948,29 +3997,48 @@ class LoLAutoRecorder(RecordingSessionManager):
             await self.capture_match_metadata_async()
             result = await self.poll_all_game_data()
             data = result.payload
+            self._update_waiting_match_metadata(merge_live_game_metadata({}, data), live_client=True)
             game_time = self._live_game_time(data)
-            if result.status == RiotPollStatus.IN_GAME and game_time is not None:
+            gameflow_phase = self.match_metadata.get("gameflow_phase")
+            has_live_start = result.status == RiotPollStatus.IN_GAME and game_time is not None
+            is_tft = is_tft_match(self.match_metadata) or is_tft_match(merge_live_game_metadata({}, data))
+            lcu_start_checked = False
+            if (
+                not is_tft
+                and not has_live_start
+                and self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES
+            ):
+                live_result = await self.wait_for_live_client_after_lcu_start_async(initial_result=result)
+                if self.should_stop():
+                    self.session_phase = RecordingPhase.CANCELLED
+                    return False
+                # Classification/phase may arrive or change during the grace period.
+                await self.poll_gameflow_phase()
+                await self.capture_match_metadata_async()
+                gameflow_phase = self.match_metadata.get("gameflow_phase")
+                data, game_time = live_result if live_result is not None else (None, None)
+                self._update_waiting_match_metadata(merge_live_game_metadata({}, data), live_client=True)
+                has_live_start = live_result is not None
+                is_tft = is_tft_match(self.match_metadata) or is_tft_match(merge_live_game_metadata({}, data))
+                lcu_start_checked = True
+
+            if is_tft:
+                if not skipping_tft:
+                    self.log("TFTは録画対象外です。次のLoLの試合を待機します。")
+                skipping_tft = True
+                # No pending champion-select data may cause a JSON save on shutdown.
+                self.champ_select_tracker.reset()
+            elif has_live_start:
                 return await self._mark_game_started(
                     source="live_client",
                     live_data=data,
                     game_time=game_time,
                 )
-
-            gameflow_phase = self.match_metadata.get("gameflow_phase")
-            if self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES:
-                live_result = await self.wait_for_live_client_after_lcu_start_async(initial_result=result)
-                if live_result is None:
-                    if self.should_stop():
-                        self.session_phase = RecordingPhase.CANCELLED
-                        return False
-                    self.log("⚠️ Live Clientを確認できないため、LCU Gameflow Phaseで録画開始します。")
-                    return await self._mark_game_started(source="lcu")
-                live_data, live_game_time = live_result
-                return await self._mark_game_started(
-                    source="live_client",
-                    live_data=live_data,
-                    game_time=live_game_time,
-                )
+            elif lcu_start_checked and self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES:
+                self.log("⚠️ Live Clientを確認できないため、LCU Gameflow Phaseで録画開始します。")
+                return await self._mark_game_started(source="lcu")
+            else:
+                skipping_tft = False
 
             if loop.time() >= next_diagnostic_at:
                 self.log(f"🔎 試合開始監視中: {self._game_start_poll_summary(result, gameflow_phase)}")
@@ -3997,6 +4065,9 @@ class LoLAutoRecorder(RecordingSessionManager):
                 return None
             result = results.pop(0) if results else await self.poll_all_game_data()
             data = result.payload
+            self._update_waiting_match_metadata(merge_live_game_metadata({}, data), live_client=True)
+            if is_tft_match(self.match_metadata):
+                return None
             game_time = self._live_game_time(data)
             if result.status == RiotPollStatus.IN_GAME and data is not None and game_time is not None:
                 self.log(f"Live Client接続を確認しました。GameTime: {float(game_time):.2f}s")

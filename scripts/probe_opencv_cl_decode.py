@@ -122,6 +122,35 @@ def _integer(value: str | None) -> int | None:
     return number if 0 <= number <= 0xFFFFFFFF else None
 
 
+def _value_shape(value: str | None) -> dict:
+    # Classify only; never feed stripped values back into the decoder.
+    stripped = value.strip() if value is not None else ""
+    form = "missing" if value is None else "empty" if not value else "other"
+    if value:
+        if not stripped:
+            form = "whitespace"
+        elif re.fullmatch(r"[0-9]+", stripped):
+            form = "decimal"
+        elif re.fullmatch(r"0[xX][0-9a-fA-F]+", stripped):
+            form = "hex"
+    return {
+        "present": value is not None, "form": form,
+        "length": len(value) if value is not None else None,
+        "sha256": hashlib.sha256(value.encode("utf-8")).hexdigest() if value is not None else None,
+        "surrounding_whitespace": value is not None and value != stripped,
+    }
+
+
+def _time_created_shape(timestamp: ET.Element | None) -> dict:
+    allowed = {"SystemTime", "RawTime", "TimeStamp", "Timestamp"}
+    attributes = timestamp.attrib if timestamp is not None else {}
+    return {
+        "present": timestamp is not None,
+        "attributes": {name: _value_shape(attributes.get(name)) for name in sorted(allowed)},
+        "unknown_attribute_count": len(attributes.keys() - allowed),
+    }
+
+
 def _events(path: Path, child_pid: int, schema: dict):
     _fingerprint(path)
     # A bounded local tool output, not a remotely supplied document. No DTD/entity
@@ -134,8 +163,10 @@ def _events(path: Path, child_pid: int, schema: dict):
     if b"<!DOCTYPE" in declaration_scan or b"<!ENTITY" in declaration_scan:
         raise ProbeError("xml_declaration_rejected")
     root = ET.fromstring(data)
-    schema.update(event_count=0, known_provider_counts={}, target_pid_events=0,
-                  unsupported_namespace_events=0, target_field_shapes={})
+    schema.update(event_count=0, known_provider_counts={}, provider_guid_counts={},
+                  missing_system_events=0, missing_provider_events=0,
+                  missing_provider_guid_events=0, malformed_provider_guid_events=0,
+                  target_pid_events=0, unsupported_namespace_events=0, target_field_shapes={})
     for event in root.iter():
         if event.tag.rsplit("}", 1)[-1] != "Event":
             continue
@@ -145,11 +176,28 @@ def _events(path: Path, child_pid: int, schema: dict):
             continue
         system = event.find(f"{NS}System")
         if system is None:
+            schema["missing_system_events"] += 1
             continue
         provider = system.find(f"{NS}Provider")
+        if provider is None:
+            schema["missing_provider_events"] += 1
+            continue
+        raw_guid = provider.get("Guid")
+        if raw_guid is None:
+            schema["missing_provider_guid_events"] += 1
+            continue
+        unwrapped = raw_guid[1:-1] if raw_guid.startswith("{") and raw_guid.endswith("}") else raw_guid
+        if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", unwrapped):
+            histogram = schema["provider_guid_counts"]
+            key = unwrapped.lower()
+            if key not in histogram and len(histogram) >= EVENT_LIMIT:
+                raise ProbeError("provider_guid_limit")
+            histogram[key] = histogram.get(key, 0) + 1
+        else:
+            schema["malformed_provider_guid_events"] += 1
         execution = system.find(f"{NS}Execution")
         timestamp = system.find(f"{NS}TimeCreated")
-        guid = provider.get("Guid", "").strip("{}").lower() if provider is not None else ""
+        guid = raw_guid.strip("{}").lower()
         if guid not in {BI_PROVIDER, PROCESS_PROVIDER, IMAGE_PROVIDER}:
             continue
         counts = schema["known_provider_counts"]
@@ -177,6 +225,7 @@ def _events(path: Path, child_pid: int, schema: dict):
         yield {
             "provider": guid, "header_pid": header_pid,
             "timestamp": raw_time if raw_time and re.fullmatch(r"[0-9:.TZ+\-]{1,64}", raw_time) else None,
+            "time_created_shape": _time_created_shape(timestamp),
             "opcode": _integer(system.findtext(f"{NS}Opcode")),
             "fields": fields,
         }
@@ -184,6 +233,26 @@ def _events(path: Path, child_pid: int, schema: dict):
 
 def _same_path(left: str, right: str) -> bool:
     return ntpath.normcase(ntpath.normpath(left)) == ntpath.normcase(ntpath.normpath(right))
+
+
+def _fixture_unquoted_path_comparison(private: Path, expected: str, commands: list) -> dict:
+    tokens = (f'/Fo"{private / "probe.obj"}"', f'"{private / "probe.cpp"}"')
+    result = {"candidate_available": False, "segment_sha256_matches": [], "matches_in_xml_order": False}
+    if expected.count('"') != 4 or any(expected.count(token) != 1 for token in tokens):
+        return result
+    # Only the four quotes around our two known fixture paths; no general
+    # quote/whitespace normalization and no publication of observed text.
+    candidate = expected.replace(tokens[0], f'/Fo{private / "probe.obj"}').replace(tokens[1], str(private / "probe.cpp"))
+    segments = [candidate[index:index + 1000] for index in range(0, len(candidate), 1000)]
+    matches = [
+        index < len(segments) and entry["value_sha256"] == hashlib.sha256(segments[index].encode("utf-8")).hexdigest()
+        for index, (entry, _) in enumerate(commands)
+    ]
+    result.update(candidate_available=True, candidate_length=len(candidate),
+                  expected_segment_count=len(segments), observed_segment_count=len(commands),
+                  segment_sha256_matches=matches,
+                  matches_in_xml_order=bool(commands) and len(commands) == len(segments) and all(matches))
+    return result
 
 
 def _decode(private: Path, compiler: Path, child_pid: int, expected_command: str) -> dict:
@@ -201,6 +270,8 @@ def _decode(private: Path, compiler: Path, child_pid: int, expected_command: str
         entry = {
             "name": name, "observed_header_pid": event["header_pid"],
             "invocation_id": _integer(fields.get("InvocationId")),
+            "invocation_id_shape": _value_shape(fields.get("InvocationId")),
+            "time_created_shape": event["time_created_shape"],
             "timestamp_as_rendered": event["timestamp"], "length": len(value),
             "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
         }
@@ -231,6 +302,7 @@ def _decode(private: Path, compiler: Path, child_pid: int, expected_command: str
         for entry, value in commands:
             entry["value"] = value
     result["command_matches_fixture_in_xml_order"] = bool(commands) and compact(combined) in allowed
+    result["fixture_unquoted_path_comparison"] = _fixture_unquoted_path_comparison(private, expected_command, commands)
 
     for event in _events(private / "raw.xml", child_pid, schema["raw"]):
         fields = event["fields"]

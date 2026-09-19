@@ -176,6 +176,129 @@ def test_unknown_schema_and_unexpected_command_are_not_invented_or_exposed(tmp_p
     assert "private-location" not in json.dumps(result)
 
 
+def test_provider_histogram_distinguishes_unknown_guids_and_missing_schema(tmp_path):
+    unknown = "11111111-aaaa-bbbb-cccc-222222222222"
+    root = ET.fromstring(_xml([(unknown, 42, {}), (unknown.upper(), 42, {})]))
+    ET.SubElement(root, f"{target.NS}Event")  # No System.
+    event = ET.SubElement(root, f"{target.NS}Event")
+    ET.SubElement(event, f"{target.NS}System")  # No Provider.
+    for attributes in ({}, {"Guid": ""}, {"Guid": "private-malformed-guid"}):
+        event = ET.SubElement(root, f"{target.NS}Event")
+        system = ET.SubElement(event, f"{target.NS}System")
+        ET.SubElement(system, f"{target.NS}Provider", attributes)
+    ET.SubElement(root, "Event")  # Unsupported namespace remains distinct.
+    path = tmp_path / "raw.xml"
+    path.write_bytes(ET.tostring(root))
+    schema = {}
+    assert list(target._events(path, 42, schema)) == []
+    assert schema["event_count"] == 8
+    assert schema["provider_guid_counts"] == {unknown: 2}
+    assert schema["known_provider_counts"] == {}
+    assert schema["missing_system_events"] == 1
+    assert schema["missing_provider_events"] == 1
+    assert schema["missing_provider_guid_events"] == 1
+    assert schema["malformed_provider_guid_events"] == 2
+    assert schema["unsupported_namespace_events"] == 1
+    assert "private-malformed-guid" not in json.dumps(schema)
+
+
+def test_provider_histogram_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(target, "EVENT_LIMIT", 1)
+    path = tmp_path / "raw.xml"
+    path.write_bytes(_xml([(target.BI_PROVIDER, 666, {}), (target.PROCESS_PROVIDER, 666, {})]))
+    with pytest.raises(target.ProbeError, match="provider_guid_limit"):
+        list(target._events(path, 42, {}))
+
+
+def test_target_value_shapes_explain_nulls_without_changing_parsing_or_exposing_values(tmp_path):
+    invocations = [None, "", " 17 ", "0x00000007", "invocation-secret", " \t "]
+    root = ET.fromstring(_xml([
+        (target.BI_PROVIDER, 42, {"Tool": "CL", "Name": "ToolPath", "Value": "private-tool",
+                                  **({"InvocationId": value} if value is not None else {})})
+        for value in invocations
+    ]))
+    time_attributes = [None, {}, {"SystemTime": " 123 "}, {"RawTime": "0x123"},
+                       {"unknown-attribute-name": "unknown-attribute-secret"}, {"SystemTime": ""}]
+    for event, attributes in zip(root, time_attributes, strict=True):
+        system = event.find(f"{target.NS}System")
+        timestamp = system.find(f"{target.NS}TimeCreated")
+        if attributes is None:
+            system.remove(timestamp)
+        else:
+            timestamp.attrib.clear()
+            timestamp.attrib.update(attributes)
+    (tmp_path / "relogged.xml").write_bytes(ET.tostring(root))
+    (tmp_path / "raw.xml").write_bytes(_xml([]))
+    result = target._decode(tmp_path, tmp_path / "cl.exe", 42, "fixture")
+    rows = result["cl_properties"]
+    assert [row["invocation_id"] for row in rows] == [None, None, None, 7, None, None]
+    assert all(row["timestamp_as_rendered"] is None for row in rows)
+    assert [row["invocation_id_shape"]["form"] for row in rows] == [
+        "missing", "empty", "decimal", "hex", "other", "whitespace",
+    ]
+    for row, value in zip(rows, invocations, strict=True):
+        shape = row["invocation_id_shape"]
+        assert shape["present"] is (value is not None)
+        assert shape["length"] == (len(value) if value is not None else None)
+        assert shape["sha256"] == (hashlib.sha256(value.encode()).hexdigest() if value is not None else None)
+    assert rows[2]["invocation_id_shape"]["surrounding_whitespace"] is True
+    assert rows[0]["time_created_shape"]["present"] is False
+    assert rows[1]["time_created_shape"]["present"] is True
+    assert rows[1]["time_created_shape"]["attributes"]["SystemTime"]["present"] is False
+    assert rows[2]["time_created_shape"]["attributes"]["SystemTime"]["form"] == "decimal"
+    assert rows[2]["time_created_shape"]["attributes"]["SystemTime"]["surrounding_whitespace"] is True
+    assert rows[3]["time_created_shape"]["attributes"]["RawTime"]["form"] == "hex"
+    assert rows[4]["time_created_shape"]["unknown_attribute_count"] == 1
+    assert rows[5]["time_created_shape"]["attributes"]["SystemTime"]["form"] == "empty"
+    assert not any(secret in json.dumps(result) for secret in (
+        "invocation-secret", "unknown-attribute-name", "unknown-attribute-secret", "private-tool",
+    ))
+
+
+@pytest.mark.parametrize("change", ["none", "value", "order", "omitted"])
+def test_known_fixture_path_quote_candidate_keeps_old_comparison_and_status(probe, monkeypatch, change):
+    temp, tools, tracerpt, _, original = probe
+
+    def decoded_without_path_quotes(args, private, stage, timeout, report):
+        entry = original(args, private, stage, timeout, report)
+        if stage == "decode_relogged":
+            expected = " ".join((private / "probe.rsp").read_text().splitlines())
+            candidate = expected.replace(f'/Fo"{private / "probe.obj"}"', f'/Fo{private / "probe.obj"}')
+            candidate = candidate.replace(f'"{private / "probe.cpp"}"', str(private / "probe.cpp"))
+            segments = [candidate[index:index + 1000] for index in range(0, len(candidate), 1000)]
+            if change == "value":
+                segments[-1] += "private-extra-argument"
+            elif change == "order":
+                segments.reverse()
+            elif change == "omitted":
+                segments.pop()
+            (private / "relogged.xml").write_bytes(_xml([
+                (target.BI_PROVIDER, 42, {"Tool": "CL", "InvocationId": 7, "Name": "CommandLine", "Value": value})
+                for value in segments
+            ]))
+        return entry
+
+    monkeypatch.setattr(target, "_command", decoded_without_path_quotes)
+    report = target.run_probe(temp, tools, tracerpt)
+    assert report["status"] == "incomplete" and report["product_build_evidence"] is False
+    observations = report["observations"]
+    assert observations["command_matches_fixture_in_xml_order"] is False
+    comparison = observations["fixture_unquoted_path_comparison"]
+    assert comparison["candidate_available"] is True
+    assert comparison["matches_in_xml_order"] is (change == "none")
+    if change == "none":
+        assert comparison["segment_sha256_matches"] == [True, True]
+    assert all("value" not in row for row in observations["cl_properties"])
+    assert "private-extra-argument" not in json.dumps(report)
+
+
+def test_quote_candidate_requires_exactly_the_two_known_fixture_paths(tmp_path):
+    expected = f'/Fo"{tmp_path / "probe.obj"}" "{tmp_path / "other.cpp"}"'
+    assert target._fixture_unquoted_path_comparison(tmp_path, expected, [({}, "anything")]) == {
+        "candidate_available": False, "segment_sha256_matches": [], "matches_in_xml_order": False,
+    }
+
+
 def test_backend_uses_payload_pid_and_hashes_only_observed_matching_path(tmp_path):
     backend = tmp_path / "c1xx.dll"
     backend.write_bytes(b"observed backend, never executed")

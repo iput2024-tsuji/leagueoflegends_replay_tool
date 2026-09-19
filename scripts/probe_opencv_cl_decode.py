@@ -214,18 +214,79 @@ def _missing_guid_observation(event: ET.Element, system: ET.Element, child_pid: 
     return structure, sample
 
 
-def _events(path: Path, child_pid: int, schema: dict):
-    _fingerprint(path)
-    # A bounded local tool output, not a remotely supplied document. No DTD/entity
-    # expansion is needed, even if a future decoder changes its output format.
+def _private_bytes(path: Path) -> bytes:
+    record = _fingerprint(path)
     with path.open("rb") as stream:
         data = stream.read(FILE_LIMIT + 1)
     if len(data) > FILE_LIMIT:
         raise ProbeError("decoder_file_limit")
+    if len(data) != record["size"] or hashlib.sha256(data).hexdigest() != record["sha256"]:
+        raise ProbeError("input_changed_during_read")
+    return data
+
+
+def _xml_root(data: bytes) -> ET.Element:
+    # A bounded local tool output, not a remotely supplied document. No DTD/entity
+    # expansion is needed, even if a future decoder changes its output format.
     declaration_scan = data.replace(b"\0", b"").upper()
     if b"<!DOCTYPE" in declaration_scan or b"<!ENTITY" in declaration_scan:
         raise ProbeError("xml_declaration_rejected")
-    root = ET.fromstring(data)
+    return ET.fromstring(data)
+
+
+def _stop_statistics(path: Path) -> dict:
+    lines = _private_bytes(path).split(b"\n")
+    result = {"value_format": "ascii_decimal_string_max_64_digits_not_sdk_type", "counters": {}}
+    for name, label in (
+        ("msvc_events", b"Dropped MSVC events: "),
+        ("msvc_buffers", b"Dropped MSVC buffers: "),
+        ("system_events", b"Dropped system events: "),
+        ("system_buffers", b"Dropped system buffers: "),
+    ):
+        values = [line.removesuffix(b"\r")[len(label):] for line in lines if line.startswith(label)]
+        value = values[0] if len(values) == 1 else None
+        valid = value is not None and re.fullmatch(rb"[0-9]{1,64}", value) is not None
+        result["counters"][name] = {
+            "label_occurrences": len(values), "value": value.decode("ascii") if valid else None,
+        }
+    return result
+
+
+def _decoder_document(path: Path, *, xml: bool) -> dict:
+    data = _private_bytes(path)
+    result = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+              "text_encoding": "unknown", "known_guid_literal_occurrences_not_events": None}
+    encoding = "utf-16" if data.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-8-sig"
+    try:
+        if data.startswith((b"\xff\xfe\0\0", b"\0\0\xfe\xff")) or (encoding == "utf-8-sig" and b"\0" in data):
+            raise UnicodeError("unsupported_text_encoding")
+        text = data.decode(encoding)
+    except UnicodeError:
+        pass
+    else:
+        result["text_encoding"] = encoding
+        # Literal appearances may describe schemas, not collected events. Never
+        # feed these counts into provider decoding or process lifetime matching.
+        counts = {guid: 0 for guid in (BI_PROVIDER, PROCESS_PROVIDER, IMAGE_PROVIDER)}
+        for match in re.finditer(r"(?i)(?<![0-9a-f-])[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?![0-9a-f-])", text):
+            guid = match.group().lower()
+            if guid in counts:
+                counts[guid] += 1
+        result["known_guid_literal_occurrences_not_events"] = counts
+    if xml:
+        try:
+            root = _xml_root(data)
+        except ET.ParseError:
+            result["xml_status"] = "unknown_format"
+        else:
+            result.update(xml_status="well_formed", root_name_shape=_value_shape(root.tag),
+                          element_count=sum(1 for _ in root.iter()),
+                          attribute_count=sum(len(node.attrib) for node in root.iter()))
+    return result
+
+
+def _events(path: Path, child_pid: int, schema: dict):
+    root = _xml_root(_private_bytes(path))
     schema.update(event_count=0, known_provider_counts={}, provider_guid_counts={},
                   missing_system_events=0, missing_provider_events=0,
                   missing_provider_guid_events=0, malformed_provider_guid_events=0,
@@ -431,7 +492,7 @@ def _error(error: Exception) -> dict:
 def _write_report(temp: Path, report: dict) -> None:
     output = temp / "LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
     _no_redirect(output)
-    content = (json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    content = (json.dumps(report, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
     if len(content) > JSON_LIMIT:
         raise ProbeError("public_json_limit")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -493,10 +554,23 @@ def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
                     primary = error
         if primary is not None:
             raise primary
+        report["stop_statistics"] = _stop_statistics(private / "stop.log")
         _command([str(tools["vcperf.exe"]), "/analyze", str(private / "raw.etl"), str(private / "relogged.etl")], private, "relog", 60, report)
         _command([str(tracerpt), str(private / "raw.etl"), "-of", "XML", "-rts", "-o", str(private / "raw.xml")], private, "decode_raw", 30, report)
         _command([str(tracerpt), str(private / "relogged.etl"), "-import", str(tools["CppBuildInsightsEtw.xml"]), "-of", "XML", "-rts", "-o", str(private / "relogged.xml")], private, "decode_relogged", 30, report)
         report["observations"] = _decode(private, tools["cl.exe"], report["independent_child_pid"], expected_command)
+        # Reuse the stopped raw trace. -rts is incompatible with -summary; its
+        # separate output is private and is never joined to existing RawTime.
+        _command([str(tracerpt), str(private / "raw.etl"), "-of", "XML",
+                  "-o", str(private / "inspection.xml"), "-summary", str(private / "summary.txt"),
+                  "-int", str(private / "interpreted.xml")], private, "inspect_raw", 30, report)
+        report["inspection_schema_observation"] = {}
+        for _ in _events(private / "inspection.xml", report["independent_child_pid"], report["inspection_schema_observation"]):
+            pass  # Schema counts only; do not mix its time representation into the existing observations.
+        report["decoder_documents"] = {
+            "summary": _decoder_document(private / "summary.txt", xml=False),
+            "interpreted": _decoder_document(private / "interpreted.xml", xml=True),
+        }
     except Exception as error:
         report["status"] = "failed"
         report["error"] = _error(error)

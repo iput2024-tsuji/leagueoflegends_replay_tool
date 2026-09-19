@@ -44,6 +44,10 @@ def probe(tmp_path, monkeypatch):
             (private / "checkout.log").write_text("b" * 40 + "\n", encoding="ascii")
         if stage == "stop":
             (private / "raw.etl").write_bytes(b"private trace")
+            (private / "stop.log").write_bytes(
+                b"Dropped MSVC events: 0\r\nDropped MSVC buffers: 0\r\n"
+                b"Dropped system events: 0\r\nDropped system buffers: 0\r\n"
+            )
         if stage == "relog":
             (private / "relogged.etl").write_bytes(b"private processed trace")
         if stage == "decode_raw":
@@ -58,6 +62,16 @@ def probe(tmp_path, monkeypatch):
                                         ("CommandLine", expected[:1000]), ("CommandLine", expected[1000:]))]
             rows.append((target.BI_PROVIDER, 666, {"Tool": "CL", "Name": "CommandLine", "Value": "other-process-secret"}))
             (private / "relogged.xml").write_bytes(_xml(rows))
+        if stage == "inspect_raw":
+            assert args[1] == str(private / "raw.etl") and "-rts" not in args
+            assert args[args.index("-o") + 1] == str(private / "inspection.xml")
+            assert args[args.index("-summary") + 1] == str(private / "summary.txt")
+            assert args[args.index("-int") + 1] == str(private / "interpreted.xml")
+            (private / "inspection.xml").write_bytes(_xml([
+                (target.PROCESS_PROVIDER, 999, {"ProcessId": 42, "ParentId": 10}),
+            ]))
+            (private / "summary.txt").write_text("private summary text", encoding="utf-8")
+            (private / "interpreted.xml").write_bytes(b'<private-root secret="private-value"/>')
         return entry
 
     monkeypatch.setattr(target, "_command", command)
@@ -67,7 +81,7 @@ def probe(tmp_path, monkeypatch):
 def test_probe_collects_fixture_fields_without_claiming_verified_trace(probe):
     temp, tools, tracerpt, calls, _ = probe
     report = target.run_probe(temp, tools, tracerpt)
-    assert calls == ["checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged"]
+    assert calls == ["checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged", "inspect_raw"]
     assert report["status"] == "incomplete"
     assert report["product_build_evidence"] is False
     assert report["inputs_unchanged"] is True
@@ -76,14 +90,19 @@ def test_probe_collects_fixture_fields_without_claiming_verified_trace(probe):
     assert report["observations"]["command_matches_fixture_in_xml_order"] is True
     assert report["observations"]["process_events"][0]["observed_payload_pid"] == 42
     assert "event_loss" in report["unverified"]
+    assert all(row["value"] == "0" for row in report["stop_statistics"]["counters"].values())
+    assert report["decoder_documents"]["interpreted"]["xml_status"] == "well_formed"
+    assert report["inspection_schema_observation"]["known_provider_counts"] == {target.PROCESS_PROVIDER: 1}
+    assert report["inspection_schema_observation"]["target_pid_events"] == 1
     public = temp / "LoLReplayTool-binary-cache/w/b/evidence"
     assert [path.name for path in public.iterdir()] == ["cl-decode-probe.json"]
     text = (public / "cl-decode-probe.json").read_text()
     assert "other-process-secret" not in text
     assert "raw.etl" not in text and "relogged.xml" not in text
+    assert not any(value in text for value in ("private summary text", "private-root", "private-value"))
 
 
-@pytest.mark.parametrize("failure", ["checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged"])
+@pytest.mark.parametrize("failure", ["checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged", "inspect_raw"])
 def test_stage_failure_stops_only_own_session_and_records_failure(probe, monkeypatch, failure):
     temp, tools, tracerpt, calls, original = probe
 
@@ -102,6 +121,9 @@ def test_stage_failure_stops_only_own_session_and_records_failure(probe, monkeyp
         assert "compile" not in calls
     if failure in {"checkout", "start", "compile", "stop"}:
         assert "relog" not in calls
+    if failure == "inspect_raw":
+        assert report["observations"]["cl_properties"]
+        assert "stop_statistics" in report
 
 
 def test_stop_failure_preserves_primary_and_does_not_publish_exception_text(probe, monkeypatch):
@@ -522,6 +544,99 @@ def test_decoder_rejects_entity_declarations(tmp_path, encoding):
     path.write_bytes('<!DOCTYPE test [<!ENTITY x "unexpected">]><test>&x;</test>'.encode(encoding))
     with pytest.raises(target.ProbeError, match="xml_declaration_rejected"):
         list(target._events(path, 42, {}))
+
+
+def test_stop_statistics_keep_decimal_strings_and_do_not_infer_missing_or_duplicate_values(tmp_path):
+    path = tmp_path / "stop.log"
+    path.write_bytes(
+        b"private path and command\r\nDropped MSVC events: 000\r\n"
+        b"Dropped MSVC buffers: " + b"9" * 64 + b"\r\n"
+        b"Dropped system events: 0\r\nDropped system events: invalid\r\n"
+    )
+    result = target._stop_statistics(path)
+    assert result["counters"] == {
+        "msvc_events": {"label_occurrences": 1, "value": "000"},
+        "msvc_buffers": {"label_occurrences": 1, "value": "9" * 64},
+        "system_events": {"label_occurrences": 2, "value": None},
+        "system_buffers": {"label_occurrences": 0, "value": None},
+    }
+    assert "not_sdk_type" in result["value_format"]
+    assert "private" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("value", [b"", b"-1", b"+1", b"0x10", b"1,000", b" 1", b"1 ", b"9" * 65, "１２".encode()])
+def test_stop_statistics_reject_unobserved_numeric_formats(tmp_path, value):
+    path = tmp_path / "stop.log"
+    path.write_bytes(b"Dropped MSVC events: " + value + b"\n")
+    assert target._stop_statistics(path)["counters"]["msvc_events"] == {"label_occurrences": 1, "value": None}
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig", "utf-16"])
+def test_decoder_document_counts_literals_without_interpreting_them_as_events_or_publishing_text(tmp_path, encoding):
+    path = tmp_path / "interpreted.xml"
+    content = (
+        f'<secret-root private-attribute="{target.PROCESS_PROVIDER.upper()}">'
+        f'<secret-node>{{{target.PROCESS_PROVIDER}}}</secret-node>'
+        f'<secret-node>x{target.PROCESS_PROVIDER}0</secret-node>'
+        '</secret-root>'
+    )
+    data = content.encode(encoding)
+    path.write_bytes(data)
+    result = target._decoder_document(path, xml=True)
+    assert result["bytes"] == len(data) and result["sha256"] == hashlib.sha256(data).hexdigest()
+    assert result["text_encoding"] != "unknown"
+    assert result["xml_status"] == "well_formed"
+    assert result["element_count"] == 3 and result["attribute_count"] == 1
+    assert result["root_name_shape"] == target._value_shape("secret-root")
+    assert result["known_guid_literal_occurrences_not_events"] == {
+        target.BI_PROVIDER: 0, target.PROCESS_PROVIDER: 2, target.IMAGE_PROVIDER: 0,
+    }
+    assert not any(value in json.dumps(result) for value in ("secret-root", "private-attribute", "secret-node"))
+
+
+@pytest.mark.parametrize("data", [b"\xff", "private".encode("utf-32"), "private".encode("utf-16-le")])
+def test_decoder_document_unknown_encoding_does_not_claim_zero_guid_occurrences(tmp_path, data):
+    path = tmp_path / "summary.txt"
+    path.write_bytes(data)
+    result = target._decoder_document(path, xml=False)
+    assert result["text_encoding"] == "unknown"
+    assert result["known_guid_literal_occurrences_not_events"] is None
+    assert result["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_decoder_document_unknown_xml_and_dtd_are_distinct(tmp_path):
+    path = tmp_path / "interpreted.xml"
+    path.write_text("not a known schema", encoding="utf-8")
+    result = target._decoder_document(path, xml=True)
+    assert result["xml_status"] == "unknown_format" and "element_count" not in result
+    path.write_bytes(b'<!DOCTYPE x [<!ENTITY y "private">]><x>&y;</x>')
+    with pytest.raises(target.ProbeError, match="xml_declaration_rejected"):
+        target._decoder_document(path, xml=True)
+
+
+def test_private_output_changed_after_fingerprinting_is_rejected(tmp_path, monkeypatch):
+    path = tmp_path / "summary.txt"
+    path.write_bytes(b"before")
+    original = target._fingerprint
+
+    def change(path):
+        record = original(path)
+        path.write_bytes(b"after!")
+        return record
+
+    monkeypatch.setattr(target, "_fingerprint", change)
+    with pytest.raises(target.ProbeError, match="input_changed_during_read"):
+        target._decoder_document(path, xml=False)
+
+
+def test_public_report_compaction_preserves_values_within_existing_byte_limit(tmp_path, monkeypatch):
+    report = {"rows": [{"name": "fixed", "value": " space  改行\n "}] * 8}
+    monkeypatch.setattr(target, "JSON_LIMIT", 400)
+    assert len(json.dumps(report, ensure_ascii=False, indent=2).encode()) > target.JSON_LIMIT
+    target._write_report(tmp_path, report)
+    output = tmp_path / "LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
+    assert output.stat().st_size <= target.JSON_LIMIT
+    assert json.loads(output.read_bytes()) == report
 
 
 def test_public_destination_redirect_is_rejected(tmp_path, monkeypatch):

@@ -1390,6 +1390,57 @@ def disclosed_lock():
     )
 
 
+def test_numerical_runtime_sources_keep_exact_shared_archives(disclosed_lock):
+    expected = {
+        "gcc-10.3.0.tar.xz": (
+            "https://ftp.gnu.org/gnu/gcc/gcc-10.3.0/gcc-10.3.0.tar.xz",
+            "64f404c1a650f27fc33da242e1f2df54952e3963a49e06e73f6940f3223ac344",
+            76692288,
+        ),
+        "rtools-ucrt-c5344cc8c7e310ee4eee513b2381af2e75d65cb9.tar.gz": (
+            "https://codeload.github.com/r-windows/rtools-ucrt/tar.gz/"
+            "c5344cc8c7e310ee4eee513b2381af2e75d65cb9",
+            "6540c9aeb9234f7438401257c1aacdeaaee8ef3d3877b14df50319042a1cd12f",
+            101725,
+        ),
+        "mingw-w64-acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679.tar.gz": (
+            "https://codeload.github.com/mingw-w64/mingw-w64/tar.gz/"
+            "acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679",
+            "774ebdae72b9c514c375eddcf3bb75af4472498cad9ed8b0664f0fe37b7c17bb",
+            13116265,
+        ),
+    }
+    records = source_archive_records(disclosed_lock)
+    shared = [record for record in records if record["filename"] in expected]
+    assert len(shared) == len(expected)
+    for record in shared:
+        assert (record["url"], record["sha256"], record["size"]) == expected[record["filename"]]
+        assert {ref["component"] for ref in record["component_references"]} == {"numpy", "scipy"}
+        assert all(
+            ref["source_status"] == "verified_corresponding_source"
+            for ref in record["component_references"]
+        )
+
+
+@pytest.mark.parametrize(
+    "filename", [
+        "gcc-10.3.0.tar.xz",
+        "rtools-ucrt-c5344cc8c7e310ee4eee513b2381af2e75d65cb9.tar.gz",
+        "mingw-w64-acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679.tar.gz",
+    ],
+)
+def test_numerical_shared_source_rejects_conflicting_metadata(disclosed_lock, filename):
+    scipy = next(
+        item for item in disclosed_lock["runtime_components"]
+        if item["component"] == "scipy"
+    )
+    archive = next(item for item in scipy["source_archives"] if item["filename"] == filename)
+    archive["sha256"] = "0" * 64
+
+    with pytest.raises(ReleaseAssetError, match="conflicting metadata"):
+        source_archive_records(disclosed_lock)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

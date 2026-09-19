@@ -76,11 +76,16 @@ Copied package license texts and the Qt SBOMs are under
 The unused Mesa software OpenGL fallback `opengl32sw.dll` supplied by the Qt
 wheel is removed by the packaging policy and is not distributed.
 
-For NumPy and SciPy, the locked records pin the exact MacPython
-`openblas-libs` tags, OpenBLAS commit, Windows workflow and applied patch. The
-exact Rtools/GCC toolchain manifests and the publisher artifact
-chains remain unverified and disclosed. Both records still have incomplete
-native source coverage, which remains a Release gate.
+For NumPy and SciPy, the locked source set includes their source distributions,
+the pinned OpenBLAS sources and recipes, GCC 10.3.0, the Rtools recipes and
+patches, and the complete MinGW source tree described in `SOURCE_OFFER.md`.
+The existing wheel notices are retained. GCC license texts and its Runtime
+Library Exception, and the MinGW CRT, headers and winpthreads notices, are
+copied under `licenses/python-packages/{numpy,scipy}/runtime-sources/`.
+Retaining this conservative source set does not mean every included tool or
+runtime is bundled with the application. Complete publisher toolchain
+manifests and internal artifact chains, and external legal review, remain
+unverified and disclosed; final distribution checks remain mandatory.
 
 正確なcomponentバージョンと成果物pattern、および検証できたsource URL/hashは
 `licenses/components.json`に記録します。このアプリが同梱する20個のQt成果物は
@@ -97,10 +102,14 @@ Inno Setupのライセンス本文は`licenses/inno-setup/LICENSE.txt`にあり�
 Qt wheelが提供する未使用のMesa software OpenGL fallback `opengl32sw.dll`は
 packaging policyで除外し、配布しません。
 
-NumPyとSciPyについては、MacPython `openblas-libs`のexact tag、OpenBLAS commit、
-Windows workflow、適用patchを固定しました。Rtools/GCC toolchainの
-正確なmanifestと公開wheelまでのartifact chainは未確認のまま開示します。
-両componentの未完了native source coverageは引き続きRelease gateです。
+NumPy/SciPyのsource集合は、本体sdist、固定OpenBLAS source/recipe、GCC
+10.3.0、Rtoolsのrecipeとpatch、`SOURCE_OFFER.md`に記載したMinGW全sourceを
+含みます。既存wheel noticeを保持し、GCCのlicense/Runtime Library Exceptionと
+MinGWのCRT/headers/winpthreads noticeを
+`licenses/python-packages/{numpy,scipy}/runtime-sources/`へ収録します。保守的な
+source集合の全tool・全runtimeをアプリへ同梱する意味ではありません。publisher
+toolchainの完全なmanifestと内部artifact chain、外部法務レビューは未確認のまま
+開示し、正式配布物の検証は維持します。
 
 Inno Setup 6.7.3 contributes the Setup/Uninstall stubs and LZMA decompression
 code embedded in the public installer; these are not files in the installed

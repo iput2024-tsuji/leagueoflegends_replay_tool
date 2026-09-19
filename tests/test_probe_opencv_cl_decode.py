@@ -210,7 +210,7 @@ def test_provider_histogram_is_bounded(tmp_path, monkeypatch):
         list(target._events(path, 42, {}))
 
 
-def test_target_value_shapes_explain_nulls_without_changing_parsing_or_exposing_values(tmp_path):
+def test_target_value_shapes_preserve_raw_metadata_after_invocation_trim(tmp_path):
     invocations = [None, "", " 17 ", "0x00000007", "invocation-secret", " \t "]
     root = ET.fromstring(_xml([
         (target.BI_PROVIDER, 42, {"Tool": "CL", "Name": "ToolPath", "Value": "private-tool",
@@ -231,8 +231,10 @@ def test_target_value_shapes_explain_nulls_without_changing_parsing_or_exposing_
     (tmp_path / "raw.xml").write_bytes(_xml([]))
     result = target._decode(tmp_path, tmp_path / "cl.exe", 42, "fixture")
     rows = result["cl_properties"]
-    assert [row["invocation_id"] for row in rows] == [None, None, None, 7, None, None]
+    assert [row["invocation_id"] for row in rows] == [None, None, 17, 7, None, None]
+    assert [row["invocation_id_trimmed"] for row in rows] == [False, False, True, False, False, True]
     assert all(row["timestamp_as_rendered"] is None for row in rows)
+    assert all(row["raw_time_as_rendered"] is None for row in rows)
     assert [row["invocation_id_shape"]["form"] for row in rows] == [
         "missing", "empty", "decimal", "hex", "other", "whitespace",
     ]
@@ -253,6 +255,51 @@ def test_target_value_shapes_explain_nulls_without_changing_parsing_or_exposing_
     assert not any(secret in json.dumps(result) for secret in (
         "invocation-secret", "unknown-attribute-name", "unknown-attribute-secret", "private-tool",
     ))
+
+
+def test_invocation_trim_keeps_uint32_limits_and_does_not_relax_other_fields(tmp_path):
+    values = ["\t4294967295\n", " 4294967296 ", " -1 ", " +7 ", " 1 7 ", " １２ ", "\u200317\u2003"]
+    root = ET.fromstring(_xml([
+        (target.BI_PROVIDER, 42, {"Tool": "CL", "InvocationId": value, "Name": "ToolPath", "Value": "private-tool"})
+        for value in values
+    ] + [(target.BI_PROVIDER, " 42 ", {"Tool": "CL", "InvocationId": " 7 ", "Name": "ToolPath", "Value": "excluded"})]))
+    (tmp_path / "relogged.xml").write_bytes(ET.tostring(root))
+    raw = ET.fromstring(_xml([
+        (target.PROCESS_PROVIDER, 42, {"ProcessId": " 42 ", "ParentId": 1}),
+        (target.PROCESS_PROVIDER, 999, {"ProcessId": 42, "ParentId": " 1 "}),
+    ]))
+    raw[1].find(f"{target.NS}System/{target.NS}Opcode").text = " 1 "
+    (tmp_path / "raw.xml").write_bytes(ET.tostring(raw))
+    result = target._decode(tmp_path, tmp_path / "cl.exe", 42, "fixture")
+    assert [row["invocation_id"] for row in result["cl_properties"]] == [0xFFFFFFFF, None, None, None, None, None, 17]
+    assert all(row["invocation_id_trimmed"] for row in result["cl_properties"])
+    assert len(result["process_events"]) == 1
+    assert result["process_events"][0]["parent_pid"] is None
+    assert result["process_events"][0]["opcode"] is None
+    assert "private-tool" not in json.dumps(result) and "excluded" not in json.dumps(result)
+
+
+def test_raw_time_is_bounded_ascii_text_separate_from_system_time(tmp_path):
+    values = ["12345678901", "000123", "9" * 64, "9" * 65, " 123 ", "0x123", "１２３", "raw-time-secret", ""]
+    root = ET.fromstring(_xml([
+        (target.BI_PROVIDER, 42, {"Tool": "CL", "InvocationId": 7, "Name": "ToolPath", "Value": "private-tool"})
+        for _ in values
+    ]))
+    for index, (event, value) in enumerate(zip(root, values, strict=True)):
+        timestamp = event.find(f"{target.NS}System/{target.NS}TimeCreated")
+        if index != 1:
+            timestamp.attrib.clear()
+        timestamp.set("RawTime", value)
+    (tmp_path / "relogged.xml").write_bytes(ET.tostring(root))
+    (tmp_path / "raw.xml").write_bytes(_xml([]))
+    result = target._decode(tmp_path, tmp_path / "cl.exe", 42, "fixture")
+    rows = result["cl_properties"]
+    assert [row["raw_time_as_rendered"] for row in rows] == values[:3] + [None] * 6
+    assert [row["timestamp_as_rendered"] for row in rows] == [None, "123456"] + [None] * 7
+    assert result["raw_time_semantics"] == {"unit": "unknown", "clock": "unknown"}
+    assert rows[3]["time_created_shape"]["attributes"]["RawTime"]["length"] == 65
+    assert rows[7]["time_created_shape"]["attributes"]["RawTime"]["sha256"] == hashlib.sha256(b"raw-time-secret").hexdigest()
+    assert "raw-time-secret" not in json.dumps(result) and "private-tool" not in json.dumps(result)
 
 
 @pytest.mark.parametrize("change", ["none", "value", "order", "omitted"])

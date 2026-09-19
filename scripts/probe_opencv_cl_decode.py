@@ -123,7 +123,7 @@ def _integer(value: str | None) -> int | None:
 
 
 def _value_shape(value: str | None) -> dict:
-    # Classify only; never feed stripped values back into the decoder.
+    # Describe the original text; this helper never alters parser input.
     stripped = value.strip() if value is not None else ""
     form = "missing" if value is None else "empty" if not value else "other"
     if value:
@@ -221,10 +221,12 @@ def _events(path: Path, child_pid: int, schema: dict):
                 shapes = schema["target_field_shapes"]
                 shape = shapes.setdefault(name, {"xml_value_type": "text", "occurrences": 0})
                 shape["occurrences"] += 1
-        raw_time = timestamp.get("SystemTime") if timestamp is not None else None
+        system_time = timestamp.get("SystemTime") if timestamp is not None else None
+        raw_time = timestamp.get("RawTime") if timestamp is not None else None
         yield {
             "provider": guid, "header_pid": header_pid,
-            "timestamp": raw_time if raw_time and re.fullmatch(r"[0-9:.TZ+\-]{1,64}", raw_time) else None,
+            "timestamp": system_time if system_time and re.fullmatch(r"[0-9:.TZ+\-]{1,64}", system_time) else None,
+            "raw_time": raw_time if raw_time and re.fullmatch(r"[0-9]{1,64}", raw_time) else None,
             "time_created_shape": _time_created_shape(timestamp),
             "opcode": _integer(system.findtext(f"{NS}Opcode")),
             "fields": fields,
@@ -256,7 +258,8 @@ def _fixture_unquoted_path_comparison(private: Path, expected: str, commands: li
 
 
 def _decode(private: Path, compiler: Path, child_pid: int, expected_command: str) -> dict:
-    result = {"cl_properties": [], "process_events": [], "backend_events": []}
+    result = {"cl_properties": [], "process_events": [], "backend_events": [],
+              "raw_time_semantics": {"unit": "unknown", "clock": "unknown"}}
     schema = {"raw": {}, "relogged": {}}
     commands = []
     for event in _events(private / "relogged.xml", child_pid, schema["relogged"]):
@@ -267,12 +270,17 @@ def _decode(private: Path, compiler: Path, child_pid: int, expected_command: str
         if name not in {"ToolPath", "WorkingDirectory", "CommandLine"}:
             continue
         value = fields.get("Value", "")
+        invocation = fields.get("InvocationId")
+        # Observed tracerpt padding is accepted only at the InvocationId boundary.
+        trimmed_invocation = invocation.strip() if invocation is not None else None
         entry = {
             "name": name, "observed_header_pid": event["header_pid"],
-            "invocation_id": _integer(fields.get("InvocationId")),
-            "invocation_id_shape": _value_shape(fields.get("InvocationId")),
+            "invocation_id": _integer(trimmed_invocation),
+            "invocation_id_trimmed": invocation != trimmed_invocation,
+            "invocation_id_shape": _value_shape(invocation),
             "time_created_shape": event["time_created_shape"],
             "timestamp_as_rendered": event["timestamp"], "length": len(value),
+            "raw_time_as_rendered": event["raw_time"],
             "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
         }
         if name in {"ToolPath", "WorkingDirectory"}:

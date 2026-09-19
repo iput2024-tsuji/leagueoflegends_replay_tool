@@ -174,6 +174,26 @@ def test_lock_rejects_manifest_drift(tmp_path) -> None:
         target._lock_entries(lock)
 
 
+@pytest.mark.parametrize("fault", ["missing", "hash"])
+def test_lock_rejects_numerical_source_manifest_drift(tmp_path, fault) -> None:
+    payload = _lock_payload()
+    component = next(
+        item for item in payload["runtime_components"]  # type: ignore[union-attr]
+        if item["component"] == "numpy"
+    )
+    sources = component["source_archives"]
+    archive = next(item for item in sources if item["filename"] == "gcc-10.3.0.tar.xz")
+    if fault == "missing":
+        sources.remove(archive)
+    else:
+        archive["sha256"] = "0" * 64
+    lock = tmp_path / "components.json"
+    lock.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(target.WheelError, match="locked source archives differ"):
+        target._lock_entries(lock)
+
+
 def test_record_is_rebuilt_with_hashes(tmp_path) -> None:
     record_name = "demo-1.0.dist-info/RECORD"
     files = {

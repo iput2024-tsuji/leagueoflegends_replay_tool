@@ -87,6 +87,36 @@ EXPECTED: dict[str, dict[str, Any]] = {
                 ),
                 "size": 24_730_332,
             },
+            {
+                "filename": "gcc-10.3.0.tar.xz",
+                "url": "https://ftp.gnu.org/gnu/gcc/gcc-10.3.0/gcc-10.3.0.tar.xz",
+                "sha256": (
+                    "64f404c1a650f27fc33da242e1f2df54952e3963a49e06e73f6940f3223ac344"
+                ),
+                "size": 76_692_288,
+            },
+            {
+                "filename": "rtools-ucrt-c5344cc8c7e310ee4eee513b2381af2e75d65cb9.tar.gz",
+                "url": (
+                    "https://codeload.github.com/r-windows/rtools-ucrt/tar.gz/"
+                    "c5344cc8c7e310ee4eee513b2381af2e75d65cb9"
+                ),
+                "sha256": (
+                    "6540c9aeb9234f7438401257c1aacdeaaee8ef3d3877b14df50319042a1cd12f"
+                ),
+                "size": 101_725,
+            },
+            {
+                "filename": "mingw-w64-acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679.tar.gz",
+                "url": (
+                    "https://codeload.github.com/mingw-w64/mingw-w64/tar.gz/"
+                    "acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679"
+                ),
+                "sha256": (
+                    "774ebdae72b9c514c375eddcf3bb75af4472498cad9ed8b0664f0fe37b7c17bb"
+                ),
+                "size": 13_116_265,
+            },
         ],
     },
     "pandas-3.0.2-cp314-cp314-win_amd64.whl": {

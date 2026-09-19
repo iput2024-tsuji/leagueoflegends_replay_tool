@@ -146,11 +146,12 @@ still unverified and is disclosed under the decision above. The unused Mesa `ope
 is excluded from the application distribution. Microsoft Visual C++ runtime
 files are classified separately as excluded external prerequisites; their
 absence from the application, installer and Release assets remains mandatory.
-The NumPy and SciPy records pin the exact MacPython `openblas-libs` tags,
-OpenBLAS commit, Windows workflow and applied patch, but not the complete
-Rtools/GCC toolchain manifests or publisher artifact chains; those
-limits are disclosed. The records' incomplete native source coverage remains
-a Release gate independently of the publisher-internal chain.
+The NumPy and SciPy records include a conservative corresponding-source set:
+their source distributions, pinned OpenBLAS sources and Windows recipes, GNU
+GCC 10.3.0, the Rtools recipes and patches, and the complete MinGW source tree
+listed below. Complete publisher toolchain manifests and internal artifact
+chains remain unverified and disclosed. Source and notice checks, and
+verification of the final distribution, remain mandatory.
 Package-specific license texts and the Qt SBOMs are copied under
 `licenses/python-packages/`.
 
@@ -165,10 +166,81 @@ PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceは未確�
 未使用のMesa `opengl32sw.dll`はアプリ配布物から除外します。Microsoft Visual C++
 Runtimeは非同梱の外部前提として別componentに分類し、app、installer、Release
 assetのRuntime不存在検査を維持します。
-NumPyとSciPyについては、MacPython `openblas-libs`のexact tag、OpenBLAS commit、
-Windows workflow、適用patchを固定しましたが、Rtools/GCC toolchainの
-完全なmanifestと公開wheelまでのartifact chainは未確認のまま開示します。
-これとは別に、未完了のnative source coverageのRelease gateを維持します。
+NumPy/SciPyには、本体sdist、固定OpenBLAS sourceとWindows recipe、GNU GCC
+10.3.0、Rtoolsのrecipeとpatch、下表のMinGW全source treeからなる保守的な
+対応source集合を記録します。publisher toolchainの完全なmanifestと内部artifact
+chainは未確認のまま開示し、source/notice検査と正式配布物の検証は維持します。
+
+### NumPy / SciPy runtime sources
+
+Both records reference these three additional archives. The source-asset
+builder stores each archive once and records both component references.
+The existing NumPy/SciPy source distributions, OpenBLAS source commit
+`b5456c1b41ea88d4e0041778aa8ec09ee2a111a0`, and `openblas-libs`
+`v0.3.30.0.7` (ILP64) / `v0.3.30.0.8` (LP64) are retained.
+
+両recordは次の3archiveを共通参照し、source資産には各1件と両componentへの
+参照を収録します。既存のNumPy/SciPy本体sdist、上記OpenBLAS sourceと
+ILP64/LP64各recipeは保持します。
+
+| Source / 対応source | Bytes | SHA256 | Recipe / 適用patch |
+|---|---:|---|---|
+| [GNU GCC 10.3.0](https://ftp.gnu.org/gnu/gcc/gcc-10.3.0/gcc-10.3.0.tar.xz) | 76,692,288 | `64f404c1a650f27fc33da242e1f2df54952e3963a49e06e73f6940f3223ac344` | Full upstream source; the fixed Rtools recipe applies 26 patches. / 上流全sourceと固定Rtools recipeの26適用patch。 |
+| [Rtools c5344cc8c7e310ee4eee513b2381af2e75d65cb9](https://codeload.github.com/r-windows/rtools-ucrt/tar.gz/c5344cc8c7e310ee4eee513b2381af2e75d65cb9) | 101,725 | `6540c9aeb9234f7438401257c1aacdeaaee8ef3d3877b14df50319042a1cd12f` | GCC/Fortran 10.3.0-9804 and CRT/headers/winpthreads PKGBUILD files and patch bytes. / 各PKGBUILDとpatch原文。 |
+| [MinGW acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679](https://codeload.github.com/mingw-w64/mingw-w64/tar.gz/acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679) | 13,116,265 | `774ebdae72b9c514c375eddcf3bb75af4472498cad9ed8b0664f0fe37b7c17bb` | Full source tree, including CRT, headers and winpthreads. / CRT・headers・winpthreadsを含む全source tree。 |
+
+The [GCC recipe](https://github.com/r-windows/rtools-ucrt/blob/c5344cc8c7e310ee4eee513b2381af2e75d65cb9/mingw-w64-gcc/PKGBUILD)
+fixes the patch order. Its four `SKIP` patch checksums are supplemented by the
+fixed Git blobs and archive member hashes. The
+[CRT recipe](https://github.com/r-windows/rtools-ucrt/blob/c5344cc8c7e310ee4eee513b2381af2e75d65cb9/mingw-w64-crt-git/PKGBUILD)
+and headers recipe apply `0001-Allow-to-use-bessel-and-complex-functions-without-un.patch`
+and `0002-DirectX-9-fixes-for-VLC.patch`; the
+[winpthreads recipe](https://github.com/r-windows/rtools-ucrt/blob/c5344cc8c7e310ee4eee513b2381af2e75d65cb9/mingw-w64-winpthreads-git/PKGBUILD)
+applies `0001-Define-__-de-register_frame_info-in-fake-libgcc_s.patch`.
+The other retained patches are not described as applied. The MinGW archive's
+5,725 file blobs and modes reproduce the pinned Git tree
+`45f05c5decb885f595b9225c4797ba6ac6f9a0c1`; the
+[official project source page](https://www.mingw-w64.org/source/) identifies
+GitHub as a mirror of its SourceForge repository.
+
+GCCの適用順は固定recipeを参照し、checksumが`SKIP`の4patchも固定Git blobと
+archive memberでbytesを確認しています。CRT/headersは上記0001/0002、
+winpthreadsは上記frame-info patchを適用します。未適用の0003等は適用扱いに
+しません。MinGWの全5,725 fileのblob/modeから上記固定treeを再計算し一致を
+確認しました。公式source案内に記載されたGitHub mirrorを利用しています。
+
+The source set is supported by the public Windows recipes and observed
+Rtools package metadata: GCC/Fortran `10.3.0-9804` and CRT/headers/winpthreads
+`9.0.0.6214.acc9b9d9e-1`. The winpthreads recipe's literal `pkgrel=9800` is
+consistent with a reset to 1 when its dynamic version changes, but the
+historical invocation is unverified. An inspected development build's 14
+NumPy and 89 SciPy native files match their pinned wheels or, for two NumPy
+files, the authorized external-runtime-removal provenance. This is not
+evidence for a later formal build. NumPy itself reports MSVC 19.44.35222;
+SciPy reports GCC/GFortran 10.3.0. A Strawberry ccache wrapper path does not
+identify the compiler distribution. Old `release_gate_reason` wording is
+retained as history, not a current attribution.
+
+公開Windows recipeと実Rtools package metadataの上記版をsource集合の根拠に
+しています。winpthreadsのliteral `pkgrel=9800`と実packageの1は動的version
+変更時のresetに整合しますが、当時の実行は未確認です。検査した開発buildの
+NumPy 14/SciPy 89 nativeは固定wheelに対応し、NumPyの2fileだけは許可済み
+外部Runtime除去のprovenanceに対応します。将来の正式buildの証拠には代用
+しません。NumPy本体はMSVC、SciPyはGCC/GFortranの上記版で、Strawberryの
+ccache wrapper位置はcompiler配布元の証明ではありません。旧
+`release_gate_reason`の表記は履歴として保持し、現在の配布元断定に使いません。
+
+The exact linked-object subset, complete publisher-internal chain,
+byte-identical rebuild and external legal review remain unverified. The
+conservative set retains complete sources without requiring reverse
+identification of every object. It does not waive checks for missing source
+or notices, unknown native code, excluded external runtimes, or the final
+distribution, installer, source assets and clean-VM verification.
+
+厳密なlinked object subset、publisher内部の完全chain、byte-identical再build、
+外部法務レビューは未確認のままです。全objectの逆同定を追加条件にせず全source
+を保守的に保持します。source/notice欠損、未知native、非同梱外部Runtime混入、
+正式dist/installer/source資産とclean VMの既存検証は免除しません。
 
 If a listed source asset becomes unavailable, request the matching source
 through the project's Issue tracker. Maintainers must provide an equivalent

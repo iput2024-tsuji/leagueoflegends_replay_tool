@@ -367,7 +367,7 @@ def test_opencv_workflow_build_and_packaging_share_commit_artifact_and_seal():
     probe = source.split("      - name: Probe one CL translation unit decoder", maxsplit=1)[1].split("      - name:", maxsplit=1)[0]
     assert "!cancelled() && github.event_name == 'pull_request'" in probe
     assert "continue-on-error: true" in probe
-    assert "timeout-minutes: 5" in probe
+    assert "timeout-minutes: 8" in probe
     assert "python -m scripts.probe_opencv_cl_decode" in probe
     selected_upload = source.split(
         "      - name: Preserve selected OpenCV build intermediates", maxsplit=1

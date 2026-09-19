@@ -16,7 +16,12 @@
     "evidence": "",
     "scope": "撤回済みv0.5.2インストーラーの履歴資料と遡及対応の十分性",
     "reviewer": "",
-    "date": ""
+    "date": "",
+    "release_disclosure": {
+      "category": "unavailable-historical-artifact",
+      "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+      "limitation": "v0.5.2元artifactは取得不能で全同梱物の再監査はできない。外部法務レビューは未実施。管理者がこの限界を開示事項として受け入れたが、撤回・バイナリ差替え禁止と新しい配布物の技術検査は維持する。"
+    }
   },
   "release_binary_policy": {
     "python_implementation": "CPython",
@@ -1275,7 +1280,12 @@
         "date": ""
       },
       "release_legal_review_required": true,
-      "release_gate_reason": "CPython 3.14.6が外部Microsoft x64 Redistributableを利用する境界について、GPLv3 System Libraries例外その他の適用根拠を専門家が確認するまで公開しない。"
+      "release_gate_reason": "CPython 3.14.6が外部Microsoft x64 Redistributableを利用する境界について、GPLv3 System Libraries例外その他の適用根拠を専門家が確認するまで公開しない。",
+      "release_disclosure": {
+        "category": "external-runtime-prerequisite",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "外部法務レビューは未実施。CPythonのMicrosoft Runtimeは非同梱の外部前提であり、この分類は法的適合やsource提供完了の証明ではない。配布物・installer・Release assetのRuntime不存在と通常名importの技術監査は維持する。"
+      }
     },
     {
       "component": "microsoft-vc-runtime",
@@ -1376,7 +1386,12 @@
         "date": ""
       },
       "release_legal_review_required": true,
-      "release_gate_reason": "外部Microsoft Visual C++ Runtime前提とGPLv3 System Libraries例外その他の適用境界を専門家が確認し、証拠を記録するまで公開しない。"
+      "release_gate_reason": "外部Microsoft Visual C++ Runtime前提とGPLv3 System Libraries例外その他の適用境界を専門家が確認し、証拠を記録するまで公開しない。",
+      "release_disclosure": {
+        "category": "external-runtime-prerequisite",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "外部法務レビューは未実施。wheel由来Microsoft Runtimeは非同梱の外部前提であり、この分類は法的適合やsource提供完了の証明ではない。配布物・installer・Release assetのRuntime不存在と通常名importの技術監査は維持する。"
+      }
     },
     {
       "component": "aiohappyeyeballs",
@@ -1770,6 +1785,11 @@
       "native_source_coverage_verified": false,
       "release_legal_review_required": true,
       "release_gate_reason": "NumPy本体のMSVC build情報とOpenBLASのexact tag、submodule、Windows workflow、適用patch、Rtools指定は固定済みだが、MacPython CI run、Rtools installer hashとGCC toolchain manifest、生成物からNumPy wheelまでのartifact chainを確認できていないため公開しない。",
+      "release_disclosure": {
+        "category": "unverified-publisher-artifact-chain",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "publisher内部の完全artifact chainとtoolchain manifestは未確認、外部法務レビューは未実施。source_statusとnative source coverageは未完了のままであり、この開示は実binary・source・notice対応の技術不足を解除しない。"
+      },
       "source_archives": [
         {
           "filename": "numpy-2.4.1.tar.gz",
@@ -2066,7 +2086,7 @@
         },
         {
           "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/README.md",
-          "sha256": "0687dcf43498bc86119e591b544e326654150ae930b7c26e19bbe77d06476961",
+          "sha256": "4816023595a55a8bae342a592b0799fbfa1791e322669e5299d568ea81927a0a",
           "source": "repository"
         },
         {
@@ -2241,6 +2261,11 @@
       "native_source_coverage_verified": true,
       "release_legal_review_required": true,
       "release_gate_reason": "同梱する20個のQt成果物は公式Qt 6.10.2 archiveとbyte単位で一致し、対応sourceと通知本文も固定したが、PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceは確認できていない。",
+      "release_disclosure": {
+        "category": "unverified-publisher-repackaging",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "publisherの再packaging工程全体は未確認、外部法務レビューは未実施。20ファイルの公式archive・source・SBOM・noticeとの対応を根拠とし、wheel_build_provenance_verifiedはfalseを維持する。実file/source/notice不一致は引き続き拒否する。"
+      },
       "source_archives": [
         {
           "filename": "qtbase-everywhere-src-6.10.2.tar.xz",
@@ -2544,6 +2569,11 @@
       "native_source_coverage_verified": false,
       "release_legal_review_required": true,
       "release_gate_reason": "SciPy wheelのGCC 10.3.0 build情報とOpenBLASのexact tag、submodule、Windows workflow、適用patch、Rtools指定は固定済みだが、SciPyのStrawberry toolchainとOpenBLASのRtools/GCC toolchain manifest、MacPython CI run、生成物からSciPy wheelまでのartifact chainを確認できていないため公開しない。",
+      "release_disclosure": {
+        "category": "unverified-publisher-artifact-chain",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "publisher内部の完全artifact chainとtoolchain manifestは未確認、外部法務レビューは未実施。source_statusとnative source coverageは未完了のままであり、この開示は実binary・source・notice対応の技術不足を解除しない。"
+      },
       "source_archives": [
         {
           "filename": "scipy-1.17.1.tar.gz",

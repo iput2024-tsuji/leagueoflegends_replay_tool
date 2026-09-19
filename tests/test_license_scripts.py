@@ -388,7 +388,31 @@ def test_qt_official_sboms_have_notices_for_shipped_dependency_closure():
     assert not any("source_status" in error for error in qt_errors)
     assert not any("native_source_coverage_verified" in error for error in qt_errors)
     assert not any("third-party notices" in error for error in qt_errors)
-    assert any("wheel_build_provenance_verified" in error for error in qt_errors)
+    assert qt_errors == []
+
+
+def test_release_disclosures_preserve_unreviewed_facts_and_technical_gates():
+    from scripts.prepare_release_assets import release_gate_errors
+
+    lock = _component_lock()
+    components = {item["component"]: item for item in lock["runtime_components"]}
+    assert lock["historical_remediation"]["review_completed"] is False
+    assert lock["historical_remediation"]["original_actions_artifact_retained"] is False
+    for name in ("microsoft-vc-runtime-python", "microsoft-vc-runtime"):
+        component = components[name]
+        assert component["release_legal_review_required"] is True
+        assert component["source_exception"]["review_completed"] is False
+        assert component["license_materials_exception"]["review_completed"] is False
+        assert component["artifact_patterns"] == []
+    assert components["qt"]["wheel_build_provenance_verified"] is False
+    for name in ("numpy", "scipy", "opencv-python"):
+        assert components[name]["source_status"] == "incomplete_corresponding_source"
+        assert components[name]["native_source_coverage_verified"] is False
+    errors = release_gate_errors(lock)
+    assert {error.split(":", 1)[0] for error in errors} == {"numpy", "scipy", "opencv-python"}
+    assert len(errors) == 10
+    for name in ("numpy", "scipy", "opencv-python"):
+        assert f"{name}: native_source_coverage_verified is not verified" in errors
 
 
 def test_qt_windows_runtime_artifacts_match_official_archive_lock():
@@ -2158,7 +2182,7 @@ def test_release_mode_enforces_python_and_legal_gates(tmp_path):
     if sys.version.split()[0] != "3.14.6":
         assert any("Release build Python must be 3.14.6" in error for error in errors)
     assert any("requires the exact PyInstaller COLLECT TOC" in error for error in errors)
-    assert any("gate remains for qt:" in error for error in errors)
+    assert any("gate remains for opencv-python:" in error for error in errors)
     assert any("numpy: native_source_coverage_verified" in error for error in errors)
     assert "Release build provenance is missing." in errors
     assert (

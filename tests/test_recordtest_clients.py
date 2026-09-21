@@ -5436,3 +5436,49 @@ def test_storage_limit_deletes_session_when_clip_listing_fails(monkeypatch, tmp_
     assert not owned_video.exists()
     assert not json_path.exists()
     assert owned_clip.exists()
+
+
+@pytest.mark.parametrize("entrypoint", ["setup", "cli"])
+def test_disabled_microphone_startup_failure_propagates_and_cleans_up(monkeypatch, tmp_path, entrypoint):
+    settings = {
+        "obs": {"password": "test-password"},
+        "audio": {"mic": {"device_id": "disabled"}},
+        "paths": {"recordings_dir": str(tmp_path), "json_dir": str(tmp_path / "json")},
+    }
+    primary = recordtest.RecorderError("microphone disable failed")
+    app = Mock(spec=[
+        "open", "apply_record_output_settings", "apply_audio_profile",
+        "shutdown_obs", "disconnect_obs", "stop_recording",
+        "reset_session", "wait_for_game_start_async", "start_recording_async",
+    ])
+    app._open_cleanup_attempted = False
+    app.apply_audio_profile.side_effect = primary
+    monkeypatch.setattr(recordtest, "load_settings", lambda: settings)
+    monkeypatch.setattr(recordtest, "run_preflight_checks", lambda *args, **kwargs: {
+        "config": settings, "changed": False, "warnings": [], "errors": [],
+    })
+    monkeypatch.setattr(recordtest, "setup_environment", lambda config: None)
+    monkeypatch.setattr(recordtest, "ensure_recording_dirs", lambda config: None)
+    monkeypatch.setattr(recordtest, "OBSProcessManager", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "fixture"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: SimpleNamespace(pid=123))
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda **kwargs: app)
+
+    expected_error = recordtest.RecorderError if entrypoint == "setup" else SystemExit
+    with pytest.raises(expected_error) as captured:
+        if entrypoint == "setup":
+            recordtest._setup_obs_sync_elements_locked(settings)
+        else:
+            run(recordtest.run_cli_recorder())
+
+    if entrypoint == "setup":
+        assert captured.value is primary
+    else:
+        assert captured.value.code == 1
+        assert captured.value.__context__ is primary
+    app.apply_audio_profile.assert_called_once()
+    app.reset_session.assert_not_called()
+    app.wait_for_game_start_async.assert_not_called()
+    app.start_recording_async.assert_not_called()
+    app.shutdown_obs.assert_called_once_with()

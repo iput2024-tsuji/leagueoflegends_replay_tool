@@ -86,6 +86,10 @@ class GameAudioClient:
         else:
             self.inputs[name]["settings"] = dict(settings)
 
+    def get_scene_list(self):
+        self._call("get_scene_list")
+        return SimpleNamespace(scenes=[{"sceneName": name} for name in self.scene_items])
+
     def get_scene_item_list(self, scene):
         self._call("get_scene_item_list", scene)
         return SimpleNamespace(scene_items=deepcopy(self.scene_items.get(scene, [])))
@@ -279,3 +283,124 @@ def test_malformed_inventory_does_not_allow_recording(config, monkeypatch, opera
         client.start_recording()
 
     assert raw.record_requests == []
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_disabled_microphone_profile_never_uses_disabled_as_wasapi_device(config, existing):
+    config = replace(config, audio=replace(config.audio, mic=replace(
+        config.audio.mic, device_id="disabled", mute=False,
+    )))
+    raw = GameAudioClient(config, existing=True)
+    name = config.audio.mic.input_name
+    if existing:
+        raw._add_scene_item(config.obs.scene_name, name, True)
+        raw._add_scene_item("other-scene", name, True)
+    else:
+        del raw.inputs[name]
+    game_before = deepcopy(raw.inputs[GAME_NAME])
+
+    recordtest.apply_audio_profile_from_config(raw, config)
+    recordtest.apply_audio_profile_from_config(raw, config)
+
+    mic = raw.inputs[name]
+    assert mic["settings"]["device_id"] == ("test-microphone" if existing else "default")
+    assert mic["mute"] is False
+    mic_items = [item for item in raw.scene_items[config.obs.scene_name] if item["sourceName"] == name]
+    assert len(mic_items) == 1
+    assert mic_items[0]["sceneItemEnabled"] is False
+    assert raw.inputs[GAME_NAME] == game_before
+    assert all(call[1] == name for call in raw.calls if call[0].startswith("set_input_"))
+    assert not [call for call in raw.calls if call[0] == "set_input_settings"]
+    if existing:
+        assert raw.scene_items["other-scene"][0]["sceneItemEnabled"] is True
+
+
+def test_microphone_disable_then_device_restore_keeps_game_and_mute_independent(config):
+    raw = GameAudioClient(config, existing=True)
+    name = config.audio.mic.input_name
+    item_id = raw._add_scene_item(config.obs.scene_name, name, True)
+    game_before = deepcopy(raw.inputs[GAME_NAME])
+    for device in ("disabled", "another-device", "default"):
+        raw.calls.clear()
+        recordtest.apply_audio_input_settings(
+            raw, name, device_id=device, volume_db=-3, mute=False, scene_name=config.obs.scene_name,
+        )
+        mutations = [call for call in raw.calls if call[0].startswith("set_")]
+        if device == "disabled":
+            assert mutations[0] == ("set_scene_item_enabled", config.obs.scene_name, item_id, False)
+            assert raw.inputs[name]["settings"]["device_id"] == "test-microphone"
+        else:
+            assert mutations[-1] == ("set_scene_item_enabled", config.obs.scene_name, item_id, True)
+            assert raw.inputs[name]["settings"]["device_id"] == device
+        assert raw.inputs[name]["mute"] is False
+        assert raw.inputs[GAME_NAME] == game_before
+
+
+@pytest.mark.parametrize("failure", ["wrong_kind", "missing_item", "duplicate_item", "invalid_item", "input_query", "scene_query"])
+def test_microphone_selection_rejects_unknown_target_before_mutation(config, failure):
+    raw = GameAudioClient(config, existing=True)
+    name = config.audio.mic.input_name
+    raw._add_scene_item(config.obs.scene_name, name, True)
+    if failure == "wrong_kind":
+        raw.inputs[name]["kind"] = "wasapi_process_output_capture"
+    elif failure == "missing_item":
+        raw.scene_items[config.obs.scene_name] = []
+    elif failure == "duplicate_item":
+        raw._add_scene_item(config.obs.scene_name, name, True)
+    elif failure == "invalid_item":
+        raw.scene_items[config.obs.scene_name][-1]["sceneItemId"] = True
+    elif failure == "input_query":
+        raw.fail_at = "get_input_list"
+    else:
+        raw.fail_at = "get_scene_item_list"
+    original_inputs = deepcopy(raw.inputs)
+    original_scenes = deepcopy(raw.scene_items)
+    with pytest.raises((recordtest.RecorderError, RuntimeError)):
+        recordtest.apply_audio_input_settings(
+            raw, name, device_id="disabled", volume_db=0, mute=False, scene_name=config.obs.scene_name,
+        )
+    assert raw.inputs == original_inputs
+    assert raw.scene_items == original_scenes
+    assert all(call[0].startswith("get_") for call in raw.calls)
+
+
+@pytest.mark.parametrize("failure", ["wrong_kind", "input_query"])
+def test_disabled_microphone_setup_does_not_replace_unverified_input(config, failure):
+    raw = GameAudioClient(config, existing=True)
+    name = config.audio.mic.input_name
+    config = replace(config, audio=replace(config.audio, mic=replace(config.audio.mic, device_id="disabled")))
+    if failure == "wrong_kind":
+        raw.inputs[name]["kind"] = "wasapi_process_output_capture"
+    else:
+        raw.fail_at = "get_input_list"
+    with pytest.raises((recordtest.RecorderError, RuntimeError)):
+        recordtest.apply_audio_profile_from_config(raw, config)
+    assert all(call[0].startswith("get_") for call in raw.calls)
+
+
+def test_audio_input_settings_without_scene_preserves_normal_api_and_rejects_disabled(config):
+    raw = GameAudioClient(config)
+    name = config.audio.mic.input_name
+    recordtest.apply_audio_input_settings(raw, name, "another-device", -2, True)
+    assert raw.inputs[name]["settings"]["device_id"] == "another-device"
+    assert raw.inputs[name]["mute"] is True
+    assert [call[0] for call in raw.calls] == ["set_input_settings", "set_input_volume", "set_input_mute"]
+    raw.calls.clear()
+    with pytest.raises(recordtest.RecorderError):
+        recordtest.apply_audio_input_settings(raw, name, "disabled", 0, False)
+    assert raw.calls == []
+
+
+@pytest.mark.parametrize("failed_call", ["set_input_settings", "set_input_volume", "set_input_mute"])
+def test_microphone_restore_failure_keeps_scene_item_disabled(config, failed_call):
+    raw = GameAudioClient(config, existing=True)
+    name = config.audio.mic.input_name
+    item_id = raw._add_scene_item(config.obs.scene_name, name, False)
+    raw.fail_at = failed_call
+    with pytest.raises(RuntimeError, match=f"failed {failed_call}"):
+        recordtest.apply_audio_input_settings(
+            raw, name, device_id="another-device", volume_db=-3, mute=False, scene_name=config.obs.scene_name,
+        )
+    mic_item = next(item for item in raw.scene_items[config.obs.scene_name] if item["sceneItemId"] == item_id)
+    assert mic_item["sceneItemEnabled"] is False
+    assert not [call for call in raw.calls if call[0] == "set_scene_item_enabled"]

@@ -250,7 +250,7 @@ def live_audio_controller(monkeypatch):
     repository.load.side_effect = lambda **kwargs: deepcopy(current)
     repository.save.side_effect = lambda data: current.update(deepcopy(data))
     raw = Mock(spec=[
-        "get_input_list", "get_scene_item_id", "send",
+        "get_input_list", "get_scene_item_id", "get_scene_item_list", "set_scene_item_enabled", "send",
         "set_input_settings", "set_input_volume", "set_input_mute",
     ])
     raw.get_input_list.return_value = SimpleNamespace(inputs=[
@@ -258,6 +258,9 @@ def live_audio_controller(monkeypatch):
         {"inputName": "lol_game_audio", "inputKind": "wasapi_process_output_capture"},
     ])
     raw.get_scene_item_id.return_value = SimpleNamespace(scene_item_id=7)
+    raw.get_scene_item_list.return_value = SimpleNamespace(scene_items=[
+        {"sourceName": "existing-mic", "sceneItemId": 7, "sceneItemEnabled": True},
+    ])
     raw.send.return_value = {"propertyItems": [
         {"itemValue": "device-b", "itemName": "Microphone B"},
     ]}
@@ -321,7 +324,7 @@ def test_live_audio_refresh_uses_existing_source_without_saving_stale_catalog_sn
 
 
 @pytest.mark.parametrize(("device", "volume", "mute"), [
-    ("default", -3.0, False), ("disabled", -12.0, True), ("device-b", 6.0, True),
+    ("default", -3.0, False), ("disabled", -12.0, True), ("disabled", 0.0, False), ("device-b", 6.0, True),
 ])
 def test_live_audio_apply_only_updates_existing_mic_and_preserves_latest_general_settings(
     live_audio_controller, device, volume, mute,
@@ -346,7 +349,11 @@ def test_live_audio_apply_only_updates_existing_mic_and_preserves_latest_general
     result = state.controller.apply_audio_settings(stale, auto_launch=True, live_audio=True)
 
     assert result == {"obs_launched": False}
-    state.raw.set_input_settings.assert_called_once_with("existing-mic", {"device_id": device}, overlay=True)
+    if device == "disabled":
+        state.raw.set_input_settings.assert_not_called()
+    else:
+        state.raw.set_input_settings.assert_called_once_with("existing-mic", {"device_id": device}, overlay=True)
+    state.raw.set_scene_item_enabled.assert_called_once_with("recording-scene", 7, device != "disabled")
     state.raw.set_input_volume.assert_called_once_with("existing-mic", vol_db=volume)
     state.raw.set_input_mute.assert_called_once_with("existing-mic", mute)
     state.raw.send.assert_not_called()
@@ -389,7 +396,7 @@ def test_live_audio_invalid_existing_source_never_mutates_or_persists(live_audio
     state.recorder.disconnect_obs.assert_called_once_with()
 
 
-@pytest.mark.parametrize("failed_call", ["set_input_settings", "set_input_volume", "set_input_mute"])
+@pytest.mark.parametrize("failed_call", ["set_input_settings", "set_input_volume", "set_input_mute", "set_scene_item_enabled"])
 def test_live_audio_apply_failure_preserves_primary_and_disconnects_borrowed_runtime(
     live_audio_controller, failed_call,
 ):
@@ -433,3 +440,18 @@ def test_live_audio_owned_identity_rejection_never_reaches_obs_or_persistence(li
     assert state.raw.mock_calls == []
     state.repository.save.assert_not_called()
     state.recorder.disconnect_obs.assert_not_called()
+
+
+def test_live_microphone_disable_failure_does_not_save_or_change_device(live_audio_controller):
+    state = live_audio_controller
+    original = deepcopy(state.current)
+    state.raw.set_scene_item_enabled.side_effect = recordtest.RecorderError("scene disable failed")
+    with pytest.raises(recordtest.RecorderError, match="scene disable failed"):
+        state.controller.apply_audio_settings(
+            {"audio": {"mic": {"device_id": "disabled", "mute": False}}}, live_audio=True,
+        )
+    assert state.current == original
+    state.raw.set_input_settings.assert_not_called()
+    state.raw.set_input_mute.assert_not_called()
+    state.repository.save.assert_not_called()
+    state.recorder.disconnect_obs.assert_called_once_with()

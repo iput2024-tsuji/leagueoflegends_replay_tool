@@ -231,6 +231,7 @@ class AudioSettingsController:
                 recordtest.apply_audio_input_settings(
                     client, input_name, device_id=requested["device_id"],
                     volume_db=requested["volume_db"], mute=requested["mute"],
+                    scene_name=config.obs.scene_name,
                 )
                 latest = self.config_controller.repository.load(create_if_missing=False)
                 latest.setdefault("audio", {})["mic"] = requested

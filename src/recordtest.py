@@ -263,6 +263,8 @@ DEFAULT_MAX_STORAGE_GB = config_schema.DEFAULT_MAX_STORAGE_GB
 DEFAULT_AUDIO_MIC_INPUT_NAME = config_schema.DEFAULT_AUDIO_MIC_INPUT_NAME
 DEFAULT_AUDIO_DEVICE_ID = config_schema.DEFAULT_AUDIO_DEVICE_ID
 DEFAULT_AUDIO_DEVICE_NAME = config_schema.DEFAULT_AUDIO_DEVICE_NAME
+# Application selection only; WASAPI has no "disabled" device ID.
+DISABLED_AUDIO_DEVICE_ID = "disabled"
 DEFAULT_AUDIO_MIC_VOLUME_DB = config_schema.DEFAULT_AUDIO_MIC_VOLUME_DB
 DEFAULT_AUDIO_MIC_MUTE = config_schema.DEFAULT_AUDIO_MIC_MUTE
 DEFAULT_RECORDING_START_TIMEOUT_SEC = 15.0
@@ -2508,36 +2510,23 @@ def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg:
     input_kind = spec["input_kind"]
     created = False
 
-    input_exists = False
-    input_kind_matches = False
-    try:
-        input_resp = client.get_input_list()
-        input_items = getattr(input_resp, "inputs", []) or []
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("inputName") != input_name:
-                continue
-            input_exists = True
-            input_kind_matches = item.get("inputKind") == input_kind
-            break
-    except Exception:
-        input_exists = False
-
-    if input_exists and not input_kind_matches:
-        try:
-            client.remove_input(input_name)
-            input_exists = False
-        except Exception:
-            # 種別違いでも削除できない場合は後続の設定更新で失敗させる。
-            pass
+    input_items = client.get_input_list().inputs
+    if not isinstance(input_items, list):
+        raise RecorderError("マイクソース一覧を確認できません。")
+    matching = [item for item in input_items if isinstance(item, dict) and item.get("inputName") == input_name]
+    if matching and (len(matching) != 1 or matching[0].get("inputKind") != input_kind):
+        raise RecorderError("同名の別種マイクソースは変更できません。")
+    input_exists = bool(matching)
+    disabled = slot_cfg.get("device_id") == DISABLED_AUDIO_DEVICE_ID
 
     if not input_exists:
-        settings = {"device_id": str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)}
+        # The app's disabled selection hides this scene item, not a WASAPI device.
+        device_id = DEFAULT_AUDIO_DEVICE_ID if disabled else str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)
+        settings = {"device_id": device_id}
         last_error = None
         for kind_name in (input_kind,):
             try:
-                client.create_input(scene_name, input_name, kind_name, settings, True)
+                client.create_input(scene_name, input_name, kind_name, settings, not disabled)
                 created = True
                 input_exists = True
                 break
@@ -2546,16 +2535,7 @@ def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg:
         if not input_exists:
             raise RecorderError(f"{spec['label']}ソース '{input_name}' の作成に失敗しました: {last_error}")
 
-    # 保存されている device_id を先に適用（default でも可）
-    try:
-        client.set_input_settings(
-            input_name,
-            {"device_id": str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)},
-            overlay=True,
-        )
-    except Exception:
-        pass
-
+    # Device and enable state are applied together after scene/type validation.
     return created
 
 
@@ -2626,13 +2606,37 @@ def apply_audio_input_settings(
     device_id: str | None = None,
     volume_db: float | int | str | None = None,
     mute: bool | None = None,
+    *,
+    scene_name: str | None = None,
 ) -> None:
-    if device_id not in (None, ""):
+    disabled = device_id == DISABLED_AUDIO_DEVICE_ID
+    if disabled and not scene_name:
+        raise RecorderError("マイクを無効にする録画シーンを指定してください。")
+    if scene_name:
+        inputs = client.get_input_list().inputs
+        items = client.get_scene_item_list(scene_name).scene_items
+        if not isinstance(inputs, list) or not isinstance(items, list):
+            raise RecorderError("既存のマイクソースと録画シーンを確認できません。")
+        matching = [item for item in inputs if isinstance(item, dict) and item.get("inputName") == input_name]
+        if (len(matching) != 1
+                or matching[0].get("inputKind") != MANAGED_AUDIO_INPUTS["mic"]["input_kind"]):
+            raise RecorderError("既存のマイクソースの種別を確認できません。")
+        scene_items = [item for item in items if isinstance(item, dict) and item.get("sourceName") == input_name]
+        item_id = scene_items[0].get("sceneItemId") if len(scene_items) == 1 else None
+        if type(item_id) is not int or item_id < 0:
+            raise RecorderError("録画シーン内のマイクソースを一意に確認できません。")
+
+    if disabled:
+        client.set_scene_item_enabled(scene_name, item_id, False)
+    elif device_id not in (None, ""):
         client.set_input_settings(input_name, {"device_id": str(device_id)}, overlay=True)
     if volume_db is not None:
         client.set_input_volume(input_name, vol_db=float(volume_db))
     if mute is not None:
         client.set_input_mute(input_name, bool(mute))
+    if scene_name and not disabled:
+        # Do not enable a previously disabled microphone until all settings succeed.
+        client.set_scene_item_enabled(scene_name, item_id, True)
 
 
 def apply_audio_profile_from_config(
@@ -2654,6 +2658,7 @@ def apply_audio_profile_from_config(
                 device_id=slot_cfg.get("device_id"),
                 volume_db=slot_cfg.get("volume_db"),
                 mute=slot_cfg.get("mute"),
+                scene_name=scene_name,
             )
         except Exception as e:
             raise RecorderError(f"{MANAGED_AUDIO_INPUTS[key]['label']}設定の適用に失敗しました: {e}") from e
@@ -2713,6 +2718,8 @@ def _setup_obs_sync_elements_locked(
         try:
             recorder.apply_audio_profile(cfg)
         except Exception as e:
+            if _get_audio_slot_config(cfg, "mic")["device_id"] == DISABLED_AUDIO_DEVICE_ID:
+                raise
             if status_cb:
                 try:
                     status_cb(f"⚠️ 音声設定の初期適用に失敗しました: {e}")
@@ -4682,6 +4689,8 @@ async def run_cli_recorder() -> None:
             app.apply_audio_profile(config)
             LOGGER.info("🔊 音声設定をOBSへ適用しました。")
         except Exception as e:
+            if config.audio.mic.device_id == DISABLED_AUDIO_DEVICE_ID:
+                raise
             LOGGER.warning("⚠️ 音声設定の適用に失敗: %s", e)
         while True:
             app.reset_session()

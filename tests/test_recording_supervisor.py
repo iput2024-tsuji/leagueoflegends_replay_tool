@@ -742,3 +742,20 @@ def test_recording_supervisor_does_not_finalize_twice_when_save_fails():
     assert recorder.calls[-3:] == ["request_stop", "stop_recording", "runtime_close"]
     assert recording_controller.runtime.close_calls == [False]
     assert [item[0] for item in notifications] == ["recording_started", "recording_failed"]
+
+
+def test_disabled_microphone_apply_failure_prevents_recording_and_cleans_up():
+    recorder = FakeRecorder()
+    recorder.config = recordtest.AppConfig.from_dict({"audio": {"mic": {"device_id": "disabled"}}})
+    primary = recordtest.RecorderError("microphone disable failed")
+    recorder.apply_audio_profile = Mock(side_effect=primary)
+    controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(), recording_controller=controller,
+    )
+    with pytest.raises(recordtest.RecorderError) as captured:
+        run(run_supervisor(supervisor))
+    assert captured.value is primary
+    assert "start_recording_async" not in recorder.calls
+    assert "wait_for_game_start_async" not in recorder.calls
+    assert controller.runtime.close_calls == [False]

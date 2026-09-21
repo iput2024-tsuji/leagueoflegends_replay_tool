@@ -484,3 +484,30 @@ def test_settings_entry_checks_finished_worker_before_queued_finished_signal(mon
     settings.set_recording_audio_only.assert_not_called()
     window.stack.setCurrentWidget.assert_not_called()
     assert window._last_recorder_shutdown_failed
+
+
+def test_microphone_disabled_choice_survives_refresh_save_and_restore(live_audio_page):
+    page = live_audio_page
+    assert page.audio_mic_device.findData("disabled") >= 0
+    page.audio_mic_device.setCurrentIndex(page.audio_mic_device.findData("disabled"))
+    page._audio_apply_timer.stop()
+    assert page.refresh_audio_devices(show_message=False)
+    refresh = HeldAudioWorker.instances[-1]
+    refresh.loaded.emit({"catalog": {"mic": [{"id": "other", "name": "Other"}]}})
+    refresh.finished.emit()
+    assert page.audio_mic_device.currentData() == "disabled"
+    assert sum(page.audio_mic_device.itemData(i) == "disabled"
+               for i in range(page.audio_mic_device.count())) == 1
+    page.save_settings()
+    saved = HeldAudioWorker.instances[-1]
+    assert saved.kwargs == {"auto_launch": False, "live_audio": True}
+    assert saved.data["audio"]["mic"]["device_id"] == "disabled"
+    assert saved.data["audio"]["mic"]["mute"] is False
+    saved.finished.emit()
+    page._set_audio_ui_from_config("mic", saved.data["audio"]["mic"])
+    assert page.audio_mic_device.currentData() == "disabled"
+    page.audio_mic_device.setCurrentIndex(page.audio_mic_device.findData("other"))
+    page.save_settings()
+    restored = HeldAudioWorker.instances[-1]
+    assert restored.data["audio"]["mic"]["device_id"] == "other"
+    restored.finished.emit()

@@ -1279,7 +1279,10 @@ class SettingsPage(QWidget):
         current_text = combo.currentText()
         combo.blockSignals(True)
         combo.clear()
+        combo.addItem("無効（マイクを録音しない）", recordtest.DISABLED_AUDIO_DEVICE_ID)
         for item in items:
+            if item.get("id") == recordtest.DISABLED_AUDIO_DEVICE_ID:
+                continue
             label = f"{item.get('name', '')} [{item.get('id', '')}]".strip()
             combo.addItem(label, item.get("id"))
         if current_id:

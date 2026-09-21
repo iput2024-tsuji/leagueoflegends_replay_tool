@@ -352,6 +352,65 @@ def test_sampling_summary_does_not_infer_unknown_schema_or_publish_values(tmp_pa
     assert "private" not in json.dumps(result)
 
 
+@pytest.mark.parametrize("guid_count", [32, 33])
+def test_sampling_report_retains_bounded_schema_without_samples_or_raw_values(probe, monkeypatch, guid_count):
+    temp, tools, tracerpt, _, original = probe
+    guids = [f"{index:08x}-aaaa-bbbb-cccc-222222222222" for index in range(guid_count)]
+
+    def sampling_schema(args, private, stage, timeout, report):
+        entry = original(args, private, stage, timeout, report)
+        if stage == "sampling_decode_raw":
+            root = ET.fromstring(_xml([(guid, 43, {}) for guid in guids]))
+            missing = ET.fromstring(_xml([
+                (target.BI_PROVIDER, 43, {"ProcessId": 43, "FileName": "private-path",
+                                          "CommandLine": "private-command", "private-field": "private-value"})
+                for _ in range(11)
+            ]))
+            for event, event_id in zip(missing, [*range(9), 0, 8], strict=True):
+                system = event.find(f"{target.NS}System")
+                provider = system.find(f"{target.NS}Provider")
+                provider.attrib.clear()
+                provider.attrib.update(Name="private-provider", EventSourceName="private-source")
+                ET.SubElement(system, f"{target.NS}EventID").text = str(event_id)
+                root.append(event)
+            (private / "sampling_raw.xml").write_bytes(ET.tostring(root))
+        return entry
+
+    monkeypatch.setattr(target, "_command", sampling_schema)
+    report = target.run_probe(temp, tools, tracerpt)
+    comparison = report["cpu_sampling_comparison"]
+    assert report["product_build_evidence"] is False
+    assert report["observations"]["process_events"][0]["observed_payload_pid"] == 42
+    if guid_count > 32:
+        assert report["status"] == comparison["status"] == "failed"
+        assert report["error"]["code"] == comparison["error"]["code"] == "provider_guid_limit"
+        assert "raw_summary" not in comparison
+    else:
+        assert report["status"] == comparison["status"] == "incomplete"
+        summary = comparison["raw_summary"]
+        assert summary["provider_guid_counts"] == dict.fromkeys(guids, 1)
+        assert summary["event_count"] == 43 and summary["missing_provider_guid_events"] == 11
+        assert all(value == 0 for value in summary["known_provider_counts"].values())
+        assert all(value == 0 for value in summary["child_matches_by_provider"].values())
+        assert summary["target_pid_events"] == 0 and "not_provider_absence" in summary["scope"]
+        missing = summary["missing_guid_schema"]
+        assert len(missing["groups"]) == 8 and missing["groups"][0]["count"] == 2
+        assert missing["overflow_events"] == 2 and missing["truncated"] is True
+        assert missing["header_child_matches"] == missing["payload_child_matches"] == 11
+        assert all(set(group) == {"count", "structure"} for group in missing["groups"])
+        structure = missing["groups"][0]["structure"]
+        assert structure["system_fields"]["EventID"]["uint32"] == 0
+        assert structure["other_payload_field_count"] == 1
+        assert structure["payload_fields"]["FileName"]["form"] == "other"
+    public = temp / "LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
+    assert public.stat().st_size <= target.JSON_LIMIT == 64 * 1024
+    text = public.read_text(encoding="utf-8")
+    assert json.loads(text) == report
+    assert "first_sample" not in text and "private-" not in text
+    assert hashlib.sha256(b"private-path").hexdigest() not in text
+    assert hashlib.sha256(b"private-command").hexdigest() not in text
+
+
 def test_unknown_schema_and_unexpected_command_are_not_invented_or_exposed(tmp_path):
     (tmp_path / "raw.xml").write_bytes(b'<Events><Data Name="ProcessId">42</Data></Events>')
     (tmp_path / "relogged.xml").write_bytes(_xml([

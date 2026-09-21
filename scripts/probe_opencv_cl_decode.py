@@ -535,6 +535,7 @@ def _sampling_summary(path: Path, child_pid: int) -> dict:
     matched = {guid: 0 for guid in (BI_PROVIDER, PROCESS_PROVIDER, IMAGE_PROVIDER)}
     for event in _events(path, child_pid, schema):
         matched[event["provider"]] += 1
+    missing_guid = schema["missing_guid_schema"]
     return {
         "scope": "strict_decoded_xml_only_not_provider_absence_or_trace_completeness",
         **{key: schema[key] for key in (
@@ -542,6 +543,13 @@ def _sampling_summary(path: Path, child_pid: int) -> dict:
             "missing_provider_guid_events", "malformed_provider_guid_events",
             "unsupported_namespace_events", "target_pid_events",
         )},
+        "provider_guid_counts": schema["provider_guid_counts"],
+        "missing_guid_schema": {
+            **{key: missing_guid[key] for key in (
+                "overflow_events", "truncated", "header_child_matches", "payload_child_matches",
+            )},
+            "groups": [{key: group[key] for key in ("count", "structure")} for group in missing_guid["groups"]],
+        },
         "known_provider_counts": {guid: schema["known_provider_counts"].get(guid, 0) for guid in matched},
         "child_matches_by_provider": matched,
     }

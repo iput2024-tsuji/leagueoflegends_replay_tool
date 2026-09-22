@@ -3386,6 +3386,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self._sync_sampling_disabled = False
         self.record_path = None
         self.recording_started = False
+        self._recording_stop_attempted = False
         self.session_started = False
         self.saved_events = []
         self.all_events = []
@@ -4465,23 +4466,43 @@ class LoLAutoRecorder(RecordingSessionManager):
         return RecordingOutcome.COMPLETED
 
     def stop_recording(self) -> None:
-        if not self.obs_client.raw_client or self.record_path is not None:
+        with OBS_OPERATION_LOCK:
+            self._stop_recording_locked()
+
+    def _stop_recording_locked(self) -> None:
+        if self.record_path is not None:
             return
         if not self.recording_started:
+            return
+        if self.obs_client.raw_client is None:
+            failed_before = self.session_outcome is RecordingOutcome.FAILED_PARTIAL
+            self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+            if not failed_before or not self.failure_reason:
+                self.failure_reason = "OBS接続が失われたため、録画停止と動画ファイルを確認できませんでした。"
+            return
+        if self._recording_stop_attempted:
+            self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+            self.failure_reason = self.failure_reason or "OBS録画停止の結果が不明なため、停止要求を再送しません。"
             return
 
         try:
             is_active = self.obs_client.is_recording_active()
+            if type(is_active) is not bool:
+                raise RecorderError("OBSから有効な録画状態が返されませんでした。")
             if is_active is False:
                 self.recording_started = False
                 if self.record_path is None:
                     self.session_outcome = RecordingOutcome.FAILED_PARTIAL
                     self.failure_reason = "OBS録画が完了処理前に停止しており、動画ファイルを確認できませんでした。"
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"⚠️ 録画状態確認エラー: {e}")
+            self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+            self.failure_reason = f"OBS録画状態を確認できず、停止処理を中止しました: {e}"
+            return
 
         try:
+            self._recording_stop_attempted = True
             self.record_path = self.obs_client.stop_recording()
             if self.record_path:
                 self.log(f"💾 保存完了: {self.record_path}")
@@ -4642,6 +4663,10 @@ def _cleanup_cli_recorder(
     selected_error = primary_error
     try:
         app.stop_recording()
+        if getattr(app, "session_outcome", None) is RecordingOutcome.FAILED_PARTIAL:
+            raise RecorderError(
+                getattr(app, "failure_reason", None) or "OBS録画の停止を確認できませんでした。"
+            )
     except BaseException as exc:
         if selected_error is None:
             selected_error = exc
@@ -4764,16 +4789,26 @@ async def run_cli_recorder() -> None:
                         outcome=RecordingOutcome.ABORTED,
                         failure_reason="recording was cancelled",
                     )
-                    if result.success:
-                        LOGGER.info("⏹️ 録画セッションを中断ログとして保存しました。")
-                    else:
-                        LOGGER.error("❌ 中断ログの保存に失敗しました: %s", result.error)
+                    if not result.success:
+                        raise RecorderError(f"中断ログの保存に失敗しました: {result.error}")
+                    if getattr(result, "outcome", RecordingOutcome.ABORTED) != RecordingOutcome.ABORTED:
+                        raise RecorderError(
+                            getattr(app, "failure_reason", None)
+                            or getattr(result, "error", None)
+                            or "録画の停止を確認できませんでした。"
+                        )
+                    LOGGER.info("⏹️ 録画セッションを中断ログとして保存しました。")
                 LOGGER.info("⏹️ 録画セッションを中断しました。")
                 break
             result = app.finalize_session(outcome=RecordingOutcome.COMPLETED)
             if not result.success:
-                LOGGER.error("❌ セッション保存に失敗しました: %s", result.error)
-                break
+                raise RecorderError(f"セッション保存に失敗しました: {result.error}")
+            if getattr(result, "outcome", RecordingOutcome.COMPLETED) != RecordingOutcome.COMPLETED:
+                raise RecorderError(
+                    getattr(app, "failure_reason", None)
+                    or getattr(result, "error", None)
+                    or "録画の正常終了を確認できませんでした。"
+                )
             LOGGER.info("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
         if not startup_handoff_complete:

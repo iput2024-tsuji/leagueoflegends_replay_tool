@@ -25,8 +25,10 @@ asset to the same Release. OBS Studio and standalone FFmpeg are external tools
 that users explicitly obtain and place. This project does not automatically
 download, mirror, bundle, or redistribute them. No new public Release will be
 made until the remaining gates for the distributed files, including runtime and
-wheel-vendored native source coverage and PyQt6-Qt6 wheel build provenance, are
+wheel-vendored native source coverage, licenses, notices and native binaries, are
 complete. Publication also requires an explicit maintainer instruction.
+Unperformed external legal review and publisher-internal chain limitations are
+disclosed under the maintainer decision in [SOURCE_OFFER.md](SOURCE_OFFER.md).
 
 An mpv DLL is also not bundled. Obtain a supported 64-bit DLL separately and
 place it in `%LOCALAPPDATA%\LoLReplayTool\bin`.
@@ -47,6 +49,7 @@ Ban/Pick capture uses the League Client API (LCU). LCU is not an officially supp
 - Recording video and JSON event-log storage
 - Ban/Pick order, champion, team, and position capture
 - Queue information such as Ranked, Normal, and ARAM
+- Matches identified as TFT are skipped while monitoring continues for the next LoL match
 - mpv-based replay playback
 - Seeking from events categorized as kills, deaths, assists, objectives, and buildings
 - Ban/Pick order and final team composition in the replay view, with locally available champion icons
@@ -209,6 +212,10 @@ python main.py
 - Match monitoring starts with the main screen.
 - OBS recording starts after match-start detection.
 - The recording encoder defaults to GPU-priority automatic selection and falls back to x264 if recording cannot start.
+- Game audio is captured separately for LoL using OBS's built-in Application Audio Capture and recorded on track 1. Audio capture through the video window source (WGC) and desktop-wide audio capture are disabled.
+- The selected microphone records to the same track 1 as game audio. The disabled microphone option excludes only the microphone from the recording scene and preserves its mute setting; it does not disable the Windows device.
+- Recording continues when you open settings; while recording, only the microphone device, volume, and mute can be changed, and both automatic updates and Save apply only those microphone settings. To change general settings, reopen settings after recording ends.
+- Recording does not start if OBS lacks Application Audio Capture or game-audio source configuration fails; an error is shown instead.
 - Recording stops and JSON is saved after the match ends.
 - Previous matches can be opened from the replay screen.
 - The trash button moves the video, JSON, and related clips to the Windows Recycle Bin.
@@ -292,11 +299,11 @@ Windows x64 distributions require the user to install the Microsoft Visual C++ 2
 
 Before changing files for a new install or overwrite update, the installer checks the 64-bit and 32-bit HKLM registry views, `Installed`, and `Version`. It fails closed when the x64 Runtime is missing, incomplete, inconsistent, or below minimum version `14.44.35211.0`; newer compatible versions are accepted. When the prerequisite is missing, the installer gives Microsoft’s official guidance. A browser is opened only after interactive user consent; silent mode does not prompt or browse and exits non-zero.
 
-Custom wheels are verified with pinned input wheels, source archives, tools, SHA256 values, PE import inventories before and after transformation, and a reproducible build recipe. The CI / Release workflows audit the dist directory, expanded installer, and Release assets at their respective stages and fail closed on app-local or hashed Microsoft Runtime DLLs/imports. This is a technical packaging policy, not a legal conclusion about GPL or Microsoft terms. The legal gate, public-Release hold, and withdrawn v0.5.2 status remain unchanged.
+Custom wheels are verified with pinned input wheels, source archives, tools, SHA256 values, PE import inventories before and after transformation, and a reproducible build recipe. The CI / Release workflows audit the dist directory, expanded installer, and Release assets at their respective stages and fail closed on app-local or hashed Microsoft Runtime DLLs/imports. This is a technical packaging policy, not a legal conclusion about GPL or Microsoft terms. Technical gates, the public-Release hold and the withdrawn v0.5.2 status remain unchanged.
 
 ## Publishing a GitHub Release
 
-Publish only after the licensing review, a dedicated Release-preparation Issue,
+Publish only after the license and technical checks, a dedicated Release-preparation Issue,
 CI, real-Windows checks, and an explicit maintainer decision are complete.
 Update `VERSION` and both changelogs, merge the change into `main`, and then
 create the matching tag. A tag push alone does not publish a Release; the
@@ -354,4 +361,6 @@ GPL dependencies obtained where necessary.
 - If OBS appears in the system tray, close all existing OBS processes before restarting the application.
 - If events are missing, inspect the JSON `events` and `events_all` fields.
 - Analytics requires multiple JSON files containing both wins and losses.
-- If synchronization is incorrect, use synchronization correction or run the OBS configuration and recheck action again.
+- If synchronization is incorrect, select an event, move the video to its matching scene, and press the button labeled 「現在位置で同期」 (sync at the current position).
+- New recordings use observed game and video times on both sides of an in-game pause. Events whose timing could not be observed, such as during a reconnect, require manual synchronization instead of an automatic jump. Manual synchronization for such an event applies only to that event.
+- Older recordings have no pause timing data, so pauses cannot be corrected automatically. Their existing synchronization adjustment remains available.

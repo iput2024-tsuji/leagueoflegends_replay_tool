@@ -139,6 +139,62 @@ async def run_supervisor(supervisor):
     await supervisor.run(asyncio.Event())
 
 
+@pytest.mark.parametrize("live_available", [False, True])
+def test_supervisor_skips_tft_before_cancellation_without_recording_or_saving(tmp_path, live_available):
+    obs_client = Mock(obs_process=None, raw_client=object())
+    riot_client = SimpleNamespace(
+        get_gameflow_phase_result=AsyncMock(return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME, payload={"phase": "InProgress"},
+        )),
+        get_match_metadata=AsyncMock(return_value={"queue_id": 1090, "game_id": "tft-1"}),
+        get_all_game_data_result=AsyncMock(return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME if live_available else recordtest.RiotPollStatus.TEMPORARY_FAILURE,
+            payload={"gameData": {"gameTime": 0}} if live_available else None,
+        )),
+        get_champ_select_session_result=AsyncMock(return_value=recordtest.RiotPollResult(
+            recordtest.RiotPollStatus.IN_GAME,
+            payload={"actions": [[{"id": 1, "type": "pick", "championId": 103, "completed": True}]]},
+        )),
+        get_champion_catalog=AsyncMock(return_value={103: "Ahri"}),
+        get_active_player_name=AsyncMock(return_value=None),
+    )
+    recorder = recordtest.LoLAutoRecorder(
+        config=recordtest.AppConfig.from_dict({"paths": {
+            "recordings_dir": str(tmp_path / "recordings"), "json_dir": str(tmp_path / "json"),
+        }}),
+        obs_client=obs_client, riot_api_client=riot_client, auto_setup=False,
+    )
+
+    async def cancel_wait(*args, **kwargs):
+        recorder.request_stop()
+        return False
+
+    recorder.wait_with_stop_async = AsyncMock(side_effect=cancel_wait)
+    recorder.log = Mock(wraps=recorder.log)
+    recorder.save_json = Mock(wraps=recorder.save_json)
+    recording_controller = FakeRecordingController(recorder)
+    recording_controller.runtime.close = Mock()
+    notifications = []
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(), recording_controller=recording_controller,
+        notification_cb=lambda *args: notifications.append(args),
+    )
+
+    run(run_supervisor(supervisor))
+
+    assert any("TFTは録画対象外" in call.args[0] for call in recorder.log.call_args_list)
+    assert recorder.session_phase == recordtest.RecordingPhase.CANCELLED
+    assert recorder.session_started is False
+    assert recorder.has_session_data() is False
+    assert recorder.output_file is None
+    assert notifications == []
+    obs_client.start_recording.assert_not_called()
+    obs_client.toggle_recording.assert_not_called()
+    recorder.save_json.assert_not_called()
+    assert list(tmp_path.rglob("*.json")) == []
+    recording_controller.runtime.close.assert_called_once_with(finalize_session=False)
+
+
 def test_update_shutdown_reservation_wins_before_recording_transition():
     class ReservingRecorder(FakeRecorder):
         async def wait_for_game_start_async(self):
@@ -894,3 +950,20 @@ def test_recording_supervisor_does_not_finalize_twice_when_save_fails():
     assert recorder.calls[-3:] == ["request_stop", "stop_recording", "runtime_close"]
     assert recording_controller.runtime.close_calls == [False]
     assert [item[0] for item in notifications] == ["recording_started", "recording_failed"]
+
+
+def test_disabled_microphone_apply_failure_prevents_recording_and_cleans_up():
+    recorder = FakeRecorder()
+    recorder.config = recordtest.AppConfig.from_dict({"audio": {"mic": {"device_id": "disabled"}}})
+    primary = recordtest.RecorderError("microphone disable failed")
+    recorder.apply_audio_profile = Mock(side_effect=primary)
+    controller = FakeRecordingController(recorder)
+    supervisor = RecordingSupervisor(
+        config_controller=FakeConfigController(), recording_controller=controller,
+    )
+    with pytest.raises(recordtest.RecorderError) as captured:
+        run(run_supervisor(supervisor))
+    assert captured.value is primary
+    assert "start_recording_async" not in recorder.calls
+    assert "wait_for_game_start_async" not in recorder.calls
+    assert controller.runtime.close_calls == [False]

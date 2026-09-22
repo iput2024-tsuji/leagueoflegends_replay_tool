@@ -1,4 +1,6 @@
-from src.match_metadata import build_match_metadata, merge_live_game_metadata
+import pytest
+
+from src.match_metadata import build_match_metadata, is_tft_match, merge_live_game_metadata
 
 
 def test_build_match_metadata_uses_queue_catalog_definition():
@@ -73,3 +75,54 @@ def test_merge_live_game_metadata_marks_live_client_source_when_current_has_no_s
         "game_mode": "CLASSIC",
         "source": "live_client",
     }
+
+
+@pytest.mark.parametrize(
+    "queue_id", [1090, 1100, 1110, 1111, 1130, 1160, 1170, 1180, 1190, 1210, 1220, 6000, 6100, 6120, 6130]
+)
+def test_tft_queue_ids_from_official_catalogs(queue_id):
+    assert is_tft_match({"queue_id": queue_id})
+    assert is_tft_match({"queue_id": str(queue_id)})
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"game_mode": "TFT"},
+        {"game_mode": " tft "},
+        {"queue_type": "RANKED_TFT_DOUBLE_UP", "queue_id": 99999},
+        {"queue_type": "TFT"},
+        {"queue_type": "PVE_PUZZLE_TFT"},
+    ],
+)
+def test_tft_explicit_classification_does_not_require_known_queue_id(metadata):
+    assert is_tft_match(metadata)
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {},
+        {"queue_id": None},
+        {"queue_id": "invalid"},
+        {"queue_id": 1200},
+        {"queue_id": 420},
+        {"queue_id": 450},
+        {"queue_id": 1700},
+        {"game_mode": "CLASSIC"},
+        {"game_mode": "ARAM"},
+        {"queue_type": "NOTTFT"},
+        {"display_name": "TFT", "game_type": "MATCHED_GAME"},
+    ],
+)
+def test_other_or_missing_metadata_is_not_assumed_to_be_tft(metadata):
+    assert not is_tft_match(metadata)
+
+
+@pytest.mark.parametrize("use_catalog", [False, True])
+def test_queue_game_mode_is_available_to_the_recording_filter(use_catalog):
+    queue = {"id": 99999, "gameMode": "TFT"}
+    payload = {"gameData": {"queue": {"id": 99999} if use_catalog else queue}}
+    metadata = build_match_metadata(payload, [queue] if use_catalog else [])
+    assert metadata["game_mode"] == "TFT"
+    assert is_tft_match(metadata)

@@ -266,6 +266,8 @@ def test_windows_workflows_prepare_and_reverify_the_pinned_toolchain():
         "LICENSE text eol=lf",
         "licenses/inno-setup/LICENSE.txt text eol=lf",
         "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/** -text -whitespace",
+        "licenses/python-packages/numpy/runtime-sources/** -text -whitespace",
+        "licenses/python-packages/scipy/runtime-sources/** -text -whitespace",
     ]
 
 

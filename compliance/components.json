@@ -16,7 +16,12 @@
     "evidence": "",
     "scope": "撤回済みv0.5.2インストーラーの履歴資料と遡及対応の十分性",
     "reviewer": "",
-    "date": ""
+    "date": "",
+    "release_disclosure": {
+      "category": "unavailable-historical-artifact",
+      "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+      "limitation": "v0.5.2元artifactは取得不能で全同梱物の再監査はできない。外部法務レビューは未実施。管理者がこの限界を開示事項として受け入れたが、撤回・バイナリ差替え禁止と新しい配布物の技術検査は維持する。"
+    }
   },
   "release_binary_policy": {
     "python_implementation": "CPython",
@@ -1152,7 +1157,12 @@
         "date": ""
       },
       "release_legal_review_required": true,
-      "release_gate_reason": "CPython 3.14.6が外部Microsoft x64 Redistributableを利用する境界について、GPLv3 System Libraries例外その他の適用根拠を専門家が確認するまで公開しない。"
+      "release_gate_reason": "CPython 3.14.6が外部Microsoft x64 Redistributableを利用する境界について、GPLv3 System Libraries例外その他の適用根拠を専門家が確認するまで公開しない。",
+      "release_disclosure": {
+        "category": "external-runtime-prerequisite",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "外部法務レビューは未実施。CPythonのMicrosoft Runtimeは非同梱の外部前提であり、この分類は法的適合やsource提供完了の証明ではない。配布物・installer・Release assetのRuntime不存在と通常名importの技術監査は維持する。"
+      }
     },
     {
       "component": "microsoft-vc-runtime",
@@ -1253,7 +1263,12 @@
         "date": ""
       },
       "release_legal_review_required": true,
-      "release_gate_reason": "外部Microsoft Visual C++ Runtime前提とGPLv3 System Libraries例外その他の適用境界を専門家が確認し、証拠を記録するまで公開しない。"
+      "release_gate_reason": "外部Microsoft Visual C++ Runtime前提とGPLv3 System Libraries例外その他の適用境界を専門家が確認し、証拠を記録するまで公開しない。",
+      "release_disclosure": {
+        "category": "external-runtime-prerequisite",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "外部法務レビューは未実施。wheel由来Microsoft Runtimeは非同梱の外部前提であり、この分類は法的適合やsource提供完了の証明ではない。配布物・installer・Release assetのRuntime不存在と通常名importの技術監査は維持する。"
+      }
     },
     {
       "component": "aiohappyeyeballs",
@@ -1600,11 +1615,66 @@
       "distribution": "numpy",
       "version": "2.4.1",
       "license": "BSD-3-Clause AND bundled component licenses",
-      "source_status": "incomplete_corresponding_source",
+      "source_status": "verified_corresponding_source",
       "license_materials": [
         {
           "path": "licenses/python-packages/numpy/numpy-2.4.1.dist-info/licenses/LICENSE.txt",
           "sha256": "a804dff0ead9fadc5293456410bcbfc32bf024be9c4513459663fb7b442d2341"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/gcc-10.3.0/COPYING.RUNTIME",
+          "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/gcc-10.3.0/COPYING3",
+          "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/gcc-10.3.0/COPYING.LIB",
+          "sha256": "a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/gcc-10.3.0/COPYING3.LIB",
+          "sha256": "a853c2ffec17057872340eee242ae4d96cbf2b520ae27d903e1b2fef1a5f9d1c",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/gcc-10.3.0/COPYING",
+          "sha256": "231f7edcc7352d7734a96eef0b8030f77982678c516876fcb81e25b32d68564c",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/mingw-w64-acc9b9d9/AUTHORS",
+          "sha256": "8f308316e7a94b8410f871868bd3948f126526dc1775aeee97a0e365f9a0fd9f",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/mingw-w64-acc9b9d9/COPYING",
+          "sha256": "99a69660981156c21336fdb5661f89341b013c94e4bf9e1c7467b4745718397f",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/mingw-w64-acc9b9d9/COPYING.MinGW-w64-runtime/COPYING.MinGW-w64-runtime.txt",
+          "sha256": "e9b2dc02451ea29092a1f25fa0f3c07207ed421f1807dffb0c4e6dce69dee7bd",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/mingw-w64-acc9b9d9/COPYING.MinGW-w64/COPYING.MinGW-w64.txt",
+          "sha256": "f38e6194bd3bfa1b654f118e5acefe0aead437bbe669eee43957ccc65a7127f1",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/mingw-w64-acc9b9d9/mingw-w64-headers/ddk/readme.txt",
+          "sha256": "fdb6018009cec99085041e4fd1f13db7b82852e9aa73012d0cc7da6449b94f13",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/numpy/runtime-sources/mingw-w64-acc9b9d9/mingw-w64-libraries/winpthreads/COPYING",
+          "sha256": "63263614cdd29f2f93cba85e992f041b31f9fc7b4033692f31269489a8a1b177",
+          "source": "repository"
         }
       ],
       "artifact_patterns": [
@@ -1644,9 +1714,14 @@
           "sha256": "9e3e5a4229c1ca39f10dc82bba9e2b2bf48037790932566f37aff1a7ccf3588f"
         }
       },
-      "native_source_coverage_verified": false,
+      "native_source_coverage_verified": true,
       "release_legal_review_required": true,
       "release_gate_reason": "NumPy本体のMSVC build情報とOpenBLASのexact tag、submodule、Windows workflow、適用patch、Rtools指定は固定済みだが、MacPython CI run、Rtools installer hashとGCC toolchain manifest、生成物からNumPy wheelまでのartifact chainを確認できていないため公開しない。",
+      "release_disclosure": {
+        "category": "unverified-publisher-artifact-chain",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "固定wheel・公開build情報・実package metadataに対応する保守的source集合とnoticeを保持する。publisher内部の完全artifact chain/toolchain manifest、厳密なlinked object subset、byte-identical再build、外部法務レビューは未確認。これらの開示はsource/notice欠損・未知native・外部Runtime混入や正式配布物の検証を免除しない。旧review-required/reasonは履歴として保持し、旧Strawberry表記はcompiler配布元の認定としない。"
+      },
       "source_archives": [
         {
           "filename": "numpy-2.4.1.tar.gz",
@@ -1665,6 +1740,24 @@
           "url": "https://codeload.github.com/OpenMathLib/OpenBLAS/tar.gz/b5456c1b41ea88d4e0041778aa8ec09ee2a111a0",
           "sha256": "0a17959ade3b0fc0b7d4af7b67bc5fc7823da643ad3f0699c9c84e795e6c204a",
           "size": 24730332
+        },
+        {
+          "filename": "gcc-10.3.0.tar.xz",
+          "url": "https://ftp.gnu.org/gnu/gcc/gcc-10.3.0/gcc-10.3.0.tar.xz",
+          "sha256": "64f404c1a650f27fc33da242e1f2df54952e3963a49e06e73f6940f3223ac344",
+          "size": 76692288
+        },
+        {
+          "filename": "rtools-ucrt-c5344cc8c7e310ee4eee513b2381af2e75d65cb9.tar.gz",
+          "url": "https://codeload.github.com/r-windows/rtools-ucrt/tar.gz/c5344cc8c7e310ee4eee513b2381af2e75d65cb9",
+          "sha256": "6540c9aeb9234f7438401257c1aacdeaaee8ef3d3877b14df50319042a1cd12f",
+          "size": 101725
+        },
+        {
+          "filename": "mingw-w64-acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679.tar.gz",
+          "url": "https://codeload.github.com/mingw-w64/mingw-w64/tar.gz/acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679",
+          "sha256": "774ebdae72b9c514c375eddcf3bb75af4472498cad9ed8b0664f0fe37b7c17bb",
+          "size": 13116265
         }
       ]
     },
@@ -1943,7 +2036,7 @@
         },
         {
           "path": "licenses/python-packages/PyQt6-Qt6/qt-6.10.2/README.md",
-          "sha256": "0687dcf43498bc86119e591b544e326654150ae930b7c26e19bbe77d06476961",
+          "sha256": "4816023595a55a8bae342a592b0799fbfa1791e322669e5299d568ea81927a0a",
           "source": "repository"
         },
         {
@@ -2118,6 +2211,11 @@
       "native_source_coverage_verified": true,
       "release_legal_review_required": true,
       "release_gate_reason": "同梱する20個のQt成果物は公式Qt 6.10.2 archiveとbyte単位で一致し、対応sourceと通知本文も固定したが、PyQt6-Qt6 wheel公開者による再packaging工程全体のprovenanceは確認できていない。",
+      "release_disclosure": {
+        "category": "unverified-publisher-repackaging",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "publisherの再packaging工程全体は未確認、外部法務レビューは未実施。20ファイルの公式archive・source・SBOM・noticeとの対応を根拠とし、wheel_build_provenance_verifiedはfalseを維持する。実file/source/notice不一致は引き続き拒否する。"
+      },
       "source_archives": [
         {
           "filename": "qtbase-everywhere-src-6.10.2.tar.xz",
@@ -2373,11 +2471,66 @@
       "distribution": "scipy",
       "version": "1.17.1",
       "license": "BSD-3-Clause AND bundled component licenses",
-      "source_status": "incomplete_corresponding_source",
+      "source_status": "verified_corresponding_source",
       "license_materials": [
         {
           "path": "licenses/python-packages/scipy/scipy-1.17.1.dist-info/LICENSE.txt",
           "sha256": "564d63dbef2ef3eb1dec94908966d3edf5f11c487ee2cf2baf8bf3faef01bdd9"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/gcc-10.3.0/COPYING.RUNTIME",
+          "sha256": "9d6b43ce4d8de0c878bf16b54d8e7a10d9bd42b75178153e3af6a815bdc90f74",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/gcc-10.3.0/COPYING3",
+          "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/gcc-10.3.0/COPYING.LIB",
+          "sha256": "a9bdde5616ecdd1e980b44f360600ee8783b1f99b8cc83a2beb163a0a390e861",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/gcc-10.3.0/COPYING3.LIB",
+          "sha256": "a853c2ffec17057872340eee242ae4d96cbf2b520ae27d903e1b2fef1a5f9d1c",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/gcc-10.3.0/COPYING",
+          "sha256": "231f7edcc7352d7734a96eef0b8030f77982678c516876fcb81e25b32d68564c",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/mingw-w64-acc9b9d9/AUTHORS",
+          "sha256": "8f308316e7a94b8410f871868bd3948f126526dc1775aeee97a0e365f9a0fd9f",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/mingw-w64-acc9b9d9/COPYING",
+          "sha256": "99a69660981156c21336fdb5661f89341b013c94e4bf9e1c7467b4745718397f",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/mingw-w64-acc9b9d9/COPYING.MinGW-w64-runtime/COPYING.MinGW-w64-runtime.txt",
+          "sha256": "e9b2dc02451ea29092a1f25fa0f3c07207ed421f1807dffb0c4e6dce69dee7bd",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/mingw-w64-acc9b9d9/COPYING.MinGW-w64/COPYING.MinGW-w64.txt",
+          "sha256": "f38e6194bd3bfa1b654f118e5acefe0aead437bbe669eee43957ccc65a7127f1",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/mingw-w64-acc9b9d9/mingw-w64-headers/ddk/readme.txt",
+          "sha256": "fdb6018009cec99085041e4fd1f13db7b82852e9aa73012d0cc7da6449b94f13",
+          "source": "repository"
+        },
+        {
+          "path": "licenses/python-packages/scipy/runtime-sources/mingw-w64-acc9b9d9/mingw-w64-libraries/winpthreads/COPYING",
+          "sha256": "63263614cdd29f2f93cba85e992f041b31f9fc7b4033692f31269489a8a1b177",
+          "source": "repository"
         }
       ],
       "artifact_patterns": [
@@ -2391,9 +2544,9 @@
         "size": 37290984
       },
       "wheel_build_compilers": {
-        "c": "GCC 10.3.0 (Strawberry toolchain)",
-        "cxx": "GCC 10.3.0 (Strawberry toolchain)",
-        "fortran": "GFortran 10.3.0 (Strawberry toolchain)"
+        "c": "GCC 10.3.0",
+        "cxx": "GCC 10.3.0",
+        "fortran": "GFortran 10.3.0"
       },
       "openblas_windows_build_evidence": {
         "source_archive_filename": "openblas-libs-v0.3.30.0.8.tar.gz",
@@ -2418,9 +2571,14 @@
           "sha256": "64eda39e79589aedb16f58e5547eb599f0b5855505d56b9d40022e2eee354a0b"
         }
       },
-      "native_source_coverage_verified": false,
+      "native_source_coverage_verified": true,
       "release_legal_review_required": true,
       "release_gate_reason": "SciPy wheelのGCC 10.3.0 build情報とOpenBLASのexact tag、submodule、Windows workflow、適用patch、Rtools指定は固定済みだが、SciPyのStrawberry toolchainとOpenBLASのRtools/GCC toolchain manifest、MacPython CI run、生成物からSciPy wheelまでのartifact chainを確認できていないため公開しない。",
+      "release_disclosure": {
+        "category": "unverified-publisher-artifact-chain",
+        "decision_url": "https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910",
+        "limitation": "固定wheel・公開build情報・実package metadataに対応する保守的source集合とnoticeを保持する。publisher内部の完全artifact chain/toolchain manifest、厳密なlinked object subset、byte-identical再build、外部法務レビューは未確認。これらの開示はsource/notice欠損・未知native・外部Runtime混入や正式配布物の検証を免除しない。旧review-required/reasonは履歴として保持し、旧Strawberry表記はcompiler配布元の認定としない。"
+      },
       "source_archives": [
         {
           "filename": "scipy-1.17.1.tar.gz",
@@ -2439,6 +2597,24 @@
           "url": "https://codeload.github.com/OpenMathLib/OpenBLAS/tar.gz/b5456c1b41ea88d4e0041778aa8ec09ee2a111a0",
           "sha256": "0a17959ade3b0fc0b7d4af7b67bc5fc7823da643ad3f0699c9c84e795e6c204a",
           "size": 24730332
+        },
+        {
+          "filename": "gcc-10.3.0.tar.xz",
+          "url": "https://ftp.gnu.org/gnu/gcc/gcc-10.3.0/gcc-10.3.0.tar.xz",
+          "sha256": "64f404c1a650f27fc33da242e1f2df54952e3963a49e06e73f6940f3223ac344",
+          "size": 76692288
+        },
+        {
+          "filename": "rtools-ucrt-c5344cc8c7e310ee4eee513b2381af2e75d65cb9.tar.gz",
+          "url": "https://codeload.github.com/r-windows/rtools-ucrt/tar.gz/c5344cc8c7e310ee4eee513b2381af2e75d65cb9",
+          "sha256": "6540c9aeb9234f7438401257c1aacdeaaee8ef3d3877b14df50319042a1cd12f",
+          "size": 101725
+        },
+        {
+          "filename": "mingw-w64-acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679.tar.gz",
+          "url": "https://codeload.github.com/mingw-w64/mingw-w64/tar.gz/acc9b9d9eb63a13d8122cbac4882eb5f4ee2f679",
+          "sha256": "774ebdae72b9c514c375eddcf3bb75af4472498cad9ed8b0664f0fe37b7c17bb",
+          "size": 13116265
         }
       ]
     },

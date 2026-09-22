@@ -37,7 +37,7 @@ try:
         champion_kill_role,
         normalize_summoner_name,
     )
-    from .match_metadata import merge_live_game_metadata
+    from .match_metadata import is_tft_match, merge_live_game_metadata
     from .mpv_support import has_mpv_dll
     from .obs_bootstrap import (
         OBSBootstrapApplyPlan,
@@ -108,6 +108,7 @@ try:
         RecordingOutcome,
         RecordingPhase,
     )
+    from .replay_timing import make_sync_interval
     from .riot_api import LiveClientRiotAPIClient, RiotAPIClient, RiotPollResult, RiotPollStatus
     from .session_log import SessionLogV1, save_session_payload
 except ImportError:
@@ -122,7 +123,7 @@ except ImportError:
         champion_kill_role,
         normalize_summoner_name,
     )
-    from match_metadata import merge_live_game_metadata
+    from match_metadata import is_tft_match, merge_live_game_metadata
     from mpv_support import has_mpv_dll
     from obs_bootstrap import (
         OBSBootstrapApplyPlan,
@@ -189,6 +190,7 @@ except ImportError:
         RecordingOutcome,
         RecordingPhase,
     )
+    from replay_timing import make_sync_interval
     from riot_api import LiveClientRiotAPIClient, RiotAPIClient, RiotPollResult, RiotPollStatus
     from session_log import SessionLogV1, save_session_payload
 
@@ -263,6 +265,8 @@ DEFAULT_MAX_STORAGE_GB = config_schema.DEFAULT_MAX_STORAGE_GB
 DEFAULT_AUDIO_MIC_INPUT_NAME = config_schema.DEFAULT_AUDIO_MIC_INPUT_NAME
 DEFAULT_AUDIO_DEVICE_ID = config_schema.DEFAULT_AUDIO_DEVICE_ID
 DEFAULT_AUDIO_DEVICE_NAME = config_schema.DEFAULT_AUDIO_DEVICE_NAME
+# Application selection only; WASAPI has no "disabled" device ID.
+DISABLED_AUDIO_DEVICE_ID = "disabled"
 DEFAULT_AUDIO_MIC_VOLUME_DB = config_schema.DEFAULT_AUDIO_MIC_VOLUME_DB
 DEFAULT_AUDIO_MIC_MUTE = config_schema.DEFAULT_AUDIO_MIC_MUTE
 DEFAULT_RECORDING_START_TIMEOUT_SEC = 15.0
@@ -2508,36 +2512,23 @@ def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg:
     input_kind = spec["input_kind"]
     created = False
 
-    input_exists = False
-    input_kind_matches = False
-    try:
-        input_resp = client.get_input_list()
-        input_items = getattr(input_resp, "inputs", []) or []
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("inputName") != input_name:
-                continue
-            input_exists = True
-            input_kind_matches = item.get("inputKind") == input_kind
-            break
-    except Exception:
-        input_exists = False
-
-    if input_exists and not input_kind_matches:
-        try:
-            client.remove_input(input_name)
-            input_exists = False
-        except Exception:
-            # 種別違いでも削除できない場合は後続の設定更新で失敗させる。
-            pass
+    input_items = client.get_input_list().inputs
+    if not isinstance(input_items, list):
+        raise RecorderError("マイクソース一覧を確認できません。")
+    matching = [item for item in input_items if isinstance(item, dict) and item.get("inputName") == input_name]
+    if matching and (len(matching) != 1 or matching[0].get("inputKind") != input_kind):
+        raise RecorderError("同名の別種マイクソースは変更できません。")
+    input_exists = bool(matching)
+    disabled = slot_cfg.get("device_id") == DISABLED_AUDIO_DEVICE_ID
 
     if not input_exists:
-        settings = {"device_id": str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)}
+        # The app's disabled selection hides this scene item, not a WASAPI device.
+        device_id = DEFAULT_AUDIO_DEVICE_ID if disabled else str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)
+        settings = {"device_id": device_id}
         last_error = None
         for kind_name in (input_kind,):
             try:
-                client.create_input(scene_name, input_name, kind_name, settings, True)
+                client.create_input(scene_name, input_name, kind_name, settings, not disabled)
                 created = True
                 input_exists = True
                 break
@@ -2546,16 +2537,7 @@ def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg:
         if not input_exists:
             raise RecorderError(f"{spec['label']}ソース '{input_name}' の作成に失敗しました: {last_error}")
 
-    # 保存されている device_id を先に適用（default でも可）
-    try:
-        client.set_input_settings(
-            input_name,
-            {"device_id": str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)},
-            overlay=True,
-        )
-    except Exception:
-        pass
-
+    # Device and enable state are applied together after scene/type validation.
     return created
 
 
@@ -2626,13 +2608,37 @@ def apply_audio_input_settings(
     device_id: str | None = None,
     volume_db: float | int | str | None = None,
     mute: bool | None = None,
+    *,
+    scene_name: str | None = None,
 ) -> None:
-    if device_id not in (None, ""):
+    disabled = device_id == DISABLED_AUDIO_DEVICE_ID
+    if disabled and not scene_name:
+        raise RecorderError("マイクを無効にする録画シーンを指定してください。")
+    if scene_name:
+        inputs = client.get_input_list().inputs
+        items = client.get_scene_item_list(scene_name).scene_items
+        if not isinstance(inputs, list) or not isinstance(items, list):
+            raise RecorderError("既存のマイクソースと録画シーンを確認できません。")
+        matching = [item for item in inputs if isinstance(item, dict) and item.get("inputName") == input_name]
+        if (len(matching) != 1
+                or matching[0].get("inputKind") != MANAGED_AUDIO_INPUTS["mic"]["input_kind"]):
+            raise RecorderError("既存のマイクソースの種別を確認できません。")
+        scene_items = [item for item in items if isinstance(item, dict) and item.get("sourceName") == input_name]
+        item_id = scene_items[0].get("sceneItemId") if len(scene_items) == 1 else None
+        if type(item_id) is not int or item_id < 0:
+            raise RecorderError("録画シーン内のマイクソースを一意に確認できません。")
+
+    if disabled:
+        client.set_scene_item_enabled(scene_name, item_id, False)
+    elif device_id not in (None, ""):
         client.set_input_settings(input_name, {"device_id": str(device_id)}, overlay=True)
     if volume_db is not None:
         client.set_input_volume(input_name, vol_db=float(volume_db))
     if mute is not None:
         client.set_input_mute(input_name, bool(mute))
+    if scene_name and not disabled:
+        # Do not enable a previously disabled microphone until all settings succeed.
+        client.set_scene_item_enabled(scene_name, item_id, True)
 
 
 def apply_audio_profile_from_config(
@@ -2654,6 +2660,7 @@ def apply_audio_profile_from_config(
                 device_id=slot_cfg.get("device_id"),
                 volume_db=slot_cfg.get("volume_db"),
                 mute=slot_cfg.get("mute"),
+                scene_name=scene_name,
             )
         except Exception as e:
             raise RecorderError(f"{MANAGED_AUDIO_INPUTS[key]['label']}設定の適用に失敗しました: {e}") from e
@@ -2713,6 +2720,8 @@ def _setup_obs_sync_elements_locked(
         try:
             recorder.apply_audio_profile(cfg)
         except Exception as e:
+            if _get_audio_slot_config(cfg, "mic")["device_id"] == DISABLED_AUDIO_DEVICE_ID:
+                raise
             if status_cb:
                 try:
                     status_cb(f"⚠️ 音声設定の初期適用に失敗しました: {e}")
@@ -3304,12 +3313,13 @@ class LoLAutoRecorder(RecordingSessionManager):
         self._open_cleanup_attempted = False
         self.reset_session()
 
-    def open(self) -> None:
+    def open(self, *, configure_output: bool = True) -> None:
         if self.opened:
             return
         try:
             self.connect_obs()
-            self.ensure_record_output_setup()
+            if configure_output:
+                self.ensure_record_output_setup()
             if self.auto_setup:
                 self.ensure_sync_setup()
             self.opened = True
@@ -3370,6 +3380,10 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.session_outcome = RecordingOutcome.COMPLETED
         self.failure_reason = None
         self.sync_game_time = 0.0
+        self.sync_intervals: list[dict[str, float]] = []
+        self._last_sync_sample: tuple[float, float] | None = None
+        self._latest_sync_sample: tuple[float, float] | None = None
+        self._sync_sampling_disabled = False
         self.record_path = None
         self.recording_started = False
         self._recording_stop_attempted = False
@@ -3385,6 +3399,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.player_team = None
         self.enemy_champions = []
         self.match_metadata: dict[str, Any] = {}
+        self._tft_classification_source: str | None = None
         self.game_start_detection_source: str | None = None
         self.game_start_anchor_game_time: float | None = None
         self.sync_time_source: str | None = None
@@ -3529,7 +3544,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             return
 
         previous_name = self.match_metadata.get("display_name")
-        self.match_metadata.update(metadata)
+        self._update_waiting_match_metadata(metadata)
         current_name = self.match_metadata.get("display_name")
         if current_name and current_name != previous_name:
             self.log(f"マッチ種類を検出: {current_name}")
@@ -3540,6 +3555,53 @@ class LoLAutoRecorder(RecordingSessionManager):
             return None
         normalized = re.sub(r"[\s_-]+", "", str(value)).casefold()
         return normalized or None
+
+    def _update_waiting_match_metadata(self, metadata: dict[str, Any], *, live_client: bool = False) -> None:
+        """Keep confirmed TFT classification until a new match or lobby is observed."""
+        metadata = {key: value for key, value in metadata.items() if value not in (None, "")}
+        previous_id = self.match_metadata.get("game_id")
+        current_id = metadata.get("game_id")
+        has_both_ids = previous_id not in (None, "") and current_id not in (None, "")
+        has_neither_id = previous_id in (None, "") and current_id in (None, "")
+        source = "live_client" if live_client else metadata.get("source")
+        previous_source = self._tft_classification_source or self.match_metadata.get("source")
+        new_match = (
+            str(previous_id) != str(current_id)
+            if has_both_ids
+            else (
+                has_neither_id
+                and source == previous_source
+                and any(
+                    metadata.get(key) not in (None, "")
+                    and self.match_metadata.get(key) not in (None, "")
+                    and metadata[key] != self.match_metadata[key]
+                    for key in ("queue_id", "game_mode")
+                )
+            )
+        )
+        phase = self._normalize_gameflow_phase(metadata.get("gameflow_phase"))
+        previous_phase = self._normalize_gameflow_phase(self.match_metadata.get("gameflow_phase"))
+        outside_game = phase != previous_phase and phase in {
+            "none", "lobby", "matchmaking", "readycheck", "champselect",
+        }
+        if not self.session_started and (new_match or outside_game):
+            phase = self.match_metadata.get("gameflow_phase")
+            self.match_metadata = {"gameflow_phase": phase} if phase else {}
+            self._tft_classification_source = None
+        explicit_tft = is_tft_match(metadata)
+        if explicit_tft:
+            self._tft_classification_source = source
+        if not self.session_started and is_tft_match(self.match_metadata) and not is_tft_match(metadata):
+            # Partial/conflicting replies from the same game must not undo an exclusion.
+            metadata = {
+                key: value for key, value in metadata.items()
+                if key not in {"queue_id", "queue_type", "game_mode"}
+            }
+        if live_client:
+            metadata = {key: value for key, value in metadata.items() if key not in self.match_metadata}
+        self.match_metadata.update(metadata)
+        if explicit_tft and live_client:
+            self.match_metadata["game_mode"] = "TFT"
 
     async def poll_gameflow_phase(self) -> RiotPollResult:
         get_phase = getattr(self.riot_api_client, "get_gameflow_phase_result", None)
@@ -3559,7 +3621,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         if result.status == RiotPollStatus.IN_GAME and isinstance(result.payload, dict):
             phase = _first_mapping_value(result.payload, "phase", "value")
             if phase not in (None, ""):
-                self.match_metadata["gameflow_phase"] = str(phase)
+                self._update_waiting_match_metadata({"gameflow_phase": str(phase)})
         return result
 
     async def is_lol_game_process_running_async(self) -> bool | None:
@@ -3940,6 +4002,7 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.log("⚔️  LoLの試合開始を待機中 (API監視)...")
         loop = asyncio.get_running_loop()
         next_diagnostic_at = loop.time() + DEFAULT_GAME_START_DIAGNOSTIC_INTERVAL_SEC
+        skipping_tft = False
         while True:
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
@@ -3949,29 +4012,48 @@ class LoLAutoRecorder(RecordingSessionManager):
             await self.capture_match_metadata_async()
             result = await self.poll_all_game_data()
             data = result.payload
+            self._update_waiting_match_metadata(merge_live_game_metadata({}, data), live_client=True)
             game_time = self._live_game_time(data)
-            if result.status == RiotPollStatus.IN_GAME and game_time is not None:
+            gameflow_phase = self.match_metadata.get("gameflow_phase")
+            has_live_start = result.status == RiotPollStatus.IN_GAME and game_time is not None
+            is_tft = is_tft_match(self.match_metadata) or is_tft_match(merge_live_game_metadata({}, data))
+            lcu_start_checked = False
+            if (
+                not is_tft
+                and not has_live_start
+                and self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES
+            ):
+                live_result = await self.wait_for_live_client_after_lcu_start_async(initial_result=result)
+                if self.should_stop():
+                    self.session_phase = RecordingPhase.CANCELLED
+                    return False
+                # Classification/phase may arrive or change during the grace period.
+                await self.poll_gameflow_phase()
+                await self.capture_match_metadata_async()
+                gameflow_phase = self.match_metadata.get("gameflow_phase")
+                data, game_time = live_result if live_result is not None else (None, None)
+                self._update_waiting_match_metadata(merge_live_game_metadata({}, data), live_client=True)
+                has_live_start = live_result is not None
+                is_tft = is_tft_match(self.match_metadata) or is_tft_match(merge_live_game_metadata({}, data))
+                lcu_start_checked = True
+
+            if is_tft:
+                if not skipping_tft:
+                    self.log("TFTは録画対象外です。次のLoLの試合を待機します。")
+                skipping_tft = True
+                # No pending champion-select data may cause a JSON save on shutdown.
+                self.champ_select_tracker.reset()
+            elif has_live_start:
                 return await self._mark_game_started(
                     source="live_client",
                     live_data=data,
                     game_time=game_time,
                 )
-
-            gameflow_phase = self.match_metadata.get("gameflow_phase")
-            if self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES:
-                live_result = await self.wait_for_live_client_after_lcu_start_async(initial_result=result)
-                if live_result is None:
-                    if self.should_stop():
-                        self.session_phase = RecordingPhase.CANCELLED
-                        return False
-                    self.log("⚠️ Live Clientを確認できないため、LCU Gameflow Phaseで録画開始します。")
-                    return await self._mark_game_started(source="lcu")
-                live_data, live_game_time = live_result
-                return await self._mark_game_started(
-                    source="live_client",
-                    live_data=live_data,
-                    game_time=live_game_time,
-                )
+            elif lcu_start_checked and self._normalize_gameflow_phase(gameflow_phase) in LCU_GAMEFLOW_START_PHASES:
+                self.log("⚠️ Live Clientを確認できないため、LCU Gameflow Phaseで録画開始します。")
+                return await self._mark_game_started(source="lcu")
+            else:
+                skipping_tft = False
 
             if loop.time() >= next_diagnostic_at:
                 self.log(f"🔎 試合開始監視中: {self._game_start_poll_summary(result, gameflow_phase)}")
@@ -3998,6 +4080,9 @@ class LoLAutoRecorder(RecordingSessionManager):
                 return None
             result = results.pop(0) if results else await self.poll_all_game_data()
             data = result.payload
+            self._update_waiting_match_metadata(merge_live_game_metadata({}, data), live_client=True)
+            if is_tft_match(self.match_metadata):
+                return None
             game_time = self._live_game_time(data)
             if result.status == RiotPollStatus.IN_GAME and data is not None and game_time is not None:
                 self.log(f"Live Client接続を確認しました。GameTime: {float(game_time):.2f}s")
@@ -4285,6 +4370,45 @@ class LoLAutoRecorder(RecordingSessionManager):
 
             self.processed_event_keys.add(event_key)
 
+    def _observe_recording_sync(self, result: RiotPollResult, poll_started_at: float) -> None:
+        if self._sync_sampling_disabled:
+            return
+        previous = self._last_sync_sample
+        self._last_sync_sample = None
+        if result.status != RiotPollStatus.IN_GAME:
+            return
+        try:
+            game_time = self._live_game_time(result.payload)
+            if game_time is None:
+                return
+            get_clock = getattr(self.obs_client, "get_recording_clock", None)
+            video_time = get_clock() if callable(get_clock) else None
+            elapsed = time.monotonic() - poll_started_at
+            if (
+                isinstance(video_time, bool)
+                or not isinstance(video_time, (int, float))
+                or not math.isfinite(video_time)
+                or video_time < 0
+                or not 0.0 <= elapsed <= 0.5
+            ):
+                return
+            current = (game_time, float(video_time))
+        except Exception as error:
+            self.logger.debug("録画時刻の対応を取得できませんでした: %s", type(error).__name__)
+            return
+        # Keep the latest valid observation across gaps to detect an ambiguous clock reset.
+        latest = self._latest_sync_sample
+        if latest is not None and (current[0] < latest[0] or current[1] < latest[1]):
+            self.sync_intervals.clear()
+            self._sync_sampling_disabled = True
+            self.log("⚠️ 時計の巻き戻りを検出したため、この録画のイベント自動同期を無効にします。")
+            return
+        interval = make_sync_interval(previous, current)
+        if interval is not None:
+            self.sync_intervals.append(interval)
+        self._last_sync_sample = current
+        self._latest_sync_sample = current
+
     async def record_until_end_async(self) -> RecordingOutcome:
         """試合終了まで待機して録画停止"""
         self.session_phase = RecordingPhase.RECORDING
@@ -4301,7 +4425,9 @@ class LoLAutoRecorder(RecordingSessionManager):
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
                 return RecordingOutcome.CANCELLED
+            poll_started_at = time.monotonic()
             result = await self.poll_all_game_data()
+            self._observe_recording_sync(result, poll_started_at)
             now = loop.time()
             data = result.payload
             if not data:
@@ -4455,6 +4581,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             winning_team=self.winning_team,
             saved_at=time.strftime("%Y-%m-%d %H:%M:%S"),
             sync_game_time=self.sync_game_time,
+            sync_intervals=list(self.sync_intervals),
             obs_record_path=record_path_for_json,
             recordings_dir=str(self.config.paths.recordings_dir),
             json_path=str(self.output_file),
@@ -4635,6 +4762,8 @@ async def run_cli_recorder() -> None:
             app.apply_audio_profile(config)
             LOGGER.info("🔊 音声設定をOBSへ適用しました。")
         except Exception as e:
+            if config.audio.mic.device_id == DISABLED_AUDIO_DEVICE_ID:
+                raise
             LOGGER.warning("⚠️ 音声設定の適用に失敗: %s", e)
         while True:
             app.reset_session()

@@ -52,9 +52,10 @@ upstream artifact and source relationship used by this audit.
 text fileでは改行コードの正規化が必要でした。
 
 This evidence does not claim that the PyQt6-Qt6 wheel publisher exposed every
-wheel repackaging step, patch, or build script. That remaining provenance
-question stays recorded as a Release gate in `licenses/components.json`.
+wheel repackaging step, patch, or build script. That provenance remains
+unverified and disclosed under the [September 4 maintainer decision](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/54#issuecomment-5538215910).
+The actual artifact, source, SBOM and notice checks remain mandatory.
 
 この証拠は、PyQt6-Qt6 wheel公開者がwheelの再packaging手順、patch、build
-scriptをすべて公開したと主張するものではありません。その残存provenanceは
-`licenses/components.json`でRelease gateとして維持します。
+scriptをすべて公開したと主張するものではありません。9月4日の管理者決定に従い、
+そのprovenanceは未確認のまま開示し、実artifact、source、SBOM、noticeの検査を維持します。

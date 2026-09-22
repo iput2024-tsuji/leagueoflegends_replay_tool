@@ -388,7 +388,107 @@ def test_qt_official_sboms_have_notices_for_shipped_dependency_closure():
     assert not any("source_status" in error for error in qt_errors)
     assert not any("native_source_coverage_verified" in error for error in qt_errors)
     assert not any("third-party notices" in error for error in qt_errors)
-    assert any("wheel_build_provenance_verified" in error for error in qt_errors)
+    assert qt_errors == []
+
+
+def test_release_disclosures_preserve_unreviewed_facts_and_technical_gates():
+    from scripts.prepare_release_assets import release_gate_errors
+
+    lock = _component_lock()
+    components = {item["component"]: item for item in lock["runtime_components"]}
+    assert lock["historical_remediation"]["review_completed"] is False
+    assert lock["historical_remediation"]["original_actions_artifact_retained"] is False
+    for name in ("microsoft-vc-runtime-python", "microsoft-vc-runtime"):
+        component = components[name]
+        assert component["release_legal_review_required"] is True
+        assert component["source_exception"]["review_completed"] is False
+        assert component["license_materials_exception"]["review_completed"] is False
+        assert component["artifact_patterns"] == []
+    assert components["qt"]["wheel_build_provenance_verified"] is False
+    for name in ("numpy", "scipy"):
+        component = components[name]
+        assert component["source_status"] == "verified_corresponding_source"
+        assert component["native_source_coverage_verified"] is True
+        assert component["release_legal_review_required"] is True
+        evidence = component["openblas_windows_build_evidence"]
+        assert evidence["toolchain_manifest_verified"] is False
+        assert evidence["publisher_artifact_chain_verified"] is False
+    assert components["opencv-python"]["source_status"] == "incomplete_corresponding_source"
+    assert components["opencv-python"]["native_source_coverage_verified"] is False
+    errors = release_gate_errors(lock)
+    assert {error.split(":", 1)[0] for error in errors} == {"opencv-python"}
+    assert len(errors) == 4
+    assert "opencv-python: native_source_coverage_verified is not verified" in errors
+
+
+@pytest.mark.parametrize("component_name", ["numpy", "scipy"])
+def test_numerical_runtime_notices_are_locked_and_copied(component_name, tmp_path):
+    component = next(
+        item for item in _component_lock()["runtime_components"]
+        if item["component"] == component_name
+    )
+    prefix = f"licenses/python-packages/{component_name}/runtime-sources/"
+    materials = [
+        item for item in component["license_materials"]
+        if item.get("source") == "repository"
+    ]
+    expected = {
+        f"gcc-10.3.0/{name}"
+        for name in ("COPYING", "COPYING3", "COPYING.LIB", "COPYING3.LIB", "COPYING.RUNTIME")
+    } | {
+        f"mingw-w64-acc9b9d9/{name}"
+        for name in (
+            "AUTHORS", "COPYING",
+            "COPYING.MinGW-w64/COPYING.MinGW-w64.txt",
+            "COPYING.MinGW-w64-runtime/COPYING.MinGW-w64-runtime.txt",
+            "mingw-w64-headers/ddk/readme.txt",
+            "mingw-w64-libraries/winpthreads/COPYING",
+        )
+    }
+    assert {item["path"].removeprefix(prefix) for item in materials} == expected
+    attributes = Path(".gitattributes").read_text(encoding="utf-8").splitlines()
+    assert f"{prefix}** -text -whitespace" in attributes
+    copied, hashes = license_collector.copy_repository_license_materials(
+        materials,
+        tmp_path / "licenses",
+        seen_targets={},
+        required_prefix=Path("python-packages") / component_name,
+    )
+    assert set(copied) == {
+        item["path"].removeprefix("licenses/") for item in materials
+    }
+    for material in materials:
+        relative = material["path"].removeprefix("licenses/")
+        assert hashes[relative] == material["sha256"]
+        assert (tmp_path / "licenses" / relative).read_bytes() == (
+            license_collector.REPO_ROOT / material["path"]
+        ).read_bytes()
+
+
+@pytest.mark.parametrize("component_name", ["numpy", "scipy"])
+@pytest.mark.parametrize("fault", ["missing", "hash"])
+def test_numerical_runtime_notice_failure_is_not_disclosed_away(
+    component_name, fault, monkeypatch, tmp_path,
+):
+    component = next(
+        item for item in _component_lock()["runtime_components"]
+        if item["component"] == component_name
+    )
+    material = dict(next(
+        item for item in component["license_materials"]
+        if item["path"].endswith("gcc-10.3.0/COPYING.RUNTIME")
+    ))
+    if fault == "missing":
+        monkeypatch.setattr(license_collector, "REPO_ROOT", tmp_path / "empty")
+        message = "Repository license material is missing"
+    else:
+        material["sha256"] = "0" * 64
+        message = "Repository license material differs from lock"
+    with pytest.raises(RuntimeError, match=message):
+        license_collector.copy_repository_license_materials(
+            [material], tmp_path / "licenses", seen_targets={},
+            required_prefix=Path("python-packages") / component_name,
+        )
 
 
 def test_qt_windows_runtime_artifacts_match_official_archive_lock():
@@ -2103,8 +2203,9 @@ def test_release_mode_enforces_python_and_legal_gates(tmp_path):
     if sys.version.split()[0] != "3.14.6":
         assert any("Release build Python must be 3.14.6" in error for error in errors)
     assert any("requires the exact PyInstaller COLLECT TOC" in error for error in errors)
-    assert any("gate remains for qt:" in error for error in errors)
-    assert any("numpy: native_source_coverage_verified" in error for error in errors)
+    assert any("gate remains for opencv-python:" in error for error in errors)
+    assert not any("numpy: native_source_coverage_verified" in error for error in errors)
+    assert not any("scipy: native_source_coverage_verified" in error for error in errors)
     assert "Release build provenance is missing." in errors
     assert (
         "Release validation requires an externally sealed build provenance SHA256."

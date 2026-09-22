@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import re
 import subprocess
 import sys
@@ -23,6 +24,8 @@ except ImportError:
     from recorder_config import AppConfig
 
 
+GAME_AUDIO_INPUT_NAME = "lol_game_audio"
+GAME_AUDIO_INPUT_KIND = "wasapi_process_output_capture"
 _RECORDING_TRANSPORT_ERRORS = (
     OSError,
     OBSSDKTimeoutError,
@@ -102,6 +105,9 @@ class OBSClient(ABC):
     @abstractmethod
     def get_record_status_details(self) -> dict[str, Any]:
         pass
+
+    def get_recording_clock(self) -> float | None:
+        return None
 
     @abstractmethod
     def shutdown(self, allow_force: bool = True) -> None:
@@ -467,9 +473,11 @@ class ObsWebSocketClient(OBSClient):
 
     def setup_sync_elements(self) -> None:
         try:
+            self._validate_game_audio_source_name()
             self._ensure_scene_exists()
             self._set_current_scene()
             window_capture_item_id = self._ensure_window_capture_exists()
+            self._ensure_game_audio_capture()
             self._fit_window_capture_to_canvas(window_capture_item_id)
             sync_source_item_id = self._ensure_sync_source_exists()
             self._remove_legacy_game_capture_sources()
@@ -628,6 +636,61 @@ class ObsWebSocketClient(OBSClient):
             )
         return scene_item_id
 
+    def _validate_game_audio_source_name(self) -> None:
+        if GAME_AUDIO_INPUT_NAME in (
+            self.config.obs.window_capture_name,
+            self.config.obs.source_name,
+            self.config.audio.mic.input_name,
+        ):
+            raise _recorder_error(
+                f"ゲーム音声用の名前 '{GAME_AUDIO_INPUT_NAME}' が別のソース設定と重複しています。"
+            )
+
+    def _ensure_game_audio_capture(self) -> None:
+        """Keep process audio independent of WGC and ready before recording."""
+        self._validate_game_audio_source_name()
+        scene_name = self.config.obs.scene_name
+        source_name = GAME_AUDIO_INPUT_NAME
+        try:
+            inputs = self.client.get_input_list().inputs
+            if not isinstance(inputs, list):
+                raise ValueError("OBS入力一覧を取得できませんでした。")
+            existing = next((item for item in inputs if item.get("inputName") == source_name), None)
+            settings = {
+                "window": self.config.obs.window_capture_window,
+                # EXE priority requires the selected executable, unlike title/class matching.
+                "priority": 2,
+            }
+            if existing is None:
+                kinds = self.client.get_input_kind_list(True).input_kinds
+                if GAME_AUDIO_INPUT_KIND not in kinds:
+                    raise ValueError("このOBS/Windows環境はApplication Audio Captureに対応していません。")
+                self.client.create_input(scene_name, source_name, GAME_AUDIO_INPUT_KIND, settings, True)
+            else:
+                if existing.get("inputKind") != GAME_AUDIO_INPUT_KIND:
+                    raise ValueError(f"'{source_name}' は別の種類のソースとして存在します。")
+                self.client.set_input_settings(source_name, settings, overlay=True)
+
+            items = self.client.get_scene_item_list(scene_name).scene_items
+            if not isinstance(items, list):
+                raise ValueError("OBSシーンアイテム一覧を取得できませんでした。")
+            item = next((item for item in items if item.get("sourceName") == source_name), None)
+            if item is None:
+                self.client.create_scene_item(scene_name, source_name, True)
+                items = self.client.get_scene_item_list(scene_name).scene_items
+                item = next((item for item in items if item.get("sourceName") == source_name), None)
+            if item is None:
+                raise ValueError(f"'{source_name}' をシーン '{scene_name}' に配置できませんでした。")
+            self.client.set_scene_item_enabled(scene_name, int(item["sceneItemId"]), True)
+            self.client.set_input_mute(source_name, False)
+            self.client.set_input_volume(source_name, vol_db=0.0)
+            self.client.set_input_audio_monitor_type(source_name, "OBS_MONITORING_TYPE_NONE")
+            # OBS updates only the supplied tracks; keep any other track assignments.
+            self.client.set_input_audio_tracks(source_name, {"1": True})
+            self.client.set_current_program_scene(scene_name)
+        except Exception as exc:
+            raise _recorder_error(f"LoLゲーム音声の設定に失敗しました: {exc}") from exc
+
     def _window_capture_fallback_settings(self) -> dict[str, Any]:
         return {
             "window": self.config.obs.window_capture_window,
@@ -752,10 +815,12 @@ class ObsWebSocketClient(OBSClient):
         self.client.set_scene_item_enabled(self.config.obs.scene_name, item_id, bool(enabled))
 
     def start_recording(self) -> None:
+        self._ensure_game_audio_capture()
         response = _obs_raw(self.client, "StartRecord")
         _raise_for_obs_request_status(response, "StartRecord")
 
     def toggle_recording(self) -> None:
+        self._ensure_game_audio_capture()
         response = _obs_raw(self.client, "ToggleRecord")
         _raise_for_obs_request_status(response, "ToggleRecord")
 
@@ -844,6 +909,19 @@ class ObsWebSocketClient(OBSClient):
     def is_recording_active(self) -> bool | None:
         status = self._get_record_status()
         return getattr(status, "output_active", None)
+
+    def get_recording_clock(self) -> float | None:
+        status = self._get_record_status()
+        if getattr(status, "output_active", None) is not True or getattr(status, "output_paused", None) is not False:
+            return None
+        duration = getattr(status, "output_duration", None)
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            return None
+        try:
+            duration = float(duration)
+        except (OverflowError, ValueError):
+            return None
+        return duration / 1000.0 if math.isfinite(duration) and duration >= 0.0 else None
 
     def get_record_status_details(self) -> dict[str, Any]:
         status = self._get_record_status()

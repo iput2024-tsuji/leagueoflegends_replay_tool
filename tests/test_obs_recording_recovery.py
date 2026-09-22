@@ -82,6 +82,8 @@ def recovery(monkeypatch):
     wrapper.client = old
     monkeypatch.setattr(wrapper, "_apply_record_output_basics", lambda: calls.append("output basics"))
     monkeypatch.setattr(wrapper, "_apply_recording_quality_settings", lambda: calls.append("quality"))
+    # Audio configuration is covered separately; this fixture exercises recording recovery.
+    monkeypatch.setattr(wrapper, "_ensure_game_audio_capture", lambda: None)
     created = []
 
     def construct(**kwargs):
@@ -144,6 +146,33 @@ def test_normal_status_does_not_probe_processes_or_reconnect(recovery):
     r.manager.query_error = AssertionError("normal status must not query processes")
     assert r.wrapper.is_recording_active() is True
     assert r.created == []
+
+
+def test_recording_clock_recovers_once_through_owned_status_boundary(recovery):
+    r = recovery
+    r.wrapper.prepare_recording_start()
+    r.calls.clear()
+    r.old.errors["get_record_status"] = TimeoutError("lost clock response")
+
+    def status_with_clock():
+        r.candidate.operation("get_record_status")
+        return SimpleNamespace(output_active=True, output_paused=False, output_duration=123400)
+
+    r.candidate.get_record_status = status_with_clock
+    assert r.wrapper.get_recording_clock() == 123.4
+    assert len(r.created) == 1
+    assert len(r.manager.commands) == 3  # capture, before reconnect, after reconnect
+    assert r.calls == [
+        ("old", "get_record_status"),
+        ("old", "disconnect"),
+        ("candidate", "get_version"),
+        ("candidate", "get_record_status"),
+    ]
+    r.candidate.errors["get_record_status"] = TimeoutError("second loss")
+    with pytest.raises(TimeoutError, match="second loss"):
+        r.wrapper.get_recording_clock()
+    assert len(r.created) == 1
+    assert r.wrapper.raw_client is None
 
 
 @pytest.mark.parametrize("active", [False, None])

@@ -1,11 +1,14 @@
 import hashlib
 import json
+import stat
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from scripts import probe_opencv_cl_decode as target
+from scripts.probe_opencv_cl_decode import _command as run_command
 
 
 def _xml(events):
@@ -322,6 +325,33 @@ def test_sampling_stop_failure_retains_primary_and_private_errors(probe, monkeyp
     assert comparison["cleanup_error"] == {"type": "RuntimeError", "code": "operation_failed"}
     assert report["observations"]["cl_properties"] and calls.count("sampling_stop") == 1
     assert "private-cleanup-error" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("prefix", ["", "sampling_"])
+def test_private_file_details_preserve_distinct_primary_and_cleanup_failures(probe, monkeypatch, prefix):
+    temp, tools, tracerpt, calls, original = probe
+    primary = target.ProbeError("private_file_limit", private_file_check={
+        "category": "probe.obj", "regular_file": True, "exceeds_file_limit": True,
+    })
+    cleanup = target.ProbeError("private_file_limit", private_file_check={
+        "category": prefix + "raw.etl", "regular_file": False, "exceeds_file_limit": False,
+    })
+
+    def fail(args, private, stage, timeout, report):
+        if stage in {prefix + "compile", prefix + "stop"}:
+            calls.append(stage)
+            raise primary if stage == prefix + "compile" else cleanup
+        return original(args, private, stage, timeout, report)
+
+    monkeypatch.setattr(target, "_command", fail)
+    report = target.run_probe(temp, tools, tracerpt)
+    capture = report["cpu_sampling_comparison"] if prefix else report
+    assert report["status"] == capture["status"] == "failed"
+    assert report["error"] == capture["error"] == target._error(primary)
+    assert capture["cleanup_error"] == target._error(cleanup)
+    assert calls.count(prefix + "stop") == 1 and prefix + "decode_raw" not in calls
+    if prefix:
+        assert report["observations"]["cl_properties"] and report["cleanup_error"] is None
 
 
 def test_input_change_during_sampling_invalidates_comparison(probe, monkeypatch):
@@ -1019,6 +1049,145 @@ def test_public_output_is_bounded_and_never_overwrites(tmp_path, monkeypatch):
         target._write_report(tmp_path, {"status": "second"})
 
 
+@pytest.mark.parametrize(("filename", "category"), [
+    *((name, name) for name in (
+        "probe.cpp", "probe.rsp", "probe.obj", "raw.etl", "relogged.etl", "raw.xml", "relogged.xml",
+        "inspection.xml", "summary.txt", "interpreted.xml", "sampling_raw.etl", "sampling_raw.xml",
+    )),
+    *((stage + ".log", "command_log") for stage in (
+        "checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged", "inspect_raw",
+        "sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw",
+    )),
+    ("private-unknown.log", "other"), ("raw.xml.private", "other"),
+])
+def test_private_file_limit_publishes_only_fixed_file_categories(tmp_path, monkeypatch, filename, category):
+    (tmp_path / filename).write_bytes(b"private-content")
+    monkeypatch.setattr(target, "FILE_LIMIT", 1)
+    with pytest.raises(target.ProbeError, match="^private_file_limit$") as caught:
+        target._check_private_size(tmp_path)
+    result = target._error(caught.value)
+    assert result == {"type": "ProbeError", "code": "private_file_limit", "private_file_check": {
+        "category": category, "regular_file": True, "exceeds_file_limit": True,
+    }}
+    public = json.dumps(result)
+    for secret in (str(tmp_path), "private-content", *([filename] if category == "other" else [])):
+        assert secret not in public and hashlib.sha256(secret.encode()).hexdigest() not in public
+
+
+@pytest.mark.parametrize(("regular", "size"), [(True, 10), (True, 11), (False, 10), (False, 11)])
+def test_private_file_limit_uses_one_stat_and_reports_only_first_failure(tmp_path, monkeypatch, regular, size):
+    first, second = tmp_path / "raw.xml", tmp_path / "private-second"
+    observed = []
+
+    def snapshot(path):
+        observed.append(path)
+        return SimpleNamespace(st_mode=stat.S_IFREG if regular or path == second else stat.S_IFDIR,
+                               st_size=size if path == first else 0)
+
+    monkeypatch.setattr(target, "FILE_LIMIT", 10)
+    monkeypatch.setattr(target, "_no_redirect", lambda _: None)
+    monkeypatch.setattr(Path, "iterdir", lambda _: iter((first, second)))
+    monkeypatch.setattr(Path, "stat", snapshot)
+    if regular and size == 10:
+        target._check_private_size(tmp_path)
+        assert observed == [first, second]
+    else:
+        with pytest.raises(target.ProbeError, match="^private_file_limit$") as caught:
+            target._check_private_size(tmp_path)
+        assert observed == [first]
+        assert caught.value.private_file_check == {
+            "category": "raw.xml", "regular_file": regular, "exceeds_file_limit": size > 10,
+        }
+
+
+def test_private_file_detail_is_optional_and_never_added_to_other_errors():
+    detail = {"category": "other", "regular_file": False, "exceeds_file_limit": True}
+    assert target._error(target.ProbeError("private_file_limit")) == {
+        "type": "ProbeError", "code": "private_file_limit",
+    }
+    for code in ("private_total_limit", "redirected_path", "command_nonzero"):
+        assert target._error(target.ProbeError(code, private_file_check=detail)) == {"type": "ProbeError", "code": code}
+    error = RuntimeError("private-error-text")
+    error.private_file_check = detail
+    assert target._error(error) == {"type": "RuntimeError", "code": "operation_failed"}
+
+
+def test_private_redirect_rejection_precedes_file_limit_detail(tmp_path, monkeypatch):
+    path = tmp_path / "raw.xml"
+    path.write_bytes(b"oversize")
+    original = Path.is_junction
+    monkeypatch.setattr(Path, "is_junction", lambda self: self == path or original(self))
+    monkeypatch.setattr(target, "FILE_LIMIT", 1)
+    with pytest.raises(target.ProbeError, match="^redirected_path$") as caught:
+        target._check_private_size(tmp_path)
+    assert target._error(caught.value) == {"type": "ProbeError", "code": "redirected_path"}
+
+
+@pytest.mark.parametrize(("failed_stage", "filename"), [
+    ("inspect_raw", "summary.txt"), ("sampling_decode_raw", "sampling_raw.xml"),
+])
+def test_completed_decoder_postcheck_failure_keeps_prior_evidence_without_killing(
+    probe, monkeypatch, failed_stage, filename,
+):
+    temp, tools, tracerpt, calls, original = probe
+    original_stat = Path.stat
+    oversized = None
+
+    class CompletedProcess:
+        pid = 123
+        returncode = 0
+
+        def poll(self):
+            return 0
+
+        def kill(self):
+            pytest.fail("decoder already exited; no kill is allowed")
+
+    def snapshot(path, *args, **kwargs):
+        if path == oversized and kwargs.get("follow_symlinks", True):
+            return SimpleNamespace(st_mode=stat.S_IFREG, st_size=target.FILE_LIMIT + 1)
+        return original_stat(path, *args, **kwargs)
+
+    def command(args, private, stage, timeout, report):
+        nonlocal oversized
+        if stage == failed_stage:
+            calls.append(stage)
+            oversized = private / filename
+            oversized.write_bytes(b"private-decoder-output")
+            return run_command(args, private, stage, timeout, report)
+        return original(args, private, stage, timeout, report)
+
+    monkeypatch.setattr(target.subprocess, "Popen", lambda *args, **kwargs: CompletedProcess())
+    monkeypatch.setattr(Path, "stat", snapshot)
+    monkeypatch.setattr(target, "_command", command)
+    report = target.run_probe(temp, tools, tracerpt)
+    assert report["status"] == "failed" and report["inputs_unchanged"] is True
+    assert report["observations"]["command_matches_fixture_in_xml_order"] is True
+    assert report["observations"]["process_events"][0]["observed_payload_pid"] == 42
+    assert report["error"] == {"type": "ProbeError", "code": "private_file_limit", "private_file_check": {
+        "category": filename, "regular_file": True, "exceeds_file_limit": True,
+    }}
+    capture = report
+    if failed_stage == "inspect_raw":
+        assert "cpu_sampling_comparison" not in report
+        assert not any(stage.startswith("sampling_") for stage in calls)
+    else:
+        capture = report["cpu_sampling_comparison"]
+        assert capture["status"] == "failed" and capture["error"] == report["error"]
+        assert "raw_summary" not in capture and report["decoder_documents"]
+        assert calls.count("sampling_stop") == 1
+    assert capture["commands"][-1] == {
+        "stage": failed_stage, "status": "failed", "pid": 123, "returncode": 0,
+    }
+    assert calls.count("stop") == 1 and capture["cleanup_error"] is None
+    assert report["product_build_evidence"] is False
+    public = temp / "LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
+    assert public.stat().st_size <= target.JSON_LIMIT == 64 * 1024
+    text = public.read_text(encoding="utf-8")
+    assert "private-decoder-output" not in text
+    assert hashlib.sha256(b"private-decoder-output").hexdigest() not in text
+
+
 def test_command_timeout_kills_owned_handle_without_real_process(tmp_path, monkeypatch):
     class Process:
         pid = 123
@@ -1088,9 +1257,10 @@ def test_sampling_command_enforces_combined_a_and_b_private_size(tmp_path, monke
     (tmp_path / "raw.etl").write_bytes(b"a" * 8)
     (tmp_path / "sampling_raw.etl").write_bytes(b"b" * 8)
     report = {"commands": []}
-    with pytest.raises(target.ProbeError, match="private_total_limit"):
+    with pytest.raises(target.ProbeError, match="private_total_limit") as caught:
         target._command(["must-not-execute"], tmp_path, "sampling_compile", 30, report)
     assert process.killed and report["commands"][0]["status"] == "failed"
+    assert target._error(caught.value) == {"type": "ProbeError", "code": "private_total_limit"}
 
 
 @pytest.mark.parametrize("stage", ["stop", "sampling_stop"])
@@ -1110,9 +1280,13 @@ def test_stop_is_attempted_even_if_private_data_is_already_oversized(tmp_path, m
     monkeypatch.setattr(target, "FILE_LIMIT", 1)
     (tmp_path / "oversized.etl").write_bytes(b"oversize")
     report = {"commands": []}
-    with pytest.raises(target.ProbeError, match="private_file_limit"):
+    with pytest.raises(target.ProbeError, match="private_file_limit") as caught:
         target._command(["must-not-execute"], tmp_path, stage, 5, report)
     assert report["commands"][0]["returncode"] == 0
+    assert report["commands"][0]["status"] == "failed"
+    assert caught.value.private_file_check == {
+        "category": "other", "regular_file": True, "exceeds_file_limit": True,
+    }
 
 
 def test_cli_refuses_local_trace_before_any_command(monkeypatch):

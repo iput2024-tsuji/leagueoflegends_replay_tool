@@ -40,6 +40,10 @@ SOURCE = (
 class ProbeError(ValueError):
     """Only fixed diagnostic codes, never raw command output, are public."""
 
+    def __init__(self, code: str, *, private_file_check: dict | None = None):
+        super().__init__(code)
+        self.private_file_check = private_file_check
+
 
 def _no_redirect(path: Path) -> None:
     for item in (path, *path.parents):
@@ -74,8 +78,22 @@ def _check_private_size(private: Path) -> None:
     for path in private.iterdir():
         _no_redirect(path)
         info = path.stat()
-        if not stat.S_ISREG(info.st_mode) or info.st_size > FILE_LIMIT:
-            raise ProbeError("private_file_limit")
+        regular_file = stat.S_ISREG(info.st_mode)
+        exceeds_file_limit = info.st_size > FILE_LIMIT
+        if not regular_file or exceeds_file_limit:
+            files = {
+                "probe.cpp", "probe.rsp", "probe.obj", "raw.etl", "relogged.etl", "raw.xml",
+                "relogged.xml", "inspection.xml", "summary.txt", "interpreted.xml",
+                "sampling_raw.etl", "sampling_raw.xml",
+            }
+            logs = {f"{stage}.log" for stage in (
+                "checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged",
+                "inspect_raw", "sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw",
+            )}
+            category = path.name if path.name in files else "command_log" if path.name in logs else "other"
+            raise ProbeError("private_file_limit", private_file_check={
+                "category": category, "regular_file": regular_file, "exceeds_file_limit": exceeds_file_limit,
+            })
         total += info.st_size
     if total > TOTAL_LIMIT:
         raise ProbeError("private_total_limit")
@@ -505,7 +523,10 @@ def _decode(private: Path, compiler: Path, child_pid: int, expected_command: str
 
 
 def _error(error: Exception) -> dict:
-    return {"type": type(error).__name__, "code": str(error) if isinstance(error, ProbeError) else "operation_failed"}
+    result = {"type": type(error).__name__, "code": str(error) if isinstance(error, ProbeError) else "operation_failed"}
+    if isinstance(error, ProbeError) and str(error) == "private_file_limit" and error.private_file_check is not None:
+        result["private_file_check"] = error.private_file_check
+    return result
 
 
 def _write_report(temp: Path, report: dict) -> None:

@@ -6,8 +6,8 @@ GPL version 3 の全文は、この画面の前に表示されるライセンス
 
 本アプリケーションには、Python、PyQt6、Qt、obsws-python、
 opencv-python、OpenCV FFmpeg、NumPy、pandas、SciPy、
-scikit-learn、Microsoft Visual C++ runtimeなどの第三者コンポーネントが
-含まれます。
+scikit-learnなどの第三者コンポーネントが含まれます。Microsoft Visual C++
+Runtimeは利用者が用意する外部前提であり、同梱しません。
 各コンポーネントには、それぞれのライセンス条件が適用されます。
 
 Qt wheelに含まれる未使用のMesa software OpenGL fallback
@@ -38,9 +38,10 @@ OBS Studio、standalone FFmpeg、libmpv DLL は、このインストーラーに
 
 v0.5.2 インストーラーは撤回を維持します。v0.5.2 の SHA-256 は撤回済み
 バイナリの履歴識別情報に限られ、元の Actions 成果物は残っていません。
-管理者はこの監査上の制約と残余リスクを認識して受け入れています。ただし、
-この決定だけで履歴是正の compliance gate を完了扱いにはしません。新しい
-配布物に関する source、provenance、履歴、配布条件の gate は維持します。
+管理者はこの監査上の制約と残余リスクを認識して受け入れています。
+SOURCE_OFFER.mdの9月4日決定に従い、外部法務レビュー未実施、取得不能な
+元artifact、publisher内部chainは開示事項とし、完了したとは扱いません。
+新しい配布物のsource、license、notice、native binaryとRuntimeの技術検査は維持します。
 
 OBS公式Release: https://github.com/obsproject/obs-studio/releases
 FFmpeg公式入手案内: https://ffmpeg.org/download.html
@@ -52,7 +53,8 @@ text appears before this page and is installed as LICENSE.
 
 The application contains third-party components including Python, PyQt6, Qt,
 obsws-python, opencv-python, the OpenCV FFmpeg DLL, NumPy, pandas, SciPy,
-scikit-learn, and Microsoft Visual C++ runtime files.
+and scikit-learn. Microsoft Visual C++ Runtime is an external prerequisite
+provided by the user and is not bundled.
 Each component remains subject to its own license terms.
 
 The unused Mesa software OpenGL fallback opengl32sw.dll supplied by the Qt
@@ -78,9 +80,10 @@ its dedicated portable OBS directory, not a normally installed OBS instance.
 The v0.5.2 installer remains withdrawn. A v0.5.2 SHA-256 is only a historical
 identifier for the withdrawn binary; its original Actions artifact is no
 longer retained. The maintainer has accepted this audit limitation and the
-associated residual risk. That decision does not by itself complete the
-historical-remediation compliance gate. Source, provenance, historical, and
-distribution gates for a new release remain in force.
+associated residual risk. Under the September 4 decision in SOURCE_OFFER.md,
+unperformed external legal review, unavailable original artifacts and
+publisher-internal chains are disclosed without claiming they were verified.
+Source, license, notice, native-binary and Runtime technical checks remain mandatory.
 
 OBS Project Releases: https://github.com/obsproject/obs-studio/releases
 FFmpeg download guidance: https://ffmpeg.org/download.html

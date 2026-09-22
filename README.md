@@ -22,8 +22,9 @@ LoL Replay Tool は、League of Legends の試合を自動録画し、試合イ�
 ライセンス資料、全資産の`SHA256SUMS.txt`を同じReleaseへ添付します。OBS Studioと
 standalone FFmpegは利用者が明示的に入手・配置する外部ツールとし、本プロジェクトは
 自動取得、ミラー、同梱、再配布を行いません。全runtime依存とwheel内native codeの
-source coverage、PyQt6-Qt6 wheelのbuild provenanceなど、配布物自体に残るgateを
+source coverage、license・notice、native binaryなど、配布物自体に残る技術gateを
 満たすまで新しい公開Releaseは行いません。公開は管理者の明示指示がある場合に限ります。
+外部法務レビュー未実施やpublisher内部chain等の開示事項は、[SOURCE_OFFER.md](SOURCE_OFFER.md)の管理者決定に従って扱います。
 
 リプレイ再生に必要なmpv DLLも同梱しないため、利用者が別途入手し、
 `%LOCALAPPDATA%\LoLReplayTool\bin`へ配置してください。
@@ -363,7 +364,7 @@ Windows x64配布物は、利用者側にMicrosoft Visual C++ 2015–2022 Redist
 
 インストーラーはインストールまたは上書き更新のファイル変更前に、HKLMの64-bit/32-bit registry view、`Installed`、`Version`を検査します。x64 Runtimeを確認できない場合、情報が欠損・不整合の場合、またはVersionが最低`14.44.35211.0`未満の場合はfail-closedで停止します。より新しい互換Versionは許可します。不足時はMicrosoft公式案内ページを示し、対話実行時に利用者が同意した場合だけブラウザーを開きます。silent modeでは対話せず、非0終了します。
 
-custom wheelは固定した入力wheel・source archive・tool、SHA256、PE import一覧、変換前後のinventory、再現可能なbuild recipeで検証します。CI / Release workflowはdist、完成インストーラー展開物、Release assetをそれぞれ監査し、app-localまたはハッシュ付きのMicrosoft Runtime DLL/importをfail-closedで拒否します。これは技術的な配布方針であり、GPLまたはMicrosoft条件への法的適合を断定するものではありません。legal gate、公開Release停止、v0.5.2撤回状態は維持します。
+custom wheelは固定した入力wheel・source archive・tool、SHA256、PE import一覧、変換前後のinventory、再現可能なbuild recipeで検証します。CI / Release workflowはdist、完成インストーラー展開物、Release assetをそれぞれ監査し、app-localまたはハッシュ付きのMicrosoft Runtime DLL/importをfail-closedで拒否します。これは技術的な配布方針であり、GPLまたはMicrosoft条件への法的適合を断定するものではありません。技術gate、公開Release停止、v0.5.2撤回状態は維持します。
 
 ### GitHub Releaseの公開
 
@@ -434,5 +435,7 @@ LoL Replay Toolは`GPL-3.0-only`で公開しています。商用PyQtを利用�
   - 勝敗が判定できる JSON が複数件あるか確認してください。
   - 決定木分析には勝敗両方を含むデータが必要です。
 - 同期が合わない
-  - 設定画面から同期補正を行うか、「OBS設定を構成・再検査」を再実行してください。
+  - リプレイのイベントを選び、対応する場面に動画を合わせて「現在位置で同期」を押してください。
+  - 新しい録画ではゲームの一時停止前後も、記録したゲーム時刻と動画時刻の対応を使います。再接続中などで時刻を確認できなかったイベントは、自動でジャンプせず手動同期を案内します。その場合の「現在位置で同期」は選んだイベントだけに適用されます。
+  - 過去の録画には停止区間の情報がないため、一時停止のずれを自動修復できません。従来の同期補正を使用してください。
 

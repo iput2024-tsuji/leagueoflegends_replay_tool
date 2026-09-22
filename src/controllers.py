@@ -196,7 +196,59 @@ class AudioSettingsController:
             retry_delay=retry_delay,
         )
 
-    def refresh_audio_devices(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
+    def _live_audio_operation(self, data: dict[str, Any], *, apply: bool) -> dict[str, Any]:
+        """録画中は既存マイクだけを操作し、OBSの構成・プロセスを変更しない。"""
+        with recordtest.OBS_OPERATION_LOCK:
+            current = self.config_controller.repository.load(create_if_missing=False)
+            config = recordtest.AppConfig.from_dict(current)
+            slot = recordtest._get_audio_slot_config(config, "mic")
+            runtime = None
+            primary_error: BaseException | None = None
+            try:
+                runtime = self.runtime_manager.open_recorder(
+                    config, auto_launch=False, auto_setup=False, configure_output=False,
+                    max_retries=2, retry_delay=0.5,
+                )
+                client = runtime.recorder.obs_client.raw_client
+                input_name = slot["input_name"]
+                inputs = client.get_input_list().inputs
+                if not any(
+                    item.get("inputName") == input_name
+                    and item.get("inputKind") == recordtest.MANAGED_AUDIO_INPUTS["mic"]["input_kind"]
+                    for item in inputs if isinstance(item, dict)
+                ):
+                    raise recordtest.RecorderError("既存のマイクソースを確認できません。録画終了後に設定してください。")
+                item = client.get_scene_item_id(config.obs.scene_name, input_name)
+                if getattr(item, "scene_item_id", None) is None:
+                    raise recordtest.RecorderError("録画シーン内のマイクソースを確認できません。")
+                if not apply:
+                    return {
+                        "catalog": {"mic": recordtest.list_audio_devices_for_input(client, input_name)},
+                        "obs_launched": False,
+                    }
+                requested = recordtest._get_audio_slot_config(data, "mic")
+                requested["input_name"] = input_name
+                recordtest.apply_audio_input_settings(
+                    client, input_name, device_id=requested["device_id"],
+                    volume_db=requested["volume_db"], mute=requested["mute"],
+                    scene_name=config.obs.scene_name,
+                )
+                latest = self.config_controller.repository.load(create_if_missing=False)
+                latest.setdefault("audio", {})["mic"] = requested
+                self.config_controller.save_config(latest)
+                return {"obs_launched": False}
+            except BaseException as exc:
+                primary_error = exc
+                raise
+            finally:
+                if runtime is not None:
+                    _close_runtime_preserving_primary(runtime, primary_error)
+
+    def refresh_audio_devices(
+        self, data: dict[str, Any], auto_launch: bool = True, *, live_audio: bool = False,
+    ) -> dict[str, Any]:
+        if live_audio:
+            return self._live_audio_operation(data, apply=False)
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=True)
         runtime = None
         primary_error: BaseException | None = None
@@ -216,7 +268,11 @@ class AudioSettingsController:
                 if runtime is not None:
                     _close_runtime_preserving_primary(runtime, primary_error)
 
-    def apply_audio_settings(self, data: dict[str, Any], auto_launch: bool = True) -> dict[str, Any]:
+    def apply_audio_settings(
+        self, data: dict[str, Any], auto_launch: bool = True, *, live_audio: bool = False,
+    ) -> dict[str, Any]:
+        if live_audio:
+            return self._live_audio_operation(data, apply=True)
         report, config = self._prepare_config(data, auto_fix=True, force_obs_detect=False)
         runtime = None
         primary_error: BaseException | None = None
@@ -246,6 +302,7 @@ class AudioSettingsController:
                     retry_delay=0.5,
                 )
                 runtime.recorder.apply_record_output_settings()
+                runtime.recorder.apply_audio_profile(config)
                 return True
             except BaseException as exc:
                 primary_error = exc

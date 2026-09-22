@@ -212,6 +212,10 @@ python main.py
 - Match monitoring starts with the main screen.
 - OBS recording starts after match-start detection.
 - The recording encoder defaults to GPU-priority automatic selection and falls back to x264 if recording cannot start.
+- Game audio is captured separately for LoL using OBS's built-in Application Audio Capture and recorded on track 1. Audio capture through the video window source (WGC) and desktop-wide audio capture are disabled.
+- The selected microphone records to the same track 1 as game audio. The disabled microphone option excludes only the microphone from the recording scene and preserves its mute setting; it does not disable the Windows device.
+- Recording continues when you open settings; while recording, only the microphone device, volume, and mute can be changed, and both automatic updates and Save apply only those microphone settings. To change general settings, reopen settings after recording ends.
+- Recording does not start if OBS lacks Application Audio Capture or game-audio source configuration fails; an error is shown instead.
 - Recording stops and JSON is saved after the match ends.
 - Previous matches can be opened from the replay screen.
 - The trash button moves the video, JSON, and related clips to the Windows Recycle Bin.

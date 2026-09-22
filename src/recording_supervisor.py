@@ -308,6 +308,8 @@ class RecordingSupervisor:
             self.recorder.apply_audio_profile(self.recorder.config)
             self._emit("🔊 音声設定をOBSへ適用しました。")
         except Exception as e:
+            if recordtest._get_audio_slot_config(self.recorder.config, "mic")["device_id"] == recordtest.DISABLED_AUDIO_DEVICE_ID:
+                raise
             self._emit(f"⚠️ 音声設定の適用に失敗: {e}")
 
     def _emit_report(self, report: dict[str, Any]) -> None:

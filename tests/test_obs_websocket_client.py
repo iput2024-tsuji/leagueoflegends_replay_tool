@@ -350,6 +350,16 @@ def test_recording_clock_does_not_retry_or_control_recording_when_status_fails()
     assert obs_websocket_client.OBSClient.get_recording_clock(object()) is None
 
 
+def test_recording_clock_uses_the_shared_recording_status_boundary():
+    client = obs_websocket_client.ObsWebSocketClient(config=app_config())
+    client._get_record_status = Mock(
+        return_value=SimpleNamespace(output_active=True, output_paused=False, output_duration=3500)
+    )
+
+    assert client.get_recording_clock() == 3.5
+    client._get_record_status.assert_called_once_with()
+
+
 def test_raw_request_falls_back_for_legacy_send_signature() -> None:
     calls = []
 

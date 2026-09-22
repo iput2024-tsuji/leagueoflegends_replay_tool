@@ -769,12 +769,15 @@ class ObsWebSocketClient(OBSClient):
         response = self.client.stop_record()
         return getattr(response, "output_path", None)
 
+    def _get_record_status(self) -> Any:
+        return self.client.get_record_status()
+
     def is_recording_active(self) -> bool | None:
-        status = self.client.get_record_status()
+        status = self._get_record_status()
         return getattr(status, "output_active", None)
 
     def get_recording_clock(self) -> float | None:
-        status = self.client.get_record_status()
+        status = self._get_record_status()
         if getattr(status, "output_active", None) is not True or getattr(status, "output_paused", None) is not False:
             return None
         duration = getattr(status, "output_duration", None)
@@ -787,7 +790,7 @@ class ObsWebSocketClient(OBSClient):
         return duration / 1000.0 if math.isfinite(duration) and duration >= 0.0 else None
 
     def get_record_status_details(self) -> dict[str, Any]:
-        status = self.client.get_record_status()
+        status = self._get_record_status()
         details = {
             "output_active": getattr(status, "output_active", None),
             "output_paused": getattr(status, "output_paused", None),

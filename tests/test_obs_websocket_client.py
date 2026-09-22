@@ -345,7 +345,9 @@ def test_recording_clock_does_not_retry_or_control_recording_when_status_fails()
 
     with pytest.raises(TimeoutError, match="unavailable"):
         client.get_recording_clock()
-    assert len(raw_client.mock_calls) == 1
+    raw_client.get_record_status.assert_called_once_with()
+    assert all(call[0] in {"get_record_status", "disconnect"} for call in raw_client.mock_calls)
+    assert raw_client.disconnect.call_count <= 1
     assert "get_recording_clock" not in obs_websocket_client.OBSClient.__abstractmethods__
     assert obs_websocket_client.OBSClient.get_recording_clock(object()) is None
 

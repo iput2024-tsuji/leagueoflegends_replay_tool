@@ -411,6 +411,65 @@ def test_sampling_report_retains_bounded_schema_without_samples_or_raw_values(pr
     assert hashlib.sha256(b"private-command").hexdigest() not in text
 
 
+
+@pytest.mark.parametrize("matching_group_count", [1, 9])
+def test_sampling_prioritizes_late_child_headers_with_exact_bounded_public_counts(
+    probe, monkeypatch, matching_group_count,
+):
+    temp, tools, tracerpt, _, original = probe
+    # Fill the first eight slots, including three occurrences of the last group.
+    rows = [(event_id, 999) for event_id in range(8)] + [(7, 999), (7, 999)]
+    rows += [(event_id, 43) for event_id in range(8, 8 + matching_group_count) for _ in range(2)]
+    rows += [(7, 999), (6, 999)]
+
+    def late_child_headers(args, private, stage, timeout, report):
+        entry = original(args, private, stage, timeout, report)
+        if stage == "sampling_decode_raw":
+            root = ET.fromstring(_xml([
+                (target.BI_PROVIDER, header, {"ProcessId": 999, "FileName": "private-priority-path",
+                                            "CommandLine": "private-priority-command"})
+                for _, header in rows
+            ]))
+            for event, (event_id, _) in zip(root, rows, strict=True):
+                system = event.find(f"{target.NS}System")
+                provider = system.find(f"{target.NS}Provider")
+                provider.attrib.clear()
+                provider.attrib.update(Name="private-priority-provider")
+                ET.SubElement(system, f"{target.NS}EventID").text = str(event_id)
+            # A real provider GUID is still decoded normally, independent of diagnostic prioritization.
+            root.append(ET.fromstring(_xml([(target.BI_PROVIDER, 43, {"Tool": "CL"})]))[0])
+            (private / "sampling_raw.xml").write_bytes(ET.tostring(root))
+        return entry
+
+    monkeypatch.setattr(target, "_command", late_child_headers)
+    report = target.run_probe(temp, tools, tracerpt)
+    summary = report["cpu_sampling_comparison"]["raw_summary"]
+    missing = summary["missing_guid_schema"]
+    groups = missing["groups"]
+    retained_ids = [group["structure"]["system_fields"]["EventID"]["uint32"] for group in groups]
+    assert retained_ids == ([*range(7), 8] if matching_group_count == 1 else list(range(8, 16)))
+    assert len(groups) == target.SCHEMA_GROUP_LIMIT == 8
+    assert sum(group["count"] for group in groups) + missing["overflow_events"] == len(rows)
+    assert missing["overflow_events"] == (4 if matching_group_count == 1 else 14)
+    assert missing["header_child_matches"] == matching_group_count * 2
+    assert missing["payload_child_matches"] == 0
+    assert missing["truncated"] is True
+    assert summary["missing_provider_guid_events"] == len(rows)
+    assert summary["known_provider_counts"][target.BI_PROVIDER] == summary["target_pid_events"] == 1
+    assert summary["child_matches_by_provider"] == {
+        target.BI_PROVIDER: 1, target.PROCESS_PROVIDER: 0, target.IMAGE_PROVIDER: 0,
+    }
+    assert report["status"] == report["cpu_sampling_comparison"]["status"] == "incomplete"
+    assert report["product_build_evidence"] is False
+    public = temp / "LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
+    assert public.stat().st_size <= target.JSON_LIMIT == 64 * 1024
+    text = public.read_text(encoding="utf-8")
+    assert json.loads(text) == report
+    assert "first_sample" not in text and "private-priority" not in text
+    for value in ("private-priority-path", "private-priority-command", "private-priority-provider"):
+        assert hashlib.sha256(value.encode()).hexdigest() not in text
+
+
 def test_unknown_schema_and_unexpected_command_are_not_invented_or_exposed(tmp_path):
     (tmp_path / "raw.xml").write_bytes(b'<Events><Data Name="ProcessId">42</Data></Events>')
     (tmp_path / "relogged.xml").write_bytes(_xml([

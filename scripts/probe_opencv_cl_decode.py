@@ -318,6 +318,15 @@ def _events(path: Path, child_pid: int, schema: dict):
             missing_guid["payload_child_matches"] += structure["payload_matches_child"] is True
             # Group only by structure and fixed System numbers, never payload hashes/values.
             key = json.dumps(structure, sort_keys=True, separators=(",", ":"))
+            if key not in groups and len(groups) == SCHEMA_GROUP_LIMIT and structure["header_matches_child"] is True:
+                displaced = next((name for name in reversed(groups)
+                                  if groups[name]["structure"]["header_matches_child"] is not True), None)
+                if displaced is not None:
+                    # Preserve the earliest groups at each priority and account for every discarded event.
+                    group = groups.pop(displaced)
+                    missing_guid["groups"].remove(group)
+                    missing_guid["overflow_events"] += group["count"]
+                    missing_guid["truncated"] = True
             if key in groups:
                 groups[key]["count"] += 1
             elif len(groups) < SCHEMA_GROUP_LIMIT:

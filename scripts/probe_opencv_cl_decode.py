@@ -165,7 +165,17 @@ def _missing_guid_observation(event: ET.Element, system: ET.Element, child_pid: 
     provider = system.find(f"{NS}Provider")
     provider_names = {"Name", "EventSourceName"}
     provider_shapes = {name: _value_shape(provider.get(name)) for name in sorted(provider_names)}
+    child_names = {"System", "EventData", "UserData", "RenderingInfo", "ProcessingErrorData", "BinaryEventData", "DebugData"}
+    child_counts = {}
+    for node in event:
+        namespace, separator, local_name = node.tag.rpartition("}")
+        namespace_kind = "event" if namespace + separator == NS else "other" if separator else "none"
+        name_kind = local_name if local_name in child_names else "other"
+        key = f"{namespace_kind}:{name_kind}"
+        child_counts[key] = child_counts.get(key, 0) + 1
     structure = {
+        "event_child_count": len(event),
+        "event_direct_children": dict(sorted(child_counts.items())),
         "provider_attributes": {name: shape["form"] for name, shape in provider_shapes.items()},
         "other_provider_attribute_count": len(provider.attrib.keys() - provider_names),
         "system_count": len(event.findall(f"{NS}System")),

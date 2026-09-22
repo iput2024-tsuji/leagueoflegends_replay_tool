@@ -421,6 +421,8 @@ def test_sampling_prioritizes_late_child_headers_with_exact_bounded_public_count
     rows = [(event_id, 999) for event_id in range(8)] + [(7, 999), (7, 999)]
     rows += [(event_id, 43) for event_id in range(8, 8 + matching_group_count) for _ in range(2)]
     rows += [(7, 999), (6, 999)]
+    child_names = ("System", "EventData", "UserData", "RenderingInfo", "ProcessingErrorData",
+                   "BinaryEventData", "DebugData", "other")
 
     def late_child_headers(args, private, stage, timeout, report):
         entry = original(args, private, stage, timeout, report)
@@ -436,6 +438,12 @@ def test_sampling_prioritizes_late_child_headers_with_exact_bounded_public_count
                 provider.attrib.clear()
                 provider.attrib.update(Name="private-priority-provider")
                 ET.SubElement(system, f"{target.NS}EventID").text = str(event_id)
+                for namespace in (target.NS, "", "{private-priority-namespace}"):
+                    for name in child_names:
+                        if namespace == target.NS and name in {"System", "EventData"}:
+                            continue
+                        local_name = "private-priority-element" if name == "other" else name
+                        ET.SubElement(event, namespace + local_name)
             # A real provider GUID is still decoded normally, independent of diagnostic prioritization.
             root.append(ET.fromstring(_xml([(target.BI_PROVIDER, 43, {"Tool": "CL"})]))[0])
             (private / "sampling_raw.xml").write_bytes(ET.tostring(root))
@@ -453,6 +461,12 @@ def test_sampling_prioritizes_late_child_headers_with_exact_bounded_public_count
     assert missing["overflow_events"] == (4 if matching_group_count == 1 else 14)
     assert missing["header_child_matches"] == matching_group_count * 2
     assert missing["payload_child_matches"] == 0
+    for group in groups:
+        structure = group["structure"]
+        assert structure["event_child_count"] == 24
+        assert structure["event_direct_children"] == {
+            f"{namespace}:{name}": 1 for namespace in ("event", "none", "other") for name in child_names
+        }
     assert missing["truncated"] is True
     assert summary["missing_provider_guid_events"] == len(rows)
     assert summary["known_provider_counts"][target.BI_PROVIDER] == summary["target_pid_events"] == 1
@@ -466,7 +480,8 @@ def test_sampling_prioritizes_late_child_headers_with_exact_bounded_public_count
     text = public.read_text(encoding="utf-8")
     assert json.loads(text) == report
     assert "first_sample" not in text and "private-priority" not in text
-    for value in ("private-priority-path", "private-priority-command", "private-priority-provider"):
+    for value in ("private-priority-path", "private-priority-command", "private-priority-provider",
+                  "private-priority-namespace", "private-priority-element"):
         assert hashlib.sha256(value.encode()).hexdigest() not in text
 
 
@@ -557,6 +572,64 @@ def test_missing_guid_schema_groups_structure_without_exposing_dynamic_values(tm
     public = json.dumps(result)
     assert not any(secret in public for secret in secrets)
     assert hashlib.sha256(b"private-sid").hexdigest() not in public
+
+
+def test_event_direct_children_group_only_fixed_namespaces_and_names_without_private_values(tmp_path):
+    root = ET.fromstring(_xml([(target.BI_PROVIDER, 42, {})] * 2))
+    secrets = []
+    for suffix, event in zip(("one", "different-two"), root, strict=True):
+        event.find(f"{target.NS}System/{target.NS}Provider").attrib.clear()
+        namespace, name, attribute, value = (f"private-{field}-{suffix}" for field in (
+            "namespace", "element", "attribute", "value",
+        ))
+        secrets.extend((namespace, name, attribute, value))
+        rendering = ET.SubElement(event, f"{target.NS}RenderingInfo", {attribute: value})
+        rendering.text = value
+        ET.SubElement(rendering, f"{target.NS}DebugData").text = value
+        for tag in (f"{{{namespace}}}EventData", "UserData"):
+            payload = ET.SubElement(event, tag)
+            ET.SubElement(payload, f"{target.NS}Data", Name="ProcessId").text = "42"
+        for prefix in (target.NS, target.NS, "", f"{{{namespace}}}"):
+            ET.SubElement(event, prefix + name, {attribute: value}).text = value
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(root))
+    result = target._sampling_summary(path, 42)
+    missing = result["missing_guid_schema"]
+    assert len(missing["groups"]) == 1 and missing["groups"][0]["count"] == 2
+    structure = missing["groups"][0]["structure"]
+    assert structure["event_child_count"] == 9
+    assert structure["event_direct_children"] == {
+        "event:System": 1, "event:EventData": 1, "event:RenderingInfo": 1,
+        "other:EventData": 1, "none:UserData": 1, "event:other": 2, "none:other": 1, "other:other": 1,
+    }
+    assert sum(structure["event_direct_children"].values()) == structure["event_child_count"]
+    assert missing["header_child_matches"] == 2 and missing["payload_child_matches"] == 0
+    assert result["target_pid_events"] == 0
+    assert all(count == 0 for count in result["child_matches_by_provider"].values())
+    public = json.dumps(result)
+    assert "first_sample" not in public
+    for secret in secrets:
+        assert secret not in public and hashlib.sha256(secret.encode()).hexdigest() not in public
+
+
+def test_event_child_observation_does_not_decode_payloads_outside_exact_event_data(tmp_path):
+    root = ET.fromstring(_xml([(target.PROCESS_PROVIDER, 42, {})] * 4))
+    for event, tag in zip(root, ("EventData", "{private-namespace}EventData",
+                                 f"{target.NS}UserData", f"{target.NS}BinaryEventData"), strict=True):
+        event.remove(event.find(f"{target.NS}EventData"))
+        payload = ET.SubElement(event, tag)
+        ET.SubElement(payload, f"{target.NS}Data", Name="ProcessId").text = "42"
+    root.append(ET.fromstring(_xml([(target.PROCESS_PROVIDER, 999, {"ProcessId": 42})]))[0])
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(root))
+    result = target._sampling_summary(path, 42)
+    assert result["known_provider_counts"][target.PROCESS_PROVIDER] == 5
+    assert result["target_pid_events"] == 1
+    assert result["child_matches_by_provider"] == {
+        target.BI_PROVIDER: 0, target.PROCESS_PROVIDER: 1, target.IMAGE_PROVIDER: 0,
+    }
+    assert result["missing_guid_schema"]["groups"] == []
+    assert "private-namespace" not in json.dumps(result)
 
 
 def test_missing_guid_child_matches_require_unique_leaf_fields_and_strict_numbers(tmp_path):

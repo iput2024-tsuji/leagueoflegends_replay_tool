@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -303,6 +304,50 @@ def test_recording_status_and_sync_marker_requests() -> None:
     assert details["output_timecode"] == "00:00:01.000"
     assert details["output_bytes"] == 2048
     assert raw_client.marker_calls == [(recordtest.DEFAULT_OBS_SCENE_NAME, 77, True)]
+
+
+@pytest.mark.parametrize(
+    ("active", "paused", "duration", "expected"),
+    [
+        (True, False, 1234, 1.234),
+        (True, False, 0, 0.0),
+        (False, False, 1234, None),
+        (True, True, 1234, None),
+        (1, False, 1234, None),
+        (True, None, 1234, None),
+        (True, False, None, None),
+        (True, False, True, None),
+        (True, False, "1234", None),
+        (True, False, -1, None),
+        (True, False, float("nan"), None),
+        (True, False, float("inf"), None),
+        (True, False, 10 ** 400, None),
+    ],
+)
+def test_recording_clock_uses_only_active_unpaused_numeric_duration(active, paused, duration, expected):
+    raw_client = Mock()
+    raw_client.get_record_status.return_value = SimpleNamespace(
+        output_active=active, output_paused=paused, output_duration=duration,
+    )
+    client = obs_websocket_client.ObsWebSocketClient(config=app_config())
+    client.client = raw_client
+
+    assert client.get_recording_clock() == expected
+    raw_client.get_record_status.assert_called_once_with()
+    assert len(raw_client.mock_calls) == 1
+
+
+def test_recording_clock_does_not_retry_or_control_recording_when_status_fails():
+    raw_client = Mock()
+    raw_client.get_record_status.side_effect = TimeoutError("unavailable")
+    client = obs_websocket_client.ObsWebSocketClient(config=app_config())
+    client.client = raw_client
+
+    with pytest.raises(TimeoutError, match="unavailable"):
+        client.get_recording_clock()
+    assert len(raw_client.mock_calls) == 1
+    assert "get_recording_clock" not in obs_websocket_client.OBSClient.__abstractmethods__
+    assert obs_websocket_client.OBSClient.get_recording_clock(object()) is None
 
 
 def test_raw_request_falls_back_for_legacy_send_signature() -> None:

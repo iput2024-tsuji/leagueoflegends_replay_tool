@@ -156,3 +156,23 @@ def test_session_log_repository_leaves_previous_file_when_replace_fails(monkeypa
         SessionLogRepository().save_payload(path, {"new": True})
 
     assert json.loads(path.read_text(encoding="utf-8")) == {"old": True}
+
+
+def test_sync_intervals_preserve_new_recordings_and_legacy_absence(tmp_path):
+    intervals = [
+        {"game_start": 10.0, "game_end": 11.0, "video_start": 5.0, "video_end": 6.0},
+        {"game_start": 12.0, "game_end": 13.0, "video_start": 106.0, "video_end": 107.0},
+    ]
+    path = tmp_path / "timed.json"
+    SessionLogRepository().save_payload(path, SessionLogV1(sync_intervals=intervals).to_payload())
+
+    assert load_session_payload(path)["sync_intervals"] == intervals
+    assert "sync_intervals" not in SessionLogV1.from_payload({}).to_payload()
+    assert "sync_intervals" not in SessionLogV1(sync_intervals=None).to_payload()
+
+
+@pytest.mark.parametrize("value", [None, False, {}, "", [], [{}], [None]])
+def test_present_invalid_sync_intervals_remain_explicitly_unavailable(value):
+    payload = SessionLogV1.from_payload({"sync_intervals": value}).to_payload()
+
+    assert payload["sync_intervals"] == []

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import re
 import subprocess
 import sys
@@ -90,6 +91,9 @@ class OBSClient(ABC):
     @abstractmethod
     def get_record_status_details(self) -> dict[str, Any]:
         pass
+
+    def get_recording_clock(self) -> float | None:
+        return None
 
     @abstractmethod
     def shutdown(self, allow_force: bool = True) -> None:
@@ -768,6 +772,19 @@ class ObsWebSocketClient(OBSClient):
     def is_recording_active(self) -> bool | None:
         status = self.client.get_record_status()
         return getattr(status, "output_active", None)
+
+    def get_recording_clock(self) -> float | None:
+        status = self.client.get_record_status()
+        if getattr(status, "output_active", None) is not True or getattr(status, "output_paused", None) is not False:
+            return None
+        duration = getattr(status, "output_duration", None)
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            return None
+        try:
+            duration = float(duration)
+        except (OverflowError, ValueError):
+            return None
+        return duration / 1000.0 if math.isfinite(duration) and duration >= 0.0 else None
 
     def get_record_status_details(self) -> dict[str, Any]:
         status = self.client.get_record_status()

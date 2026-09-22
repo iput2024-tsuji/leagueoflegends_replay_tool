@@ -357,4 +357,6 @@ GPL dependencies obtained where necessary.
 - If OBS appears in the system tray, close all existing OBS processes before restarting the application.
 - If events are missing, inspect the JSON `events` and `events_all` fields.
 - Analytics requires multiple JSON files containing both wins and losses.
-- If synchronization is incorrect, use synchronization correction or run the OBS configuration and recheck action again.
+- If synchronization is incorrect, select an event, move the video to its matching scene, and press the button labeled 「現在位置で同期」 (sync at the current position).
+- New recordings use observed game and video times on both sides of an in-game pause. Events whose timing could not be observed, such as during a reconnect, require manual synchronization instead of an automatic jump. Manual synchronization for such an event applies only to that event.
+- Older recordings have no pause timing data, so pauses cannot be corrected automatically. Their existing synchronization adjustment remains available.

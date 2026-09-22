@@ -108,6 +108,7 @@ try:
         RecordingOutcome,
         RecordingPhase,
     )
+    from .replay_timing import make_sync_interval
     from .riot_api import LiveClientRiotAPIClient, RiotAPIClient, RiotPollResult, RiotPollStatus
     from .session_log import SessionLogV1, save_session_payload
 except ImportError:
@@ -189,6 +190,7 @@ except ImportError:
         RecordingOutcome,
         RecordingPhase,
     )
+    from replay_timing import make_sync_interval
     from riot_api import LiveClientRiotAPIClient, RiotAPIClient, RiotPollResult, RiotPollStatus
     from session_log import SessionLogV1, save_session_payload
 
@@ -3370,6 +3372,10 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.session_outcome = RecordingOutcome.COMPLETED
         self.failure_reason = None
         self.sync_game_time = 0.0
+        self.sync_intervals: list[dict[str, float]] = []
+        self._last_sync_sample: tuple[float, float] | None = None
+        self._latest_sync_sample: tuple[float, float] | None = None
+        self._sync_sampling_disabled = False
         self.record_path = None
         self.recording_started = False
         self.session_started = False
@@ -4355,6 +4361,45 @@ class LoLAutoRecorder(RecordingSessionManager):
 
             self.processed_event_keys.add(event_key)
 
+    def _observe_recording_sync(self, result: RiotPollResult, poll_started_at: float) -> None:
+        if self._sync_sampling_disabled:
+            return
+        previous = self._last_sync_sample
+        self._last_sync_sample = None
+        if result.status != RiotPollStatus.IN_GAME:
+            return
+        try:
+            game_time = self._live_game_time(result.payload)
+            if game_time is None:
+                return
+            get_clock = getattr(self.obs_client, "get_recording_clock", None)
+            video_time = get_clock() if callable(get_clock) else None
+            elapsed = time.monotonic() - poll_started_at
+            if (
+                isinstance(video_time, bool)
+                or not isinstance(video_time, (int, float))
+                or not math.isfinite(video_time)
+                or video_time < 0
+                or not 0.0 <= elapsed <= 0.5
+            ):
+                return
+            current = (game_time, float(video_time))
+        except Exception as error:
+            self.logger.debug("録画時刻の対応を取得できませんでした: %s", type(error).__name__)
+            return
+        # Keep the latest valid observation across gaps to detect an ambiguous clock reset.
+        latest = self._latest_sync_sample
+        if latest is not None and (current[0] < latest[0] or current[1] < latest[1]):
+            self.sync_intervals.clear()
+            self._sync_sampling_disabled = True
+            self.log("⚠️ 時計の巻き戻りを検出したため、この録画のイベント自動同期を無効にします。")
+            return
+        interval = make_sync_interval(previous, current)
+        if interval is not None:
+            self.sync_intervals.append(interval)
+        self._last_sync_sample = current
+        self._latest_sync_sample = current
+
     async def record_until_end_async(self) -> RecordingOutcome:
         """試合終了まで待機して録画停止"""
         self.session_phase = RecordingPhase.RECORDING
@@ -4371,7 +4416,9 @@ class LoLAutoRecorder(RecordingSessionManager):
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
                 return RecordingOutcome.CANCELLED
+            poll_started_at = time.monotonic()
             result = await self.poll_all_game_data()
+            self._observe_recording_sync(result, poll_started_at)
             now = loop.time()
             data = result.payload
             if not data:
@@ -4505,6 +4552,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             winning_team=self.winning_team,
             saved_at=time.strftime("%Y-%m-%d %H:%M:%S"),
             sync_game_time=self.sync_game_time,
+            sync_intervals=list(self.sync_intervals),
             obs_record_path=record_path_for_json,
             recordings_dir=str(self.config.paths.recordings_dir),
             json_path=str(self.output_file),

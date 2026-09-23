@@ -30,7 +30,10 @@ SCHEMA_GROUP_LIMIT = 8
 BI_PROVIDER = "f78a07b0-796a-5da4-5c20-61aa526e77af"
 PROCESS_PROVIDER = "3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c"
 IMAGE_PROVIDER = "2cb15d1d-5fc1-11d2-abe1-00a0c911f518"
+SYSTEM_TRACE_PROVIDER = "9e814aad-3204-11d2-9a82-006008a86939"
 NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+TRACE_NAMESPACES = {scheme: "{" + scheme + "://schemas.microsoft.com/win/2004/08/events/trace}"
+                    for scheme in ("http", "https")}
 SOURCE = (
     "namespace { int transform(int value) { return (value * 17) ^ (value >> 2); } }\n"
     "int issue139_probe(int value) { return transform(value) + 1; }\n"
@@ -313,7 +316,88 @@ def _decoder_document(path: Path, *, xml: bool) -> dict:
     return result
 
 
-def _events(path: Path, child_pid: int, schema: dict):
+def _strict_guid(value: str | None) -> str | None:
+    if value is None or len(value) not in (36, 38):
+        return None
+    if len(value) == 38:
+        if not (value.startswith("{") and value.endswith("}")):
+            return None
+        value = value[1:-1]
+    return value.lower() if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) else None
+
+
+def _trace_identity_observation(event: ET.Element, child_pid: int, observation: dict) -> None:
+    def increment(counts, name):
+        counts[name] = counts.get(name, 0) + 1
+
+    systems = event.findall(f"{NS}System")
+    providers = systems[0].findall(f"{NS}Provider") if len(systems) == 1 else []
+    if len(systems) > 1 or len(providers) > 1:
+        increment(observation, "ambiguous_structure_events")
+        return
+    if not providers:
+        return
+    raw_guid = providers[0].get("Guid")
+    if raw_guid is None:
+        source = observation["missing_provider_guid"]
+    elif _strict_guid(raw_guid) == SYSTEM_TRACE_PROVIDER:
+        source = observation["system_trace"]
+    else:
+        return
+    increment(source, "events")
+    # Observe exact direct paths only. These classifications never select an
+    # event for the strict decoder, nor identify its process lifetime.
+    extensions = [node for node in event if node.tag.rsplit("}", 1)[-1] == "ExtendedTracingInfo"]
+    if not extensions:
+        increment(source, "missing_extension")
+        return
+    if len(extensions) != 1:
+        increment(source, "multiple_extensions")
+        return
+    extension = extensions[0]
+    scheme = next((name for name, namespace in TRACE_NAMESPACES.items()
+                   if extension.tag == f"{namespace}ExtendedTracingInfo"), None)
+    if scheme is None:
+        increment(source, "unsupported_extension_namespace")
+        return
+    counts = source.setdefault(scheme, {})
+    nodes = [node for node in extension if node.tag.rsplit("}", 1)[-1] == "EventGuid"]
+    if not nodes:
+        increment(counts, "missing_guid")
+        return
+    if len(nodes) != 1:
+        increment(counts, "multiple_guids")
+        return
+    node = nodes[0]
+    if node.tag != f"{TRACE_NAMESPACES[scheme]}EventGuid":
+        increment(counts, "foreign_guid_namespace")
+        return
+    if len(node):
+        increment(counts, "nested_guid")
+        return
+    guid = _strict_guid(node.text)
+    if guid is None:
+        increment(counts, "malformed_guid")
+        return
+    category = {PROCESS_PROVIDER: "process", IMAGE_PROVIDER: "image", BI_PROVIDER: "build_insights"}.get(guid, "other_guid")
+    row = counts.setdefault(category, dict.fromkeys((
+        "events", "header_match", "header_unknown", "payload_match", "payload_unknown",
+    ), 0))
+    row["events"] += 1
+    executions = systems[0].findall(f"{NS}Execution")
+    header = executions[0].get("ProcessID") if len(executions) == 1 and not len(executions[0]) else None
+    event_data = event.findall(f"{NS}EventData")
+    payload = [node for node in event.findall(f"{NS}EventData/{NS}Data") if node.get("Name") == "ProcessId"]
+    value = payload[0].text if len(event_data) == len(payload) == 1 and not len(payload[0]) else None
+    for name, text in (("header", header), ("payload", value)):
+        pid = _integer(text) if text is not None and len(text) <= 64 else None
+        if pid is None:
+            row[f"{name}_unknown"] += 1
+        elif pid == child_pid:
+            row[f"{name}_match"] += 1
+
+
+def _events(path: Path, child_pid: int, schema: dict, *, trace_identity: dict | None = None):
     root = _xml_root(_private_bytes(path))
     schema.update(event_count=0, known_provider_counts={}, provider_guid_counts={},
                   missing_system_events=0, missing_provider_events=0,
@@ -330,6 +414,8 @@ def _events(path: Path, child_pid: int, schema: dict):
         if event.tag != f"{NS}Event":
             schema["unsupported_namespace_events"] += 1
             continue
+        if trace_identity is not None:
+            _trace_identity_observation(event, child_pid, trace_identity)
         system = event.find(f"{NS}System")
         if system is None:
             schema["missing_system_events"] += 1
@@ -572,8 +658,9 @@ def _capture(private: Path, tools: dict, rsp: Path, report: dict, *, cpu_samplin
 
 def _sampling_summary(path: Path, child_pid: int) -> dict:
     schema = {}
+    trace_identity = {name: {"events": 0} for name in ("missing_provider_guid", "system_trace")}
     matched = {guid: 0 for guid in (BI_PROVIDER, PROCESS_PROVIDER, IMAGE_PROVIDER)}
-    for event in _events(path, child_pid, schema):
+    for event in _events(path, child_pid, schema, trace_identity=trace_identity):
         matched[event["provider"]] += 1
     missing_guid = schema["missing_guid_schema"]
     return {
@@ -584,6 +671,7 @@ def _sampling_summary(path: Path, child_pid: int) -> dict:
             "unsupported_namespace_events", "target_pid_events",
         )},
         "provider_guid_counts": schema["provider_guid_counts"],
+        "trace_identity_observation": trace_identity,
         "missing_guid_schema": {
             **{key: missing_guid[key] for key in (
                 "overflow_events", "truncated", "header_child_matches", "payload_child_matches",

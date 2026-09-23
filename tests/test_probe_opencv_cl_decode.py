@@ -26,6 +26,16 @@ def _xml(events):
     return ET.tostring(root)
 
 
+def _trace_identity_event(provider, scheme="http", guid=None):
+    event = ET.fromstring(_xml([(provider or target.BI_PROVIDER, 42, {"ProcessId": 42})]))[0]
+    if provider is None:
+        event.find(f"{target.NS}System/{target.NS}Provider").attrib.clear()
+    namespace = f"{{{scheme}://schemas.microsoft.com/win/2004/08/events/trace}}"
+    extension = ET.SubElement(event, namespace + "ExtendedTracingInfo")
+    ET.SubElement(extension, namespace + "EventGuid").text = guid or target.PROCESS_PROVIDER
+    return event
+
+
 @pytest.fixture
 def probe(tmp_path, monkeypatch):
     tool_dir = tmp_path / "tools"
@@ -380,6 +390,295 @@ def test_sampling_summary_does_not_infer_unknown_schema_or_publish_values(tmp_pa
     assert all(value == 0 for value in result["child_matches_by_provider"].values())
     assert "not_provider_absence" in result["scope"]
     assert "private" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("source", ["missing_provider_guid", "system_trace"])
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize(("guid", "kind"), [
+    ("3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c", "process"),
+    ("2cb15d1d-5fc1-11d2-abe1-00a0c911f518", "image"),
+    ("f78a07b0-796a-5da4-5c20-61aa526e77af", "build_insights"),
+    ("11111111-aaaa-bbbb-cccc-222222222222", "other_guid"),
+])
+def test_trace_identity_classifies_fixed_scopes_namespaces_and_guids(tmp_path, source, scheme, guid, kind):
+    provider = None if source == "missing_provider_guid" else "9e814aad-3204-11d2-9a82-006008a86939"
+    root = ET.Element("Events")
+    root.append(_trace_identity_event(provider, scheme, guid))
+    root.append(_trace_identity_event(provider, scheme, "{" + guid.upper() + "}"))
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(root))
+    result = target._sampling_summary(path, 42)
+    observation = result["trace_identity_observation"]
+    assert observation[source] == {"events": 2, scheme: {kind: {
+        "events": 2, "header_match": 2, "header_unknown": 0, "payload_match": 2, "payload_unknown": 0,
+    }}}
+    other = "system_trace" if source == "missing_provider_guid" else "missing_provider_guid"
+    assert observation[other] == {"events": 0}
+    assert set(observation) == {source, other}
+    assert result["target_pid_events"] == 0
+    assert all(count == 0 for count in result["child_matches_by_provider"].values())
+    assert guid not in json.dumps(observation) and hashlib.sha256(guid.encode()).hexdigest() not in json.dumps(observation)
+
+
+@pytest.mark.parametrize(("value", "valid"), [
+    (None, False), ("", False), ("3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c", True),
+    ("{3D6FA8D0-FE05-11D0-9DDA-00C04FD7BA7C}", True),
+    (" 3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c", False),
+    ("3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c\n", False),
+    ("{{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c}}", False),
+    ("{3d6fa8d0-fe05-11d0-9dda-00c04fd7ba7c", False),
+    ("3d6fa8d0fe0511d09dda00c04fd7ba7c", False), ("private-guid" * 1000, False),
+])
+def test_trace_identity_guid_parser_does_not_trim_or_relax_syntax(value, valid):
+    assert target._strict_guid(value) == (target.PROCESS_PROVIDER if valid else None)
+
+
+@pytest.mark.parametrize(("change", "expected", "within_namespace"), [
+    ("missing_extension", "missing_extension", False),
+    ("nested_extension", "missing_extension", False),
+    ("multiple_extensions", "multiple_extensions", False),
+    ("foreign_duplicate_extension", "multiple_extensions", False),
+    ("unsupported_extension", "unsupported_extension_namespace", False),
+    ("unqualified_extension", "unsupported_extension_namespace", False),
+    ("missing_guid", "missing_guid", True),
+    ("nested_only_guid", "missing_guid", True),
+    ("multiple_guids", "multiple_guids", True),
+    ("foreign_duplicate_guid", "multiple_guids", True),
+    ("foreign_guid", "foreign_guid_namespace", True),
+    ("unqualified_guid", "foreign_guid_namespace", True),
+    ("nested_guid", "nested_guid", True),
+    ("malformed_guid", "malformed_guid", True),
+])
+def test_trace_identity_reports_first_structural_error_without_private_names(
+    tmp_path, change, expected, within_namespace,
+):
+    event = _trace_identity_event(None)
+    extension, guid = event[-1], event[-1][0]
+    if change == "missing_extension":
+        event.remove(extension)
+    elif change == "nested_extension":
+        event.remove(extension)
+        ET.SubElement(event, f"{target.NS}RenderingInfo").append(extension)
+    elif change in {"multiple_extensions", "foreign_duplicate_extension"}:
+        ET.SubElement(event, extension.tag if change == "multiple_extensions" else "{private-namespace}ExtendedTracingInfo")
+    elif change in {"unsupported_extension", "unqualified_extension"}:
+        extension.tag = "{private-namespace}ExtendedTracingInfo" if change == "unsupported_extension" else "ExtendedTracingInfo"
+    elif change in {"missing_guid", "nested_only_guid"}:
+        extension.remove(guid)
+        if change == "nested_only_guid":
+            ET.SubElement(extension, "private-wrapper").append(guid)
+    elif change in {"multiple_guids", "foreign_duplicate_guid"}:
+        ET.SubElement(extension, guid.tag if change == "multiple_guids" else "{private-namespace}EventGuid")
+    elif change in {"foreign_guid", "unqualified_guid"}:
+        guid.tag = "{private-namespace}EventGuid" if change == "foreign_guid" else "EventGuid"
+        ET.SubElement(guid, "private-child")  # Namespace rejection takes priority over nested content.
+    elif change == "nested_guid":
+        ET.SubElement(guid, "private-child")
+        guid.text = "private-malformed-guid"  # Nested content takes priority over text parsing.
+    else:
+        guid.text = "private-malformed-guid"
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    result = target._sampling_summary(path, 42)
+    details = {"http": {expected: 1}} if within_namespace else {expected: 1}
+    assert result["trace_identity_observation"] == {
+        "missing_provider_guid": {"events": 1, **details}, "system_trace": {"events": 0},
+    }
+    text = json.dumps(result)
+    for secret in ("private-namespace", "private-wrapper", "private-child", "private-malformed-guid"):
+        assert secret not in text and hashlib.sha256(secret.encode()).hexdigest() not in text
+
+
+@pytest.mark.parametrize("change", ["duplicate_system", "duplicate_provider", "missing_system", "missing_provider",
+                                    "empty_provider_guid", "malformed_provider_guid", "other_provider"])
+def test_trace_identity_excludes_ambiguous_or_out_of_scope_headers(tmp_path, change):
+    event = _trace_identity_event(None)
+    system = event.find(f"{target.NS}System")
+    provider = system.find(f"{target.NS}Provider")
+    if change == "duplicate_system":
+        event.append(ET.fromstring(ET.tostring(system)))
+    elif change == "duplicate_provider":
+        ET.SubElement(system, provider.tag, Guid=target.BI_PROVIDER)
+    elif change == "missing_system":
+        event.remove(system)
+    elif change == "missing_provider":
+        system.remove(provider)
+    else:
+        provider.set("Guid", {"empty_provider_guid": "", "malformed_provider_guid": "private-provider",
+                              "other_provider": "11111111-aaaa-bbbb-cccc-222222222222"}[change])
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    observed = target._sampling_summary(path, 42)["trace_identity_observation"]
+    expected = {"missing_provider_guid": {"events": 0}, "system_trace": {"events": 0}}
+    if change.startswith("duplicate"):
+        expected["ambiguous_structure_events"] = 1
+    assert observed == expected
+
+
+@pytest.mark.parametrize(("value", "match", "unknown"), [
+    ("42", 1, 0), ("0x2a", 1, 0), ("0" * 62 + "42", 1, 0), ("43", 0, 0),
+    ("4294967295", 0, 0), ("4294967296", 0, 1), ("0" * 63 + "42", 0, 1),
+    (" 42 ", 0, 1), ("0X2A", 0, 1), ("１２", 0, 1), (None, 0, 1),
+])
+def test_trace_identity_pid_comparison_keeps_strict_bounded_numbers(tmp_path, value, match, unknown):
+    event = _trace_identity_event(None)
+    execution = event.find(f"{target.NS}System/{target.NS}Execution")
+    if value is None:
+        execution.attrib.clear()
+    else:
+        execution.set("ProcessID", value)
+    event.find(f"{target.NS}EventData/{target.NS}Data").text = value
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    group = target._sampling_summary(path, 42)["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
+    assert group == {"events": 1, "header_match": match, "header_unknown": unknown,
+                     "payload_match": match, "payload_unknown": unknown}
+
+
+@pytest.mark.parametrize("change", ["duplicate_execution", "nested_execution", "duplicate_event_data",
+                                    "duplicate_pid", "nested_pid", "missing_pid"])
+def test_trace_identity_pid_requires_unique_leaf_fields(tmp_path, change):
+    event = _trace_identity_event(None)
+    system, payload = event.find(f"{target.NS}System"), event.find(f"{target.NS}EventData")
+    if change == "duplicate_execution":
+        ET.SubElement(system, f"{target.NS}Execution", ProcessID="42")
+    elif change == "nested_execution":
+        ET.SubElement(system.find(f"{target.NS}Execution"), "private-child")
+    elif change == "duplicate_event_data":
+        ET.SubElement(event, payload.tag)
+    elif change == "duplicate_pid":
+        ET.SubElement(payload, f"{target.NS}Data", Name="ProcessId").text = "42"
+    elif change == "nested_pid":
+        ET.SubElement(payload[0], "private-child")
+    else:
+        payload.remove(payload[0])
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    group = target._sampling_summary(path, 42)["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
+    header_unknown = change.endswith("execution")
+    assert group == {"events": 1, "header_match": int(not header_unknown), "header_unknown": int(header_unknown),
+                     "payload_match": int(header_unknown), "payload_unknown": int(not header_unknown)}
+
+
+def test_trace_identity_keeps_parent_and_child_pid_matches_independent(tmp_path):
+    root = ET.Element("Events")
+    for header, payload in ((99, 42), (42, 99)):
+        event = _trace_identity_event(None)
+        event.find(f"{target.NS}System/{target.NS}Execution").set("ProcessID", str(header))
+        event.find(f"{target.NS}EventData/{target.NS}Data").text = str(payload)
+        path = tmp_path / f"pid-{header}.xml"
+        path.write_bytes(ET.tostring(event))
+        group = target._sampling_summary(path, 42)["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
+        assert group == {"events": 1, "header_match": int(header == 42), "header_unknown": 0,
+                         "payload_match": int(payload == 42), "payload_unknown": 0}
+        root.append(event)
+    path = tmp_path / "both.xml"
+    path.write_bytes(ET.tostring(root))
+    group = target._sampling_summary(path, 42)["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
+    assert group == {"events": 2, "header_match": 1, "header_unknown": 0, "payload_match": 1, "payload_unknown": 0}
+
+
+def test_trace_identity_ignores_private_value_changes_in_the_same_structure(tmp_path):
+    observations = []
+    for suffix, guid in (("one", "11111111-aaaa-bbbb-cccc-222222222222"),
+                         ("two", "33333333-dddd-eeee-ffff-444444444444")):
+        secret = f"private-{suffix}"
+        root = ET.Element("Events")
+        event = _trace_identity_event(None, guid=guid)
+        event[-1].set(secret + "-attribute", secret + "-value")
+        event[-1].text = secret + "-body"
+        root.append(event)
+        unsupported = _trace_identity_event(None)
+        unsupported[-1].tag = "{" + secret + "-namespace}ExtendedTracingInfo"
+        root.append(unsupported)
+        malformed = _trace_identity_event(None)
+        malformed[-1][0].text = secret + "-guid"
+        root.append(malformed)
+        path = tmp_path / f"{suffix}.xml"
+        path.write_bytes(ET.tostring(root))
+        result = target._sampling_summary(path, 42)
+        observations.append(result["trace_identity_observation"])
+        for value in (guid, *(secret + ending for ending in ("-attribute", "-value", "-body", "-namespace", "-guid"))):
+            assert value not in json.dumps(result) and hashlib.sha256(value.encode()).hexdigest() not in json.dumps(result)
+    assert observations[0] == observations[1] == {
+        "missing_provider_guid": {
+            "events": 3, "unsupported_extension_namespace": 1,
+            "http": {"malformed_guid": 1, "other_guid": {
+                "events": 1, "header_match": 1, "header_unknown": 0, "payload_match": 1, "payload_unknown": 0,
+            }},
+        },
+        "system_trace": {"events": 0},
+    }
+
+
+def test_trace_identity_observation_does_not_change_existing_yields_or_schema(tmp_path):
+    root = ET.fromstring(_xml([(target.PROCESS_PROVIDER, 999, {"ProcessId": 42})]))
+    root.append(_trace_identity_event(None))
+    root.append(_trace_identity_event("9e814aad-3204-11d2-9a82-006008a86939"))
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(root))
+    before, after = {}, {}
+    expected = list(target._events(path, 42, before))
+    observation = {"missing_provider_guid": {"events": 0}, "system_trace": {"events": 0}}
+    assert list(target._events(path, 42, after, trace_identity=observation)) == expected
+    assert before == after and after["target_pid_events"] == 1
+    assert observation["missing_provider_guid"]["events"] == observation["system_trace"]["events"] == 1
+
+
+def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(probe, monkeypatch):
+    temp, tools, tracerpt, _, original = probe
+    reads = []
+    private_bytes = target._private_bytes
+
+    def read(path):
+        reads.append(path.name)
+        return private_bytes(path)
+
+    def command(args, private, stage, timeout, report):
+        entry = original(args, private, stage, timeout, report)
+        if stage == "sampling_decode_raw":
+            root = ET.Element("Events")
+            for provider in (None, "9e814aad-3204-11d2-9a82-006008a86939"):
+                for scheme in ("http", "https"):
+                    for guid in (target.PROCESS_PROVIDER, target.IMAGE_PROVIDER, target.BI_PROVIDER,
+                                 "11111111-aaaa-bbbb-cccc-222222222222"):
+                        for _ in range(3):
+                            event = _trace_identity_event(provider, scheme, guid)
+                            event[-1].set("private-attribute", "private-value")
+                            root.append(event)
+            (private / "sampling_raw.xml").write_bytes(ET.tostring(root))
+        return entry
+
+    monkeypatch.setattr(target, "_private_bytes", read)
+    monkeypatch.setattr(target, "_command", command)
+    report = target.run_probe(temp, tools, tracerpt)
+    summary = report["cpu_sampling_comparison"]["raw_summary"]
+    observed = summary["trace_identity_observation"]
+    assert reads.count("sampling_raw.xml") == 1
+    assert report["status"] == report["cpu_sampling_comparison"]["status"] == "incomplete"
+    assert report["product_build_evidence"] is False and summary["target_pid_events"] == 0
+    for source in observed.values():
+        assert source["events"] == 24
+        assert sum(group["events"] for scheme in ("http", "https") for group in source[scheme].values()) == 24
+    for value in (report["observations"], report["inspection_schema_observation"], report["decoder_documents"]):
+        assert "trace_identity_observation" not in json.dumps(value)
+    assert "private-attribute" not in json.dumps(report) and "private-value" not in json.dumps(report)
+    for value in ("private-attribute", "private-value", "11111111-aaaa-bbbb-cccc-222222222222"):
+        assert hashlib.sha256(value.encode()).hexdigest() not in json.dumps(report)
+    # Bound the whole fixed wire vocabulary even when every counter needs ten digits.
+    maximum = {source: {"events": 9999999999,
+                       **dict.fromkeys(("missing_extension", "multiple_extensions", "unsupported_extension_namespace"), 9999999999),
+                       **{scheme: {**dict.fromkeys(("missing_guid", "multiple_guids", "foreign_guid_namespace", "nested_guid", "malformed_guid"), 9999999999),
+                                   **{kind: dict.fromkeys(("events", "header_match", "header_unknown", "payload_match", "payload_unknown"), 9999999999)
+                                      for kind in ("process", "image", "build_insights", "other_guid")}}
+                          for scheme in ("http", "https")}}
+               for source in ("missing_provider_guid", "system_trace")}
+    maximum["ambiguous_structure_events"] = 9999999999
+    assert len(json.dumps(maximum, separators=(",", ":")).encode()) < 4096
+    summary["trace_identity_observation"] = maximum
+    target._write_report(temp / "maximum", report)
+    public = temp / "maximum/LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
+    assert public.stat().st_size <= target.JSON_LIMIT == 64 * 1024
 
 
 @pytest.mark.parametrize("guid_count", [32, 33])

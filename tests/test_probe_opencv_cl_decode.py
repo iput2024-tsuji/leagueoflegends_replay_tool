@@ -10,6 +10,20 @@ import pytest
 from scripts import probe_opencv_cl_decode as target
 from scripts.probe_opencv_cl_decode import _command as run_command
 
+CANDIDATE_METADATA_KEYS = {
+    "version": ("missing", "multiple", "nested", "invalid_text", "v0", "v1", "v2", "other_uint8"),
+    "opcode": ("missing", "multiple", "nested", "invalid_text", "load", "unload", "dc_start", "dc_end", "other_uint8"),
+    "time_created": ("missing", "multiple", "nested", "no_known_attributes", "invalid_known_text", "system_only", "raw_only", "both"),
+    "file_name": ("missing", "foreign_namespace", "multiple", "nested", "empty", "text_limit", "c1xx_expected_path",
+                  "c2_expected_path", "c1xx_other_path", "c2_other_path", "other_basename"),
+}
+
+
+def _default_candidate_metadata(count=1):
+    return {"version": {"missing": count}, "opcode": {"other_uint8": count},
+            "time_created": {"system_only": count}, "file_name": {"missing": count},
+            "c1xx_v1_v2_load_time_path": 0, "c2_v1_v2_load_time_path": 0}
+
 
 def _xml(events):
     root = ET.Element(f"{target.NS}Events")
@@ -33,6 +47,18 @@ def _trace_identity_event(provider, scheme="http", guid=None):
     namespace = f"{{{scheme}://schemas.microsoft.com/win/2004/08/events/trace}}"
     extension = ET.SubElement(event, namespace + "ExtendedTracingInfo")
     ET.SubElement(extension, namespace + "EventGuid").text = guid or target.PROCESS_PROVIDER
+    return event
+
+
+def _candidate_image_event(compiler):
+    event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, guid=target.IMAGE_PROVIDER)
+    system = event.find(f"{target.NS}System")
+    ET.SubElement(system, f"{target.NS}Version").text = "1"
+    system.find(f"{target.NS}Opcode").text = "10"
+    system.find(f"{target.NS}TimeCreated").set("SystemTime", "2026-09-23T00:00:00Z")
+    payload = event.find(f"{target.NS}EventData")
+    payload[0].text = " 42 "
+    ET.SubElement(payload, f"{target.NS}Data", Name="FileName").text = str(compiler.parent / "c1xx.dll")
     return event
 
 
@@ -384,7 +410,7 @@ def test_input_change_during_sampling_invalidates_comparison(probe, monkeypatch)
 def test_sampling_summary_does_not_infer_unknown_schema_or_publish_values(tmp_path):
     path = tmp_path / "sampling.xml"
     path.write_bytes(b'<private-root><Event secret="private-value"/></private-root>')
-    result = target._sampling_summary(path, 43)
+    result = target._sampling_summary(path, 43, tmp_path / "compiler" / "cl.exe")
     assert result["unsupported_namespace_events"] == 1
     assert all(value == 0 for value in result["known_provider_counts"].values())
     assert all(value == 0 for value in result["child_matches_by_provider"].values())
@@ -407,7 +433,7 @@ def test_trace_identity_classifies_fixed_scopes_namespaces_and_guids(tmp_path, s
     root.append(_trace_identity_event(provider, scheme, "{" + guid.upper() + "}"))
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(root))
-    result = target._sampling_summary(path, 42)
+    result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
     observation = result["trace_identity_observation"]
     assert observation[source] == {"events": 2, scheme: {kind: {
         "events": 2, "header_match": 2, "header_unknown": 0, "payload_match": 2, "payload_unknown": 0,
@@ -479,7 +505,7 @@ def test_trace_identity_reports_first_structural_error_without_private_names(
         guid.text = "private-malformed-guid"
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    result = target._sampling_summary(path, 42)
+    result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
     details = {"http": {expected: 1}} if within_namespace else {expected: 1}
     assert result["trace_identity_observation"] == {
         "missing_provider_guid": {"events": 1, **details}, "system_trace": {"events": 0},
@@ -508,7 +534,7 @@ def test_trace_identity_excludes_ambiguous_or_out_of_scope_headers(tmp_path, cha
                               "other_provider": "11111111-aaaa-bbbb-cccc-222222222222"}[change])
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    observed = target._sampling_summary(path, 42)["trace_identity_observation"]
+    observed = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")["trace_identity_observation"]
     expected = {"missing_provider_guid": {"events": 0}, "system_trace": {"events": 0}}
     if change.startswith("duplicate"):
         expected["ambiguous_structure_events"] = 1
@@ -530,7 +556,7 @@ def test_trace_identity_pid_comparison_keeps_strict_bounded_numbers(tmp_path, va
     event.find(f"{target.NS}EventData/{target.NS}Data").text = value
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    group = target._sampling_summary(path, 42)["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
+    group = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
     assert group == {"events": 1, "header_match": match, "header_unknown": unknown,
                      "payload_match": match, "payload_unknown": unknown}
 
@@ -554,7 +580,7 @@ def test_trace_identity_pid_requires_unique_leaf_fields(tmp_path, change):
         payload.remove(payload[0])
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    group = target._sampling_summary(path, 42)["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
+    group = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
     header_unknown = change.endswith("execution")
     assert group == {"events": 1, "header_match": int(not header_unknown), "header_unknown": int(header_unknown),
                      "payload_match": int(header_unknown), "payload_unknown": int(not header_unknown)}
@@ -597,7 +623,7 @@ def test_image_payload_unknown_reports_first_structure_reason(tmp_path, scheme, 
         ET.SubElement(payload, pid.tag, Name="ProcessId").text = "42"
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    result = target._sampling_summary(path, 42)
+    result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
     group = result["trace_identity_observation"]["system_trace"][scheme]["image"]
     assert group == {"events": 1, "header_match": 1, "header_unknown": 0, "payload_match": 0,
                      "payload_unknown": 1, "payload_unknown_reasons": {reason: 1}}
@@ -627,7 +653,7 @@ def test_image_payload_unknown_preserves_strict_number_boundaries(tmp_path, sche
     event.find(f"{target.NS}EventData/{target.NS}Data").text = value
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    result = target._sampling_summary(path, 42)
+    result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
     expected = {"events": 1, "header_match": 1, "header_unknown": 0,
                 "payload_match": match, "payload_unknown": int(reason is not None)}
     if reason is not None:
@@ -635,6 +661,8 @@ def test_image_payload_unknown_preserves_strict_number_boundaries(tmp_path, sche
     if scheme == "http" and reason == "surrounding_whitespace":
         # This table's only valid candidate is the explicitly listed decimal PID.
         expected.update(ascii_valid=int(value == " 42 "), ascii_match=int(value == " 42 "))
+        if value == " 42 ":
+            expected["candidate_child_metadata"] = _default_candidate_metadata()
     assert result["trace_identity_observation"]["system_trace"][scheme]["image"] == expected
     if value and "private-value" in value:
         text = json.dumps(result)
@@ -653,7 +681,7 @@ def test_image_payload_unknown_keeps_standard_selection_with_foreign_siblings(tm
     ET.SubElement(payload, f"{target.NS}Data", Name="private-name").text = "private-value"
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    result = target._sampling_summary(path, 42)
+    result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
     expected = {
         "events": 1, "header_match": 1, "header_unknown": 0,
         "payload_match": int(value is not None), "payload_unknown": int(value is None),
@@ -678,7 +706,7 @@ def test_image_payload_unknown_reasons_do_not_expand_other_scopes(tmp_path, prov
     event.find(f"{target.NS}EventData/{target.NS}Data").text = value
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    group = target._sampling_summary(path, 42)["trace_identity_observation"][source]["http"][kind]
+    group = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")["trace_identity_observation"][source]["http"][kind]
     assert group == {"events": 1, "header_match": 1, "header_unknown": 0, "payload_match": 0, "payload_unknown": 1}
 
 
@@ -690,7 +718,7 @@ def test_image_payload_unknown_reason_totals_do_not_count_valid_mismatches(tmp_p
         root.append(event)
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(root))
-    group = target._sampling_summary(path, 42)["trace_identity_observation"]["system_trace"]["http"]["image"]
+    group = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")["trace_identity_observation"]["system_trace"]["http"]["image"]
     assert group == {"events": 5, "header_match": 5, "header_unknown": 0, "payload_match": 1,
                      "payload_unknown": 3,
                      "payload_unknown_reasons": {"empty_text": 1, "invalid_syntax": 1, "out_of_range": 1}}
@@ -716,11 +744,14 @@ def test_image_ascii_candidate_does_not_replace_strict_pid_or_use_header(tmp_pat
     ET.SubElement(payload, f"{target.NS}Data", Name="private-field").text = "private-value"
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
-    result = target._sampling_summary(path, 42)
+    result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
     group = result["trace_identity_observation"]["system_trace"]["http"]["image"]
-    assert group == {"events": 1, "header_match": 0, "header_unknown": 0, "payload_match": 0,
-                     "payload_unknown": 1, "payload_unknown_reasons": {"surrounding_whitespace": 1},
-                     "ascii_valid": valid, "ascii_match": matched}
+    expected = {"events": 1, "header_match": 0, "header_unknown": 0, "payload_match": 0,
+                "payload_unknown": 1, "payload_unknown_reasons": {"surrounding_whitespace": 1},
+                "ascii_valid": valid, "ascii_match": matched}
+    if matched:
+        expected["candidate_child_metadata"] = _default_candidate_metadata()
+    assert group == expected
     assert result["target_pid_events"] == 0
     assert all(count == 0 for count in result["child_matches_by_provider"].values())
     assert all(type(group[name]) is int for name in ("ascii_valid", "ascii_match"))
@@ -731,16 +762,19 @@ def test_image_ascii_candidate_does_not_replace_strict_pid_or_use_header(tmp_pat
 
 
 @pytest.mark.parametrize(("value", "valid", "matched"), [("\f42\v", 1, 1), ("\v43\f", 1, 0), ("\f\v", 0, 0)])
-def test_image_ascii_candidate_ff_vt_only_in_memory(value, valid, matched):
+def test_image_ascii_candidate_ff_vt_only_in_memory(tmp_path, value, valid, matched):
     # FF/VT cannot pass the XML parser; this checks only the six-character ASCII strip policy.
     event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, guid=target.IMAGE_PROVIDER)
     event.find(f"{target.NS}EventData/{target.NS}Data").text = value
     observed = {"missing_provider_guid": {"events": 0}, "system_trace": {"events": 0}}
-    target._trace_identity_observation(event, 42, observed)
-    assert observed["system_trace"]["http"]["image"] == {
+    target._trace_identity_observation(event, 42, observed, tmp_path / "compiler" / "cl.exe")
+    expected = {
         "events": 1, "header_match": 1, "header_unknown": 0, "payload_match": 0, "payload_unknown": 1,
         "payload_unknown_reasons": {"surrounding_whitespace": 1}, "ascii_valid": valid, "ascii_match": matched,
     }
+    if matched:
+        expected["candidate_child_metadata"] = _default_candidate_metadata()
+    assert observed["system_trace"]["http"]["image"] == expected
 
 
 def test_image_ascii_candidate_counts_only_eligible_events_within_the_same_row(tmp_path):
@@ -753,13 +787,338 @@ def test_image_ascii_candidate_counts_only_eligible_events_within_the_same_row(t
         root.append(event)
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(root))
-    group = target._sampling_summary(path, 42)["trace_identity_observation"]["system_trace"]["http"]["image"]
+    group = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")["trace_identity_observation"]["system_trace"]["http"]["image"]
     assert group == {"events": 6, "header_match": 5, "header_unknown": 0, "payload_match": 1,
                      "payload_unknown": 5,
                      "payload_unknown_reasons": {"surrounding_whitespace": 3, "empty_text": 1, "text_limit": 1},
-                     "ascii_valid": 2, "ascii_match": 1}
+                     "ascii_valid": 2, "ascii_match": 1, "candidate_child_metadata": _default_candidate_metadata()}
     assert sum(group["payload_unknown_reasons"].values()) == group["payload_unknown"]
     assert group["ascii_match"] <= group["ascii_valid"] <= group["payload_unknown_reasons"]["surrounding_whitespace"]
+
+
+@pytest.mark.parametrize(("field", "category"), [
+    (field, category) for field, categories in CANDIDATE_METADATA_KEYS.items() for category in categories
+])
+def test_candidate_metadata_all_fixed_histogram_classes_are_reachable(tmp_path, field, category):
+    compiler = tmp_path / "explicit-compiler" / "cl.exe"
+    event = _candidate_image_event(compiler)
+    system, payload = event.find(f"{target.NS}System"), event.find(f"{target.NS}EventData")
+    parent = payload if field == "file_name" else system
+    node = payload[-1] if field == "file_name" else system.find(f"{target.NS}" + {
+        "version": "Version", "opcode": "Opcode", "time_created": "TimeCreated",
+    }[field])
+    if category == "missing":
+        parent.remove(node)
+    elif category == "foreign_namespace":
+        node.tag = "{private-namespace}Data"
+    elif category == "multiple":
+        node.text = "private-invalid-text"
+        ET.SubElement(node, "private-child")
+        parent.append(ET.fromstring(ET.tostring(node)))
+    elif category == "nested":
+        node.text = "private-invalid-text" * 300
+        ET.SubElement(node, "private-child")
+    elif field == "version":
+        node.text = {"invalid_text": " 1 ", "v0": "0", "v1": "1", "v2": "2", "other_uint8": "255"}[category]
+    elif field == "opcode":
+        node.text = {"invalid_text": " 10 ", "load": "10", "unload": "2", "dc_start": "3",
+                     "dc_end": "4", "other_uint8": "255"}[category]
+    elif field == "time_created":
+        node.attrib.clear()
+        node.attrib.update({
+            "no_known_attributes": {"private-attribute": "private-value"},
+            "invalid_known_text": {"RawTime": "18446744073709551616"},
+            "system_only": {"SystemTime": "2026-09-23T00:00:00Z"},
+            "raw_only": {"RawTime": "18446744073709551615"},
+            "both": {"SystemTime": "2026-09-23T00:00:00Z", "RawTime": "1"},
+        }[category])
+    else:
+        node.text = {
+            "empty": None, "text_limit": "x" * 4097,
+            "c1xx_expected_path": str(compiler.parent / "c1xx.dll"),
+            "c2_expected_path": str(compiler.parent / "c2.dll"),
+            "c1xx_other_path": str(tmp_path / "different-compiler" / "c1xx.dll"),
+            "c2_other_path": str(tmp_path / "different-compiler" / "c2.dll"),
+            "other_basename": "private-unknown.dll",
+        }[category]
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    result = target._sampling_summary(path, 42, compiler)
+    row = result["trace_identity_observation"]["system_trace"]["http"]["image"]
+    expected = {"version": {"v1": 1}, "opcode": {"load": 1}, "time_created": {"system_only": 1},
+                "file_name": {"c1xx_expected_path": 1}}
+    expected[field] = {category: 1}
+    qualifies = category in {"version": {"v1", "v2"}, "opcode": {"load"},
+                             "time_created": {"system_only", "raw_only"},
+                             "file_name": {"c1xx_expected_path", "c2_expected_path"}}[field]
+    expected["c1xx_v1_v2_load_time_path"] = int(qualifies and category != "c2_expected_path")
+    expected["c2_v1_v2_load_time_path"] = int(qualifies and category == "c2_expected_path")
+    assert row["candidate_child_metadata"] == expected
+    assert row["ascii_match"] == row["payload_unknown"] == 1 and row["payload_match"] == 0
+    assert result["target_pid_events"] == 0
+    text = json.dumps(result)
+    for secret in ("private-namespace", "private-invalid-text", "private-child", "private-attribute", "private-value",
+                   "private-unknown.dll", str(compiler), str(compiler.parent / "c1xx.dll")):
+        assert secret not in text and hashlib.sha256(secret.encode()).hexdigest() not in text
+
+
+@pytest.mark.parametrize("field", ["Version", "Opcode"])
+@pytest.mark.parametrize(("value", "valid"), [
+    (None, False), ("", False), (" 1 ", False), ("0x1", False), ("+1", False), ("-1", False),
+    ("１", False), ("1 0", False), ("256", False), ("4294967295", False),
+    ("0" * 64, True), ("0" * 65, False), ("000255", True), ("255", True),
+])
+def test_candidate_descriptor_does_not_inherit_pid_trimming_hex_or_uint32(tmp_path, field, value, valid):
+    compiler = tmp_path / "compiler" / "cl.exe"
+    event = _candidate_image_event(compiler)
+    event.find(f"{target.NS}System/{target.NS}{field}").text = value
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    row = target._sampling_summary(path, 42, compiler)["trace_identity_observation"]["system_trace"]["http"]["image"]
+    category = "v0" if valid and field == "Version" and value == "0" * 64 else "other_uint8" if valid else "invalid_text"
+    assert row["candidate_child_metadata"][field.lower()] == {category: 1}
+    assert row["candidate_child_metadata"]["c1xx_v1_v2_load_time_path"] == 0
+    assert row["ascii_match"] == 1 and row["payload_unknown_reasons"] == {"surrounding_whitespace": 1}
+
+
+@pytest.mark.parametrize(("attributes", "category"), [
+    ({}, "no_known_attributes"), ({"private-time": "private-value"}, "no_known_attributes"),
+    ({"SystemTime": ""}, "invalid_known_text"), ({"SystemTime": "T"}, "system_only"),
+    ({"SystemTime": "0" * 64}, "system_only"), ({"SystemTime": "0" * 65}, "invalid_known_text"),
+    ({"SystemTime": " 123 "}, "invalid_known_text"), ({"SystemTime": "2026-09-23t00:00:00z"}, "invalid_known_text"),
+    ({"RawTime": "0"}, "raw_only"), ({"RawTime": "18446744073709551615"}, "raw_only"),
+    ({"RawTime": "18446744073709551616"}, "invalid_known_text"),
+    ({"RawTime": "0" * 63 + "1"}, "raw_only"), ({"RawTime": "0" * 64 + "1"}, "invalid_known_text"),
+    ({"RawTime": " 1 "}, "invalid_known_text"), ({"RawTime": "0x1"}, "invalid_known_text"),
+    ({"RawTime": "１"}, "invalid_known_text"),
+    ({"SystemTime": "123", "RawTime": "1"}, "both"),
+    ({"SystemTime": "private-time", "RawTime": "1"}, "invalid_known_text"),
+    ({"SystemTime": "123", "RawTime": ""}, "invalid_known_text"),
+])
+def test_candidate_time_shapes_are_bounded_independent_of_datetime_validity(tmp_path, attributes, category):
+    compiler = tmp_path / "compiler" / "cl.exe"
+    event = _candidate_image_event(compiler)
+    timestamp = event.find(f"{target.NS}System/{target.NS}TimeCreated")
+    timestamp.attrib.clear()
+    timestamp.attrib.update(attributes)
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    metadata = target._sampling_summary(path, 42, compiler)["trace_identity_observation"]["system_trace"]["http"]["image"]["candidate_child_metadata"]
+    assert metadata["time_created"] == {category: 1}
+    assert metadata["c1xx_v1_v2_load_time_path"] == int(category in {"system_only", "raw_only"})
+    assert metadata["c2_v1_v2_load_time_path"] == 0
+    for value in attributes.values():
+        assert hashlib.sha256(value.encode()).hexdigest() not in json.dumps(metadata)
+
+
+@pytest.mark.parametrize("field", ["Version", "Opcode", "TimeCreated", "FileName"])
+@pytest.mark.parametrize("location", ["foreign", "unqualified", "descendant"])
+def test_candidate_metadata_requires_exact_standard_direct_paths(tmp_path, field, location):
+    compiler = tmp_path / "compiler" / "cl.exe"
+    event = _candidate_image_event(compiler)
+    parent = event.find(f"{target.NS}" + ("EventData" if field == "FileName" else "System"))
+    node = parent[-1] if field == "FileName" else parent.find(f"{target.NS}{field}")
+    if location == "descendant":
+        parent.remove(node)
+        ET.SubElement(parent, "private-wrapper").append(node)
+    else:
+        node.tag = ("{private-namespace}" if location == "foreign" else "") + ("Data" if field == "FileName" else field)
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    metadata = target._sampling_summary(path, 42, compiler)["trace_identity_observation"]["system_trace"]["http"]["image"]["candidate_child_metadata"]
+    key = {"Version": "version", "Opcode": "opcode", "TimeCreated": "time_created", "FileName": "file_name"}[field]
+    category = "foreign_namespace" if field == "FileName" and location != "descendant" else "missing"
+    assert metadata[key] == {category: 1}
+    assert metadata["c1xx_v1_v2_load_time_path"] == metadata["c2_v1_v2_load_time_path"] == 0
+
+
+def test_candidate_metadata_keeps_standard_nodes_when_foreign_siblings_exist(tmp_path):
+    compiler = tmp_path / "compiler" / "cl.exe"
+    event = _candidate_image_event(compiler)
+    system, payload = event.find(f"{target.NS}System"), event.find(f"{target.NS}EventData")
+    for name in ("Version", "Opcode", "TimeCreated"):
+        ET.SubElement(system, "{private-namespace}" + name, SystemTime="private-time").text = "private-value"
+    ET.SubElement(payload, "{private-namespace}Data", Name="FileName").text = "private-path"
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    metadata = target._sampling_summary(path, 42, compiler)["trace_identity_observation"]["system_trace"]["http"]["image"]["candidate_child_metadata"]
+    assert metadata == {"version": {"v1": 1}, "opcode": {"load": 1}, "time_created": {"system_only": 1},
+                        "file_name": {"c1xx_expected_path": 1}, "c1xx_v1_v2_load_time_path": 1, "c2_v1_v2_load_time_path": 0}
+    assert "private" not in json.dumps(metadata)
+
+
+@pytest.mark.parametrize(("change", "category"), [
+    ("case_and_separators", "c1xx_expected_path"), ("dot_segments", "c1xx_expected_path"),
+    ("only_basename", "c1xx_other_path"), ("alternate_name", "missing"),
+    ("whitespace", "other_basename"), ("quoted", "other_basename"),
+    ("limit", "c1xx_other_path"), ("over_limit", "text_limit"),
+])
+def test_candidate_filename_uses_only_lexical_explicit_compiler_context(tmp_path, change, category):
+    compiler = tmp_path / "compiler" / "cl.exe"
+    event = _candidate_image_event(compiler)
+    node = event.find(f"{target.NS}EventData")[-1]
+    if change == "case_and_separators":
+        node.text = str(compiler.parent / "C1XX.DLL").upper().replace("\\", "/")
+    elif change == "dot_segments":
+        node.text = str(compiler.parent / "subdirectory" / ".." / "c1xx.dll")
+    elif change == "only_basename":
+        node.text = "c1xx.dll"
+    elif change == "alternate_name":
+        node.set("Name", "ImageFileName")
+    elif change == "whitespace":
+        node.text = " "
+    elif change == "quoted":
+        node.text = '"' + node.text + '"'
+    else:
+        suffix = "/c1xx.dll"
+        node.text = "x" * ((4096 if change == "limit" else 4097) - len(suffix)) + suffix
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    metadata = target._sampling_summary(path, 42, compiler)["trace_identity_observation"]["system_trace"]["http"]["image"]["candidate_child_metadata"]
+    assert metadata["file_name"] == {category: 1}
+    assert metadata["c1xx_v1_v2_load_time_path"] == int(category == "c1xx_expected_path")
+
+
+@pytest.mark.parametrize("change", ["https", "missing_provider", "process_guid", "other_guid", "pid_mismatch",
+                                    "pid_invalid", "strict_pid", "missing_pid", "long_pid", "header_only_match"])
+def test_candidate_metadata_is_absent_outside_the_exact_ascii_child_scope(tmp_path, change):
+    compiler = tmp_path / "compiler" / "cl.exe"
+    event = _candidate_image_event(compiler)
+    system, payload = event.find(f"{target.NS}System"), event.find(f"{target.NS}EventData")
+    if change == "https":
+        for node in (event[-1], event[-1][0]):
+            node.tag = node.tag.replace("http:", "https:")
+    elif change == "missing_provider":
+        system.find(f"{target.NS}Provider").attrib.clear()
+    elif change in {"process_guid", "other_guid"}:
+        event[-1][0].text = target.PROCESS_PROVIDER if change == "process_guid" else "11111111-aaaa-bbbb-cccc-222222222222"
+    elif change == "missing_pid":
+        payload.remove(payload[0])
+    else:
+        payload[0].text = {"pid_mismatch": " 43 ", "pid_invalid": " private-pid ", "strict_pid": "42",
+                           "long_pid": " " + "0" * 62 + "42", "header_only_match": "\u00a042\u00a0"}[change]
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    result = target._sampling_summary(path, 42, compiler)
+    assert "candidate_child_metadata" not in json.dumps(result)
+
+
+def test_candidate_metadata_joint_counters_cannot_combine_different_events_or_dlls(tmp_path):
+    compiler = tmp_path / "compiler" / "cl.exe"
+    root = ET.Element("Events")
+    # All marginals have successful values, but only the first c1xx and last c2 event satisfy every condition.
+    for version, opcode, clock, dll in (("1", "10", "system", "c1xx.dll"), ("0", "10", "system", "c2.dll"),
+                                       ("2", "2", "system", "c2.dll"), ("2", "10", "both", "c2.dll"),
+                                       ("2", "10", "raw", "c2.dll")):
+        event = _candidate_image_event(compiler)
+        system = event.find(f"{target.NS}System")
+        system.find(f"{target.NS}Version").text = version
+        system.find(f"{target.NS}Opcode").text = opcode
+        timestamp = system.find(f"{target.NS}TimeCreated")
+        if clock == "raw":
+            timestamp.attrib.clear()
+        if clock in {"raw", "both"}:
+            timestamp.set("RawTime", "1")
+        event.find(f"{target.NS}EventData")[-1].text = str(compiler.parent / dll)
+        root.append(event)
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(root))
+    row = target._sampling_summary(path, 42, compiler)["trace_identity_observation"]["system_trace"]["http"]["image"]
+    metadata = row["candidate_child_metadata"]
+    assert metadata == {"version": {"v1": 1, "v0": 1, "v2": 3}, "opcode": {"load": 4, "unload": 1},
+                        "time_created": {"system_only": 3, "both": 1, "raw_only": 1},
+                        "file_name": {"c1xx_expected_path": 1, "c2_expected_path": 4},
+                        "c1xx_v1_v2_load_time_path": 1, "c2_v1_v2_load_time_path": 1}
+    assert all(sum(metadata[field].values()) == row["ascii_match"] == 5 for field in CANDIDATE_METADATA_KEYS)
+    root.remove(root[-1])
+    path.write_bytes(ET.tostring(root))
+    metadata = target._sampling_summary(path, 42, compiler)["trace_identity_observation"]["system_trace"]["http"]["image"]["candidate_child_metadata"]
+    assert metadata["file_name"] == {"c1xx_expected_path": 1, "c2_expected_path": 3}
+    assert metadata["c1xx_v1_v2_load_time_path"] == 1 and metadata["c2_v1_v2_load_time_path"] == 0
+
+
+def test_candidate_metadata_has_no_path_io_and_does_not_publish_values_or_hashes(tmp_path, monkeypatch):
+    compiler = tmp_path / "nonexistent-private-toolchain" / "cl.exe"
+    root = ET.Element("Events")
+    for filename in (str(compiler.parent / "c1xx.dll"), r"\\private-host\private-share\c2.dll", "private-name.dll"):
+        event = _candidate_image_event(compiler)
+        event.find(f"{target.NS}EventData")[-1].text = filename
+        root.append(event)
+    raw = ET.tostring(root)
+    path = tmp_path / "sampling.xml"
+    reads = []
+
+    def read(selected):
+        assert selected == path
+        reads.append(selected)
+        return raw
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("candidate metadata performed path IO or executed a command")
+
+    monkeypatch.setattr(target, "_private_bytes", read)
+    monkeypatch.setattr(target, "_fingerprint", forbidden)
+    monkeypatch.setattr(target.subprocess, "Popen", forbidden)
+    with monkeypatch.context() as no_io:
+        for name in ("stat", "open", "resolve", "exists"):
+            no_io.setattr(Path, name, forbidden)
+        result = target._sampling_summary(path, 42, compiler)
+    assert reads == [path]
+    metadata = result["trace_identity_observation"]["system_trace"]["http"]["image"]["candidate_child_metadata"]
+    assert metadata["file_name"] == {"c1xx_expected_path": 1, "c2_other_path": 1, "other_basename": 1}
+    text = json.dumps(result)
+    secrets = [str(compiler), "private-name.dll", r"\\private-host\private-share\c2.dll", "2026-09-23T00:00:00Z"]
+    secrets.extend(event.find(f"{target.NS}EventData")[-1].text for event in root)
+    for secret in secrets:
+        assert secret not in text and hashlib.sha256(secret.encode()).hexdigest() not in text
+    assert "private" not in text
+
+
+def test_candidate_metadata_is_identical_when_private_paths_attributes_text_and_namespaces_change(tmp_path):
+    compiler = tmp_path / "compiler" / "cl.exe"
+    results = []
+    for suffix in ("one", "two"):
+        event = _candidate_image_event(compiler)
+        system, payload = event.find(f"{target.NS}System"), event.find(f"{target.NS}EventData")
+        namespace = f"private-{suffix}-namespace"
+        filename = f"\\\\private-{suffix}-host\\private-{suffix}-share\\c2.dll"
+        attribute, body = f"private-{suffix}-attribute", f"private-{suffix}-body"
+        value = f"private-{suffix}-value"
+        payload[-1].text = filename
+        system.find(f"{target.NS}TimeCreated").set(attribute, value)
+        ET.SubElement(system, "{" + namespace + "}Version").text = body
+        ET.SubElement(payload, f"{target.NS}Data", Name=f"private-{suffix}-field").text = body
+        event[-1].set(attribute, value)
+        event[-1].text = body
+        path = tmp_path / f"{suffix}.xml"
+        path.write_bytes(ET.tostring(event))
+        result = target._sampling_summary(path, 42, compiler)
+        metadata = result["trace_identity_observation"]["system_trace"]["http"]["image"]["candidate_child_metadata"]
+        assert metadata == {"version": {"v1": 1}, "opcode": {"load": 1}, "time_created": {"system_only": 1},
+                            "file_name": {"c2_other_path": 1}, "c1xx_v1_v2_load_time_path": 0, "c2_v1_v2_load_time_path": 0}
+        text = json.dumps(result)
+        for secret in (namespace, filename, attribute, body, value, f"private-{suffix}-field"):
+            assert secret not in text and hashlib.sha256(secret.encode()).hexdigest() not in text
+        results.append(result)
+    assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("observation", [{}, {"missing_provider_guid": {"events": 0}, "system_trace": {"events": 0}}])
+def test_trace_identity_requires_explicit_compiler_context_but_a_does_not(tmp_path, monkeypatch, observation):
+    path = tmp_path / "empty.xml"
+    path.write_bytes(b"<Events/>")
+    schema = {"existing": ["unchanged"]}
+    schema_before, observation_before = json.dumps(schema), json.dumps(observation)
+
+    def forbidden_read(*args, **kwargs):
+        pytest.fail("missing compiler context was not rejected before reading XML")
+
+    with monkeypatch.context() as no_read:
+        no_read.setattr(target, "_private_bytes", forbidden_read)
+        with pytest.raises(ValueError, match="trace_identity_requires_compiler"):
+            list(target._events(path, 42, schema, trace_identity=observation))
+    assert json.dumps(schema) == schema_before and json.dumps(observation) == observation_before
+    assert list(target._events(path, 42, {})) == []
 
 
 def test_trace_identity_keeps_parent_and_child_pid_matches_independent(tmp_path):
@@ -770,13 +1129,13 @@ def test_trace_identity_keeps_parent_and_child_pid_matches_independent(tmp_path)
         event.find(f"{target.NS}EventData/{target.NS}Data").text = str(payload)
         path = tmp_path / f"pid-{header}.xml"
         path.write_bytes(ET.tostring(event))
-        group = target._sampling_summary(path, 42)["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
+        group = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
         assert group == {"events": 1, "header_match": int(header == 42), "header_unknown": 0,
                          "payload_match": int(payload == 42), "payload_unknown": 0}
         root.append(event)
     path = tmp_path / "both.xml"
     path.write_bytes(ET.tostring(root))
-    group = target._sampling_summary(path, 42)["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
+    group = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")["trace_identity_observation"]["missing_provider_guid"]["http"]["process"]
     assert group == {"events": 2, "header_match": 1, "header_unknown": 0, "payload_match": 1, "payload_unknown": 0}
 
 
@@ -798,7 +1157,7 @@ def test_trace_identity_ignores_private_value_changes_in_the_same_structure(tmp_
         root.append(malformed)
         path = tmp_path / f"{suffix}.xml"
         path.write_bytes(ET.tostring(root))
-        result = target._sampling_summary(path, 42)
+        result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
         observations.append(result["trace_identity_observation"])
         for value in (guid, *(secret + ending for ending in ("-attribute", "-value", "-body", "-namespace", "-guid"))):
             assert value not in json.dumps(result) and hashlib.sha256(value.encode()).hexdigest() not in json.dumps(result)
@@ -825,7 +1184,7 @@ def test_trace_identity_observation_does_not_change_existing_yields_or_schema(tm
     before, after = {}, {}
     expected = list(target._events(path, 42, before))
     observation = {"missing_provider_guid": {"events": 0}, "system_trace": {"events": 0}}
-    assert list(target._events(path, 42, after, trace_identity=observation)) == expected
+    assert list(target._events(path, 42, after, trace_identity=observation, compiler=tmp_path / "compiler" / "cl.exe")) == expected
     assert before == after and after["target_pid_events"] == 1
     assert observation["missing_provider_guid"]["events"] == 1
     assert observation["system_trace"]["events"] == 2
@@ -858,6 +1217,12 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
                                 pid = event.find(f"{target.NS}EventData/{target.NS}Data")
                                 if index == 0:
                                     pid.text = " 43 "
+                                    if provider == target.SYSTEM_TRACE_PROVIDER and scheme == "http":
+                                        system = event.find(f"{target.NS}System")
+                                        ET.SubElement(system, f"{target.NS}Version").text = "2"
+                                        system.find(f"{target.NS}Opcode").text = "10"
+                                        ET.SubElement(event.find(f"{target.NS}EventData"), f"{target.NS}Data",
+                                                      Name="FileName").text = str(tools / "c2.dll")
                                 else:
                                     pid.set("Name", "private-payload-name")
                             root.append(event)
@@ -882,8 +1247,12 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
         assert "payload_unknown_reasons" not in observed["missing_provider_guid"][scheme]["image"]
         if scheme == "http":
             assert image["ascii_valid"] == image["ascii_match"] == 1
+            assert image["candidate_child_metadata"] == {
+                "version": {"v2": 1}, "opcode": {"load": 1}, "time_created": {"system_only": 1},
+                "file_name": {"c2_expected_path": 1}, "c1xx_v1_v2_load_time_path": 0, "c2_v1_v2_load_time_path": 1,
+            }
         else:
-            assert "ascii_valid" not in image and "ascii_match" not in image
+            assert "ascii_valid" not in image and "ascii_match" not in image and "candidate_child_metadata" not in image
     for value in (report["observations"], report["inspection_schema_observation"], report["decoder_documents"]):
         assert "trace_identity_observation" not in json.dumps(value)
     assert "private-attribute" not in json.dumps(report) and "private-value" not in json.dumps(report)
@@ -905,7 +1274,12 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
             "surrounding_whitespace", "invalid_syntax", "out_of_range",
         ), 9999999999)
     maximum["system_trace"]["http"]["image"].update(ascii_valid=9999999999, ascii_match=9999999999)
-    assert len(json.dumps(maximum, separators=(",", ":")).encode()) < 4096
+    maximum["system_trace"]["http"]["image"]["candidate_child_metadata"] = {
+        **{name: dict.fromkeys(keys, 9999999999) for name, keys in CANDIDATE_METADATA_KEYS.items()},
+        "c1xx_v1_v2_load_time_path": 9999999999, "c2_v1_v2_load_time_path": 9999999999,
+    }
+    assert sum(map(len, CANDIDATE_METADATA_KEYS.values())) + 2 == 38
+    assert len(json.dumps(maximum, separators=(",", ":")).encode()) == 5079 < 5 * 1024
     summary["trace_identity_observation"] = maximum
     target._write_report(temp / "maximum", report)
     public = temp / "maximum/LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
@@ -1153,7 +1527,7 @@ def test_event_direct_children_group_only_fixed_namespaces_and_names_without_pri
             ET.SubElement(event, prefix + name, {attribute: value}).text = value
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(root))
-    result = target._sampling_summary(path, 42)
+    result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
     missing = result["missing_guid_schema"]
     assert len(missing["groups"]) == 1 and missing["groups"][0]["count"] == 2
     structure = missing["groups"][0]["structure"]
@@ -1182,7 +1556,7 @@ def test_event_child_observation_does_not_decode_payloads_outside_exact_event_da
     root.append(ET.fromstring(_xml([(target.PROCESS_PROVIDER, 999, {"ProcessId": 42})]))[0])
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(root))
-    result = target._sampling_summary(path, 42)
+    result = target._sampling_summary(path, 42, tmp_path / "compiler" / "cl.exe")
     assert result["known_provider_counts"][target.PROCESS_PROVIDER] == 5
     assert result["target_pid_events"] == 1
     assert result["child_matches_by_provider"] == {

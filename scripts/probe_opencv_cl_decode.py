@@ -354,7 +354,87 @@ def _image_payload_unknown_reason(event: ET.Element, event_data: list, payload: 
     return "out_of_range"
 
 
-def _trace_identity_observation(event: ET.Element, child_pid: int, observation: dict) -> None:
+def _candidate_child_metadata(system: ET.Element, event_data: ET.Element, compiler: Path, row: dict) -> None:
+    # Fixed shapes for the B-side candidate only: no path IO or strict event selection.
+    classes = {}
+    for name, known in (
+        ("Version", {0: "v0", 1: "v1", 2: "v2"}),
+        ("Opcode", {10: "load", 2: "unload", 3: "dc_start", 4: "dc_end"}),
+    ):
+        nodes = system.findall(f"{NS}{name}")
+        if not nodes:
+            category = "missing"
+        elif len(nodes) != 1:
+            category = "multiple"
+        elif len(nodes[0]):
+            category = "nested"
+        elif not re.fullmatch(r"[0-9]{1,64}", nodes[0].text or "") or int(nodes[0].text) > 255:
+            category = "invalid_text"
+        else:
+            category = known.get(int(nodes[0].text), "other_uint8")
+        classes[name.lower()] = category
+
+    times = system.findall(f"{NS}TimeCreated")
+    if not times:
+        category = "missing"
+    elif len(times) != 1:
+        category = "multiple"
+    elif len(times[0]):
+        category = "nested"
+    else:
+        system_time, raw_time = times[0].get("SystemTime"), times[0].get("RawTime")
+        if system_time is None and raw_time is None:
+            category = "no_known_attributes"
+        elif (system_time is not None and not re.fullmatch(r"[0-9:.TZ+\-]{1,64}", system_time)) or (
+            raw_time is not None and (
+                not re.fullmatch(r"[0-9]{1,64}", raw_time) or int(raw_time) > (1 << 64) - 1
+            )
+        ):
+            category = "invalid_known_text"
+        else:
+            category = "both" if system_time is not None and raw_time is not None else (
+                "system_only" if system_time is not None else "raw_only"
+            )
+    classes["time_created"] = category
+
+    names = [node for node in event_data.findall(f"{NS}Data") if node.get("Name") == "FileName"]
+    if not names:
+        category = "foreign_namespace" if any(
+            node.tag.rsplit("}", 1)[-1] == "Data" and node.get("Name") == "FileName" for node in event_data
+        ) else "missing"
+    elif len(names) != 1:
+        category = "multiple"
+    elif len(names[0]):
+        category = "nested"
+    elif not names[0].text:
+        category = "empty"
+    elif len(names[0].text) > 4096:
+        category = "text_limit"
+    else:
+        value = names[0].text
+        leaf = ntpath.basename(value).lower()
+        if leaf in {"c1xx.dll", "c2.dll"}:
+            location = "expected_path" if _same_path(value, str(compiler.parent / leaf)) else "other_path"
+            category = f"{leaf[:-4]}_{location}"
+        else:
+            category = "other_basename"
+    classes["file_name"] = category
+
+    counts = row.setdefault("candidate_child_metadata", {
+        "version": {}, "opcode": {}, "time_created": {}, "file_name": {},
+        "c1xx_v1_v2_load_time_path": 0, "c2_v1_v2_load_time_path": 0,
+    })
+    for name, category in classes.items():
+        counts[name][category] = counts[name].get(category, 0) + 1
+    if (classes["version"] in {"v1", "v2"} and classes["opcode"] == "load"
+            and classes["time_created"] in {"system_only", "raw_only"}):
+        joint = {"c1xx_expected_path": "c1xx_v1_v2_load_time_path",
+                 "c2_expected_path": "c2_v1_v2_load_time_path"}.get(classes["file_name"])
+        if joint is not None:
+            counts[joint] += 1
+
+
+def _trace_identity_observation(event: ET.Element, child_pid: int, observation: dict, compiler: Path) -> None:
     def increment(counts, name):
         counts[name] = counts.get(name, 0) + 1
 
@@ -429,11 +509,16 @@ def _trace_identity_observation(event: ET.Element, child_pid: int, observation: 
                     candidate = _integer(value.strip(" \t\r\n\f\v"))
                     row["ascii_valid"] = row.get("ascii_valid", 0) + (candidate is not None)
                     row["ascii_match"] = row.get("ascii_match", 0) + (candidate == child_pid)
+                    if candidate == child_pid:
+                        _candidate_child_metadata(systems[0], event_data[0], compiler, row)
         elif pid == child_pid:
             row[f"{name}_match"] += 1
 
 
-def _events(path: Path, child_pid: int, schema: dict, *, trace_identity: dict | None = None):
+def _events(path: Path, child_pid: int, schema: dict, *, trace_identity: dict | None = None,
+            compiler: Path | None = None):
+    if trace_identity is not None and compiler is None:
+        raise ValueError("trace_identity_requires_compiler")
     root = _xml_root(_private_bytes(path))
     schema.update(event_count=0, known_provider_counts={}, provider_guid_counts={},
                   missing_system_events=0, missing_provider_events=0,
@@ -451,7 +536,7 @@ def _events(path: Path, child_pid: int, schema: dict, *, trace_identity: dict | 
             schema["unsupported_namespace_events"] += 1
             continue
         if trace_identity is not None:
-            _trace_identity_observation(event, child_pid, trace_identity)
+            _trace_identity_observation(event, child_pid, trace_identity, compiler)
         system = event.find(f"{NS}System")
         if system is None:
             schema["missing_system_events"] += 1
@@ -692,11 +777,11 @@ def _capture(private: Path, tools: dict, rsp: Path, report: dict, *, cpu_samplin
     return raw
 
 
-def _sampling_summary(path: Path, child_pid: int) -> dict:
+def _sampling_summary(path: Path, child_pid: int, compiler: Path) -> dict:
     schema = {}
     trace_identity = {name: {"events": 0} for name in ("missing_provider_guid", "system_trace")}
     matched = {guid: 0 for guid in (BI_PROVIDER, PROCESS_PROVIDER, IMAGE_PROVIDER)}
-    for event in _events(path, child_pid, schema, trace_identity=trace_identity):
+    for event in _events(path, child_pid, schema, trace_identity=trace_identity, compiler=compiler):
         matched[event["provider"]] += 1
     missing_guid = schema["missing_guid_schema"]
     return {
@@ -781,7 +866,7 @@ def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
             raw = _capture(private, tools, rsp, comparison, cpu_sampling=True)
             xml = private / "sampling_raw.xml"
             _command([str(tracerpt), str(raw), "-of", "XML", "-rts", "-o", str(xml)], private, "sampling_decode_raw", 30, comparison)
-            comparison["raw_summary"] = _sampling_summary(xml, comparison["independent_child_pid"])
+            comparison["raw_summary"] = _sampling_summary(xml, comparison["independent_child_pid"], tools["cl.exe"])
         except Exception as error:
             comparison["status"] = "failed"
             comparison["error"] = _error(error)

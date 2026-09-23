@@ -611,6 +611,7 @@ def test_image_payload_unknown_reports_first_structure_reason(tmp_path, scheme, 
 @pytest.mark.parametrize(("value", "reason", "match"), [
     (None, "empty_text", 0), ("", "empty_text", 0),
     (" " * 65, "text_limit", 0), ("0" * 63 + "42", "text_limit", 0),
+    (" " + "0" * 62 + "42", "text_limit", 0),
     (" ", "surrounding_whitespace", 0), (" 42 ", "surrounding_whitespace", 0),
     (" 4294967296", "surrounding_whitespace", 0), ("\tprivate-value\n", "surrounding_whitespace", 0),
     ("0X2A", "invalid_syntax", 0), ("１２", "invalid_syntax", 0),
@@ -631,6 +632,9 @@ def test_image_payload_unknown_preserves_strict_number_boundaries(tmp_path, sche
                 "payload_match": match, "payload_unknown": int(reason is not None)}
     if reason is not None:
         expected["payload_unknown_reasons"] = {reason: 1}
+    if scheme == "http" and reason == "surrounding_whitespace":
+        # This table's only valid candidate is the explicitly listed decimal PID.
+        expected.update(ascii_valid=int(value == " 42 "), ascii_match=int(value == " 42 "))
     assert result["trace_identity_observation"]["system_trace"][scheme]["image"] == expected
     if value and "private-value" in value:
         text = json.dumps(result)
@@ -668,9 +672,10 @@ def test_image_payload_unknown_keeps_standard_selection_with_foreign_siblings(tm
     (target.SYSTEM_TRACE_PROVIDER, target.BI_PROVIDER, "system_trace", "build_insights"),
     (target.SYSTEM_TRACE_PROVIDER, "11111111-aaaa-bbbb-cccc-222222222222", "system_trace", "other_guid"),
 ])
-def test_image_payload_unknown_reasons_do_not_expand_other_scopes(tmp_path, provider, guid, source, kind):
+@pytest.mark.parametrize("value", [None, " 42 "])
+def test_image_payload_unknown_reasons_do_not_expand_other_scopes(tmp_path, provider, guid, source, kind, value):
     event = _trace_identity_event(provider, guid=guid)
-    event.find(f"{target.NS}EventData/{target.NS}Data").text = None
+    event.find(f"{target.NS}EventData/{target.NS}Data").text = value
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(event))
     group = target._sampling_summary(path, 42)["trace_identity_observation"][source]["http"][kind]
@@ -690,6 +695,71 @@ def test_image_payload_unknown_reason_totals_do_not_count_valid_mismatches(tmp_p
                      "payload_unknown": 3,
                      "payload_unknown_reasons": {"empty_text": 1, "invalid_syntax": 1, "out_of_range": 1}}
     assert sum(group["payload_unknown_reasons"].values()) == group["payload_unknown"]
+
+
+@pytest.mark.parametrize(("value", "valid", "matched"), [
+    # XML normalizes CR to LF; these results describe parsed text, not original XML bytes.
+    (" 42 ", 1, 1), ("\t0x2A\n", 1, 1), ("\r42\r", 1, 1),
+    (" " + "0" * 61 + "42", 1, 1),  # Exactly 64 original characters.
+    (" 43 ", 1, 0), (" 0 ", 1, 0), (" 4294967295 ", 1, 0), (" 0xffffffff ", 1, 0),
+    (" 4294967296 ", 0, 0), (" 0x100000000 ", 0, 0),
+    (" 0X2A ", 0, 0), (" +42 ", 0, 0), (" -1 ", 0, 0), (" 4 2 ", 0, 0),
+    (" \t\n ", 0, 0), (" " * 64, 0, 0),
+    ("\u00a042\u00a0", 0, 0), (" \u00a042 ", 0, 0), ("\u200342\u2003", 0, 0),
+    (" １２ ", 0, 0), (" private-pid-one ", 0, 0), (" private-pid-two ", 0, 0),
+])
+def test_image_ascii_candidate_does_not_replace_strict_pid_or_use_header(tmp_path, value, valid, matched):
+    event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, guid=target.IMAGE_PROVIDER)
+    event.find(f"{target.NS}System/{target.NS}Execution").set("ProcessID", "99")
+    payload = event.find(f"{target.NS}EventData")
+    payload[0].text = value
+    ET.SubElement(payload, f"{target.NS}Data", Name="private-field").text = "private-value"
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    result = target._sampling_summary(path, 42)
+    group = result["trace_identity_observation"]["system_trace"]["http"]["image"]
+    assert group == {"events": 1, "header_match": 0, "header_unknown": 0, "payload_match": 0,
+                     "payload_unknown": 1, "payload_unknown_reasons": {"surrounding_whitespace": 1},
+                     "ascii_valid": valid, "ascii_match": matched}
+    assert result["target_pid_events"] == 0
+    assert all(count == 0 for count in result["child_matches_by_provider"].values())
+    assert all(type(group[name]) is int for name in ("ascii_valid", "ascii_match"))
+    text = json.dumps(result)
+    for secret in ("private-field", "private-value", "private-pid-one", "private-pid-two"):
+        assert secret not in text and hashlib.sha256(secret.encode()).hexdigest() not in text
+    assert hashlib.sha256(value.encode()).hexdigest() not in text
+
+
+@pytest.mark.parametrize(("value", "valid", "matched"), [("\f42\v", 1, 1), ("\v43\f", 1, 0), ("\f\v", 0, 0)])
+def test_image_ascii_candidate_ff_vt_only_in_memory(value, valid, matched):
+    # FF/VT cannot pass the XML parser; this checks only the six-character ASCII strip policy.
+    event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, guid=target.IMAGE_PROVIDER)
+    event.find(f"{target.NS}EventData/{target.NS}Data").text = value
+    observed = {"missing_provider_guid": {"events": 0}, "system_trace": {"events": 0}}
+    target._trace_identity_observation(event, 42, observed)
+    assert observed["system_trace"]["http"]["image"] == {
+        "events": 1, "header_match": 1, "header_unknown": 0, "payload_match": 0, "payload_unknown": 1,
+        "payload_unknown_reasons": {"surrounding_whitespace": 1}, "ascii_valid": valid, "ascii_match": matched,
+    }
+
+
+def test_image_ascii_candidate_counts_only_eligible_events_within_the_same_row(tmp_path):
+    root = ET.Element("Events")
+    for header, value in ((99, " 42 "), (42, " 99 "), (42, "\u00a042\u00a0"),
+                          (42, "42"), (42, None), (42, " " + "0" * 62 + "42")):
+        event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, guid=target.IMAGE_PROVIDER)
+        event.find(f"{target.NS}System/{target.NS}Execution").set("ProcessID", str(header))
+        event.find(f"{target.NS}EventData/{target.NS}Data").text = value
+        root.append(event)
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(root))
+    group = target._sampling_summary(path, 42)["trace_identity_observation"]["system_trace"]["http"]["image"]
+    assert group == {"events": 6, "header_match": 5, "header_unknown": 0, "payload_match": 1,
+                     "payload_unknown": 5,
+                     "payload_unknown_reasons": {"surrounding_whitespace": 3, "empty_text": 1, "text_limit": 1},
+                     "ascii_valid": 2, "ascii_match": 1}
+    assert sum(group["payload_unknown_reasons"].values()) == group["payload_unknown"]
+    assert group["ascii_match"] <= group["ascii_valid"] <= group["payload_unknown_reasons"]["surrounding_whitespace"]
 
 
 def test_trace_identity_keeps_parent_and_child_pid_matches_independent(tmp_path):
@@ -748,7 +818,7 @@ def test_trace_identity_observation_does_not_change_existing_yields_or_schema(tm
     root.append(_trace_identity_event(None))
     root.append(_trace_identity_event("9e814aad-3204-11d2-9a82-006008a86939"))
     image = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, guid=target.IMAGE_PROVIDER)
-    image.find(f"{target.NS}EventData/{target.NS}Data").text = None
+    image.find(f"{target.NS}EventData/{target.NS}Data").text = " 42 "
     root.append(image)
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(root))
@@ -759,7 +829,9 @@ def test_trace_identity_observation_does_not_change_existing_yields_or_schema(tm
     assert before == after and after["target_pid_events"] == 1
     assert observation["missing_provider_guid"]["events"] == 1
     assert observation["system_trace"]["events"] == 2
-    assert observation["system_trace"]["http"]["image"]["payload_unknown_reasons"] == {"empty_text": 1}
+    assert observation["system_trace"]["http"]["image"]["payload_unknown_reasons"] == {"surrounding_whitespace": 1}
+    assert observation["system_trace"]["http"]["image"]["ascii_valid"] == 1
+    assert observation["system_trace"]["http"]["image"]["ascii_match"] == 1
 
 
 def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(probe, monkeypatch):
@@ -779,11 +851,15 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
                 for scheme in ("http", "https"):
                     for guid in (target.PROCESS_PROVIDER, target.IMAGE_PROVIDER, target.BI_PROVIDER,
                                  "11111111-aaaa-bbbb-cccc-222222222222"):
-                        for _ in range(3):
+                        for index in range(3):
                             event = _trace_identity_event(provider, scheme, guid)
                             event[-1].set("private-attribute", "private-value")
                             if guid == target.IMAGE_PROVIDER:
-                                event.find(f"{target.NS}EventData/{target.NS}Data").set("Name", "private-payload-name")
+                                pid = event.find(f"{target.NS}EventData/{target.NS}Data")
+                                if index == 0:
+                                    pid.text = " 43 "
+                                else:
+                                    pid.set("Name", "private-payload-name")
                             root.append(event)
             (private / "sampling_raw.xml").write_bytes(ET.tostring(root))
         return entry
@@ -801,9 +877,13 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
         assert sum(group["events"] for scheme in ("http", "https") for group in source[scheme].values()) == 24
     for scheme in ("http", "https"):
         image = observed["system_trace"][scheme]["image"]
-        assert image["payload_unknown_reasons"] == {"missing_process_id": 3}
+        assert image["payload_unknown_reasons"] == {"surrounding_whitespace": 1, "missing_process_id": 2}
         assert sum(image["payload_unknown_reasons"].values()) == image["payload_unknown"] == 3
         assert "payload_unknown_reasons" not in observed["missing_provider_guid"][scheme]["image"]
+        if scheme == "http":
+            assert image["ascii_valid"] == image["ascii_match"] == 1
+        else:
+            assert "ascii_valid" not in image and "ascii_match" not in image
     for value in (report["observations"], report["inspection_schema_observation"], report["decoder_documents"]):
         assert "trace_identity_observation" not in json.dumps(value)
     assert "private-attribute" not in json.dumps(report) and "private-value" not in json.dumps(report)
@@ -824,6 +904,7 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
             "missing_process_id", "multiple_process_id", "nested_process_id", "empty_text", "text_limit",
             "surrounding_whitespace", "invalid_syntax", "out_of_range",
         ), 9999999999)
+    maximum["system_trace"]["http"]["image"].update(ascii_valid=9999999999, ascii_match=9999999999)
     assert len(json.dumps(maximum, separators=(",", ":")).encode()) < 4096
     summary["trace_identity_observation"] = maximum
     target._write_report(temp / "maximum", report)

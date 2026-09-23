@@ -424,6 +424,11 @@ def _trace_identity_observation(event: ET.Element, child_pid: int, observation: 
             if name == "payload" and guid == IMAGE_PROVIDER and source is observation["system_trace"]:
                 reason = _image_payload_unknown_reason(event, event_data, payload)
                 increment(row.setdefault("payload_unknown_reasons", {}), reason)
+                if scheme == "http" and reason == "surrounding_whitespace":
+                    # Bounded diagnostic candidate only; strict decoding keeps the original text.
+                    candidate = _integer(value.strip(" \t\r\n\f\v"))
+                    row["ascii_valid"] = row.get("ascii_valid", 0) + (candidate is not None)
+                    row["ascii_match"] = row.get("ascii_match", 0) + (candidate == child_pid)
         elif pid == child_pid:
             row[f"{name}_match"] += 1
 

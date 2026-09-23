@@ -560,6 +560,138 @@ def test_trace_identity_pid_requires_unique_leaf_fields(tmp_path, change):
                      "payload_match": int(header_unknown), "payload_unknown": int(not header_unknown)}
 
 
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize(("change", "reason"), [
+    ("missing_event_data", "missing_event_data"), ("nested_event_data", "missing_event_data"),
+    ("foreign_event_data", "foreign_event_data"), ("unqualified_event_data", "foreign_event_data"),
+    ("multiple_event_data", "multiple_event_data"),
+    ("missing_process_id", "missing_process_id"), ("nested_only_process_id", "missing_process_id"),
+    ("different_case_name", "missing_process_id"),
+    ("foreign_process_id", "foreign_process_id"), ("unqualified_process_id", "foreign_process_id"),
+    ("multiple_process_id", "multiple_process_id"), ("nested_process_id", "nested_process_id"),
+])
+def test_image_payload_unknown_reports_first_structure_reason(tmp_path, scheme, change, reason):
+    event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, scheme, target.IMAGE_PROVIDER)
+    payload = event.find(f"{target.NS}EventData")
+    pid = payload[0]
+    # Earlier structural reasons must win over invalid private text and nesting.
+    pid.text = " private-pid-value "
+    ET.SubElement(pid, "private-child")
+    if change in {"missing_event_data", "nested_event_data"}:
+        event.remove(payload)
+        if change == "nested_event_data":
+            ET.SubElement(event, "private-wrapper").append(payload)
+    elif change in {"foreign_event_data", "unqualified_event_data"}:
+        payload.tag = "{private-namespace}EventData" if change == "foreign_event_data" else "EventData"
+    elif change == "multiple_event_data":
+        ET.SubElement(event, payload.tag)
+    elif change in {"missing_process_id", "nested_only_process_id"}:
+        payload.remove(pid)
+        if change == "nested_only_process_id":
+            ET.SubElement(payload, "private-wrapper").append(pid)
+    elif change == "different_case_name":
+        pid.set("Name", "ProcessID")
+    elif change in {"foreign_process_id", "unqualified_process_id"}:
+        pid.tag = "{private-namespace}Data" if change == "foreign_process_id" else "Data"
+    elif change == "multiple_process_id":
+        ET.SubElement(payload, pid.tag, Name="ProcessId").text = "42"
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    result = target._sampling_summary(path, 42)
+    group = result["trace_identity_observation"]["system_trace"][scheme]["image"]
+    assert group == {"events": 1, "header_match": 1, "header_unknown": 0, "payload_match": 0,
+                     "payload_unknown": 1, "payload_unknown_reasons": {reason: 1}}
+    assert result["target_pid_events"] == 0
+    text = json.dumps(result)
+    for secret in (" private-pid-value ", "private-child", "private-wrapper", "private-namespace"):
+        assert secret not in text and hashlib.sha256(secret.encode()).hexdigest() not in text
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize(("value", "reason", "match"), [
+    (None, "empty_text", 0), ("", "empty_text", 0),
+    (" " * 65, "text_limit", 0), ("0" * 63 + "42", "text_limit", 0),
+    (" ", "surrounding_whitespace", 0), (" 42 ", "surrounding_whitespace", 0),
+    (" 4294967296", "surrounding_whitespace", 0), ("\tprivate-value\n", "surrounding_whitespace", 0),
+    ("0X2A", "invalid_syntax", 0), ("１２", "invalid_syntax", 0),
+    ("+42", "invalid_syntax", 0), ("-1", "invalid_syntax", 0),
+    ("4 2", "invalid_syntax", 0), ("0x", "invalid_syntax", 0),
+    ("private-value", "invalid_syntax", 0), ("4294967296", "out_of_range", 0),
+    ("0x100000000", "out_of_range", 0),
+    ("0" * 62 + "42", None, 1), ("42", None, 1), ("0x2a", None, 1),
+    ("0", None, 0), ("43", None, 0), ("4294967295", None, 0), ("0xffffffff", None, 0),
+])
+def test_image_payload_unknown_preserves_strict_number_boundaries(tmp_path, scheme, value, reason, match):
+    event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, scheme, target.IMAGE_PROVIDER)
+    event.find(f"{target.NS}EventData/{target.NS}Data").text = value
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    result = target._sampling_summary(path, 42)
+    expected = {"events": 1, "header_match": 1, "header_unknown": 0,
+                "payload_match": match, "payload_unknown": int(reason is not None)}
+    if reason is not None:
+        expected["payload_unknown_reasons"] = {reason: 1}
+    assert result["trace_identity_observation"]["system_trace"][scheme]["image"] == expected
+    if value and "private-value" in value:
+        text = json.dumps(result)
+        assert "private-value" not in text and hashlib.sha256(value.encode()).hexdigest() not in text
+
+
+@pytest.mark.parametrize("scheme", ["http", "https"])
+@pytest.mark.parametrize("foreign_parent", [False, True])
+@pytest.mark.parametrize("value", ["42", None])
+def test_image_payload_unknown_keeps_standard_selection_with_foreign_siblings(tmp_path, scheme, foreign_parent, value):
+    event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, scheme, target.IMAGE_PROVIDER)
+    payload = event.find(f"{target.NS}EventData")
+    payload[0].text = value
+    parent = ET.SubElement(event, "{private-namespace}EventData") if foreign_parent else payload
+    ET.SubElement(parent, "{private-namespace}Data", Name="ProcessId").text = "private-pid"
+    ET.SubElement(payload, f"{target.NS}Data", Name="private-name").text = "private-value"
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    result = target._sampling_summary(path, 42)
+    expected = {
+        "events": 1, "header_match": 1, "header_unknown": 0,
+        "payload_match": int(value is not None), "payload_unknown": int(value is None),
+    }
+    if value is None:
+        expected["payload_unknown_reasons"] = {"empty_text": 1}
+    assert result["trace_identity_observation"]["system_trace"][scheme]["image"] == expected
+    text = json.dumps(result)
+    for secret in ("private-namespace", "private-pid", "private-name", "private-value"):
+        assert secret not in text and hashlib.sha256(secret.encode()).hexdigest() not in text
+
+
+@pytest.mark.parametrize(("provider", "guid", "source", "kind"), [
+    (None, target.IMAGE_PROVIDER, "missing_provider_guid", "image"),
+    (target.SYSTEM_TRACE_PROVIDER, target.PROCESS_PROVIDER, "system_trace", "process"),
+    (target.SYSTEM_TRACE_PROVIDER, target.BI_PROVIDER, "system_trace", "build_insights"),
+    (target.SYSTEM_TRACE_PROVIDER, "11111111-aaaa-bbbb-cccc-222222222222", "system_trace", "other_guid"),
+])
+def test_image_payload_unknown_reasons_do_not_expand_other_scopes(tmp_path, provider, guid, source, kind):
+    event = _trace_identity_event(provider, guid=guid)
+    event.find(f"{target.NS}EventData/{target.NS}Data").text = None
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(event))
+    group = target._sampling_summary(path, 42)["trace_identity_observation"][source]["http"][kind]
+    assert group == {"events": 1, "header_match": 1, "header_unknown": 0, "payload_match": 0, "payload_unknown": 1}
+
+
+def test_image_payload_unknown_reason_totals_do_not_count_valid_mismatches(tmp_path):
+    root = ET.Element("Events")
+    for value in (None, "private-value", "4294967296", "42", "43"):
+        event = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, guid=target.IMAGE_PROVIDER)
+        event.find(f"{target.NS}EventData/{target.NS}Data").text = value
+        root.append(event)
+    path = tmp_path / "sampling.xml"
+    path.write_bytes(ET.tostring(root))
+    group = target._sampling_summary(path, 42)["trace_identity_observation"]["system_trace"]["http"]["image"]
+    assert group == {"events": 5, "header_match": 5, "header_unknown": 0, "payload_match": 1,
+                     "payload_unknown": 3,
+                     "payload_unknown_reasons": {"empty_text": 1, "invalid_syntax": 1, "out_of_range": 1}}
+    assert sum(group["payload_unknown_reasons"].values()) == group["payload_unknown"]
+
+
 def test_trace_identity_keeps_parent_and_child_pid_matches_independent(tmp_path):
     root = ET.Element("Events")
     for header, payload in ((99, 42), (42, 99)):
@@ -615,6 +747,9 @@ def test_trace_identity_observation_does_not_change_existing_yields_or_schema(tm
     root = ET.fromstring(_xml([(target.PROCESS_PROVIDER, 999, {"ProcessId": 42})]))
     root.append(_trace_identity_event(None))
     root.append(_trace_identity_event("9e814aad-3204-11d2-9a82-006008a86939"))
+    image = _trace_identity_event(target.SYSTEM_TRACE_PROVIDER, guid=target.IMAGE_PROVIDER)
+    image.find(f"{target.NS}EventData/{target.NS}Data").text = None
+    root.append(image)
     path = tmp_path / "sampling.xml"
     path.write_bytes(ET.tostring(root))
     before, after = {}, {}
@@ -622,7 +757,9 @@ def test_trace_identity_observation_does_not_change_existing_yields_or_schema(tm
     observation = {"missing_provider_guid": {"events": 0}, "system_trace": {"events": 0}}
     assert list(target._events(path, 42, after, trace_identity=observation)) == expected
     assert before == after and after["target_pid_events"] == 1
-    assert observation["missing_provider_guid"]["events"] == observation["system_trace"]["events"] == 1
+    assert observation["missing_provider_guid"]["events"] == 1
+    assert observation["system_trace"]["events"] == 2
+    assert observation["system_trace"]["http"]["image"]["payload_unknown_reasons"] == {"empty_text": 1}
 
 
 def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(probe, monkeypatch):
@@ -645,6 +782,8 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
                         for _ in range(3):
                             event = _trace_identity_event(provider, scheme, guid)
                             event[-1].set("private-attribute", "private-value")
+                            if guid == target.IMAGE_PROVIDER:
+                                event.find(f"{target.NS}EventData/{target.NS}Data").set("Name", "private-payload-name")
                             root.append(event)
             (private / "sampling_raw.xml").write_bytes(ET.tostring(root))
         return entry
@@ -660,11 +799,16 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
     for source in observed.values():
         assert source["events"] == 24
         assert sum(group["events"] for scheme in ("http", "https") for group in source[scheme].values()) == 24
+    for scheme in ("http", "https"):
+        image = observed["system_trace"][scheme]["image"]
+        assert image["payload_unknown_reasons"] == {"missing_process_id": 3}
+        assert sum(image["payload_unknown_reasons"].values()) == image["payload_unknown"] == 3
+        assert "payload_unknown_reasons" not in observed["missing_provider_guid"][scheme]["image"]
     for value in (report["observations"], report["inspection_schema_observation"], report["decoder_documents"]):
         assert "trace_identity_observation" not in json.dumps(value)
     assert "private-attribute" not in json.dumps(report) and "private-value" not in json.dumps(report)
-    for value in ("private-attribute", "private-value", "11111111-aaaa-bbbb-cccc-222222222222"):
-        assert hashlib.sha256(value.encode()).hexdigest() not in json.dumps(report)
+    for value in ("private-attribute", "private-value", "private-payload-name", "11111111-aaaa-bbbb-cccc-222222222222"):
+        assert value not in json.dumps(report) and hashlib.sha256(value.encode()).hexdigest() not in json.dumps(report)
     # Bound the whole fixed wire vocabulary even when every counter needs ten digits.
     maximum = {source: {"events": 9999999999,
                        **dict.fromkeys(("missing_extension", "multiple_extensions", "unsupported_extension_namespace"), 9999999999),
@@ -674,6 +818,12 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
                           for scheme in ("http", "https")}}
                for source in ("missing_provider_guid", "system_trace")}
     maximum["ambiguous_structure_events"] = 9999999999
+    for scheme in ("http", "https"):
+        maximum["system_trace"][scheme]["image"]["payload_unknown_reasons"] = dict.fromkeys((
+            "foreign_event_data", "missing_event_data", "multiple_event_data", "foreign_process_id",
+            "missing_process_id", "multiple_process_id", "nested_process_id", "empty_text", "text_limit",
+            "surrounding_whitespace", "invalid_syntax", "out_of_range",
+        ), 9999999999)
     assert len(json.dumps(maximum, separators=(",", ":")).encode()) < 4096
     summary["trace_identity_observation"] = maximum
     target._write_report(temp / "maximum", report)

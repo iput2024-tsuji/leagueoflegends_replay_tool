@@ -326,6 +326,34 @@ def _strict_guid(value: str | None) -> str | None:
     return value.lower() if re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", value) else None
 
 
+def _image_payload_unknown_reason(event: ET.Element, event_data: list, payload: list) -> str:
+    # Explain only a failed existing PID check; never supply a replacement PID.
+    if not event_data:
+        return "foreign_event_data" if any(
+            node.tag.rsplit("}", 1)[-1] == "EventData" for node in event
+        ) else "missing_event_data"
+    if len(event_data) != 1:
+        return "multiple_event_data"
+    if not payload:
+        return "foreign_process_id" if any(
+            node.tag.rsplit("}", 1)[-1] == "Data" and node.get("Name") == "ProcessId" for node in event_data[0]
+        ) else "missing_process_id"
+    if len(payload) != 1:
+        return "multiple_process_id"
+    if len(payload[0]):
+        return "nested_process_id"
+    value = payload[0].text
+    if not value:
+        return "empty_text"
+    if len(value) > 64:
+        return "text_limit"
+    if value != value.strip():
+        return "surrounding_whitespace"
+    if not re.fullmatch(r"(?:0x[0-9a-fA-F]+|[0-9]+)", value):
+        return "invalid_syntax"
+    return "out_of_range"
+
+
 def _trace_identity_observation(event: ET.Element, child_pid: int, observation: dict) -> None:
     def increment(counts, name):
         counts[name] = counts.get(name, 0) + 1
@@ -393,6 +421,9 @@ def _trace_identity_observation(event: ET.Element, child_pid: int, observation: 
         pid = _integer(text) if text is not None and len(text) <= 64 else None
         if pid is None:
             row[f"{name}_unknown"] += 1
+            if name == "payload" and guid == IMAGE_PROVIDER and source is observation["system_trace"]:
+                reason = _image_payload_unknown_reason(event, event_data, payload)
+                increment(row.setdefault("payload_unknown_reasons", {}), reason)
         elif pid == child_pid:
             row[f"{name}_match"] += 1
 

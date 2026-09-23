@@ -892,6 +892,61 @@ def test_collect_distribution_licenses_checks_version_and_is_idempotent(
         )
 
 
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"])
+def test_opencv_notice_collection_and_shared_hash_gate_remain_byte_exact(
+    monkeypatch, tmp_path, newline,
+):
+    source = tmp_path / "installed" / "cv2" / "LICENSE-3RD-PARTY.txt"
+    source.parent.mkdir(parents=True)
+    original = newline.join([
+        b"Permission is granted to use, copy, modify, and distribute this software.",
+        b"THE SOFTWARE IS PROVIDED AS IS WITHOUT WARRANTY.",
+        b"",
+    ])
+    source.write_bytes(original)
+
+    class FakeDistribution:
+        metadata = {"Name": "opencv-python", "License-Expression": "MIT"}
+        version = "4.13.0.90"
+        files = [Path("cv2/LICENSE-3RD-PARTY.txt")]
+
+        @staticmethod
+        def locate_file(relative_path):
+            return tmp_path / "installed" / relative_path
+
+    monkeypatch.setattr(
+        license_collector.metadata, "distribution", lambda _name: FakeDistribution(),
+    )
+    root = tmp_path / "distribution"
+    package = license_collector.collect_distribution_licenses(
+        "opencv-python", root / "licenses" / "python-packages",
+    )
+    relative = "python-packages/opencv-python/cv2/LICENSE-3RD-PARTY.txt"
+    target = root / "licenses" / relative
+    expected_hash = hashlib.sha256(original).hexdigest()
+    assert target.read_bytes() == source.read_bytes() == original
+    assert package["license_file_sha256"][relative] == expected_hash
+    components = [
+        {"component": name, "license_materials": [{
+            "path": "licenses/" + relative,
+            "sha256": expected_hash,
+            "shared": True,
+        }]}
+        for name in ("opencv-python", "opencv-ffmpeg")
+    ]
+    monkeypatch.setattr(compliance, "_component_entries", lambda _lock: components)
+    manifest = {"packages": [package]}
+    assert compliance._validate_locked_license_materials(root, {}, manifest) == []
+    other_newline = b"\r\n" if newline == b"\n" else b"\n"
+    for changed in (original.replace(newline, other_newline), original + b"changed"):
+        target.write_bytes(changed)
+        # Updating the collected inventory cannot override either component's lock.
+        package["license_file_sha256"][relative] = sha256_file(target)
+        errors = compliance._validate_locked_license_materials(root, {}, manifest)
+        assert len(errors) == 2
+        assert all("Locked license material SHA256 differs" in error for error in errors)
+
+
 def test_collect_distribution_merges_locked_repository_license_materials(
     monkeypatch,
     tmp_path,

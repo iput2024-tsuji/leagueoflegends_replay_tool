@@ -145,6 +145,7 @@ def test_installer_forwards_explicit_python_as_named_argument(tmp_path):
     )
 
     captured = _captured_arguments(capture, result)
+    assert "未検証開発ビルド" in result.stdout + result.stderr
     assert Path(captured["PythonExe"]).resolve() == python
     assert captured["BuildProvenance"] == ""
     assert captured["BuildProvenanceSha256"] == ""
@@ -185,6 +186,7 @@ def test_installer_forwards_python_and_provenance_by_name_with_spaced_paths(
     )
 
     captured = _captured_arguments(capture, result)
+    assert "未検証開発ビルド" not in result.stdout + result.stderr
     assert Path(captured["PythonExe"]).resolve() == python
     assert Path(captured["BuildProvenance"]).resolve() == provenance
     assert captured["BuildProvenanceSha256"] == provenance_sha256
@@ -244,6 +246,7 @@ def test_skip_build_does_not_invoke_build_script(tmp_path):
     assert "CAPTURED_BUILD_ARGUMENTS" not in output
     assert not capture.exists()
     assert "LoLReplayTool.exe" in output
+    assert "未検証開発ビルド" in output
 
 
 def test_installer_uses_short_external_pytest_base_temp():

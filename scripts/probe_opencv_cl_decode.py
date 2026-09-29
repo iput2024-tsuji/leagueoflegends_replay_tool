@@ -14,12 +14,14 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from scripts import probe_opencv_tdh
 from scripts.prepare_opencv_wheel import REQUIRED_TOOLSET_VERSION
 
 FILE_LIMIT = 64 * 1024 * 1024
@@ -92,6 +94,7 @@ def _check_private_size(private: Path) -> None:
             logs = {f"{stage}.log" for stage in (
                 "checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged",
                 "inspect_raw", "sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw",
+                "sampling_tdh",
             )}
             category = path.name if path.name in files else "command_log" if path.name in logs else "other"
             raise ProbeError("private_file_limit", private_file_check={
@@ -804,6 +807,25 @@ def _sampling_summary(path: Path, child_pid: int, compiler: Path) -> dict:
     }
 
 
+def _tdh_summary(path: Path) -> dict:
+    data = _private_bytes(path)
+    if len(data) > 4096:
+        raise ProbeError("tdh_report_limit")
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate_key")
+            result[key] = value
+        return result
+
+    try:
+        return probe_opencv_tdh.validate_report(json.loads(data, object_pairs_hook=unique))
+    except (ValueError, TypeError):
+        raise ProbeError("tdh_invalid_report") from None
+
+
 def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
     report = {
         "schema_version": 1, "purpose": "synthetic_one_tu_decoder_probe_only",
@@ -830,7 +852,8 @@ def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
         flags.append(f'"{source}"')
         expected_command = " ".join(flags)
         rsp.write_text("\n".join(flags) + "\n", encoding="ascii", newline="\n")
-        inputs = [*tools.values(), tracerpt, Path(__file__), source, rsp]
+        tdh_reader = Path(__file__).with_name("probe_opencv_tdh.py")
+        inputs = [*tools.values(), tracerpt, Path(__file__), source, rsp, tdh_reader]
         report["inputs"] = [_fingerprint(path) for path in inputs]
         _command(["git", "-C", str(Path(__file__).resolve().parents[1]), "rev-parse", "--verify", "HEAD"], private, "checkout", 10, report)
         checkout_sha = (private / "checkout.log").read_text(encoding="ascii").strip()
@@ -867,6 +890,10 @@ def run_probe(temp: Path, tool_dir: Path, tracerpt: Path) -> dict:
             xml = private / "sampling_raw.xml"
             _command([str(tracerpt), str(raw), "-of", "XML", "-rts", "-o", str(xml)], private, "sampling_decode_raw", 30, comparison)
             comparison["raw_summary"] = _sampling_summary(xml, comparison["independent_child_pid"], tools["cl.exe"])
+            _command([sys.executable, "-I", str(tdh_reader), "--trace", str(raw),
+                      "--child-pid", str(comparison["independent_child_pid"]),
+                      "--compiler", str(tools["cl.exe"])], private, "sampling_tdh", 30, comparison)
+            comparison["tdh_observation"] = _tdh_summary(private / "sampling_tdh.log")
         except Exception as error:
             comparison["status"] = "failed"
             comparison["error"] = _error(error)

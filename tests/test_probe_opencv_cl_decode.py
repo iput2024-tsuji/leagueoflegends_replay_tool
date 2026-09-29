@@ -1,13 +1,14 @@
 import hashlib
 import json
 import stat
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from scripts import probe_opencv_cl_decode as target
+from scripts import probe_opencv_cl_decode as target, probe_opencv_tdh as tdh
 from scripts.probe_opencv_cl_decode import _command as run_command
 
 CANDIDATE_METADATA_KEYS = {
@@ -23,6 +24,12 @@ def _default_candidate_metadata(count=1):
     return {"version": {"missing": count}, "opcode": {"other_uint8": count},
             "time_created": {"system_only": count}, "file_name": {"missing": count},
             "c1xx_v1_v2_load_time_path": 0, "c2_v1_v2_load_time_path": 0}
+
+
+def _empty_tdh_report():
+    return {"events": 0, "header_provider": {}, "query": {},
+            "image": {"provider": {}, "version": {}, "opcode": {}, "pid": {}, "header_match": 0},
+            "child": {"version": {}, "file_name": {}, "path_form": {}, "header_match": 0}}
 
 
 def _xml(events):
@@ -99,6 +106,12 @@ def probe(tmp_path, monkeypatch):
                 (target.PROCESS_PROVIDER, 999, {"ProcessId": 43, "ParentId": 10, "CommandLine": "sampling-private-command"}),
                 (target.IMAGE_PROVIDER, 43, {"ProcessId": 666, "FileName": "sampling-private-path"}),
             ]))
+        if stage == "sampling_tdh":
+            assert "sampling_stop" in calls and "raw_summary" in report
+            assert args == [sys.executable, "-I", str(Path(target.__file__).with_name("probe_opencv_tdh.py")),
+                            "--trace", str(private / "sampling_raw.etl"), "--child-pid", "43",
+                            "--compiler", str(tool_dir / "cl.exe")]
+            (private / "sampling_tdh.log").write_text(json.dumps(_empty_tdh_report()), encoding="utf-8")
         if stage == "decode_relogged":
             expected = " ".join((private / "probe.rsp").read_text().splitlines())
             rows = [(target.BI_PROVIDER, 42, {"Tool": "CL", "InvocationId": 7, "Name": name, "Value": value})
@@ -127,7 +140,7 @@ def test_probe_collects_fixture_fields_without_claiming_verified_trace(probe):
     temp, tools, tracerpt, calls, _ = probe
     report = target.run_probe(temp, tools, tracerpt)
     assert calls == ["checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged", "inspect_raw",
-                     "sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw"]
+                     "sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw", "sampling_tdh"]
     assert len(report["commands"]) == 8
     assert report["status"] == "incomplete"
     assert report["product_build_evidence"] is False
@@ -142,8 +155,9 @@ def test_probe_collects_fixture_fields_without_claiming_verified_trace(probe):
     assert report["inspection_schema_observation"]["known_provider_counts"] == {target.PROCESS_PROVIDER: 1}
     assert report["inspection_schema_observation"]["target_pid_events"] == 1
     comparison = report["cpu_sampling_comparison"]
-    assert len(report["inputs"]) == 11 and report["inputs_unchanged_before_cpu_sampling"] is True
-    assert len(comparison["commands"]) == 4 and comparison["status"] == "incomplete"
+    assert len(report["inputs"]) == 12 and report["inputs_unchanged_before_cpu_sampling"] is True
+    assert len(comparison["commands"]) == 5 and comparison["status"] == "incomplete"
+    assert comparison["tdh_observation"] == _empty_tdh_report()
     assert comparison["session"] != report["session"]
     assert comparison["independent_child_pid"] == 43
     assert comparison["raw_summary"]["known_provider_counts"][target.IMAGE_PROVIDER] == 1
@@ -258,10 +272,10 @@ def test_sampling_capture_reuses_inputs_arguments_and_cwd_after_a_stops(probe, m
         recorded[stage] = (args, private, timeout)
         if stage == "sampling_start":
             assert "inspect_raw" in recorded and "stop" in recorded
-            assert set(fingerprints[-11:]) == {
+            assert set(fingerprints[-12:]) == {
                 "cl.exe", "c1xx.dll", "c2.dll", "vcperf.exe", "CppBuildInsights.dll",
                 "KernelTraceControl.dll", "CppBuildInsightsEtw.xml", "tracerpt.exe",
-                "probe_opencv_cl_decode.py", "probe.cpp", "probe.rsp",
+                "probe_opencv_cl_decode.py", "probe_opencv_tdh.py", "probe.cpp", "probe.rsp",
             }
         return original(args, private, stage, timeout, report)
 
@@ -277,8 +291,13 @@ def test_sampling_capture_reuses_inputs_arguments_and_cwd_after_a_stops(probe, m
     assert recorded["sampling_stop"][0][2] == b[-1]
     assert recorded["stop"][0][3] != recorded["sampling_stop"][0][3]
     assert all(item[1] == recorded["start"][1] for item in recorded.values())
-    # 340 seconds of command budgets + at most 5 seconds per owned-child cleanup.
-    assert sum(item[2] for item in recorded.values()) == 340
+    reader_args, reader_cwd, reader_timeout = recorded["sampling_tdh"]
+    assert reader_args == [sys.executable, "-I", str(Path(target.__file__).with_name("probe_opencv_tdh.py")),
+                           "--trace", str(reader_cwd / "sampling_raw.etl"), "--child-pid", "43",
+                           "--compiler", str(tools / "cl.exe")]
+    assert reader_timeout == 30
+    # 370 seconds of command budgets + at most 5 seconds per owned-child cleanup.
+    assert sum(item[2] for item in recorded.values()) == 370
     workflow = Path(".github/workflows/build-opencv.yml").read_text(encoding="utf-8")
     diagnostic_step = workflow.split("- name: Probe one CL translation unit decoder", 1)[1].split("\n      - name:", 1)[0]
     assert "timeout-minutes: 8" in diagnostic_step
@@ -289,7 +308,7 @@ def test_sampling_capture_reuses_inputs_arguments_and_cwd_after_a_stops(probe, m
 @pytest.mark.parametrize("name", [
     "cl.exe", "c1xx.dll", "c2.dll", "vcperf.exe", "CppBuildInsights.dll",
     "KernelTraceControl.dll", "CppBuildInsightsEtw.xml", "tracerpt.exe",
-    "probe_opencv_cl_decode.py", "probe.cpp", "probe.rsp",
+    "probe_opencv_cl_decode.py", "probe_opencv_tdh.py", "probe.cpp", "probe.rsp",
 ])
 def test_each_changed_input_prevents_sampling_capture(probe, monkeypatch, name):
     temp, tools, tracerpt, calls, original = probe
@@ -319,7 +338,7 @@ def test_each_changed_input_prevents_sampling_capture(probe, monkeypatch, name):
     assert report["observations"]["cl_properties"]
 
 
-@pytest.mark.parametrize("failure", ["sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw"])
+@pytest.mark.parametrize("failure", ["sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw", "sampling_tdh"])
 def test_sampling_failure_preserves_a_and_stops_only_b_once(probe, monkeypatch, failure):
     temp, tools, tracerpt, calls, original = probe
 
@@ -339,8 +358,11 @@ def test_sampling_failure_preserves_a_and_stops_only_b_once(probe, monkeypatch, 
     assert calls.count("stop") == calls.count("sampling_stop") == 1
     if failure == "sampling_start":
         assert "sampling_compile" not in calls
-    if failure != "sampling_decode_raw":
+    if failure not in {"sampling_decode_raw", "sampling_tdh"}:
         assert "sampling_decode_raw" not in calls
+    if failure == "sampling_tdh":
+        assert comparison["raw_summary"]["event_count"] == 2
+        assert "tdh_observation" not in comparison
 
 
 def test_sampling_stop_failure_retains_primary_and_private_errors(probe, monkeypatch):
@@ -361,6 +383,58 @@ def test_sampling_stop_failure_retains_primary_and_private_errors(probe, monkeyp
     assert comparison["cleanup_error"] == {"type": "RuntimeError", "code": "operation_failed"}
     assert report["observations"]["cl_properties"] and calls.count("sampling_stop") == 1
     assert "private-cleanup-error" not in json.dumps(report)
+
+
+@pytest.mark.parametrize("data", [
+    b"\xffprivate-child-error", b"private-child-error", b"[]", b"null",
+    b'{"events":0,"events":0}', b'{"private-name":"private-child-error"}',
+])
+def test_tdh_invalid_child_json_preserves_a_and_existing_b(probe, monkeypatch, data):
+    temp, tools, tracerpt, calls, original = probe
+
+    def command(args, private, stage, timeout, report):
+        entry = original(args, private, stage, timeout, report)
+        if stage == "sampling_tdh":
+            (private / "sampling_tdh.log").write_bytes(data)
+        return entry
+
+    monkeypatch.setattr(target, "_command", command)
+    report = target.run_probe(temp, tools, tracerpt)
+    comparison = report["cpu_sampling_comparison"]
+    assert report["status"] == comparison["status"] == "failed"
+    assert report["error"] == comparison["error"]
+    assert report["error"]["code"] == "tdh_invalid_report"
+    assert report["observations"]["cl_properties"] and report["decoder_documents"]
+    assert comparison["raw_summary"]["event_count"] == 2
+    assert "tdh_observation" not in comparison
+    assert comparison["commands"][-1]["status"] == "success"
+    assert calls.count("stop") == calls.count("sampling_stop") == calls.count("sampling_tdh") == 1
+    assert report["cleanup_error"] is comparison["cleanup_error"] is None
+    assert report["inputs_unchanged"] is True and report["product_build_evidence"] is False
+    text = json.dumps(report)
+    for value in ("private-child-error", "private-name"):
+        assert value not in text and hashlib.sha256(value.encode()).hexdigest() not in text
+
+
+@pytest.mark.parametrize("size", [4096, 4097])
+def test_tdh_child_output_has_its_own_byte_bound_before_json_decode(tmp_path, monkeypatch, size):
+    data = json.dumps(_empty_tdh_report()).encode()
+    path = tmp_path / "sampling_tdh.log"
+    path.write_bytes(data + b" " * (size - len(data)))
+    if size == 4096:
+        assert target._tdh_summary(path) == _empty_tdh_report()
+    else:
+        monkeypatch.setattr(target.json, "loads", lambda *a, **k: pytest.fail("oversized child output must not be decoded"))
+        with pytest.raises(target.ProbeError, match="^tdh_report_limit$"):
+            target._tdh_summary(path)
+
+
+def test_tdh_duplicate_keys_are_rejected_before_schema_validation(tmp_path, monkeypatch):
+    path = tmp_path / "sampling_tdh.log"
+    path.write_bytes(b'{"events":0,"events":0}')
+    monkeypatch.setattr(tdh, "validate_report", lambda _: pytest.fail("duplicate keys must be rejected before validation"))
+    with pytest.raises(target.ProbeError, match="^tdh_invalid_report$"):
+        target._tdh_summary(path)
 
 
 @pytest.mark.parametrize("prefix", ["", "sampling_"])
@@ -1280,7 +1354,11 @@ def test_trace_identity_is_b_only_single_read_bounded_and_preserves_all_counts(p
     }
     assert sum(map(len, CANDIDATE_METADATA_KEYS.values())) + 2 == 38
     assert len(json.dumps(maximum, separators=(",", ":")).encode()) == 5079 < 5 * 1024
+    maximum_tdh = tdh.maximum_report()
+    combined = {"trace_identity_observation": maximum, "tdh_observation": maximum_tdh}
+    assert len(json.dumps(combined, separators=(",", ":")).encode()) < 7 * 1024
     summary["trace_identity_observation"] = maximum
+    report["cpu_sampling_comparison"]["tdh_observation"] = maximum_tdh
     target._write_report(temp / "maximum", report)
     public = temp / "maximum/LoLReplayTool-binary-cache/w/b/evidence/cl-decode-probe.json"
     assert public.stat().st_size <= target.JSON_LIMIT == 64 * 1024
@@ -1960,7 +2038,7 @@ def test_public_output_is_bounded_and_never_overwrites(tmp_path, monkeypatch):
     )),
     *((stage + ".log", "command_log") for stage in (
         "checkout", "start", "compile", "stop", "relog", "decode_raw", "decode_relogged", "inspect_raw",
-        "sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw",
+        "sampling_start", "sampling_compile", "sampling_stop", "sampling_decode_raw", "sampling_tdh",
     )),
     ("private-unknown.log", "other"), ("raw.xml.private", "other"),
 ])
@@ -2029,6 +2107,7 @@ def test_private_redirect_rejection_precedes_file_limit_detail(tmp_path, monkeyp
 
 @pytest.mark.parametrize(("failed_stage", "filename"), [
     ("inspect_raw", "summary.txt"), ("sampling_decode_raw", "sampling_raw.xml"),
+    ("sampling_tdh", "sampling_raw.etl"),
 ])
 def test_completed_decoder_postcheck_failure_keeps_prior_evidence_without_killing(
     probe, monkeypatch, failed_stage, filename,
@@ -2078,7 +2157,12 @@ def test_completed_decoder_postcheck_failure_keeps_prior_evidence_without_killin
     else:
         capture = report["cpu_sampling_comparison"]
         assert capture["status"] == "failed" and capture["error"] == report["error"]
-        assert "raw_summary" not in capture and report["decoder_documents"]
+        assert report["decoder_documents"]
+        if failed_stage == "sampling_tdh":
+            assert capture["raw_summary"]["event_count"] == 2
+            assert "tdh_observation" not in capture
+        else:
+            assert "raw_summary" not in capture
         assert calls.count("sampling_stop") == 1
     assert capture["commands"][-1] == {
         "stage": failed_stage, "status": "failed", "pid": 123, "returncode": 0,

@@ -67,6 +67,7 @@ try:
     from .qt_lifecycle import request_worker_stop
     from .recorder_config import AppConfig as RecorderAppConfig
     from .recording_library import RecordingDeletionPlan, RecordingLibrary
+    from .replay_timing import map_game_time_to_video, normalize_sync_intervals
     from .session_log import load_session_payload
 except ImportError:
     from app_paths import get_app_root, get_resource_root, get_user_data_root
@@ -88,6 +89,7 @@ except ImportError:
     from qt_lifecycle import request_worker_stop
     from recorder_config import AppConfig as RecorderAppConfig
     from recording_library import RecordingDeletionPlan, RecordingLibrary
+    from replay_timing import map_game_time_to_video, normalize_sync_intervals
     from session_log import load_session_payload
 
 ROOT_DIR = get_app_root()
@@ -1433,6 +1435,8 @@ class PlayerWidget(QWidget):
         self.fullscreen_cb = fullscreen_cb
 
         self.offset = None
+        self.sync_intervals = None
+        self.manual_event_times: dict[float, float] = {}
         self.duration = 0
         self.is_slider_pressed = False
         self.current_video_path = None
@@ -1941,6 +1945,10 @@ class PlayerWidget(QWidget):
             self.current_video_path = video_path
             self.duration = 0.0
             self.sync_game_time = data.get("sync_game_time", 0.0)
+            self.sync_intervals = (
+                normalize_sync_intervals(data["sync_intervals"]) if "sync_intervals" in data else None
+            )
+            self.manual_event_times.clear()
             match = data.get("match") if isinstance(data.get("match"), dict) else {}
             sync_unavailable = match.get("sync_time_source") == "unavailable"
             self.events = data.get("events", []) or []
@@ -1948,7 +1956,7 @@ class PlayerWidget(QWidget):
             self.ban_pick = data.get("ban_pick") if isinstance(data.get("ban_pick"), dict) else {}
             self.my_name = data.get("summoner_name", "Unknown")
             self.my_name_short = normalize_summoner_name(self.my_name)
-            self.offset = None
+            self.offset = 0.0 if self.sync_intervals is not None else None
             self.update_offset_label()
             self.clip_start = None
             self.clip_end = None
@@ -1966,6 +1974,16 @@ class PlayerWidget(QWidget):
             self.video_frame.setFocus()
 
             self.update_video_fps()
+            if self.sync_intervals is not None:
+                self.info_label.setText(
+                    "記録した時刻でイベントを同期します。\n未確認の区間は、イベントを選んで現在位置で同期してください。"
+                    if self.sync_intervals
+                    else "⚠️ 自動同期できません\nイベントを選び、動画を合わせて現在位置で同期してください。"
+                )
+                self.event_list.setEnabled(True)
+                self.player.pause = False
+                self.play_btn.setText("Pause")
+                return True
             if sync_unavailable:
                 self.info_label.setText("⚠️ 自動同期できません\nイベントを選び、動画を合わせて現在位置で同期してください。")
                 self.event_list.setEnabled(True)
@@ -2053,7 +2071,11 @@ class PlayerWidget(QWidget):
 
         events = build_events()
         self.event_list.clear()
-        self.add_event_item("🎬 Game Start", 0.0, "#4CAF50")
+        if self.sync_intervals is None:
+            self.add_event_item("🎬 Game Start", 0.0, "#4CAF50")
+        else:
+            self.add_event_item("🎬 録画の先頭", 0.0, "#4CAF50")
+            self.event_list.item(0).setData(Qt.ItemDataRole.UserRole + 2, "recording_start")
         for evt in events:
             if not isinstance(evt, dict):
                 continue
@@ -2165,18 +2187,29 @@ class PlayerWidget(QWidget):
         if self.player is None:
             return
         try:
-            current = float(self.player.time_pos or 0.0)
+            current = _finite_number(self.player.time_pos)
         except Exception:
             current = None
-        if current is None:
+        if current is None or current < 0:
             return
         selected = self.event_list.currentItem()
         if not selected:
             return
-        game_time = selected.data(Qt.ItemDataRole.UserRole)
+        if selected.data(Qt.ItemDataRole.UserRole + 2) == "recording_start":
+            return
+        game_time = _finite_number(selected.data(Qt.ItemDataRole.UserRole))
         if game_time is None:
             return
-        self.offset = current - float(game_time)
+        if self.sync_intervals is None:
+            self.offset = current - game_time
+        else:
+            mapped = map_game_time_to_video(game_time, self.sync_intervals)
+            if mapped is None:
+                # A manual choice in an unobserved gap applies to this event only.
+                self.manual_event_times[game_time] = current - (self.offset or 0.0)
+                self.info_label.setText("選択したイベントを手動同期しました。他の未確認イベントは個別に同期してください。")
+            else:
+                self.offset = current - mapped
         self.update_offset_label()
 
     def get_current_position(self) -> float | None:
@@ -2348,7 +2381,21 @@ class PlayerWidget(QWidget):
             game_time = item.data(Qt.ItemDataRole.UserRole)
         except (AttributeError, RuntimeError):
             return
-        seek_pos = calculate_event_seek_position(game_time, self.offset, self.duration)
+        seek_offset = self.offset
+        if self.sync_intervals is not None and item.data(Qt.ItemDataRole.UserRole + 2) == "recording_start":
+            game_time = 0.0
+            seek_offset = 0.0
+        elif self.sync_intervals is not None:
+            normalized_time = _finite_number(game_time)
+            if normalized_time is None:
+                return
+            game_time = self.manual_event_times.get(normalized_time)
+            if game_time is None:
+                game_time = map_game_time_to_video(normalized_time, self.sync_intervals)
+            if game_time is None:
+                self.info_label.setText("⚠️ このイベントの同期時刻は未確認です。\n該当場面に合わせて「現在位置で同期」を押してください。")
+                return
+        seek_pos = calculate_event_seek_position(game_time, seek_offset, self.duration)
         if seek_pos is None:
             return
         self.player.seek(seek_pos, reference="absolute", precision="exact")

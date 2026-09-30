@@ -104,6 +104,9 @@ class _SettingsPageStub(QWidget):
     def on_page_shown(self) -> None:
         self.shown_count += 1
 
+    def set_recording_audio_only(self, enabled: bool) -> None:
+        self.recording_audio_only = enabled
+
     def stop_workers(self, timeout_ms: int = 1500) -> bool:
         return True
 

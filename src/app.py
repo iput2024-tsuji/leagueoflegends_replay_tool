@@ -242,14 +242,17 @@ class AudioDeviceRefreshWorker(QThread):
     loaded = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, data: dict[str, Any], auto_launch: bool) -> None:
+    def __init__(self, data: dict[str, Any], auto_launch: bool, *, live_audio: bool = False) -> None:
         super().__init__()
         self.data = data
         self.auto_launch = auto_launch
+        self.live_audio = live_audio
 
     def run(self) -> None:
         try:
-            self.loaded.emit(AUDIO_CONTROLLER.refresh_audio_devices(self.data, auto_launch=self.auto_launch))
+            self.loaded.emit(AUDIO_CONTROLLER.refresh_audio_devices(
+                self.data, auto_launch=self.auto_launch, live_audio=self.live_audio,
+            ))
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
@@ -258,14 +261,17 @@ class AudioApplyWorker(QThread):
     loaded = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, data: dict[str, Any], auto_launch: bool) -> None:
+    def __init__(self, data: dict[str, Any], auto_launch: bool, *, live_audio: bool = False) -> None:
         super().__init__()
         self.data = data
         self.auto_launch = auto_launch
+        self.live_audio = live_audio
 
     def run(self) -> None:
         try:
-            self.loaded.emit(AUDIO_CONTROLLER.apply_audio_settings(self.data, auto_launch=self.auto_launch))
+            self.loaded.emit(AUDIO_CONTROLLER.apply_audio_settings(
+                self.data, auto_launch=self.auto_launch, live_audio=self.live_audio,
+            ))
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
@@ -791,6 +797,7 @@ class SettingsPage(QWidget):
         root_layout.setSpacing(10)
         self.fields = {}
         self.audio_device_cache = {"mic": []}
+        self._recording_audio_only = False
         self._audio_ui_loading = False
         self._audio_refresh_in_progress = False
         self._audio_auto_refreshed_once = False
@@ -804,14 +811,21 @@ class SettingsPage(QWidget):
         self._runtime_output_worker = None
         self._preflight_worker = None
         self._quick_setup_worker = None
+        self._quick_setup_refresh_pending = False
         self._audio_apply_timer = QTimer(self)
         self._audio_apply_timer.setSingleShot(True)
         self._audio_apply_timer.timeout.connect(self._apply_audio_settings_auto)
         self.worker_registry = WorkerRegistry()
 
         back_btn = QPushButton("← 戻る")
+        self.back_btn = back_btn
         back_btn.clicked.connect(on_back)
         root_layout.addWidget(back_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.recording_audio_notice = QLabel("録画を継続中です。マイクだけ変更・保存できます。")
+        self.recording_audio_notice.setWordWrap(True)
+        self.recording_audio_notice.hide()
+        root_layout.addWidget(self.recording_audio_notice)
 
         self.tabs = QTabWidget()
         root_layout.addWidget(self.tabs, stretch=1)
@@ -948,10 +962,20 @@ class SettingsPage(QWidget):
 
         self.audio_mic_device = QComboBox()
         self.audio_mic_volume_row, self.audio_mic_volume, self.audio_mic_volume_label = self._create_db_slider()
-        self.audio_mic_mute = QCheckBox("ミュート")
+        self.audio_mic_mute = QCheckBox("ミュート OFF（マイク音声を録音）")
+        self.audio_mic_mute.setMinimumHeight(36)
+        self.audio_mic_mute.setStyleSheet(
+            "QCheckBox { spacing: 10px; padding: 6px; color: #ffffff; }"
+            "QCheckBox::indicator { width: 24px; height: 24px; }"
+            "QCheckBox::indicator:unchecked { background: #ffffff; border: 2px solid #757575; }"
+            "QCheckBox::indicator:checked { background: #16835d; border: 2px solid #ffffff; }"
+        )
+        self.audio_mic_mute.toggled.connect(lambda checked: self.audio_mic_mute.setText(
+            "ミュート ON（マイク音声を録音しない）" if checked else "ミュート OFF（マイク音声を録音）"
+        ))
 
         audio_description = QLabel(
-            "LoLの音声はウィンドウキャプチャから取得します。ここではマイクのみ設定します。"
+            "LoLの音声は専用のアプリケーション音声キャプチャから取得します。ここではマイクのみ設定します。"
         )
         audio_description.setWordWrap(True)
         audio_form.addRow(audio_description)
@@ -993,8 +1017,9 @@ class SettingsPage(QWidget):
         advanced_form.addRow(self.quick_fix_btn)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Reset)
+        self.settings_buttons = buttons
         buttons.accepted.connect(self.save_settings)
-        buttons.rejected.connect(self.load_settings)
+        buttons.button(QDialogButtonBox.StandardButton.Reset).clicked.connect(self.reset_settings)
         root_layout.addWidget(buttons)
 
         self.audio_mic_device.currentIndexChanged.connect(self.queue_audio_auto_apply)
@@ -1037,6 +1062,46 @@ class SettingsPage(QWidget):
             self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
             return
         self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
+
+    def set_recording_audio_only(self, enabled: bool) -> None:
+        self._recording_audio_only = enabled
+        self.recording_audio_notice.setVisible(enabled)
+        self._update_settings_operation_controls()
+        if enabled:
+            self.tabs.setCurrentIndex(1)
+            self.audio_status_label.setText("録画を継続中です。マイクだけ変更・保存できます。")
+
+    def _settings_operation_active(self) -> bool:
+        return any((
+            self._audio_refresh_worker, self._audio_apply_worker, self._runtime_output_worker,
+            self._preflight_worker, self._quick_setup_worker,
+        ))
+
+    def _update_settings_operation_controls(self) -> None:
+        busy = self._settings_operation_active()
+        self.settings_buttons.setEnabled(not busy)
+        self.back_btn.setEnabled(not busy and not self._audio_apply_pending and not self._audio_apply_timer.isActive())
+        for index in (0, 2, 3):
+            self.tabs.setTabEnabled(index, not self._recording_audio_only and not busy)
+        self.tabs.setTabEnabled(1, not (self._preflight_worker or self._quick_setup_worker))
+
+    def reset_settings(self) -> None:
+        if self._settings_operation_active():
+            return
+        self._audio_apply_timer.stop()
+        self._audio_apply_pending = False
+        try:
+            if self._recording_audio_only:
+                data = CONFIG_CONTROLLER.repository.load(create_if_missing=False)
+                self._audio_ui_loading = True
+                try:
+                    self._set_audio_ui_from_config("mic", data.get("audio", {}).get("mic", {}))
+                finally:
+                    self._audio_ui_loading = False
+            else:
+                self.load_settings()
+        finally:
+            self._update_settings_operation_controls()
 
     def browse_recordings_dir(self) -> None:
         current = self.fields["paths.recordings_dir"].text().strip()
@@ -1182,6 +1247,14 @@ class SettingsPage(QWidget):
         self._audio_ui_loading = False
 
     def save_settings(self) -> None:
+        if self._settings_operation_active():
+            return
+        self._audio_apply_timer.stop()
+        self._audio_apply_pending = False
+        self._update_settings_operation_controls()
+        if self._recording_audio_only:
+            self.apply_audio_settings_to_obs(show_success=True, show_error=True, auto_launch=False)
+            return
         data = load_config()
         self._write_settings_ui_to_config(data)
 
@@ -1192,10 +1265,9 @@ class SettingsPage(QWidget):
 
         report["config"]["app"]["setup_completed"] = True
         save_config(report["config"])
-        self.apply_runtime_output_settings_to_obs(report["config"], show_error=False)
+        self.apply_runtime_output_settings_to_obs(report["config"], show_error=True)
         self.load_settings()
         self.setup_completed.emit()
-        QMessageBox.information(self, "設定保存", "設定を保存しました。")
 
     def _get_audio_widgets(self, key: str) -> tuple[QComboBox, QSlider, QCheckBox]:
         if key == "mic":
@@ -1204,13 +1276,19 @@ class SettingsPage(QWidget):
 
     def _add_or_update_audio_combo_items(self, combo: QComboBox, items: list[dict[str, Any]]) -> None:
         current_id = combo.currentData()
+        current_text = combo.currentText()
         combo.blockSignals(True)
         combo.clear()
+        combo.addItem("無効（マイクを録音しない）", recordtest.DISABLED_AUDIO_DEVICE_ID)
         for item in items:
+            if item.get("id") == recordtest.DISABLED_AUDIO_DEVICE_ID:
+                continue
             label = f"{item.get('name', '')} [{item.get('id', '')}]".strip()
             combo.addItem(label, item.get("id"))
         if current_id:
-            self._select_combo_by_data(combo, current_id)
+            if not self._select_combo_by_data(combo, current_id):
+                combo.addItem(current_text, current_id)
+                self._select_combo_by_data(combo, current_id)
         combo.blockSignals(False)
 
     def _select_combo_by_data(self, combo: QComboBox, value: Any) -> bool:
@@ -1349,29 +1427,33 @@ class SettingsPage(QWidget):
         self._write_settings_ui_to_config(data)
         return data
 
+    def _collect_audio_data_from_ui(self) -> dict[str, Any]:
+        if self._recording_audio_only:
+            return {"audio": {"mic": self._read_audio_slot_from_ui("mic")}}
+        data = load_config()
+        self._write_audio_settings_to_config(data)
+        return data
+
     def queue_audio_auto_apply(self, *_args: Any) -> None:
         if self._audio_ui_loading:
             return
         self._audio_apply_timer.start(350)
+        self.back_btn.setEnabled(False)
 
     def _apply_audio_settings_auto(self) -> None:
         self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=True)
 
     def _set_audio_controls_enabled(self, enabled: bool) -> None:
-        for widget in (
-            self.audio_mic_device,
-            self.audio_mic_volume,
-            self.audio_mic_mute,
-        ):
-            widget.setEnabled(enabled)
+        # 一覧取得中もミュートと音量は操作でき、反映は取得終了後に直列化する。
+        self.audio_mic_device.setEnabled(enabled)
 
     def refresh_audio_devices(
         self, show_message: bool = True, show_error: bool = True, auto_launch: bool = True
     ) -> bool:
-        if self._audio_refresh_in_progress:
+        if self._settings_operation_active() or self._audio_apply_timer.isActive():
             return False
         try:
-            data = self._collect_settings_data_from_ui()
+            data = self._collect_audio_data_from_ui()
         except Exception as e:
             if show_error:
                 QMessageBox.warning(self, "音声デバイス一覧", f"取得準備に失敗しました。\n{e}")
@@ -1383,8 +1465,12 @@ class SettingsPage(QWidget):
         self.audio_status_label.setText("音声デバイス一覧を読み込み中...")
         self._set_audio_controls_enabled(False)
 
-        worker = self.worker_registry.register(AudioDeviceRefreshWorker(data, auto_launch=auto_launch))
+        worker = self.worker_registry.register(AudioDeviceRefreshWorker(
+            data, auto_launch=auto_launch and not self._recording_audio_only,
+            live_audio=self._recording_audio_only,
+        ))
         self._audio_refresh_worker = worker
+        self._update_settings_operation_controls()
         worker.loaded.connect(self._on_audio_devices_loaded)
         worker.failed.connect(self._on_audio_devices_failed)
         worker.finished.connect(self._on_audio_refresh_finished)
@@ -1392,13 +1478,9 @@ class SettingsPage(QWidget):
         return True
 
     def _on_audio_devices_loaded(self, result: dict[str, Any]) -> None:
-        cfg = result["config"]
         catalog = result["catalog"]
         self.audio_device_cache["mic"] = list(catalog.get("mic", []))
-        self._audio_ui_loading = True
-        self._set_audio_ui_from_config("mic", cfg.get("audio", {}).get("mic", {}))
-        self._audio_ui_loading = False
-        save_config(cfg)
+        self._add_or_update_audio_combo_items(self.audio_mic_device, self.audio_device_cache["mic"])
 
         msg = "OBSが認識している音声デバイス一覧を更新しました。"
         if result.get("obs_launched"):
@@ -1419,16 +1501,18 @@ class SettingsPage(QWidget):
         if self._audio_refresh_worker:
             self._audio_refresh_worker.deleteLater()
             self._audio_refresh_worker = None
+        self._finish_audio_operation()
 
     def apply_audio_settings_to_obs(
         self, show_success: bool = True, show_error: bool = True, auto_launch: bool = True
     ) -> bool:
-        if self._audio_apply_worker and self._audio_apply_worker.isRunning():
+        if self._settings_operation_active():
             self._audio_apply_pending = True
             return False
         try:
-            data = self._collect_settings_data_from_ui()
+            data = self._collect_audio_data_from_ui()
         except Exception as e:
+            self._update_settings_operation_controls()
             if show_error:
                 QMessageBox.warning(self, "音声設定", f"反映準備に失敗しました。\n{e}")
             return False
@@ -1436,8 +1520,12 @@ class SettingsPage(QWidget):
         self._audio_apply_show_success = show_success
         self._audio_apply_show_error = show_error
         self.audio_status_label.setText("音声設定をOBSへ反映中...")
-        worker = self.worker_registry.register(AudioApplyWorker(data, auto_launch=auto_launch))
+        worker = self.worker_registry.register(AudioApplyWorker(
+            data, auto_launch=auto_launch and not self._recording_audio_only,
+            live_audio=self._recording_audio_only,
+        ))
         self._audio_apply_worker = worker
+        self._update_settings_operation_controls()
         worker.loaded.connect(self._on_audio_settings_applied)
         worker.failed.connect(self._on_audio_settings_apply_failed)
         worker.finished.connect(self._on_audio_apply_finished)
@@ -1445,7 +1533,7 @@ class SettingsPage(QWidget):
         return True
 
     def _on_audio_settings_applied(self, result: dict[str, Any]) -> None:
-        msg = "音声設定をOBSへ反映しました。"
+        msg = "マイク設定を保存し、OBSへ反映しました。"
         if result.get("obs_launched"):
             msg += "\n（ポータブルOBSをバックグラウンドで起動しました）"
         self.audio_status_label.setText(msg)
@@ -1461,12 +1549,17 @@ class SettingsPage(QWidget):
         if self._audio_apply_worker:
             self._audio_apply_worker.deleteLater()
             self._audio_apply_worker = None
+        self._finish_audio_operation()
+
+    def _finish_audio_operation(self) -> None:
         if self._audio_apply_pending:
             self._audio_apply_pending = False
+            self._audio_apply_timer.stop()
             self.apply_audio_settings_to_obs(show_success=False, show_error=False, auto_launch=True)
+        self._update_settings_operation_controls()
 
     def apply_runtime_output_settings_to_obs(self, cfg: dict[str, Any] | None = None, show_error: bool = False) -> bool:
-        if self._runtime_output_worker and self._runtime_output_worker.isRunning():
+        if self._recording_audio_only or self._settings_operation_active():
             return False
         try:
             data = cfg if cfg is not None else load_config()
@@ -1476,6 +1569,8 @@ class SettingsPage(QWidget):
             return False
         worker = self.worker_registry.register(RuntimeOutputApplyWorker(data))
         self._runtime_output_worker = worker
+        self._update_settings_operation_controls()
+        worker.loaded.connect(lambda _result: QMessageBox.information(self, "設定保存", "設定を保存し、OBSへ反映しました。"))
         worker.failed.connect(
             lambda message: (
                 QMessageBox.warning(self, "設定反映", f"録画設定のOBS反映に失敗しました。\n{message}")
@@ -1491,6 +1586,7 @@ class SettingsPage(QWidget):
         if self._runtime_output_worker:
             self._runtime_output_worker.deleteLater()
             self._runtime_output_worker = None
+        self._finish_audio_operation()
 
     def auto_fill_settings(self) -> None:
         data = load_config()
@@ -1506,7 +1602,7 @@ class SettingsPage(QWidget):
         QMessageBox.information(self, "自動補完", f"設定の自動補完を実行しました。\n{note_text}")
 
     def run_preflight_fix(self) -> None:
-        if self._preflight_worker and self._preflight_worker.isRunning():
+        if self._recording_audio_only or self._settings_operation_active() or self._audio_apply_timer.isActive():
             QMessageBox.information(self, "録画前チェック", "チェック実行中です。完了まで待ってください。")
             return
         data = load_config()
@@ -1514,6 +1610,7 @@ class SettingsPage(QWidget):
         self.preflight_btn.setText("チェック実行中...")
         worker = self.worker_registry.register(PreflightWorker(data))
         self._preflight_worker = worker
+        self._update_settings_operation_controls()
         worker.loaded.connect(self._on_preflight_finished)
         worker.failed.connect(self._on_preflight_failed)
         worker.finished.connect(self._on_preflight_worker_finished)
@@ -1541,6 +1638,7 @@ class SettingsPage(QWidget):
         if self._preflight_worker:
             self._preflight_worker.deleteLater()
             self._preflight_worker = None
+        self._finish_audio_operation()
 
     def open_setup_wizard(self) -> None:
         dialog = SetupWizardDialog(self, startup_mode=False)
@@ -1550,7 +1648,7 @@ class SettingsPage(QWidget):
             self.setup_completed.emit()
 
     def run_quick_setup(self) -> bool:
-        if self._quick_setup_worker and self._quick_setup_worker.isRunning():
+        if self._recording_audio_only or self._settings_operation_active() or self._audio_apply_timer.isActive():
             QMessageBox.information(self, "OBS設定", "OBS設定の構成を実行中です。完了まで待ってください。")
             return False
         data = load_config()
@@ -1558,6 +1656,8 @@ class SettingsPage(QWidget):
         self.quick_fix_btn.setText("構成・再検査中...")
         worker = self.worker_registry.register(QuickSetupWorker(data))
         self._quick_setup_worker = worker
+        self._quick_setup_refresh_pending = False
+        self._update_settings_operation_controls()
         worker.loaded.connect(self._on_quick_setup_finished)
         worker.failed.connect(self._on_quick_setup_failed)
         worker.finished.connect(self._on_quick_setup_worker_finished)
@@ -1574,7 +1674,7 @@ class SettingsPage(QWidget):
             return
 
         self.load_settings()
-        self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
+        self._quick_setup_refresh_pending = True
         self.setup_completed.emit()
         color_hex = recordtest.obs_color_to_hex(info.get("source_color"))
         launch_note = "（セットアップのためポータブルOBSを自動起動しました）" if info.get("obs_launched") else ""
@@ -1599,6 +1699,10 @@ class SettingsPage(QWidget):
         if self._quick_setup_worker:
             self._quick_setup_worker.deleteLater()
             self._quick_setup_worker = None
+        self._finish_audio_operation()
+        if self._quick_setup_refresh_pending:
+            self._quick_setup_refresh_pending = False
+            self.refresh_audio_devices(show_message=False, show_error=False, auto_launch=True)
 
     def stop_workers(self, timeout_ms: int = 1500) -> bool:
         self._audio_apply_timer.stop()
@@ -1888,14 +1992,25 @@ class MainWindow(QMainWindow):
 
     def show_settings(self) -> None:
         self._stop_player()
-        if self.bg_recorder_worker and self.bg_recorder_worker.isRunning():
-            if not self.stop_background_recorder(wait_ms=5000):
+        audio_only = False
+        worker = self.bg_recorder_worker
+        if worker and worker.update_shutdown_failed():
+            self._last_recorder_shutdown_failed = True
+        if worker and worker.isRunning():
+            if not worker.request_update_shutdown():
+                audio_only = True
+            elif not self.stop_background_recorder(wait_ms=5000) or worker.update_shutdown_failed():
+                self._last_recorder_shutdown_failed = worker.update_shutdown_failed()
                 QMessageBox.warning(
                     self,
                     "設定",
                     "録画監視の停止が完了していないため、設定画面を開けません。少し待ってから再試行してください。",
                 )
                 return
+        if self._last_recorder_shutdown_failed:
+            QMessageBox.warning(self, "設定", "OBSの終了状態を確認できないため、設定画面を開けません。")
+            return
+        self.settings_page.set_recording_audio_only(audio_only)
         self.stack.setCurrentWidget(self.settings_page)
         self.settings_page.on_page_shown()
 

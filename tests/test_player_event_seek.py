@@ -11,6 +11,7 @@ from src.player import (
     calculate_event_seek_position,
     calculate_sync_offset,
 )
+from src.replay_timing import make_sync_interval
 from src.session_log import load_session_payload, save_session_payload
 
 
@@ -355,4 +356,110 @@ def test_active_sync_completion_fails_closed_for_invalid_sync_game_time(qtbot, s
     assert widget.event_list.isEnabled() is True
     assert widget.player.pause is False
     assert widget.play_btn.text() == "Pause"
+    widget.player = None
+
+
+def _timed_widget(qtbot):
+    widget = PlayerWidget(auto_open=False)
+    qtbot.addWidget(widget)
+    widget.player = SimpleNamespace(seek=Mock(), pause=True, time_pos=0.0)
+    widget.offset = 0.0
+    widget.duration = 204.034
+    widget.sync_intervals = [
+        make_sync_interval((29, 24), (30, 25)),
+        make_sync_interval((75, 184), (76, 185)),
+    ]
+    return widget
+
+
+def _event_item(widget, game_time):
+    item = QListWidgetItem()
+    item.setData(Qt.ItemDataRole.UserRole, game_time)
+    widget.event_list.addItem(item)
+    widget.event_list.setCurrentItem(item)
+    return item
+
+
+def test_pause_recording_uses_video_time_before_applying_five_second_preroll(qtbot):
+    widget = _timed_widget(qtbot)
+    first = _event_item(widget, 29.5)
+    later = _event_item(widget, 75.78820037841797)
+
+    widget.on_event_clicked(first)
+    assert widget.player.seek.call_args.args[0] == 19.5
+    widget.on_event_clicked(later)
+    assert widget.player.seek.call_args.args[0] == pytest.approx(179.78820037841797)
+    widget.player = None
+
+
+def test_manual_correction_does_not_apply_the_pause_twice(qtbot):
+    widget = _timed_widget(qtbot)
+    later = _event_item(widget, 75.5)
+    widget.player.time_pos = 186.5
+    widget.sync_to_current_position()
+
+    assert widget.offset == 2.0
+    widget.on_event_clicked(later)
+    assert widget.player.seek.call_args.args[0] == 181.5
+    widget.on_event_clicked(_event_item(widget, 29.5))
+    assert widget.player.seek.call_args.args[0] == 21.5
+    widget.player = None
+
+
+def test_unobserved_event_requires_its_own_manual_sync_without_changing_other_events(qtbot):
+    widget = _timed_widget(qtbot)
+    unknown = _event_item(widget, 50)
+    widget.on_event_clicked(unknown)
+    widget.player.seek.assert_not_called()
+    assert "未確認" in widget.info_label.text()
+
+    widget.player.time_pos = 160
+    widget.sync_to_current_position()
+    widget.on_event_clicked(unknown)
+    assert widget.player.seek.call_args.args[0] == 155
+    widget.player.seek.reset_mock()
+    widget.on_event_clicked(_event_item(widget, 51))
+    widget.player.seek.assert_not_called()
+    widget.on_event_clicked(_event_item(widget, 75.5))
+    assert widget.player.seek.call_args.args[0] == 179.5
+    widget.player = None
+
+
+def test_new_recording_start_row_seeks_zero_without_changing_event_sync(qtbot):
+    widget = _timed_widget(qtbot)
+    widget.offset = 2.0
+    widget.populate_event_list()
+    first = widget.event_list.item(0)
+    assert "録画の先頭" in first.text()
+    widget.event_list.setCurrentItem(first)
+    widget.player.time_pos = 80
+    widget.sync_to_current_position()
+    assert widget.offset == 2.0
+    assert widget.manual_event_times == {}
+
+    widget.on_event_clicked(first)
+    widget.player.seek.assert_called_once_with(0.0, reference="absolute", precision="exact")
+    widget.player = None
+
+
+@pytest.mark.parametrize("intervals", [[], None, {"bad": True}])
+def test_new_timing_payload_never_falls_back_to_initial_marker_sync(qtbot, monkeypatch, tmp_path, intervals):
+    widget = _timed_widget(qtbot)
+    widget.player.play = Mock()
+    widget.manual_event_times[50] = 160
+    monkeypatch.setattr(player_module, "load_session_payload", lambda _path: {"sync_intervals": intervals})
+    monkeypatch.setattr(player_module, "resolve_video_path", lambda *_args: tmp_path / "recording.mkv")
+    monkeypatch.setattr(widget, "cancel_sync_worker", lambda **_kwargs: True)
+    monkeypatch.setattr(widget, "init_mpv", lambda: True)
+    monkeypatch.setattr(widget, "update_video_fps", lambda: None)
+    start_sync_worker = Mock()
+    monkeypatch.setattr(widget, "start_sync_worker", start_sync_worker)
+
+    assert widget.load_data(tmp_path / "recording.json") is True
+    start_sync_worker.assert_not_called()
+    assert widget.sync_intervals == []
+    assert widget.manual_event_times == {}
+    assert "自動同期できません" in widget.info_label.text()
+    widget.on_event_clicked(_event_item(widget, 50))
+    widget.player.seek.assert_not_called()
     widget.player = None

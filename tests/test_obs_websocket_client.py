@@ -4,6 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -178,6 +179,9 @@ class SceneClient:
     def get_input_list(self):
         return SimpleNamespace(inputs=self.inputs)
 
+    def get_input_kind_list(self, unversioned):
+        return SimpleNamespace(input_kinds=["wasapi_process_output_capture"])
+
     def create_input(self, scene_name, input_name, input_kind, settings, enabled):
         self.inputs.append({"inputName": input_name, "inputKind": input_kind})
         self.created_inputs.append((scene_name, input_name, input_kind, dict(settings), enabled))
@@ -202,6 +206,18 @@ class SceneClient:
     def set_input_settings(self, input_name, settings, overlay=True):
         return None
 
+    def set_input_mute(self, input_name, muted):
+        return None
+
+    def set_input_volume(self, input_name, *, vol_db):
+        return None
+
+    def set_input_audio_monitor_type(self, input_name, monitor_type):
+        return None
+
+    def set_input_audio_tracks(self, input_name, tracks):
+        return None
+
     def set_scene_item_transform(self, scene_name, item_id, transform):
         return None
 
@@ -220,7 +236,7 @@ def test_setup_sync_elements_handles_scene_and_input_crud() -> None:
     client.setup_sync_elements()
 
     created_kinds = [item[2] for item in raw_client.created_inputs]
-    assert created_kinds == ["window_capture", "color_source_v3"]
+    assert created_kinds == ["window_capture", "wasapi_process_output_capture", "color_source_v3"]
     assert raw_client.current_scene == recordtest.DEFAULT_OBS_SCENE_NAME
     assert raw_client.removed_inputs == [recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME]
     assert raw_client.removed_scenes == ["Scene"]
@@ -288,10 +304,11 @@ class RecordingClient:
         self.marker_calls.append((scene_name, item_id, enabled))
 
 
-def test_recording_status_and_sync_marker_requests() -> None:
+def test_recording_status_and_sync_marker_requests(monkeypatch) -> None:
     raw_client = RecordingClient()
     client = obs_websocket_client.ObsWebSocketClient(config=app_config())
     client.client = raw_client
+    monkeypatch.setattr(client, "_ensure_game_audio_capture", lambda: None)
 
     client.start_recording()
     assert client.stop_recording() == "C:/recordings/game.mkv"
@@ -303,6 +320,62 @@ def test_recording_status_and_sync_marker_requests() -> None:
     assert details["output_timecode"] == "00:00:01.000"
     assert details["output_bytes"] == 2048
     assert raw_client.marker_calls == [(recordtest.DEFAULT_OBS_SCENE_NAME, 77, True)]
+
+
+@pytest.mark.parametrize(
+    ("active", "paused", "duration", "expected"),
+    [
+        (True, False, 1234, 1.234),
+        (True, False, 0, 0.0),
+        (False, False, 1234, None),
+        (True, True, 1234, None),
+        (1, False, 1234, None),
+        (True, None, 1234, None),
+        (True, False, None, None),
+        (True, False, True, None),
+        (True, False, "1234", None),
+        (True, False, -1, None),
+        (True, False, float("nan"), None),
+        (True, False, float("inf"), None),
+        (True, False, 10 ** 400, None),
+    ],
+)
+def test_recording_clock_uses_only_active_unpaused_numeric_duration(active, paused, duration, expected):
+    raw_client = Mock()
+    raw_client.get_record_status.return_value = SimpleNamespace(
+        output_active=active, output_paused=paused, output_duration=duration,
+    )
+    client = obs_websocket_client.ObsWebSocketClient(config=app_config())
+    client.client = raw_client
+
+    assert client.get_recording_clock() == expected
+    raw_client.get_record_status.assert_called_once_with()
+    assert len(raw_client.mock_calls) == 1
+
+
+def test_recording_clock_does_not_retry_or_control_recording_when_status_fails():
+    raw_client = Mock()
+    raw_client.get_record_status.side_effect = TimeoutError("unavailable")
+    client = obs_websocket_client.ObsWebSocketClient(config=app_config())
+    client.client = raw_client
+
+    with pytest.raises(TimeoutError, match="unavailable"):
+        client.get_recording_clock()
+    raw_client.get_record_status.assert_called_once_with()
+    assert all(call[0] in {"get_record_status", "disconnect"} for call in raw_client.mock_calls)
+    assert raw_client.disconnect.call_count <= 1
+    assert "get_recording_clock" not in obs_websocket_client.OBSClient.__abstractmethods__
+    assert obs_websocket_client.OBSClient.get_recording_clock(object()) is None
+
+
+def test_recording_clock_uses_the_shared_recording_status_boundary():
+    client = obs_websocket_client.ObsWebSocketClient(config=app_config())
+    client._get_record_status = Mock(
+        return_value=SimpleNamespace(output_active=True, output_paused=False, output_duration=3500)
+    )
+
+    assert client.get_recording_clock() == 3.5
+    client._get_record_status.assert_called_once_with()
 
 
 def test_raw_request_falls_back_for_legacy_send_signature() -> None:

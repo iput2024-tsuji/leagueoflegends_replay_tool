@@ -170,6 +170,7 @@ class OBSRuntimeManager:
         auto_launch: bool = False,
         force_launch: bool = False,
         auto_setup: bool = False,
+        configure_output: bool = True,
         status_cb: Any | None = None,
         max_retries: int = 2,
         retry_delay: float = 0.5,
@@ -180,6 +181,7 @@ class OBSRuntimeManager:
                 auto_launch=auto_launch,
                 force_launch=force_launch,
                 auto_setup=auto_setup,
+                configure_output=configure_output,
                 status_cb=status_cb,
                 max_retries=max_retries,
                 retry_delay=retry_delay,
@@ -192,6 +194,7 @@ class OBSRuntimeManager:
         auto_launch: bool = False,
         force_launch: bool = False,
         auto_setup: bool = False,
+        configure_output: bool = True,
         status_cb: Any | None = None,
         max_retries: int = 2,
         retry_delay: float = 0.5,
@@ -226,7 +229,7 @@ class OBSRuntimeManager:
                     pass
                 else:
                     launched_process = recordtest.launch_obs(config)
-            elif recordtest.is_tcp_port_open(
+            elif not configure_output or recordtest.is_tcp_port_open(
                 config.obs.host,
                 config.obs.port,
                 timeout=0.3,
@@ -253,7 +256,12 @@ class OBSRuntimeManager:
                 auto_setup=auto_setup,
                 obs_client=obs_client,
             )
-            recorder.open()
+            if configure_output:
+                recorder.open()
+            else:
+                recorder.open(configure_output=False)
+                if not self._has_owned_process(process_manager):
+                    raise recordtest.RecorderError("接続中に管理対象OBSの所有権を確認できなくなりました。")
             return RecorderRuntime(
                 recorder=recorder,
                 owns_process=launched_process is not None or owns_existing_process,

@@ -1244,7 +1244,7 @@ def test_record_status_details_include_obs_profile_and_output_diagnostics():
     assert details["simple_file_output.path"] == "C:/recordings/game.mkv"
 
 
-def test_start_recording_raises_when_raw_obs_response_reports_failure():
+def test_start_recording_raises_when_raw_obs_response_reports_failure(monkeypatch):
     class RawClient:
         def send(self, request_type, payload, raw=True):
             assert request_type == "StartRecord"
@@ -1258,6 +1258,7 @@ def test_start_recording_raises_when_raw_obs_response_reports_failure():
 
     obs_client = recordtest.ObsWebSocketClient(config=app_config())
     obs_client.client = RawClient()
+    monkeypatch.setattr(obs_client, "_ensure_game_audio_capture", lambda: None)
 
     with pytest.raises(recordtest.RecorderError, match="Output start failed"):
         obs_client.start_recording()
@@ -3356,6 +3357,87 @@ def test_cli_typed_preflight_error_still_exits_with_status_one(monkeypatch):
     assert captured.value.code == 1
 
 
+@pytest.mark.parametrize("saved", [True, False])
+@pytest.mark.parametrize("cancelled", [True, False])
+@pytest.mark.parametrize("partial", [True, False])
+def test_cli_exit_matches_finalization_outcome(monkeypatch, saved, cancelled, partial):
+    expected_outcome = recordtest.RecordingOutcome.ABORTED if cancelled else recordtest.RecordingOutcome.COMPLETED
+    app = SimpleNamespace(
+        open=Mock(), apply_audio_profile=Mock(), reset_session=Mock(),
+        wait_for_game_start_async=AsyncMock(side_effect=[True, False]),
+        start_recording_async=AsyncMock(),
+        record_until_end_async=AsyncMock(return_value=(
+            recordtest.RecordingOutcome.CANCELLED if cancelled else recordtest.RecordingOutcome.COMPLETED
+        )),
+        finalize_session=Mock(return_value=recordtest.FinalizeResult(
+            success=saved, saved=saved,
+            outcome=recordtest.RecordingOutcome.FAILED_PARTIAL if partial else expected_outcome,
+            error=None if saved else "disk full",
+        )),
+        failure_reason="OBS録画停止の応答が失われました。",
+        has_session_data=Mock(return_value=True), mark_session_aborted=Mock(),
+        stop_recording=Mock(), shutdown_obs=Mock(),
+    )
+    monkeypatch.setattr(recordtest, "load_settings", lambda: {})
+    monkeypatch.setattr(recordtest, "run_preflight_checks", lambda *_args, **_kwargs: {"config": {}})
+    monkeypatch.setattr(recordtest, "setup_environment", lambda _config: None)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda _config: SimpleNamespace(pid=101))
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda **_kwargs: app)
+    logger = Mock()
+    monkeypatch.setattr(recordtest, "LOGGER", logger)
+
+    failed = partial or not saved
+    if failed:
+        with pytest.raises(SystemExit) as captured:
+            asyncio.run(recordtest.run_cli_recorder())
+        assert captured.value.code == 1
+        logger.error.assert_called_once()
+        assert logger.error.call_args.args[0] == "❌ %s"
+        failed_save = "中断ログの保存に失敗しました" if cancelled else "セッション保存に失敗しました"
+        expected_error = app.failure_reason if saved else f"{failed_save}: disk full"
+        assert str(logger.error.call_args.args[1]) == expected_error
+    else:
+        asyncio.run(recordtest.run_cli_recorder())
+        logger.error.assert_not_called()
+    completion_logged = any("試合記録完了" in call.args[0] for call in logger.info.call_args_list)
+    assert completion_logged is (not failed and not cancelled)
+    assert app.wait_for_game_start_async.await_count == (1 if failed or cancelled else 2)
+    app.start_recording_async.assert_awaited_once()
+    assert app.finalize_session.call_count == 1
+    assert app.finalize_session.call_args.kwargs["outcome"] is expected_outcome
+    app.shutdown_obs.assert_called_once()
+
+
+@pytest.mark.parametrize("stop_failed", [False, True])
+def test_cli_interrupt_preserves_cleanup_stop_result(monkeypatch, stop_failed):
+    app = SimpleNamespace(
+        open=Mock(), apply_audio_profile=Mock(), reset_session=Mock(),
+        wait_for_game_start_async=AsyncMock(return_value=True), start_recording_async=AsyncMock(),
+        record_until_end_async=AsyncMock(side_effect=KeyboardInterrupt()), shutdown_obs=Mock(),
+        session_outcome=recordtest.RecordingOutcome.COMPLETED, failure_reason=None,
+    )
+
+    def stop_recording():
+        if stop_failed:
+            app.session_outcome = recordtest.RecordingOutcome.FAILED_PARTIAL
+            app.failure_reason = "stop response unavailable"
+
+    app.stop_recording = Mock(side_effect=stop_recording)
+    monkeypatch.setattr(recordtest, "load_settings", lambda: {})
+    monkeypatch.setattr(recordtest, "run_preflight_checks", lambda *_args, **_kwargs: {"config": {}})
+    monkeypatch.setattr(recordtest, "setup_environment", lambda _config: None)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda _config: SimpleNamespace(pid=101))
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda **_kwargs: app)
+    if stop_failed:
+        with pytest.raises(recordtest.RecorderError, match="stop response unavailable"):
+            asyncio.run(recordtest.run_cli_recorder())
+    else:
+        asyncio.run(recordtest.run_cli_recorder())
+    app.stop_recording.assert_called_once()
+    app.shutdown_obs.assert_called_once()
+    app.wait_for_game_start_async.assert_awaited_once()
+
+
 def test_disable_obs_global_audio_devices_disables_profile_and_live_inputs():
     class FakeObsRawClient:
         def __init__(self):
@@ -3442,6 +3524,9 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
         def get_input_list(self):
             return SimpleNamespace(inputs=self.inputs)
 
+        def get_input_kind_list(self, unversioned):
+            return SimpleNamespace(input_kinds=["wasapi_process_output_capture"])
+
         def remove_input(self, input_name):
             self.removed_inputs.append(input_name)
             self.inputs = [item for item in self.inputs if item.get("inputName") != input_name]
@@ -3484,6 +3569,18 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
         def set_input_settings(self, input_name, settings, overlay=True):
             return None
 
+        def set_input_mute(self, input_name, muted):
+            return None
+
+        def set_input_volume(self, input_name, *, vol_db):
+            return None
+
+        def set_input_audio_monitor_type(self, input_name, monitor_type):
+            return None
+
+        def set_input_audio_tracks(self, input_name, tracks):
+            return None
+
         def set_scene_item_transform(self, scene_name, item_id, transform):
             self.transform_calls.append((scene_name, item_id, dict(transform)))
 
@@ -3506,7 +3603,8 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     client.setup_sync_elements()
 
     window_capture = raw_client.created_inputs[0]
-    sync_marker = raw_client.created_inputs[1]
+    game_audio = raw_client.created_inputs[1]
+    sync_marker = raw_client.created_inputs[2]
     assert raw_client.current_scene == recordtest.DEFAULT_OBS_SCENE_NAME
     assert raw_client.removed_scenes == ["Scene"]
     assert raw_client.removed_inputs == [recordtest.DEFAULT_OBS_GAME_CAPTURE_NAME]
@@ -3516,13 +3614,15 @@ def test_setup_sync_elements_replaces_game_capture_with_window_capture_and_remov
     assert window_capture["settings"]["window"] == recordtest.DEFAULT_OBS_WINDOW_CAPTURE_WINDOW
     assert window_capture["settings"]["client_area"] is True
     assert window_capture["settings"]["capture_audio"] is False
+    assert game_audio["kind"] == "wasapi_process_output_capture"
+    assert game_audio["name"] == "lol_game_audio"
     assert sync_marker["name"] == recordtest.DEFAULT_OBS_SOURCE_NAME
 
     scene_items = raw_client.scene_items_by_scene[recordtest.DEFAULT_OBS_SCENE_NAME]
     window_item_id = scene_items[0]["sceneItemId"]
-    sync_item_id = scene_items[1]["sceneItemId"]
+    sync_item_id = scene_items[2]["sceneItemId"]
     assert (recordtest.DEFAULT_OBS_SCENE_NAME, window_item_id, 0) in raw_client.index_calls
-    assert (recordtest.DEFAULT_OBS_SCENE_NAME, sync_item_id, 1) in raw_client.index_calls
+    assert (recordtest.DEFAULT_OBS_SCENE_NAME, sync_item_id, 2) in raw_client.index_calls
     assert (
         recordtest.DEFAULT_OBS_SCENE_NAME,
         window_item_id,
@@ -5417,3 +5517,49 @@ def test_storage_limit_deletes_session_when_clip_listing_fails(monkeypatch, tmp_
     assert not owned_video.exists()
     assert not json_path.exists()
     assert owned_clip.exists()
+
+
+@pytest.mark.parametrize("entrypoint", ["setup", "cli"])
+def test_disabled_microphone_startup_failure_propagates_and_cleans_up(monkeypatch, tmp_path, entrypoint):
+    settings = {
+        "obs": {"password": "test-password"},
+        "audio": {"mic": {"device_id": "disabled"}},
+        "paths": {"recordings_dir": str(tmp_path), "json_dir": str(tmp_path / "json")},
+    }
+    primary = recordtest.RecorderError("microphone disable failed")
+    app = Mock(spec=[
+        "open", "apply_record_output_settings", "apply_audio_profile",
+        "shutdown_obs", "disconnect_obs", "stop_recording",
+        "reset_session", "wait_for_game_start_async", "start_recording_async",
+    ])
+    app._open_cleanup_attempted = False
+    app.apply_audio_profile.side_effect = primary
+    monkeypatch.setattr(recordtest, "load_settings", lambda: settings)
+    monkeypatch.setattr(recordtest, "run_preflight_checks", lambda *args, **kwargs: {
+        "config": settings, "changed": False, "warnings": [], "errors": [],
+    })
+    monkeypatch.setattr(recordtest, "setup_environment", lambda config: None)
+    monkeypatch.setattr(recordtest, "ensure_recording_dirs", lambda config: None)
+    monkeypatch.setattr(recordtest, "OBSProcessManager", lambda *args, **kwargs: SimpleNamespace())
+    monkeypatch.setattr(recordtest, "test_obs_connection", lambda *args, **kwargs: (False, "fixture"))
+    monkeypatch.setattr(recordtest, "wait_for_owned_obs_connection", lambda *args, **kwargs: False)
+    monkeypatch.setattr(recordtest, "launch_obs", lambda config: SimpleNamespace(pid=123))
+    monkeypatch.setattr(recordtest, "LoLAutoRecorder", lambda **kwargs: app)
+
+    expected_error = recordtest.RecorderError if entrypoint == "setup" else SystemExit
+    with pytest.raises(expected_error) as captured:
+        if entrypoint == "setup":
+            recordtest._setup_obs_sync_elements_locked(settings)
+        else:
+            run(recordtest.run_cli_recorder())
+
+    if entrypoint == "setup":
+        assert captured.value is primary
+    else:
+        assert captured.value.code == 1
+        assert captured.value.__context__ is primary
+    app.apply_audio_profile.assert_called_once()
+    app.reset_session.assert_not_called()
+    app.wait_for_game_start_async.assert_not_called()
+    app.start_recording_async.assert_not_called()
+    app.shutdown_obs.assert_called_once_with()

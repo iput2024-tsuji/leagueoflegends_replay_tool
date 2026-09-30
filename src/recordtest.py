@@ -108,6 +108,7 @@ try:
         RecordingOutcome,
         RecordingPhase,
     )
+    from .replay_timing import make_sync_interval
     from .riot_api import LiveClientRiotAPIClient, RiotAPIClient, RiotPollResult, RiotPollStatus
     from .session_log import SessionLogV1, save_session_payload
 except ImportError:
@@ -189,6 +190,7 @@ except ImportError:
         RecordingOutcome,
         RecordingPhase,
     )
+    from replay_timing import make_sync_interval
     from riot_api import LiveClientRiotAPIClient, RiotAPIClient, RiotPollResult, RiotPollStatus
     from session_log import SessionLogV1, save_session_payload
 
@@ -263,6 +265,8 @@ DEFAULT_MAX_STORAGE_GB = config_schema.DEFAULT_MAX_STORAGE_GB
 DEFAULT_AUDIO_MIC_INPUT_NAME = config_schema.DEFAULT_AUDIO_MIC_INPUT_NAME
 DEFAULT_AUDIO_DEVICE_ID = config_schema.DEFAULT_AUDIO_DEVICE_ID
 DEFAULT_AUDIO_DEVICE_NAME = config_schema.DEFAULT_AUDIO_DEVICE_NAME
+# Application selection only; WASAPI has no "disabled" device ID.
+DISABLED_AUDIO_DEVICE_ID = "disabled"
 DEFAULT_AUDIO_MIC_VOLUME_DB = config_schema.DEFAULT_AUDIO_MIC_VOLUME_DB
 DEFAULT_AUDIO_MIC_MUTE = config_schema.DEFAULT_AUDIO_MIC_MUTE
 DEFAULT_RECORDING_START_TIMEOUT_SEC = 15.0
@@ -2508,36 +2512,23 @@ def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg:
     input_kind = spec["input_kind"]
     created = False
 
-    input_exists = False
-    input_kind_matches = False
-    try:
-        input_resp = client.get_input_list()
-        input_items = getattr(input_resp, "inputs", []) or []
-        for item in input_items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("inputName") != input_name:
-                continue
-            input_exists = True
-            input_kind_matches = item.get("inputKind") == input_kind
-            break
-    except Exception:
-        input_exists = False
-
-    if input_exists and not input_kind_matches:
-        try:
-            client.remove_input(input_name)
-            input_exists = False
-        except Exception:
-            # 種別違いでも削除できない場合は後続の設定更新で失敗させる。
-            pass
+    input_items = client.get_input_list().inputs
+    if not isinstance(input_items, list):
+        raise RecorderError("マイクソース一覧を確認できません。")
+    matching = [item for item in input_items if isinstance(item, dict) and item.get("inputName") == input_name]
+    if matching and (len(matching) != 1 or matching[0].get("inputKind") != input_kind):
+        raise RecorderError("同名の別種マイクソースは変更できません。")
+    input_exists = bool(matching)
+    disabled = slot_cfg.get("device_id") == DISABLED_AUDIO_DEVICE_ID
 
     if not input_exists:
-        settings = {"device_id": str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)}
+        # The app's disabled selection hides this scene item, not a WASAPI device.
+        device_id = DEFAULT_AUDIO_DEVICE_ID if disabled else str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)
+        settings = {"device_id": device_id}
         last_error = None
         for kind_name in (input_kind,):
             try:
-                client.create_input(scene_name, input_name, kind_name, settings, True)
+                client.create_input(scene_name, input_name, kind_name, settings, not disabled)
                 created = True
                 input_exists = True
                 break
@@ -2546,16 +2537,7 @@ def _ensure_single_audio_input(client: Any, scene_name: str, key: str, slot_cfg:
         if not input_exists:
             raise RecorderError(f"{spec['label']}ソース '{input_name}' の作成に失敗しました: {last_error}")
 
-    # 保存されている device_id を先に適用（default でも可）
-    try:
-        client.set_input_settings(
-            input_name,
-            {"device_id": str(slot_cfg.get("device_id") or DEFAULT_AUDIO_DEVICE_ID)},
-            overlay=True,
-        )
-    except Exception:
-        pass
-
+    # Device and enable state are applied together after scene/type validation.
     return created
 
 
@@ -2626,13 +2608,37 @@ def apply_audio_input_settings(
     device_id: str | None = None,
     volume_db: float | int | str | None = None,
     mute: bool | None = None,
+    *,
+    scene_name: str | None = None,
 ) -> None:
-    if device_id not in (None, ""):
+    disabled = device_id == DISABLED_AUDIO_DEVICE_ID
+    if disabled and not scene_name:
+        raise RecorderError("マイクを無効にする録画シーンを指定してください。")
+    if scene_name:
+        inputs = client.get_input_list().inputs
+        items = client.get_scene_item_list(scene_name).scene_items
+        if not isinstance(inputs, list) or not isinstance(items, list):
+            raise RecorderError("既存のマイクソースと録画シーンを確認できません。")
+        matching = [item for item in inputs if isinstance(item, dict) and item.get("inputName") == input_name]
+        if (len(matching) != 1
+                or matching[0].get("inputKind") != MANAGED_AUDIO_INPUTS["mic"]["input_kind"]):
+            raise RecorderError("既存のマイクソースの種別を確認できません。")
+        scene_items = [item for item in items if isinstance(item, dict) and item.get("sourceName") == input_name]
+        item_id = scene_items[0].get("sceneItemId") if len(scene_items) == 1 else None
+        if type(item_id) is not int or item_id < 0:
+            raise RecorderError("録画シーン内のマイクソースを一意に確認できません。")
+
+    if disabled:
+        client.set_scene_item_enabled(scene_name, item_id, False)
+    elif device_id not in (None, ""):
         client.set_input_settings(input_name, {"device_id": str(device_id)}, overlay=True)
     if volume_db is not None:
         client.set_input_volume(input_name, vol_db=float(volume_db))
     if mute is not None:
         client.set_input_mute(input_name, bool(mute))
+    if scene_name and not disabled:
+        # Do not enable a previously disabled microphone until all settings succeed.
+        client.set_scene_item_enabled(scene_name, item_id, True)
 
 
 def apply_audio_profile_from_config(
@@ -2654,6 +2660,7 @@ def apply_audio_profile_from_config(
                 device_id=slot_cfg.get("device_id"),
                 volume_db=slot_cfg.get("volume_db"),
                 mute=slot_cfg.get("mute"),
+                scene_name=scene_name,
             )
         except Exception as e:
             raise RecorderError(f"{MANAGED_AUDIO_INPUTS[key]['label']}設定の適用に失敗しました: {e}") from e
@@ -2713,6 +2720,8 @@ def _setup_obs_sync_elements_locked(
         try:
             recorder.apply_audio_profile(cfg)
         except Exception as e:
+            if _get_audio_slot_config(cfg, "mic")["device_id"] == DISABLED_AUDIO_DEVICE_ID:
+                raise
             if status_cb:
                 try:
                     status_cb(f"⚠️ 音声設定の初期適用に失敗しました: {e}")
@@ -3304,12 +3313,13 @@ class LoLAutoRecorder(RecordingSessionManager):
         self._open_cleanup_attempted = False
         self.reset_session()
 
-    def open(self) -> None:
+    def open(self, *, configure_output: bool = True) -> None:
         if self.opened:
             return
         try:
             self.connect_obs()
-            self.ensure_record_output_setup()
+            if configure_output:
+                self.ensure_record_output_setup()
             if self.auto_setup:
                 self.ensure_sync_setup()
             self.opened = True
@@ -3370,8 +3380,13 @@ class LoLAutoRecorder(RecordingSessionManager):
         self.session_outcome = RecordingOutcome.COMPLETED
         self.failure_reason = None
         self.sync_game_time = 0.0
+        self.sync_intervals: list[dict[str, float]] = []
+        self._last_sync_sample: tuple[float, float] | None = None
+        self._latest_sync_sample: tuple[float, float] | None = None
+        self._sync_sampling_disabled = False
         self.record_path = None
         self.recording_started = False
+        self._recording_stop_attempted = False
         self.session_started = False
         self.saved_events = []
         self.all_events = []
@@ -4355,6 +4370,45 @@ class LoLAutoRecorder(RecordingSessionManager):
 
             self.processed_event_keys.add(event_key)
 
+    def _observe_recording_sync(self, result: RiotPollResult, poll_started_at: float) -> None:
+        if self._sync_sampling_disabled:
+            return
+        previous = self._last_sync_sample
+        self._last_sync_sample = None
+        if result.status != RiotPollStatus.IN_GAME:
+            return
+        try:
+            game_time = self._live_game_time(result.payload)
+            if game_time is None:
+                return
+            get_clock = getattr(self.obs_client, "get_recording_clock", None)
+            video_time = get_clock() if callable(get_clock) else None
+            elapsed = time.monotonic() - poll_started_at
+            if (
+                isinstance(video_time, bool)
+                or not isinstance(video_time, (int, float))
+                or not math.isfinite(video_time)
+                or video_time < 0
+                or not 0.0 <= elapsed <= 0.5
+            ):
+                return
+            current = (game_time, float(video_time))
+        except Exception as error:
+            self.logger.debug("録画時刻の対応を取得できませんでした: %s", type(error).__name__)
+            return
+        # Keep the latest valid observation across gaps to detect an ambiguous clock reset.
+        latest = self._latest_sync_sample
+        if latest is not None and (current[0] < latest[0] or current[1] < latest[1]):
+            self.sync_intervals.clear()
+            self._sync_sampling_disabled = True
+            self.log("⚠️ 時計の巻き戻りを検出したため、この録画のイベント自動同期を無効にします。")
+            return
+        interval = make_sync_interval(previous, current)
+        if interval is not None:
+            self.sync_intervals.append(interval)
+        self._last_sync_sample = current
+        self._latest_sync_sample = current
+
     async def record_until_end_async(self) -> RecordingOutcome:
         """試合終了まで待機して録画停止"""
         self.session_phase = RecordingPhase.RECORDING
@@ -4371,7 +4425,9 @@ class LoLAutoRecorder(RecordingSessionManager):
             if self.should_stop():
                 self.session_phase = RecordingPhase.CANCELLED
                 return RecordingOutcome.CANCELLED
+            poll_started_at = time.monotonic()
             result = await self.poll_all_game_data()
+            self._observe_recording_sync(result, poll_started_at)
             now = loop.time()
             data = result.payload
             if not data:
@@ -4410,23 +4466,43 @@ class LoLAutoRecorder(RecordingSessionManager):
         return RecordingOutcome.COMPLETED
 
     def stop_recording(self) -> None:
-        if not self.obs_client.raw_client or self.record_path is not None:
+        with OBS_OPERATION_LOCK:
+            self._stop_recording_locked()
+
+    def _stop_recording_locked(self) -> None:
+        if self.record_path is not None:
             return
         if not self.recording_started:
+            return
+        if self.obs_client.raw_client is None:
+            failed_before = self.session_outcome is RecordingOutcome.FAILED_PARTIAL
+            self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+            if not failed_before or not self.failure_reason:
+                self.failure_reason = "OBS接続が失われたため、録画停止と動画ファイルを確認できませんでした。"
+            return
+        if self._recording_stop_attempted:
+            self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+            self.failure_reason = self.failure_reason or "OBS録画停止の結果が不明なため、停止要求を再送しません。"
             return
 
         try:
             is_active = self.obs_client.is_recording_active()
+            if type(is_active) is not bool:
+                raise RecorderError("OBSから有効な録画状態が返されませんでした。")
             if is_active is False:
                 self.recording_started = False
                 if self.record_path is None:
                     self.session_outcome = RecordingOutcome.FAILED_PARTIAL
                     self.failure_reason = "OBS録画が完了処理前に停止しており、動画ファイルを確認できませんでした。"
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"⚠️ 録画状態確認エラー: {e}")
+            self.session_outcome = RecordingOutcome.FAILED_PARTIAL
+            self.failure_reason = f"OBS録画状態を確認できず、停止処理を中止しました: {e}"
+            return
 
         try:
+            self._recording_stop_attempted = True
             self.record_path = self.obs_client.stop_recording()
             if self.record_path:
                 self.log(f"💾 保存完了: {self.record_path}")
@@ -4505,6 +4581,7 @@ class LoLAutoRecorder(RecordingSessionManager):
             winning_team=self.winning_team,
             saved_at=time.strftime("%Y-%m-%d %H:%M:%S"),
             sync_game_time=self.sync_game_time,
+            sync_intervals=list(self.sync_intervals),
             obs_record_path=record_path_for_json,
             recordings_dir=str(self.config.paths.recordings_dir),
             json_path=str(self.output_file),
@@ -4586,6 +4663,10 @@ def _cleanup_cli_recorder(
     selected_error = primary_error
     try:
         app.stop_recording()
+        if getattr(app, "session_outcome", None) is RecordingOutcome.FAILED_PARTIAL:
+            raise RecorderError(
+                getattr(app, "failure_reason", None) or "OBS録画の停止を確認できませんでした。"
+            )
     except BaseException as exc:
         if selected_error is None:
             selected_error = exc
@@ -4681,6 +4762,8 @@ async def run_cli_recorder() -> None:
             app.apply_audio_profile(config)
             LOGGER.info("🔊 音声設定をOBSへ適用しました。")
         except Exception as e:
+            if config.audio.mic.device_id == DISABLED_AUDIO_DEVICE_ID:
+                raise
             LOGGER.warning("⚠️ 音声設定の適用に失敗: %s", e)
         while True:
             app.reset_session()
@@ -4706,16 +4789,26 @@ async def run_cli_recorder() -> None:
                         outcome=RecordingOutcome.ABORTED,
                         failure_reason="recording was cancelled",
                     )
-                    if result.success:
-                        LOGGER.info("⏹️ 録画セッションを中断ログとして保存しました。")
-                    else:
-                        LOGGER.error("❌ 中断ログの保存に失敗しました: %s", result.error)
+                    if not result.success:
+                        raise RecorderError(f"中断ログの保存に失敗しました: {result.error}")
+                    if getattr(result, "outcome", RecordingOutcome.ABORTED) != RecordingOutcome.ABORTED:
+                        raise RecorderError(
+                            getattr(app, "failure_reason", None)
+                            or getattr(result, "error", None)
+                            or "録画の停止を確認できませんでした。"
+                        )
+                    LOGGER.info("⏹️ 録画セッションを中断ログとして保存しました。")
                 LOGGER.info("⏹️ 録画セッションを中断しました。")
                 break
             result = app.finalize_session(outcome=RecordingOutcome.COMPLETED)
             if not result.success:
-                LOGGER.error("❌ セッション保存に失敗しました: %s", result.error)
-                break
+                raise RecorderError(f"セッション保存に失敗しました: {result.error}")
+            if getattr(result, "outcome", RecordingOutcome.COMPLETED) != RecordingOutcome.COMPLETED:
+                raise RecorderError(
+                    getattr(app, "failure_reason", None)
+                    or getattr(result, "error", None)
+                    or "録画の正常終了を確認できませんでした。"
+                )
             LOGGER.info("✅ 試合記録完了。次の試合を待機します。")
     except KeyboardInterrupt:
         if not startup_handoff_complete:

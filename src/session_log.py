@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+try:
+    from .replay_timing import normalize_sync_intervals
+except ImportError:
+    from replay_timing import normalize_sync_intervals
+
 SESSION_LOG_SCHEMA_VERSION = 1
 SessionLogMigration = Callable[[dict[str, Any]], dict[str, Any]]
 SESSION_LOG_MIGRATIONS: dict[int, SessionLogMigration] = {}
@@ -36,6 +41,7 @@ class SessionLogV1:
     winning_team: str | int | None = None
     saved_at: str | None = None
     sync_game_time: float = 0.0
+    sync_intervals: list[dict[str, float]] | None = None
     obs_record_path: str | None = None
     recordings_dir: str | None = None
     json_path: str | None = None
@@ -63,6 +69,9 @@ class SessionLogV1:
             winning_team=payload.get("winning_team"),
             saved_at=_optional_str(payload.get("saved_at")),
             sync_game_time=_float_value(payload.get("sync_game_time"), 0.0),
+            sync_intervals=(
+                normalize_sync_intervals(payload["sync_intervals"]) if "sync_intervals" in payload else None
+            ),
             obs_record_path=_optional_str(payload.get("obs_record_path")),
             recordings_dir=_optional_str(paths.get("recordings_dir")),
             json_path=_optional_str(paths.get("json_path")),
@@ -73,7 +82,7 @@ class SessionLogV1:
         )
 
     def to_payload(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": SESSION_LOG_SCHEMA_VERSION,
             "session_status": self.session_status,
             "session_phase": self.session_phase,
@@ -100,6 +109,9 @@ class SessionLogV1:
                 "all": len(self.events_all),
             },
         }
+        if self.sync_intervals is not None:
+            payload["sync_intervals"] = normalize_sync_intervals(self.sync_intervals)
+        return payload
 
 
 def migrate_session_payload(

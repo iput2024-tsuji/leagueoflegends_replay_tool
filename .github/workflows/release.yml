@@ -319,10 +319,11 @@ jobs:
           }
 
           $source = ".\dist\installer\LoLReplayTool-source-$env:APP_VERSION.zip"
-          git archive `
-            --format=zip `
-            --output=$source `
-            $env:RELEASE_COMMIT
+          & $env:RELEASE_PYTHON -m scripts.prepare_release_assets `
+            create-application-source `
+            --output $source `
+            --version $env:APP_VERSION `
+            --source-commit $env:RELEASE_COMMIT
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

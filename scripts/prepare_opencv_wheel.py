@@ -70,6 +70,8 @@ DIAGNOSTIC_TOOL_NAMES = (
     "cl.exe", "c1.dll", "c1xx.dll", "c2.dll", "link.exe", "lib.exe",
     "mspdbcore.dll", "mspdbsrv.exe",
 )
+
+
 DIAGNOSTIC_FILE_LIMIT = 64 * 1024 * 1024
 DIAGNOSTIC_TOTAL_LIMIT = 256 * 1024 * 1024
 DIAGNOSTIC_FILE_COUNT_LIMIT = 512
@@ -111,6 +113,22 @@ def _regular(path: Path, label: str) -> None:
 def _directory(path: Path, label: str) -> None:
     if path.is_symlink() or not path.is_dir():
         raise OpenCVWheelError(f"{label} is not a regular directory: {path}")
+
+
+def _validate_msvc_tools(tools: Any) -> None:
+    if not isinstance(tools, dict) or set(tools) != set(DIAGNOSTIC_TOOL_NAMES):
+        raise OpenCVWheelError("OpenCV MSVC tool receipt names differ")
+    for name, record in tools.items():
+        if (
+            not isinstance(record, dict)
+            or set(record) != {"size", "sha256"}
+            or not isinstance(record["size"], int)
+            or isinstance(record["size"], bool)
+            or record["size"] <= 0
+            or not isinstance(record["sha256"], str)
+            or _SHA256.fullmatch(record["sha256"]) is None
+        ):
+            raise OpenCVWheelError(f"OpenCV MSVC tool receipt is invalid: {name}")
 
 
 def _policy(lock: dict[str, Any]) -> dict[str, Any]:
@@ -171,8 +189,10 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
         "source_date_epoch",
         "build_packages",
         "cmake_args",
+        "msvc_tools",
     }:
         raise OpenCVWheelError("OpenCV build environment fields are invalid")
+    _validate_msvc_tools(environment["msvc_tools"])
     if environment["cmake_args"] != list(REQUIRED_CMAKE_ARGS):
         raise OpenCVWheelError(
             "OpenCV CMake flags must disable IPP, G-API, and ADE and enable "
@@ -781,9 +801,10 @@ def _capture_msbuild_project(source_tree: Path) -> dict[str, Any]:
 
 
 def _configured_compiler_path(
-    cache: dict[str, str], source_tree: Path | None = None, *, language: str = "CXX"
+    cache: dict[str, str], source_tree: Path | None = None, *, language: str = "CXX",
+    variable: str | None = None,
 ) -> Path:
-    variable = f"CMAKE_{language}_COMPILER"
+    variable = variable or f"CMAKE_{language}_COMPILER"
     raw = cache.get(variable)
     if not raw and source_tree is not None:
         candidates = sorted(source_tree.glob(f"_skbuild/*/cmake-build/CMakeFiles/*/CMake{language}Compiler.cmake"))
@@ -806,6 +827,50 @@ def _configured_compiler_path(
     compiler = Path(raw)
     _regular(compiler, f"OpenCV {language} compiler")
     return compiler
+
+
+def _capture_msvc_tools(compiler: Path) -> dict[str, Any]:
+    """Receipt for selected on-disk siblings; not proof of loaded DLL identity."""
+    records = {}
+    for name in DIAGNOSTIC_TOOL_NAMES:
+        tool = compiler.parent / name
+        _regular(tool, f"OpenCV MSVC tool {name}")
+        records[name] = {"size": tool.stat().st_size, "sha256": _sha256(tool)}
+    _validate_msvc_tools(records)
+    return records
+
+
+def _select_msvc_instance(policy: dict[str, Any]) -> tuple[Path, Path, dict[str, Any]]:
+    vswhere = (
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    )
+    _regular(vswhere, "Visual Studio instance locator")
+    try:
+        result = subprocess.run(
+            [str(vswhere), "-latest", "-products", "*", "-version", "[17.0,18.0)",
+             "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+             "-property", "installationPath", "-utf8"],
+            check=False, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OpenCVWheelError(f"Visual Studio instance lookup failed: {exc}") from exc
+    candidates = result.stdout.strip().splitlines()
+    if result.returncode != 0 or len(candidates) != 1:
+        raise OpenCVWheelError("Expected one installed Visual Studio 2022 instance")
+    instance = Path(candidates[0])
+    if not instance.is_absolute():
+        raise OpenCVWheelError("Visual Studio instance path must be absolute")
+    _directory(instance, "Selected Visual Studio instance")
+    compiler = (
+        instance / "VC" / "Tools" / "MSVC" / REQUIRED_TOOLSET_VERSION
+        / "bin" / "Hostx64" / "x64" / "cl.exe"
+    )
+    tools = _capture_msvc_tools(compiler)
+    if tools != policy["build_environment"]["msvc_tools"]:
+        raise OpenCVWheelError("OpenCV selected MSVC tool bytes differ from policy")
+    return instance, compiler.resolve(), tools
 
 
 def _capture_compiler(
@@ -937,7 +1002,10 @@ def _is_required_toolset_version(value: str) -> bool:
     return value == REQUIRED_TOOLSET_VERSION
 
 
-def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
+def _capture_configured_toolchain(
+    source_tree: Path, *, selected_compiler: Path | None = None,
+    expected_tools: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     cache = _read_cmake_cache(source_tree)
     expected = {
         "CMAKE_GENERATOR": REQUIRED_GENERATOR,
@@ -965,6 +1033,19 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
     c_compiler = _capture_compiler(cache, source_tree, language="C")
     if c_compiler != compiler:
         raise OpenCVWheelError("OpenCV C and C++ compilers differ")
+    compiler_path = _configured_compiler_path(cache, source_tree)
+    if selected_compiler is not None:
+        for language in ("C", "CXX"):
+            configured_path = _configured_compiler_path(cache, source_tree, language=language)
+            if configured_path.resolve() != selected_compiler.resolve():
+                raise OpenCVWheelError("OpenCV configured compiler differs from selected VS instance")
+        for variable, name in (("CMAKE_LINKER", "link.exe"), ("CMAKE_AR", "lib.exe")):
+            configured_path = _configured_compiler_path(cache, source_tree, variable=variable)
+            if configured_path.resolve() != (selected_compiler.parent / name).resolve():
+                raise OpenCVWheelError(f"OpenCV configured {name} differs from selected VS instance")
+    tools = _capture_msvc_tools(compiler_path)
+    if expected_tools is not None and tools != expected_tools:
+        raise OpenCVWheelError("OpenCV MSVC tool bytes changed or differ from policy")
     selected = cache.get("CMAKE_VS_PLATFORM_TOOLSET_VERSION")
     if selected and (
         not _is_required_toolset_version(selected)
@@ -984,6 +1065,7 @@ def _capture_configured_toolchain(source_tree: Path) -> dict[str, Any]:
         "msbuild_project": _capture_msbuild_project(source_tree),
         "compile_projects": _capture_dynamic_crt_projects(source_tree),
         "selected_msvc_toolset_version": selected,
+        "msvc_tools": tools,
     }
 
 
@@ -1657,6 +1739,7 @@ def _validate_provenance_payload(
         "msbuild_project",
         "compile_projects",
         "selected_msvc_toolset_version",
+        "msvc_tools",
     }:
         raise OpenCVWheelError("OpenCV configured toolchain fields are invalid")
     if configured["cmake_cache"] != {
@@ -1724,6 +1807,11 @@ def _validate_provenance_payload(
         raise OpenCVWheelError("OpenCV compiler provenance is invalid")
     if configured["c_compiler"] != compiler:
         raise OpenCVWheelError("OpenCV C compiler provenance differs from C++ compiler")
+    _validate_msvc_tools(configured["msvc_tools"])
+    if configured["msvc_tools"] != policy["build_environment"]["msvc_tools"]:
+        raise OpenCVWheelError("OpenCV MSVC tool provenance differs from policy")
+    if {key: compiler[key] for key in ("size", "sha256")} != configured["msvc_tools"]["cl.exe"]:
+        raise OpenCVWheelError("OpenCV compiler provenance differs from MSVC tool receipt")
     runner = observed_environment["runner_image"]
     if not isinstance(runner, dict) or set(runner) != {"os", "version"} or not all(
         isinstance(value, str) and value for value in runner.values()
@@ -1969,6 +2057,7 @@ def _run_once(
     """Build and inspect one wheel in a clean directory."""
     _reject_inherited_compiler_flags()
     inputs = _verify_inputs(source_dir, policy)
+    instance, selected_compiler, selected_tools = _select_msvc_instance(policy)
     if output_dir.exists() or output_dir.is_symlink():
         raise OpenCVWheelError(f"OpenCV output directory already exists: {output_dir}")
     work_dir.mkdir(parents=True, exist_ok=False)
@@ -2013,6 +2102,7 @@ def _run_once(
     environment["OPENCV_DOWNLOAD_PATH"] = str(download_path.resolve())
     build_environment = policy["build_environment"]
     environment["CMAKE_GENERATOR"] = str(build_environment["generator"])
+    environment["CMAKE_GENERATOR_INSTANCE"] = str(instance)
     environment["CMAKE_GENERATOR_TOOLSET"] = str(
         build_environment["msvc_toolset"]
     )
@@ -2063,7 +2153,9 @@ def _run_once(
     _verify_download_cache(download_path, ffmpeg_records)
     wheel = _output_wheel(output_dir, str(policy["output_filename"]))
     _reject_ipp(wheel)
-    configured_toolchain = _capture_configured_toolchain(source_tree)
+    configured_toolchain = _capture_configured_toolchain(
+        source_tree, selected_compiler=selected_compiler, expected_tools=selected_tools,
+    )
     for generated in source_tree.glob("_skbuild/*/cmake-build/modules/core/version_string.inc"):
         _regular(generated, "OpenCV generated build information")
         shutil.copy2(generated, evidence / "version_string.inc")

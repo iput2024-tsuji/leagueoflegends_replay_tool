@@ -11,6 +11,16 @@ import pytest
 from scripts import prepare_opencv_wheel as target
 
 
+def _msvc_tools() -> dict:
+    return {
+        name: {
+            "size": len(b"cl" if name == "cl.exe" else name.encode()),
+            "sha256": hashlib.sha256(b"cl" if name == "cl.exe" else name.encode()).hexdigest(),
+        }
+        for name in target.DIAGNOSTIC_TOOL_NAMES
+    }
+
+
 def _archive(
     path: Path,
     root: str,
@@ -148,6 +158,7 @@ def _lock(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
             "cmake_args": list(target.REQUIRED_CMAKE_ARGS),
             "python_hash_seed": "0",
             "source_date_epoch": "1767690756",
+            "msvc_tools": _msvc_tools(),
         },
     }
     lock_path = tmp_path / "components.json"
@@ -191,14 +202,12 @@ def _configured_toolchain() -> dict:
         "compiler": {
             "filename": "cl.exe",
             "msvc_toolset_version": "14.44.35207",
-            "sha256": "a" * 64,
-            "size": 1,
+            **_msvc_tools()["cl.exe"],
         },
         "c_compiler": {
             "filename": "cl.exe",
             "msvc_toolset_version": "14.44.35207",
-            "sha256": "a" * 64,
-            "size": 1,
+            **_msvc_tools()["cl.exe"],
         },
         "msbuild_project": {
             "path": "_skbuild/win-amd64-3.14/cmake-build/ALL_BUILD.vcxproj",
@@ -208,6 +217,7 @@ def _configured_toolchain() -> dict:
             "windows_target_platform_versions": [target.REQUIRED_WINDOWS_SDK],
         },
         "selected_msvc_toolset_version": "14.44.35207",
+        "msvc_tools": _msvc_tools(),
         "compile_projects": [
             {
                 "path": "_skbuild/win-amd64-3.14/cmake-build/modules/python3/opencv_python3.vcxproj",
@@ -318,6 +328,10 @@ def _mock_build_dependencies(monkeypatch) -> None:
     monkeypatch.setenv("ImageOS", "win22")
     monkeypatch.setenv("ImageVersion", "20260831.1")
     monkeypatch.setattr(
+        target, "_select_msvc_instance",
+        lambda _policy: (Path("selected-vs"), Path("selected-vs/cl.exe"), _msvc_tools()),
+    )
+    monkeypatch.setattr(
         target,
         "_validate_build_environment",
         lambda *args: _prebuild_environment(),
@@ -350,7 +364,7 @@ def _mock_build_dependencies(monkeypatch) -> None:
             )
         return _probes()
     monkeypatch.setattr(target, "_probe_wheel", fake_probe)
-    def fake_configured_toolchain(source):
+    def fake_configured_toolchain(source, **_kwargs):
         _write_msbuild_project(source, target.REQUIRED_WINDOWS_SDK)
         _write_dynamic_project(source, "modules/python3/opencv_python3.vcxproj")
         record = target._capture_dynamic_crt_projects(source)[0]
@@ -423,7 +437,8 @@ def _write_configured_toolchain(tmp_path: Path, *, selected: str | None = None) 
     build.mkdir(parents=True)
     compiler = tmp_path / "MSVC" / "14.44.35207" / "bin" / "Hostx64" / "x64" / "cl.exe"
     compiler.parent.mkdir(parents=True)
-    compiler.write_bytes(b"cl")
+    for name in target.DIAGNOSTIC_TOOL_NAMES:
+        (compiler.parent / name).write_bytes(b"cl" if name == "cl.exe" else name.encode())
     cache = {
         "CMAKE_GENERATOR": target.REQUIRED_GENERATOR,
         "CMAKE_GENERATOR_TOOLSET": target.REQUIRED_TOOLSET_NAME,
@@ -438,6 +453,8 @@ def _write_configured_toolchain(tmp_path: Path, *, selected: str | None = None) 
         "BUILD_WITH_STATIC_CRT": "OFF",
         "CMAKE_CXX_COMPILER": str(compiler),
         "CMAKE_C_COMPILER": str(compiler),
+        "CMAKE_LINKER": str(compiler.parent / "link.exe"),
+        "CMAKE_AR": str(compiler.parent / "lib.exe"),
     }
     if selected is not None:
         cache["CMAKE_VS_PLATFORM_TOOLSET_VERSION"] = selected
@@ -971,6 +988,7 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
             )
         )
         assert env["SKBUILD_BUILD_OPTIONS"] == "/clp:ShowCommandLine;NoItemAndPropertyList"
+        assert env["CMAKE_GENERATOR_INSTANCE"] == "selected-vs"
         assert "SKBUILD_CONFIGURE_OPTIONS" not in env
         assert (cwd / "opencv" / "CMakeLists.txt").is_file()
         assert (cwd / target.NOTICE_SOURCE_PATH).read_bytes() == b"source\r\n"
@@ -990,6 +1008,142 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
     assert provenance["observed_build_environment"]["source_date_epoch"] == "1767690756"
     assert target.validate_output_directory(output, lock_path)["version"] == "4.13.0.90"
     assert not work.exists()
+
+
+def _selected_vs(tmp_path, monkeypatch):
+    instance = tmp_path / "selected-vs"
+    compiler = (
+        instance / "VC" / "Tools" / "MSVC" / target.REQUIRED_TOOLSET_VERSION
+        / "bin" / "Hostx64" / "x64" / "cl.exe"
+    )
+    compiler.parent.mkdir(parents=True)
+    for name in target.DIAGNOSTIC_TOOL_NAMES:
+        (compiler.parent / name).write_bytes(b"cl" if name == "cl.exe" else name.encode())
+    program_files = tmp_path / "program-files"
+    locator = program_files / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+    locator.parent.mkdir(parents=True)
+    locator.write_bytes(b"locator")
+    monkeypatch.setenv("ProgramFiles(x86)", str(program_files))
+    calls = []
+
+    def locate(command, **kwargs):
+        assert command == [
+            str(locator), "-latest", "-products", "*", "-version", "[17.0,18.0)",
+            "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property", "installationPath", "-utf8",
+        ]
+        assert kwargs["timeout"] == 30
+        calls.append(command)
+        return type("Completed", (), {"returncode": 0, "stdout": str(instance) + "\n"})()
+
+    monkeypatch.setattr(target.subprocess, "run", locate)
+    return instance, compiler, calls
+
+
+def test_msvc_preflight_selects_and_verifies_all_tool_bytes(tmp_path, monkeypatch):
+    policy, _lock_path, _source, _opencv = _lock(tmp_path)
+    instance, compiler, calls = _selected_vs(tmp_path, monkeypatch)
+
+    assert target._select_msvc_instance(policy) == (instance, compiler.resolve(), _msvc_tools())
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("change", ["backend", "missing"])
+def test_msvc_preflight_rejects_drift_before_setup_build(tmp_path, monkeypatch, change):
+    policy, _lock_path, _source, _opencv = _lock(tmp_path)
+    _instance, compiler, calls = _selected_vs(tmp_path, monkeypatch)
+    original_cl = compiler.read_bytes()
+    if change == "backend":
+        (compiler.parent / "c1xx.dll").write_bytes(b"another compiler patch")
+    else:
+        (compiler.parent / "c2.dll").unlink()
+
+    with pytest.raises(target.OpenCVWheelError, match="MSVC tool"):
+        target._run_once(tmp_path, tmp_path / "output", policy, tmp_path / "work")
+
+    assert compiler.read_bytes() == original_cl
+    assert len(calls) == 1
+    assert not (tmp_path / "output").exists()
+    assert not (tmp_path / "work").exists()
+
+
+@pytest.mark.parametrize("change", ["missing", "extra", "size", "sha256", "field"])
+def test_policy_rejects_invalid_msvc_tool_receipts(tmp_path, change):
+    policy, lock_path, _source, _opencv = _lock(tmp_path)
+    tools = policy["build_environment"]["msvc_tools"]
+    if change == "missing":
+        del tools["c1xx.dll"]
+    elif change == "extra":
+        tools["other.dll"] = tools["cl.exe"]
+    elif change == "size":
+        tools["c1xx.dll"]["size"] = True
+    elif change == "sha256":
+        tools["c1xx.dll"]["sha256"] = "invalid"
+    else:
+        tools["c1xx.dll"]["version"] = "19.44"
+    lock_path.write_text(json.dumps({target.POLICY_KEY: policy}), encoding="utf-8")
+
+    with pytest.raises(target.OpenCVWheelError, match="MSVC tool receipt"):
+        target._load_lock(lock_path)
+
+
+@pytest.mark.parametrize("variable,name", [
+    ("CMAKE_C_COMPILER", "cl.exe"), ("CMAKE_CXX_COMPILER", "cl.exe"),
+    ("CMAKE_LINKER", "link.exe"), ("CMAKE_AR", "lib.exe"),
+])
+def test_configured_tools_reject_another_instance_with_identical_bytes(tmp_path, variable, name):
+    compiler = _write_configured_toolchain(tmp_path)
+    other = tmp_path / "other" / "MSVC" / target.REQUIRED_TOOLSET_VERSION / "bin" / name
+    other.parent.mkdir(parents=True)
+    other.write_bytes((compiler.parent / name).read_bytes())
+    cache = tmp_path / "_skbuild" / "win-amd64-3.14" / "cmake-build" / "CMakeCache.txt"
+    contents = cache.read_text(encoding="utf-8")
+    old = compiler if name == "cl.exe" else compiler.parent / name
+    contents = contents.replace(f"{variable}:INTERNAL={old}", f"{variable}:INTERNAL={other}")
+    cache.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(target.OpenCVWheelError, match="selected VS instance"):
+        target._capture_configured_toolchain(
+            tmp_path, selected_compiler=compiler, expected_tools=_msvc_tools(),
+        )
+
+
+def test_configured_tools_detect_backend_mutation_after_build(tmp_path):
+    compiler = _write_configured_toolchain(tmp_path)
+    (compiler.parent / "c1xx.dll").write_bytes(b"changed")
+
+    with pytest.raises(target.OpenCVWheelError, match="MSVC tool bytes changed"):
+        target._capture_configured_toolchain(
+            tmp_path, selected_compiler=compiler, expected_tools=_msvc_tools(),
+        )
+
+
+@pytest.mark.parametrize("change", ["missing", "extra", "digest"])
+def test_embedded_provenance_rejects_msvc_receipt_tampering(tmp_path, monkeypatch, change):
+    _policy, lock_path, _source, _opencv = _lock(tmp_path)
+    _mock_build_dependencies(monkeypatch)
+
+    def build(command, **_kwargs):
+        _wheel(Path(command[-1]) / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", build)
+    provenance = target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
+    tools = provenance["observed_build_environment"]["configured_toolchain"]["msvc_tools"]
+    if change == "missing":
+        del tools["c1xx.dll"]
+    elif change == "extra":
+        tools["other.dll"] = tools["cl.exe"]
+    else:
+        tools["c1xx.dll"]["sha256"] = "a" * 64
+    canonical = json.dumps(provenance, ensure_ascii=False, indent=2) + "\n"
+    wrapper = {
+        "provenance": provenance,
+        "provenance_sha256": hashlib.sha256(canonical.encode()).hexdigest(),
+    }
+
+    with pytest.raises(target.OpenCVWheelError, match="MSVC tool"):
+        target.validate_embedded_provenance_record(wrapper, lock_path)
 
 
 def test_required_cmake_args_pin_dynamic_crt_and_static_libraries():
@@ -1205,10 +1359,14 @@ def test_build_diagnostics_capture_only_selected_static_evidence(tmp_path, monke
     assert report["missing_categories"] == []
     assert report["copied_bytes"] == sum(map(len, selected.values()))
     assert {item["name"] for item in report["tools"]} == set(target.DIAGNOSTIC_TOOL_NAMES)
+    configured_variables = {
+        "cl.exe": "CMAKE_CXX_COMPILER", "link.exe": "CMAKE_LINKER", "lib.exe": "CMAKE_AR",
+    }
     for item in report["tools"]:
         assert item["sha256"] == hashlib.sha256(item["name"].encode()).hexdigest()
         assert item["path_origin"] == (
-            "cmake_cache:CMAKE_CXX_COMPILER" if item["name"] == "cl.exe"
+            f"cmake_cache:{configured_variables[item['name']]}"
+            if item["name"] in configured_variables
             else "inferred_configured_compiler_sibling"
         )
     copied = {
@@ -1231,6 +1389,10 @@ def test_build_diagnostics_use_configured_linker_and_archiver(tmp_path, configur
         tool.parent.mkdir(exist_ok=True)
         tool.write_bytes(f"configured {name}".encode())
         configured[variable] = tool
+    cache_path.write_text("\n".join(
+        line for line in cache_path.read_text(encoding="utf-8").splitlines()
+        if not any(line.startswith(key + ":") for key in ("CMAKE_LINKER", "CMAKE_AR"))
+    ), encoding="utf-8")
     if configuration_source == "cmake_cache":
         with cache_path.open("a", encoding="utf-8") as stream:
             stream.write("\n" + "\n".join(

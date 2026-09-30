@@ -147,7 +147,7 @@
     "output_filename": "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl",
     "expected_byte_identical": false,
     "expected_wheel_sha256": null,
-    "expected_semantic_manifest_sha256": "2826ea102992dd29be108df17d0d95c0a8a81733df49b9b6cb02378ec51972ff",
+    "expected_semantic_manifest_sha256": "4be414796959ed7f95843b2e99414b36579836eb451749b23e0ca1c4fa57dd22",
     "license_notice_normalization": {
       "source_path": "LICENSE-3RD-PARTY.txt",
       "source_size": 174432,
@@ -234,6 +234,16 @@
       "generator": "Visual Studio 17 2022",
       "msvc_toolset": "v143",
       "expected_msvc_toolset_version": "14.44.35207",
+      "msvc_tools": {
+        "cl.exe": {"size": 677776, "sha256": "fe251ef50a1545b1b0835ee17b1e785459712b38d79e45b5c1d3d28970a36619"},
+        "c1.dll": {"size": 3430200, "sha256": "6176d88c3e682f64ef960e29ecde0ff431785da664eba854e571e280dba6604b"},
+        "c1xx.dll": {"size": 12332344, "sha256": "b96238e05dcc5fd9aa2614ab5e29ee2f9d3fd775fe41ce0a2202875956f383ed"},
+        "c2.dll": {"size": 10462008, "sha256": "b057a18570f712ffb535e227825a291706620f3337e5b13d896d6586fb6b3cec"},
+        "link.exe": {"size": 3252616, "sha256": "a364af801a8539e4324d9489313dbf001d959128451fc99a27b24676bbac058f"},
+        "lib.exe": {"size": 23376, "sha256": "fde148a275981855689c45f932dda56b10dc9289a0290826a0fb93478da34929"},
+        "mspdbcore.dll": {"size": 1321824, "sha256": "589861f069bbbcc47cbf496c1d9c823a23cdaccbda671d602d88ff67b48d227e"},
+        "mspdbsrv.exe": {"size": 186248, "sha256": "8ffbacfdbef90a79e8441d640bc8b4c86be02a2d9035ce87c5fa4f36dc3c70e1"}
+      },
       "windows_sdk": "10.0.26100.0",
       "cmake_version": "3.31.6",
       "cmake_build_parallel_level": "2",

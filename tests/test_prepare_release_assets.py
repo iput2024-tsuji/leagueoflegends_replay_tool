@@ -430,6 +430,35 @@ def test_binary_install_selects_source_built_opencv_wheel(tmp_path):
     assert path == tmp_path / "opencv" / wheel["filename"]
 
 
+@pytest.mark.parametrize("missing", ["opencv_dir", "opencv_payload", "opencv_plan"])
+def test_source_built_opencv_never_falls_back_to_upstream_without_proof(tmp_path, missing):
+    lock = json.loads(release_assets.COMPONENTS_FILE.read_text(encoding="utf-8"))
+    component = next(item for item in lock["runtime_components"] if item["component"] == "opencv-python")
+    wheel = {
+        "filename": lock["opencv_source_build_policy"]["output_filename"],
+        "sha256": "a" * 64,
+        "size": 123,
+        "distribution": "opencv-python",
+        "version": "4.13.0.90",
+    }
+    proof = {
+        "opencv_dir": tmp_path / "opencv",
+        "opencv_payload": {"wheel": wheel},
+        "opencv_plan": {"provenance_sha256": "b" * 64},
+    }
+    proof[missing] = None
+
+    with pytest.raises(ReleaseAssetError, match="Verified OpenCV source-built wheel is missing"):
+        release_assets._binary_install_requirements(
+            lock=lock,
+            pins=[{"name": "opencv-python", "canonical_name": "opencv-python", "version": "4.13.0.90"}],
+            binary_by_name={"opencv-python": component["binary_archive"]},
+            binary_cache_dir=tmp_path / "binary",
+            external_dir=None,
+            **proof,
+        )
+
+
 def test_binary_install_plan_uses_generated_opencv_wheel_hash(
     monkeypatch,
     tmp_path,
@@ -1474,6 +1503,7 @@ def test_disclosure_cannot_be_transferred_to_an_unapproved_component(disclosed_l
     qt = next(item for item in disclosed_lock["runtime_components"] if item["component"] == "qt")
     if subject == "opencv-python":
         target = next(item for item in disclosed_lock["runtime_components"] if item["component"] == subject)
+        target["native_source_coverage_verified"] = False
         target["release_disclosure"] = copy.deepcopy(qt["release_disclosure"])
     else:
         qt["component"] = subject

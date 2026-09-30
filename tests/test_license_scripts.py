@@ -249,7 +249,7 @@ def test_unused_mesa_software_opengl_is_not_a_release_component():
     )
 
 
-def test_opencv_ippicv_provenance_is_locked_without_legal_exception():
+def test_upstream_opencv_ippicv_history_is_locked_without_legal_exception():
     import cv2
 
     from scripts.prepare_release_assets import release_gate_errors
@@ -260,8 +260,9 @@ def test_opencv_ippicv_provenance_is_locked_without_legal_exception():
         for item in lock["runtime_components"]
         if item.get("component") == "opencv-python"
     )
-    evidence = component["wheel_build_evidence"]
-    vendored = component["vendored_binary_input"]
+    history = component["upstream_wheel_history"]
+    evidence = history["wheel_build_evidence"]
+    vendored = history["vendored_binary_input"]
     build_information = cv2.getBuildInformation()
 
     assert f"Version control:               {evidence['opencv_source_revision']}" in (
@@ -286,7 +287,18 @@ def test_opencv_ippicv_provenance_is_locked_without_legal_exception():
     }
     assert len(vendored["archive_license_materials"]) == 3
     assert vendored["source_exception_reviewed"] is False
-    assert component["release_legal_review_required"] is True
+    assert history["binary_archive_sha256"] == component["binary_archive"]["sha256"]
+    assert history["source_status"] == "incomplete_corresponding_source"
+    assert history["native_source_coverage_verified"] is False
+    assert history["release_legal_review_required"] is True
+    # The unchanged publisher wheel remains blocked if used as the active input.
+    component.update(
+        source_status=history["source_status"],
+        native_source_coverage_verified=history["native_source_coverage_verified"],
+        release_legal_review_required=history["release_legal_review_required"],
+        release_gate_reason=history["release_gate_reason"],
+    )
+    lock.pop("opencv_source_build_policy")
     assert any(
         error.startswith("opencv-python:") for error in release_gate_errors(lock)
     )
@@ -413,12 +425,55 @@ def test_release_disclosures_preserve_unreviewed_facts_and_technical_gates():
         evidence = component["openblas_windows_build_evidence"]
         assert evidence["toolchain_manifest_verified"] is False
         assert evidence["publisher_artifact_chain_verified"] is False
-    assert components["opencv-python"]["source_status"] == "incomplete_corresponding_source"
-    assert components["opencv-python"]["native_source_coverage_verified"] is False
+    assert components["opencv-python"]["source_status"] == "verified_corresponding_source"
+    assert components["opencv-python"]["native_source_coverage_verified"] is True
+    assert components["opencv-python"]["release_legal_review_required"] is False
     errors = release_gate_errors(lock)
-    assert {error.split(":", 1)[0] for error in errors} == {"opencv-python"}
-    assert len(errors) == 4
-    assert "opencv-python: native_source_coverage_verified is not verified" in errors
+    assert errors == []
+
+
+@pytest.mark.parametrize("policy_state", ["missing", None, {}, "invalid"])
+def test_adopted_opencv_source_metadata_rejects_missing_or_invalid_policy(tmp_path, policy_state):
+    from scripts.prepare_release_assets import (
+        ReleaseAssetError,
+        assert_release_gates_closed,
+        release_gate_errors,
+    )
+
+    lock = _component_lock()
+    if policy_state == "missing":
+        lock.pop("opencv_source_build_policy")
+    else:
+        lock["opencv_source_build_policy"] = policy_state
+    error = "opencv-python: adopted source metadata requires a verified source-build policy"
+    assert error in release_gate_errors(lock)
+    components = tmp_path / "components.json"
+    components.write_text(json.dumps(lock), encoding="utf-8")
+    with pytest.raises(ReleaseAssetError, match="adopted source metadata"):
+        assert_release_gates_closed(components)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("source_status", "verified_corresponding_source"),
+    ("native_source_coverage_verified", True),
+    ("release_legal_review_required", False),
+])
+def test_partial_opencv_source_adoption_still_requires_policy(field, value):
+    from scripts.prepare_release_assets import release_gate_errors
+
+    lock = _component_lock()
+    lock.pop("opencv_source_build_policy")
+    component = next(item for item in lock["runtime_components"] if item["component"] == "opencv-python")
+    component.update(
+        source_status="incomplete_corresponding_source",
+        native_source_coverage_verified=False,
+        release_legal_review_required=True,
+    )
+    component[field] = value
+    assert (
+        "opencv-python: adopted source metadata requires a verified source-build policy"
+        in release_gate_errors(lock)
+    )
 
 
 @pytest.mark.parametrize("component_name", ["numpy", "scipy"])
@@ -2251,6 +2306,12 @@ def test_existing_distribution_manifest_detects_missing_record(monkeypatch, tmp_
 def test_release_mode_enforces_python_and_legal_gates(tmp_path):
     root = tmp_path / "distribution"
     _write_distribution_materials(root)
+    components = root / "licenses" / "components.json"
+    lock = json.loads(components.read_text(encoding="utf-8"))
+    opencv = next(item for item in lock["runtime_components"] if item["component"] == "opencv-python")
+    opencv["release_legal_review_required"] = True
+    opencv["release_gate_reason"] = "Isolated uncompleted review fixture"
+    components.write_text(json.dumps(lock), encoding="utf-8")
     _write_existing_inventory(root)
 
     errors = validate_distribution(root, release=True)

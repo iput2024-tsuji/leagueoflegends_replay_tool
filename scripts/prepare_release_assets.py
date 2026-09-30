@@ -958,6 +958,18 @@ def release_gate_errors(lock: dict[str, Any]) -> list[str]:
     except OpenCVWheelError as exc:
         errors.append(f"opencv-python-source-build: {exc}")
         opencv_policy = None
+    if opencv_policy is None and any(
+        component.get("component") == "opencv-python"
+        and (
+            component.get("source_status") == "verified_corresponding_source"
+            or component.get("native_source_coverage_verified") is True
+            or component.get("release_legal_review_required") is False
+        )
+        for component in _component_entries(lock)
+    ):
+        errors.append(
+            "opencv-python: adopted source metadata requires a verified source-build policy"
+        )
     if opencv_policy is not None:
         if opencv_policy["expected_byte_identical"] is None:
             errors.append(

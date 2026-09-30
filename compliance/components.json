@@ -1927,7 +1927,7 @@
       "distribution": "opencv-python",
       "version": "4.13.0.90",
       "license": "MIT AND Apache-2.0 AND bundled component licenses",
-      "source_status": "incomplete_corresponding_source",
+      "source_status": "verified_corresponding_source",
       "license_materials": [
         {
           "path": "licenses/python-packages/opencv-python/cv2/LICENSE-3RD-PARTY.txt",
@@ -1942,41 +1942,53 @@
         "sha256": "526bde4c33a86808a751e2bb57bf4921beb49794621810971926c472897f6433",
         "size": 40211706
       },
-      "wheel_build_evidence": {
-        "opencv_source_revision": "4.13.0-1-gb4c5ec4042",
-        "intel_ipp": "2022.2.0 [2022.2.0]",
-        "intel_ipp_iw": "sources (2022.2.0)"
+      "source_build_evidence": {
+        "verification_document": "docs/opencv-source-adoption.md",
+        "workflow_run_id": 36705978374,
+        "producer_provenance_sha256": "5e587204bdd12a27c4ebd821886211f6ffe2531a5abc158279bbbd7fcf15122a",
+        "semantic_manifest_sha256": "4be414796959ed7f95843b2e99414b36579836eb451749b23e0ca1c4fa57dd22"
       },
-      "vendored_binary_input": {
-        "component": "Intel IPP ICV",
-        "version": "2022.2.0",
-        "archive": {
-          "filename": "ippicv_2022.2.0_win_intel64_20250730_general.zip",
-          "url": "https://raw.githubusercontent.com/opencv/opencv_3rdparty/c934a2a15a6df020446ac3dfa07e3acf72b63a8f/ippicv/ippicv_2022.2.0_win_intel64_20250730_general.zip",
-          "md5": "7c0973976ab0716bc33f03a76a50017f",
-          "sha256": "56c7bada1067982afd5dd43636f8a9b5a5b80447ec452b754252168cde9d8be8",
-          "size": 29247105
+      "upstream_wheel_history": {
+        "binary_archive_sha256": "526bde4c33a86808a751e2bb57bf4921beb49794621810971926c472897f6433",
+        "source_status": "incomplete_corresponding_source",
+        "wheel_build_evidence": {
+          "opencv_source_revision": "4.13.0-1-gb4c5ec4042",
+          "intel_ipp": "2022.2.0 [2022.2.0]",
+          "intel_ipp_iw": "sources (2022.2.0)"
         },
-        "archive_license_materials": [
-          {
-            "path": "ippicv_win/EULA.rtf",
-            "sha256": "37f11c79f36fb5e1b00aca31c1234a7435c2929d83e181ee802a349ca8571749"
+        "vendored_binary_input": {
+          "component": "Intel IPP ICV",
+          "version": "2022.2.0",
+          "archive": {
+            "filename": "ippicv_2022.2.0_win_intel64_20250730_general.zip",
+            "url": "https://raw.githubusercontent.com/opencv/opencv_3rdparty/c934a2a15a6df020446ac3dfa07e3acf72b63a8f/ippicv/ippicv_2022.2.0_win_intel64_20250730_general.zip",
+            "md5": "7c0973976ab0716bc33f03a76a50017f",
+            "sha256": "56c7bada1067982afd5dd43636f8a9b5a5b80447ec452b754252168cde9d8be8",
+            "size": 29247105
           },
-          {
-            "path": "ippicv_win/support.txt",
-            "sha256": "b65d6663771b4ec4af82c5064543ddc8d1cb4e1510c72a29a29ca5da4d517851"
-          },
-          {
-            "path": "ippicv_win/third-party-programs.txt",
-            "sha256": "a0a246b67784450f7a1b99b244d00cbdb8c001aa9b13755ababf4a218431703c"
-          }
-        ],
-        "wheel_notice_path": "licenses/python-packages/opencv-python/cv2/LICENSE-3RD-PARTY.txt",
-        "source_exception_reviewed": false
+          "archive_license_materials": [
+            {
+              "path": "ippicv_win/EULA.rtf",
+              "sha256": "37f11c79f36fb5e1b00aca31c1234a7435c2929d83e181ee802a349ca8571749"
+            },
+            {
+              "path": "ippicv_win/support.txt",
+              "sha256": "b65d6663771b4ec4af82c5064543ddc8d1cb4e1510c72a29a29ca5da4d517851"
+            },
+            {
+              "path": "ippicv_win/third-party-programs.txt",
+              "sha256": "a0a246b67784450f7a1b99b244d00cbdb8c001aa9b13755ababf4a218431703c"
+            }
+          ],
+          "wheel_notice_path": "licenses/python-packages/opencv-python/cv2/LICENSE-3RD-PARTY.txt",
+          "source_exception_reviewed": false
+        },
+        "native_source_coverage_verified": false,
+        "release_legal_review_required": true,
+        "release_gate_reason": "OpenCV/opencv-python、IPPICV archive、wheel build表示、Intel noticeは固定済みだが、cv2.pydにstatic linkされたprebuilt proprietary binaryについてGPLv3と両立する承認済みsource例外がないため公開しない。"
       },
-      "native_source_coverage_verified": false,
-      "release_legal_review_required": true,
-      "release_gate_reason": "OpenCV/opencv-python、IPPICV archive、wheel build表示、Intel noticeは固定済みだが、cv2.pydにstatic linkされたprebuilt proprietary binaryについてGPLv3と両立する承認済みsource例外がないため公開しない。",
+      "native_source_coverage_verified": true,
+      "release_legal_review_required": false,
       "source_archives": [
         {
           "filename": "opencv-python-6cb94ce.tar.gz",

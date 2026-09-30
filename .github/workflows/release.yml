@@ -19,9 +19,15 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  opencv:
+    uses: ./.github/workflows/build-opencv.yml
+    with:
+      source-ref: ${{ inputs.tag }}
+
   prepare:
     name: Build and verify Windows installer
-    runs-on: windows-latest
+    runs-on: windows-2025
+    needs: opencv
     timeout-minutes: 240
     outputs:
       release_commit: ${{ steps.release_inputs.outputs.release_commit }}
@@ -32,6 +38,8 @@ jobs:
       PYTHONIOENCODING: utf8
       RELEASE_TAG: ${{ inputs.tag }}
       PUBLISH_CONFIRMATION: ${{ inputs.publish_confirmation }}
+      OPENCV_SOURCE_COMMIT: ${{ needs.opencv.outputs.source-commit }}
+      OPENCV_PROVENANCE_SHA256: ${{ needs.opencv.outputs.provenance-sha256 }}
 
     steps:
       - name: Checkout exact tag commit
@@ -67,6 +75,9 @@ jobs:
           }
 
           $headCommit = (git rev-parse HEAD).Trim()
+          if ($headCommit -cne $env:OPENCV_SOURCE_COMMIT) {
+            throw "OpenCV producer and Release checkout commits differ."
+          }
           $tagRefspec = "+refs/tags/${tag}:refs/tags/${tag}"
           git fetch origin $tagRefspec --no-tags
           if ($LASTEXITCODE -ne 0) {
@@ -113,6 +124,13 @@ jobs:
             -FilePath $env:GITHUB_OUTPUT `
             -Encoding utf8 `
             -Append
+
+      - name: Download verified OpenCV wheel from this run
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          artifact-ids: ${{ needs.opencv.outputs.artifact-id }}
+          path: ${{ runner.temp }}/opencv-source-artifact
+          merge-multiple: true
 
       - name: Prepare verified release build environment
         id: build_environment
@@ -174,7 +192,9 @@ jobs:
             --requirements .\requirements-dev.txt `
             --cache-dir $binaryCache `
             --output-requirements $generatedRequirements `
-            --output-plan $installPlan
+            --output-plan $installPlan `
+            --opencv-wheel-directory "$env:RUNNER_TEMP\opencv-source-artifact" `
+            --opencv-provenance-sha256 $env:OPENCV_PROVENANCE_SHA256
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

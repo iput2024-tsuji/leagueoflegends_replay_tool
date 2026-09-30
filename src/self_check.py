@@ -204,12 +204,62 @@ def _native_runtime_summary() -> str:
     if gray.shape != (2, 2):
         raise RuntimeError(f"OpenCV conversion returned an unexpected shape: {gray.shape}")
 
+    positive_time, negative_time = _synthetic_sync_probe(cv2, np)
+    if not abs(positive_time - 1.0) <= 0.05:
+        raise RuntimeError(f"Synthetic sync marker was found at {positive_time:.3f}s, expected 1.000s")
+    if negative_time != -1.0:
+        raise RuntimeError(f"Synthetic absent sync marker returned {negative_time:.3f}s")
+
     qt_summary = _qt_runtime_summary(QtCore)
     return (
         f"{qt_summary}; NumPy {np.__version__}; "
         f"pandas {pd.__version__}; scikit-learn {sklearn.__version__}; "
-        f"OpenCV {cv2.__version__}"
+        f"OpenCV {cv2.__version__}; sync marker probe ok (1.000s/-1.000s)"
     )
+
+
+def _synthetic_sync_probe(cv2: Any, np: Any) -> tuple[float, float]:
+    from .player import SyncWorker
+
+    with tempfile.TemporaryDirectory(prefix=".self-check-video-") as directory:
+        positive_path = Path(directory) / "positive.avi"
+        negative_path = Path(directory) / "negative.avi"
+        for path, marker_frame in ((positive_path, 30), (negative_path, None)):
+            writer = cv2.VideoWriter(
+                str(path), cv2.VideoWriter_fourcc(*"MJPG"), 30.0, (320, 240)
+            )
+            try:
+                if not writer.isOpened() or writer.getBackendName() != "FFMPEG":
+                    backend = writer.getBackendName() if writer.isOpened() else "unopened"
+                    raise RuntimeError(f"OpenCV MJPG writer backend is {backend}, expected FFMPEG")
+                for frame_index in range(60):
+                    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+                    if frame_index == marker_frame:
+                        frame[:140, :140] = (0, 0, 255)
+                    writer.write(frame)
+            finally:
+                writer.release()
+
+            capture = cv2.VideoCapture(str(path), cv2.CAP_FFMPEG)
+            try:
+                if not capture.isOpened() or capture.getBackendName() != "FFMPEG":
+                    backend = capture.getBackendName() if capture.isOpened() else "unopened"
+                    raise RuntimeError(f"OpenCV synthetic video backend is {backend}, expected FFMPEG")
+                if not capture.grab() or capture.retrieve()[0] is not True:
+                    raise RuntimeError(f"OpenCV synthetic video could not be read: {path}")
+            finally:
+                capture.release()
+
+        def find_marker(path: Path) -> float:
+            result: list[float] = []
+            worker = SyncWorker(path, max_seconds=3)
+            worker.finished.connect(result.append)
+            worker.run()
+            if not result:
+                raise RuntimeError("SyncWorker did not emit a result")
+            return result[0]
+
+        return find_marker(positive_path), find_marker(negative_path)
 
 
 def _qt_runtime_summary(QtCore: Any) -> str:

@@ -108,7 +108,8 @@ SHA256をlocal configへ固定します。
     `sfc /verifyfile` exit 0を確認した証拠が揃った場合だけWindows/.NET componentとして許可します。
     欠損、追加、署名・hardlink・SFC不成立はfail closedです。
 13. powered-off root snapshot `A0-runtime-absent`を1個だけ作成します。
-14. 次節のVMSD統合状態の条件を確認してから、configのidentity値を一度`capture`にして`Capture`を実行し、返された
+14. 通常shutdown、既存snapshot 0件、新しい停止状態root A0の正規作成（0→1件）の証跡を保存します。
+    次節のVMSD統合状態の条件を確認してから、configのidentity値を一度`capture`にして`Capture`を実行し、返された
     `replacement_values`をconfigへ固定します。その後、`Plan`を実行します。
 
 bootstrapはguestを`192.168.20.10/24`、hostを`192.168.20.1`として設定し、default routeを
@@ -129,15 +130,27 @@ local administratorをWinRMで使用するため`LocalAccountTokenFilterPolicy=1
 
 ## VMSDの統合状態
 
-`Capture`、`Plan`、`Doctor`、`Run`の共通snapshot検査では、VMSDの
-`snapshot.needConsolidate`が明示的な`FALSE`の場合だけ続行します（値の大小文字は区別しません）。
-`TRUE`は統合待ちとして拒否し、欠損・空文字・その他の値は「統合状態を確認できない」として
-拒否します。snapshot fingerprintの取得・照合より前に検査するため、`Capture`し直しても回避できません。
-`Doctor`は`ready_for_run=false`となり、`Run`はcredential読込やVM操作へ進みません。
+`Capture`、`Plan`、`Doctor`、`Run`は同じsnapshot検査を使用します。
+`snapshot.needConsolidate`が明示的な`FALSE`の場合は、従来のidentity、hash、path、disk chain検査を
+行います（値の大小文字は区別しません）。`TRUE`、空文字、空白、その他の値はsnapshot fingerprintの
+取得・照合より前に拒否します。`Doctor`は`ready_for_run=false`となり、`Run`はcredential読込や
+VM操作へ進みません。`Capture`し直して拒否を回避してはいけません。
 
-これはこのlabが受け入れる証拠の条件です。正常なVMwareが常に明示的な`FALSE`を出力するという
-保証や、欠損したVMが破損しているという判断ではありません。項目が省略される環境は未検証のため
-停止します。別の受入条件を採用するには、対象Workstation版の証拠と回帰テストが必要です。
+Workstation 26.0.0 build-25388281では、通常shutdown済みの新cloneに停止状態root A0を
+0→1件で正規作成しても、この項目が省略される実例を確認しました。欠損を`FALSE`へ読み替えず、
+この準備証跡を保存した専用VMについて、次の限定した構造条件を別の受入根拠とします。
+
+- `snapshot.numSnapshots=1`、snapshot metadataが1組だけ、`snapshot.current`が唯一のA0 UIDと一致する。
+- A0がrootで、disk metadataが`disk0`の1組だけ、そのVMDK descriptorが親を持たず、参照fileもその1個だけである。
+- 両diskの先頭1 MiB以内に`createType=monolithicSparse`が唯一あり、extent宣言が正のsector数の単一`RW SPARSE` self leafだけである。
+- active diskがA0 diskの直接の子で、parent CIDと`parentFileNameHint`が一致する。
+- VM directory直下のVMDK leaf fileがその2個だけで、追加diskやextent、残存deltaがない。
+
+これらに加え、従来のUUID/MAC、暗号化、ISO、reparse point、VMSD/VMSN/VMDK hashと固定fingerprintを
+すべて検査します。結果の`consolidation_state`は実値の`missing`、`consolidation_validation`は
+`single_root_disk_layout`として記録し、統合完了や欠損一般の安全性、disk内容全体の整合性を証明したとは扱いません。
+split disk、複数snapshot、深いdelta chainなどは欠損時の受入対象外です。通常停止と新規A0作成の
+履歴はfile構造だけでは証明できないため、手順13〜14の証跡も必要です。
 
 拒否された場合は元VMと復旧可能なbackupを保持し、VMwareで状態と統合方法を確認してください。
 VMSDの値を手書きで`FALSE`へ変更したり、項目を削除したりして検査を回避してはいけません。
@@ -267,7 +280,7 @@ evidenceへ出力しません。
 
 - VM暗号化passwordを`vmrun`で検証できない
 - VMX UUID/MAC/encryption/vTPM/NIC/ISO/isolationまたはsnapshot UID/fingerprintが一致しない
-- VMSDの`snapshot.needConsolidate`が明示的な`FALSE`ではない（大小文字を除く）
+- VMSDの`snapshot.needConsolidate`が`TRUE`、空値、不明値、または欠損時の限定構造条件を満たさない
 - VMX、VMSD、VMSN、VMDK chain、payload ISOのpathにreparse pointがある
 - VMware Tools、default route、既存Runtime、canonical/hashed/unknownなSystem32 DLLをEnvironment Aで検出する
 - CLR0400の3ファイルについて、Microsoft署名・OriginalFilename・System32/WinSxS hardlink・SFC exit 0の全証拠を確認できない

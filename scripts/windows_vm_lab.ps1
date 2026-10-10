@@ -553,6 +553,25 @@ function Get-VmdkDescriptorHeader {
       '(?im)^\s*parentFileNameHint\s*=\s*"([^"]+\.vmdk)"\s*$'
     )
   )
+  $parentHintLines = @([regex]::Matches($descriptor, '(?im)^\s*"?parentFileNameHint\b[^\r\n]*\r?$'))
+  $createTypeLines = @([regex]::Matches($descriptor, '(?im)^\s*createType\b[^\r\n]*\r?$'))
+  $extentLines = @([regex]::Matches($descriptor, '(?im)^\s*(?:RW|RDONLY|NOACCESS)\b[^\r\n]*\r?$'))
+  $monolithicSparseSelfExtent = $false
+  if (
+    $createTypeLines.Count -eq 1 -and
+    [regex]::IsMatch($createTypeLines[0].Value, '^\s*createType\s*=\s*"monolithicSparse"\s*$') -and
+    $extentLines.Count -eq 1 -and
+    $parentHintLines.Count -eq $parentMatches.Count
+  ) {
+    $extent = [regex]::Match($extentLines[0].Value, '^\s*RW\s+([0-9]+)\s+SPARSE\s+"([^"]+)"\s*$')
+    $sectors = [uint64]0
+    $monolithicSparseSelfExtent = (
+      $extent.Success -and
+      [uint64]::TryParse($extent.Groups[1].Value, [ref]$sectors) -and
+      $sectors -gt 0 -and
+      $extent.Groups[2].Value.Equals([IO.Path]::GetFileName($Path), [StringComparison]::OrdinalIgnoreCase)
+    )
+  }
   if ($cidMatches.Count -ne 1 -or $parentCidMatches.Count -ne 1) {
     throw "VMDK descriptorのCID/parentCIDを一意に解釈できません: $Path"
   }
@@ -562,6 +581,8 @@ function Get-VmdkDescriptorHeader {
   return [pscustomobject][ordered]@{
     cid = $cidMatches[0].Groups[1].Value.ToLowerInvariant()
     parent_cid = $parentCidMatches[0].Groups[1].Value.ToLowerInvariant()
+    parent_hint_present = $parentHintLines.Count -ne 0
+    monolithic_sparse_self_extent = [bool]$monolithicSparseSelfExtent
     parent_file_name = if ($parentMatches.Count -eq 1) {
       $parentMatches[0].Groups[1].Value
     } else {
@@ -959,14 +980,21 @@ function Get-SnapshotDefinition {
     -Values $values `
     -Key "snapshot.needConsolidate" `
     -Optional
-  if ($null -eq $needConsolidate -or [string]::IsNullOrWhiteSpace($needConsolidate)) {
-    throw "VMSDのsnapshot.needConsolidate状態を確認できません。VMwareで状態を確認してください。"
+  if (
+    $null -eq $needConsolidate -and
+    @(Get-Content -LiteralPath $vmsdPath -Encoding utf8 | Where-Object {
+      $_ -match '^\s*"?snapshot\.needConsolidate\b'
+    }).Count -ne 0
+  ) {
+    throw "VMSDのsnapshot.needConsolidate行を解釈できません。VMwareで状態を確認してください。"
   }
-  if ($needConsolidate.Equals("true", [StringComparison]::OrdinalIgnoreCase)) {
-    throw "VMware snapshot consolidationが必要です: snapshot.needConsolidate=$needConsolidate。VMwareで状態を確認してください。"
-  }
-  if (-not $needConsolidate.Equals("false", [StringComparison]::OrdinalIgnoreCase)) {
-    throw "VMSDのsnapshot.needConsolidate状態を確認できません。VMwareで状態を確認してください。"
+  if ($null -ne $needConsolidate) {
+    if ($needConsolidate.Equals("true", [StringComparison]::OrdinalIgnoreCase)) {
+      throw "VMware snapshot consolidationが必要です: snapshot.needConsolidate=$needConsolidate。VMwareで状態を確認してください。"
+    }
+    if (-not $needConsolidate.Equals("false", [StringComparison]::OrdinalIgnoreCase)) {
+      throw "VMSDのsnapshot.needConsolidate状態を確認できません。VMwareで状態を確認してください。"
+    }
   }
   $vmsdFileSha256 = Get-Sha256 -Path $vmsdPath
   $matches = @(
@@ -987,6 +1015,23 @@ function Get-SnapshotDefinition {
   $uid = Get-VmwareValue -Values $values -Key "${prefix}uid"
   if ($uid -cnotmatch '^\d+$') {
     throw "VMSD snapshot UIDを解釈できません: $uid"
+  }
+  if ($null -eq $needConsolidate) {
+    $snapshotIndexes = @(
+      foreach ($key in @($values.Keys)) {
+        if ($key -match '^snapshot(\d+)\.') { $Matches[1] }
+      }
+    ) | Sort-Object -Unique
+    $snapshotCount = Get-VmwareValue -Values $values -Key "snapshot.numSnapshots" -Optional
+    $currentUid = Get-VmwareValue -Values $values -Key "snapshot.current" -Optional
+    if (
+      $snapshotCount -cne "1" -or
+      @($snapshotIndexes).Count -ne 1 -or
+      @($snapshotIndexes)[0] -cne $index -or
+      $currentUid -cne $uid
+    ) {
+      throw "snapshot.needConsolidate欠損時はcurrent UIDが一致する単一root snapshotだけを使用してください。"
+    }
   }
   $parent = Get-VmwareValue -Values $values -Key "${prefix}parent" -Optional
   if (-not [string]::IsNullOrEmpty($parent)) {
@@ -1010,6 +1055,15 @@ function Get-SnapshotDefinition {
   if (-not [int]::TryParse($numDisksValue, [ref]$numDisks) -or $numDisks -ne 1) {
     throw "Environment A snapshotのvirtual diskは1件だけにしてください。"
   }
+  if ($null -eq $needConsolidate) {
+    $diskKeys = @($values.Keys | Where-Object {
+      $_.StartsWith("${prefix}disk", [StringComparison]::OrdinalIgnoreCase)
+    })
+    $diskKeyPattern = '^' + [regex]::Escape($prefix) + 'disk0\.'
+    if ($diskKeys.Count -eq 0 -or @($diskKeys | Where-Object { $_ -notmatch $diskKeyPattern }).Count -ne 0) {
+      throw "snapshot.needConsolidate欠損時のdisk metadataはdisk0の1組だけにしてください。"
+    }
+  }
   $snapshotDisks = @(
     for ($diskIndex = 0; $diskIndex -lt $numDisks; $diskIndex++) {
       $diskRelativePath = Get-VmwareValue `
@@ -1017,6 +1071,22 @@ function Get-SnapshotDefinition {
         -Key "${prefix}disk$diskIndex.fileName"
       Assert-RelativePayloadPath -Path $diskRelativePath -Label "snapshot disk path"
       $diskPath = [IO.Path]::GetFullPath((Join-Path $vmDirectory $diskRelativePath))
+      if ($null -eq $needConsolidate) {
+        if (
+          -not (Test-PathWithin -Path $diskPath -Root $vmDirectory) -or
+          -not (Test-Path -LiteralPath $diskPath -PathType Leaf)
+        ) {
+          throw "snapshot diskが専用VM directory内に見つかりません: $diskPath"
+        }
+        Assert-NoReparsePointInPath -Path $diskPath -Label "snapshot disk"
+        $descriptor = Get-VmdkDescriptorHeader -Path $diskPath
+        if ($descriptor.parent_cid -cne "ffffffff" -or $descriptor.parent_hint_present) {
+          throw "snapshot.needConsolidate欠損時のsnapshot diskには親diskを使用できません。"
+        }
+        if (-not $descriptor.monolithic_sparse_self_extent) {
+          throw "snapshot.needConsolidate欠損時のsnapshot diskは単一self extentのmonolithicSparseだけを使用してください。"
+        }
+      }
       [pscustomobject][ordered]@{
         index = $diskIndex
         node = Get-VmwareValue -Values $values -Key "${prefix}disk$diskIndex.node"
@@ -1061,6 +1131,8 @@ function Get-SnapshotDefinition {
     state_file_size = $vmsn.Length
     state_file_sha256 = $vmsnHash
     vmsd_file_sha256 = $vmsdFileSha256
+    consolidation_state = if ($null -eq $needConsolidate) { "missing" } else { $needConsolidate }
+    consolidation_validation = if ($null -eq $needConsolidate) { "single_root_disk_layout" } else { "explicit_false" }
     disks = $snapshotDisks
     fingerprint_sha256 = $fingerprint
   }
@@ -1087,6 +1159,31 @@ function Get-LabDefinition {
     -ActiveDiskPath $vm.active_disk_path `
     -SnapshotDiskPath $snapshot.disks[0].primary_path `
     -VmDirectory (Split-Path -Parent $Config.vmx_path)
+  if ($snapshot.consolidation_state -ceq "missing") {
+    # Workstation can omit this field on a fresh A0; absence never means FALSE.
+    $snapshotDisk = $snapshot.disks[0]
+    $vmDirectory = Split-Path -Parent $Config.vmx_path
+    $diskFiles = @(Get-ChildItem -LiteralPath $vmDirectory -File -Force -Filter "*.vmdk" -ErrorAction Stop)
+    if (
+      @($snapshotDisk.files).Count -ne 1 -or
+      $diskFiles.Count -ne 2 -or
+      $vm.active_disk_path.Equals($snapshotDisk.primary_path, [StringComparison]::OrdinalIgnoreCase) -or
+      @($diskFiles | Where-Object {
+        -not $_.FullName.Equals($vm.active_disk_path, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $_.FullName.Equals($snapshotDisk.primary_path, [StringComparison]::OrdinalIgnoreCase)
+      }).Count -ne 0
+    ) {
+      throw "snapshot.needConsolidate欠損時はsnapshot diskとactive diskだけの単一root disk layoutが必要です。"
+    }
+    $activeDescriptor = Get-VmdkDescriptorHeader -Path $vm.active_disk_path
+    if (-not $activeDescriptor.monolithic_sparse_self_extent) {
+      throw "snapshot.needConsolidate欠損時のactive diskは単一self extentのmonolithicSparseだけを使用してください。"
+    }
+    $parentPath = [IO.Path]::GetFullPath((Join-Path $vmDirectory $activeDescriptor.parent_file_name))
+    if (-not $parentPath.Equals($snapshotDisk.primary_path, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "snapshot.needConsolidate欠損時のactive diskはroot snapshot diskの直接の子にしてください。"
+    }
+  }
   return [pscustomobject][ordered]@{
     vm = $vm
     snapshot = $snapshot

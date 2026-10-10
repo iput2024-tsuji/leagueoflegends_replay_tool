@@ -141,7 +141,8 @@ def _config(external_temp: Path, **overrides: object) -> tuple[Path, dict[str, o
         "version=1\n"
         "CID=11111111\n"
         "parentCID=ffffffff\n"
-        'createType="monolithicSparse"\n',
+        'createType="monolithicSparse"\n'
+        f'RW 2048 SPARSE "{vm_name}.vmdk"\n',
         encoding="ascii",
     )
     (vmx.parent / f"{vm_name}-000001.vmdk").write_text(
@@ -150,7 +151,8 @@ def _config(external_temp: Path, **overrides: object) -> tuple[Path, dict[str, o
         "CID=22222222\n"
         "parentCID=11111111\n"
         'createType="monolithicSparse"\n'
-        f'parentFileNameHint="{vm_name}.vmdk"\n',
+        f'parentFileNameHint="{vm_name}.vmdk"\n'
+        f'RW 2048 SPARSE "{vm_name}-000001.vmdk"\n',
         encoding="ascii",
     )
     snapshot_state = vmx.with_name(f"{vm_name}-Snapshot1.vmsn")
@@ -891,7 +893,6 @@ def test_explicit_false_snapshot_consolidation_state_proceeds(
 @pytest.mark.parametrize(
     ("replacement", "expected"),
     [
-        ("", "状態を確認できません"),
         ('snapshot.needConsolidate = ""', "状態を確認できません"),
         ('snapshot.needConsolidate = " "', "状態を確認できません"),
         ('snapshot.needConsolidate = "unknown"', "状態を確認できません"),
@@ -916,6 +917,282 @@ def test_capture_refuses_unverified_snapshot_consolidation_state(
     assert expected in output
     assert "snapshot.needConsolidate" in output
     assert "corruption" not in output.lower()
+
+
+def _omit_consolidation_state(vmsd: Path) -> None:
+    vmsd.write_text(
+        vmsd.read_text(encoding="utf-8").replace('snapshot.needConsolidate = "FALSE"', ""),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+@pytest.mark.parametrize("same_cid", [False, True])
+def test_missing_consolidation_state_accepts_single_root_layout(external_temp: Path, same_cid: bool, line_ending: bytes):
+    config, values = _config(external_temp)
+    vmx = Path(str(values["vmx_path"]))
+    _omit_consolidation_state(vmx.with_suffix(".vmsd"))
+    if same_cid:
+        active = vmx.with_name(f"{vmx.stem}-000001.vmdk")
+        active.write_text(
+            active.read_text(encoding="ascii").replace("CID=22222222", "CID=11111111"),
+            encoding="ascii",
+        )
+    for name in (f"{vmx.stem}.vmdk", f"{vmx.stem}-000001.vmdk"):
+        path = vmx.with_name(name)
+        path.write_bytes(path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", line_ending))
+
+    capture = _json_output(_run_lab(config, "Capture"))
+    snapshot = capture["definition"]["snapshot"]
+    assert snapshot["consolidation_state"] == "missing"
+    assert snapshot["consolidation_validation"] == "single_root_disk_layout"
+    values.update(capture["replacement_values"])
+    config.write_text(json.dumps(values), encoding="utf-8")
+
+    plan = _json_output(_run_lab(config, "Plan"))
+    assert plan["action"] == "Plan"
+    assert plan["readiness"]["definition"]["snapshot"]["consolidation_state"] == "missing"
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ('snapshot.numSnapshots = "1"', ""),
+        ('snapshot.numSnapshots = "1"', 'snapshot.numSnapshots = "0"'),
+        ('snapshot.numSnapshots = "1"', 'snapshot.numSnapshots = "2"'),
+        ('snapshot.numSnapshots = "1"', 'snapshot.numSnapshots = "unknown"'),
+        ('snapshot.current = "1"', ""),
+        ('snapshot.current = "1"', 'snapshot.current = "2"'),
+        ('snapshot.current = "1"', 'snapshot.current = ""'),
+        ('snapshot.current = "1"', 'snapshot.current = "1"\nsnapshot.needConsolidate TRUE'),
+        ('snapshot.current = "1"', 'snapshot.current = "1"\n"snapshot.needConsolidate" = "TRUE"'),
+        ('snapshot0.parent = ""', 'snapshot0.parent = "2"'),
+        ('snapshot0.uid = "1"', 'snapshot0.uid = "1"\nsnapshot1.uid = "2"'),
+        ('snapshot0.uid = "1"', 'snapshot0.uid = "1"\nsnapshot1.description = "orphan"'),
+        ('snapshot0.numDisks = "1"', 'snapshot0.numDisks = "1"\nsnapshot0.disk1.fileName = "other.vmdk"'),
+        ('snapshot0.numDisks = "1"', 'snapshot0.numDisks = "1"\nsnapshot0.disk01.node = "nvme0:1"'),
+        ('snapshot0.numDisks = "1"', 'snapshot0.numDisks = "1"\nsnapshot0.diskUnknown.node = "nvme0:1"'),
+    ],
+)
+def test_missing_consolidation_state_refuses_ambiguous_snapshot_metadata(external_temp: Path, old: str, new: str):
+    config, values = _config(external_temp)
+    vmsd = Path(str(values["vmx_path"])).with_suffix(".vmsd")
+    _omit_consolidation_state(vmsd)
+    vmsd.write_text(vmsd.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+
+    result = _run_lab(config, "Capture")
+
+    assert result.returncode != 0
+    assert "snapshot" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "snapshot-parent",
+        "snapshot-parent-hint",
+        "active-cid",
+        "active-base",
+        "deep-chain",
+        "orphan",
+        "extent",
+        "outside",
+    ],
+)
+def test_missing_consolidation_state_refuses_unverified_disk_layout(external_temp: Path, variant: str):
+    config, values = _config(external_temp)
+    vmx = Path(str(values["vmx_path"]))
+    vm_name = vmx.stem
+    _omit_consolidation_state(vmx.with_suffix(".vmsd"))
+    base = vmx.with_name(f"{vm_name}.vmdk")
+    active = vmx.with_name(f"{vm_name}-000001.vmdk")
+    if variant == "snapshot-parent":
+        base.write_text(
+            base.read_text(encoding="ascii").replace("parentCID=ffffffff", "parentCID=12345678"),
+            encoding="ascii",
+        )
+    elif variant == "snapshot-parent-hint":
+        base.write_text(base.read_text(encoding="ascii") + 'parentFileNameHint="unexpected.vmdk"\n', encoding="ascii")
+    elif variant == "active-base":
+        vmx.write_text(vmx.read_text(encoding="utf-8").replace(active.name, base.name), encoding="utf-8")
+    elif variant == "active-cid":
+        active.write_text(
+            active.read_text(encoding="ascii").replace("parentCID=11111111", "parentCID=12345678"),
+            encoding="ascii",
+        )
+    elif variant == "deep-chain":
+        child = vmx.with_name(f"{vm_name}-000002.vmdk")
+        child.write_text(
+            f'CID=33333333\nparentCID=22222222\nparentFileNameHint="{active.name}"\n',
+            encoding="ascii",
+        )
+        vmx.write_text(vmx.read_text(encoding="utf-8").replace(active.name, child.name), encoding="utf-8")
+    elif variant == "orphan":
+        vmx.with_name("orphan.vmdk").write_bytes(b"unreferenced disk")
+    elif variant == "extent":
+        extent = vmx.with_name("extent.vmdk")
+        extent.write_bytes(b"extent")
+        base.write_text(base.read_text(encoding="ascii") + 'RW 2048 SPARSE "extent.vmdk"\n', encoding="ascii")
+    else:
+        active.write_text(
+            active.read_text(encoding="ascii").replace(base.name, f"../{base.name}"),
+            encoding="ascii",
+        )
+
+    result = _run_lab(config, "Capture")
+
+    assert result.returncode != 0
+    assert "disk" in result.stdout + result.stderr or "path" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        "",
+        'RW 0 SPARSE "{name}"',
+        'RW 2048 UNKNOWN "{name}"',
+        'RDONLY 2048 SPARSE "{name}"',
+        'NOACCESS 2048 SPARSE "{name}"',
+        'RW 2048 SPARSE "{name}"\nRW 2048 SPARSE "{name}"',
+        'RW malformed SPARSE "{name}"',
+    ],
+)
+def test_missing_consolidation_refuses_unverified_extent_declaration(external_temp: Path, declaration: str):
+    config, values = _config(external_temp)
+    vmx = Path(str(values["vmx_path"]))
+    _omit_consolidation_state(vmx.with_suffix(".vmsd"))
+    base = vmx.with_name(f"{vmx.stem}.vmdk")
+    base.write_text(
+        base.read_text(encoding="ascii").replace(f'RW 2048 SPARSE "{base.name}"', declaration.format(name=base.name)),
+        encoding="ascii",
+    )
+
+    result = _run_lab(config, "Capture")
+
+    assert result.returncode != 0
+    assert "monolithicSparse" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("create_type", ['createType="otherSparse"', 'createType="monolithicSparse"\ncreateType="monolithicSparse"'])
+def test_missing_consolidation_refuses_unverified_create_type(external_temp: Path, create_type: str):
+    config, values = _config(external_temp)
+    vmx = Path(str(values["vmx_path"]))
+    _omit_consolidation_state(vmx.with_suffix(".vmsd"))
+    base = vmx.with_name(f"{vmx.stem}.vmdk")
+    base.write_text(base.read_text(encoding="ascii").replace('createType="monolithicSparse"', create_type), encoding="ascii")
+
+    result = _run_lab(config, "Capture")
+
+    assert result.returncode != 0
+    assert "monolithicSparse" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("disk", ["base", "active"])
+def test_missing_consolidation_refuses_external_extent_in_large_vmdk(external_temp: Path, disk: str):
+    config, values = _config(external_temp)
+    vmx = Path(str(values["vmx_path"]))
+    _omit_consolidation_state(vmx.with_suffix(".vmsd"))
+    name = f"{vmx.stem}.vmdk" if disk == "base" else f"{vmx.stem}-000001.vmdk"
+    path = vmx.with_name(name)
+    header = path.read_bytes().replace(name.encode("ascii"), b"external-extent.vmdk")
+    path.write_bytes(header + b"\0" * (4 * 1024 * 1024 + 1))
+
+    result = _run_lab(config, "Capture")
+
+    assert result.returncode != 0
+    assert "monolithicSparse" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("hint", ['parentFileNameHint="unknown.ext"', 'parentFileNameHint=""'])
+def test_missing_consolidation_refuses_unparsed_base_parent_hint(external_temp: Path, hint: str):
+    config, values = _config(external_temp)
+    vmx = Path(str(values["vmx_path"]))
+    _omit_consolidation_state(vmx.with_suffix(".vmsd"))
+    base = vmx.with_name(f"{vmx.stem}.vmdk")
+    base.write_text(base.read_text(encoding="ascii") + hint + "\n", encoding="ascii")
+
+    result = _run_lab(config, "Capture")
+
+    assert result.returncode != 0
+    assert "親disk" in result.stdout + result.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows hidden-file behavior")
+def test_missing_consolidation_state_refuses_hidden_orphan_disk(external_temp: Path):
+    import ctypes
+
+    config, values = _config(external_temp)
+    vmx = Path(str(values["vmx_path"]))
+    _omit_consolidation_state(vmx.with_suffix(".vmsd"))
+    orphan = vmx.with_name("hidden-orphan.vmdk")
+    orphan.write_bytes(b"unreferenced disk")
+    if not ctypes.windll.kernel32.SetFileAttributesW(str(orphan), 2):
+        pytest.skip("hidden attribute is unavailable")
+    try:
+        result = _run_lab(config, "Capture")
+        assert result.returncode != 0
+        assert "単一root disk layout" in result.stdout + result.stderr
+    finally:
+        ctypes.windll.kernel32.SetFileAttributesW(str(orphan), 128)
+
+
+def test_missing_consolidation_snapshot_mutation_is_not_recaptured_by_plan(external_temp: Path):
+    config, values = _config(external_temp)
+    vmsd = Path(str(values["vmx_path"])).with_suffix(".vmsd")
+    _omit_consolidation_state(vmsd)
+    capture = _json_output(_run_lab(config, "Capture"))
+    values.update(capture["replacement_values"])
+    config.write_text(json.dumps(values), encoding="utf-8")
+    vmsd.write_text(vmsd.read_text(encoding="utf-8") + 'snapshot0.description = "changed"\n', encoding="utf-8")
+
+    result = _run_lab(config, "Plan")
+
+    assert result.returncode != 0
+    assert "snapshot UID/fingerprint" in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("variant", ["orphan", "current", "disk", "malformed"])
+def test_missing_consolidation_invalid_layout_stops_before_credentials_or_mutation(external_temp: Path, variant: str):
+    config, values = _config(external_temp)
+    vmx = Path(str(values["vmx_path"]))
+    _omit_consolidation_state(vmx.with_suffix(".vmsd"))
+    capture = _json_output(_run_lab(config, "Capture"))
+    values.update(capture["replacement_values"])
+    config.write_text(json.dumps(values), encoding="utf-8")
+    if variant == "orphan":
+        vmx.with_name("orphan.vmdk").write_bytes(b"unreferenced disk")
+        expected = "単一root disk layout"
+    elif variant == "current":
+        vmsd = vmx.with_suffix(".vmsd")
+        vmsd.write_text(
+            vmsd.read_text(encoding="utf-8").replace('snapshot.current = "1"', 'snapshot.current = "2"'),
+            encoding="utf-8",
+        )
+        expected = "単一root snapshot"
+    elif variant == "disk":
+        vmsd = vmx.with_suffix(".vmsd")
+        vmsd.write_text(vmsd.read_text(encoding="utf-8") + 'snapshot0.disk1.node = "nvme0:1"\n', encoding="utf-8")
+        expected = "disk metadata"
+    else:
+        vmsd = vmx.with_suffix(".vmsd")
+        vmsd.write_text(vmsd.read_text(encoding="utf-8") + "snapshot.needConsolidate TRUE\n", encoding="utf-8")
+        expected = "行を解釈できません"
+    Path(str(values["vm_encryption_credential_path"])).write_text("not a credential", encoding="utf-8")
+    Path(str(values["guest_credential_path"])).write_text("not a credential", encoding="utf-8")
+
+    doctor = _json_output(_run_lab(config, "Doctor"))
+    run = _run_lab(
+        config, "Run", "-ConfirmSnapshotRestore", "-ConfirmRuntimeInstall", "-ConfirmVmPasswordProcessExposure"
+    )
+
+    assert doctor["ready_for_run"] is False
+    assert expected in doctor["validation_error"]
+    output = run.stdout + run.stderr
+    assert run.returncode != 0
+    assert expected in output
+    assert "credentialは" not in output
+    assert "vmrun command failed" not in output
+    assert not Path(str(values["artifact_root"])).exists()
 
 
 def test_plan_refuses_consolidation_before_snapshot_fingerprint_validation(

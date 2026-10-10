@@ -3004,6 +3004,61 @@ def _hash_zip_member(
     return size, digest.hexdigest()
 
 
+def _application_source_blobs(source_commit: str) -> dict[str, tuple[str, str]]:
+    source_commit = source_commit.casefold()
+    if COMMIT_PATTERN.fullmatch(source_commit) is None:
+        raise ReleaseAssetError("Application source commit is invalid.")
+    resolved_commit = str(
+        _git_output("rev-parse", f"{source_commit}^{{commit}}")
+    ).strip().casefold()
+    if resolved_commit != source_commit:
+        raise ReleaseAssetError("Application source commit does not resolve exactly.")
+    tree_raw = _git_output("ls-tree", "-r", "-z", source_commit, binary=True)
+    if not isinstance(tree_raw, bytes):
+        raise ReleaseAssetError("Application source Git tree is invalid.")
+    expected_blobs: dict[str, tuple[str, str]] = {}
+    for raw_entry in tree_raw.split(b"\0"):
+        if not raw_entry:
+            continue
+        try:
+            metadata_raw, raw_path = raw_entry.split(b"\t", 1)
+            mode, object_type, object_id = metadata_raw.split(b" ")
+            relative = raw_path.decode("utf-8", errors="strict")
+        except (UnicodeError, ValueError) as exc:
+            raise ReleaseAssetError("Cannot parse application source Git tree.") from exc
+        if object_type != b"blob" or _safe_archive_member(
+            relative, label="application source Git tree",
+        ).as_posix() != relative:
+            raise ReleaseAssetError(
+                f"Application source Git tree entry is unsupported: {relative}"
+            )
+        expected_blobs[relative] = (mode.decode("ascii"), object_id.decode("ascii"))
+    return expected_blobs
+
+
+def create_application_source(source_zip: Path, version: str, source_commit: str) -> Path:
+    """Archive exact Git blobs and modes, including on native Windows Git."""
+    _reject_link_target(source_zip, label="Application source archive")
+    if source_zip.exists():
+        raise ReleaseAssetError(f"Application source archive already exists: {source_zip}")
+    blobs = _application_source_blobs(source_commit)
+    with zipfile.ZipFile(source_zip, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        for relative, (mode, object_id) in blobs.items():
+            if mode not in {"100644", "100755"}:
+                raise ReleaseAssetError(
+                    f"Application source Git mode is unsupported: {relative}"
+                )
+            blob = _git_output("cat-file", "blob", object_id, binary=True)
+            if not isinstance(blob, bytes):
+                raise ReleaseAssetError(f"Application source Git blob is invalid: {relative}")
+            member = zipfile.ZipInfo(relative)
+            member.create_system = 3
+            member.external_attr = int(mode, 8) << 16
+            archive.writestr(member, blob, compress_type=zipfile.ZIP_DEFLATED)
+    validate_application_source(source_zip, version, source_commit)
+    return source_zip
+
+
 def validate_application_source(
     source_zip: Path,
     version: str,
@@ -3039,48 +3094,7 @@ def validate_application_source(
             if archived_version != version:
                 raise ReleaseAssetError(f"Application source VERSION mismatch: {archived_version} != {version}")
             if source_commit is not None:
-                source_commit = source_commit.casefold()
-                if COMMIT_PATTERN.fullmatch(source_commit) is None:
-                    raise ReleaseAssetError("Application source commit is invalid.")
-                resolved_commit = str(
-                    _git_output("rev-parse", f"{source_commit}^{{commit}}")
-                ).strip().casefold()
-                if resolved_commit != source_commit:
-                    raise ReleaseAssetError(
-                        "Application source commit does not resolve exactly."
-                    )
-                tree_raw = _git_output(
-                    "ls-tree",
-                    "-r",
-                    "-z",
-                    source_commit,
-                    binary=True,
-                )
-                if not isinstance(tree_raw, bytes):
-                    raise ReleaseAssetError("Application source Git tree is invalid.")
-                expected_blobs: dict[str, tuple[str, str]] = {}
-                for raw_entry in tree_raw.split(b"\0"):
-                    if not raw_entry:
-                        continue
-                    try:
-                        metadata_raw, raw_path = raw_entry.split(b"\t", 1)
-                        mode, object_type, object_id = metadata_raw.split(b" ")
-                        relative = raw_path.decode("utf-8", errors="strict")
-                    except (UnicodeError, ValueError) as exc:
-                        raise ReleaseAssetError(
-                            "Cannot parse application source Git tree."
-                        ) from exc
-                    if object_type != b"blob" or _safe_archive_member(
-                        relative,
-                        label="application source Git tree",
-                    ).as_posix() != relative:
-                        raise ReleaseAssetError(
-                            f"Application source Git tree entry is unsupported: {relative}"
-                        )
-                    expected_blobs[relative] = (
-                        mode.decode("ascii"),
-                        object_id.decode("ascii"),
-                    )
+                expected_blobs = _application_source_blobs(source_commit)
                 archived_files = {
                     name: info for name, info in names.items() if not info.is_dir()
                 }
@@ -3886,6 +3900,13 @@ def _create_parser() -> argparse.ArgumentParser:
         help="Test/audit only; release workflow must never pass this option.",
     )
 
+    application_source = commands.add_parser(
+        "create-application-source", help="Archive exact application Git blobs and modes.",
+    )
+    application_source.add_argument("--output", required=True, type=Path)
+    application_source.add_argument("--version", required=True)
+    application_source.add_argument("--source-commit", required=True)
+
     verify = commands.add_parser("verify", help="Re-verify an immutable asset set.")
     verify.add_argument("--asset-list", required=True, type=Path)
     verify.add_argument("--components", required=True, type=Path)
@@ -3900,6 +3921,10 @@ def _create_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _create_parser().parse_args(argv)
     try:
+        if args.command == "create-application-source":
+            create_application_source(args.output, args.version, args.source_commit)
+            print(f"Application source archive created and verified: {args.output}")
+            return 0
         if args.command == "check-gates":
             assert_release_gates_closed(args.components)
             print("All centralized release gates are closed.")

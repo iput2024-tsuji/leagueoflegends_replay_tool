@@ -2511,6 +2511,105 @@ def test_application_source_validates_git_tree_modes_and_blob_bytes(
         validate_application_source(source, "1.2.3", "a" * 40)
 
 
+@pytest.fixture
+def application_source_git_repository(tmp_path, monkeypatch):
+    repository = tmp_path / "git-source"
+    repository.mkdir()
+
+    def git(*arguments):
+        return subprocess.run(
+            ["git", "-C", str(repository), *arguments],
+            check=True, capture_output=True, text=True, encoding="utf-8",
+        ).stdout.strip()
+
+    git("init", "--quiet")
+    git("config", "core.autocrlf", "false")
+    files = {
+        "LICENSE": b"GPL\n", "VERSION": b"1.2.3\n",
+        "main.py": b"# $Format:%H$\nprint('committed')\n",
+        "ignored.txt": b"must remain in the exact source archive\n",
+        "data.bin": b"\x00\xff\r\n",
+    }
+    for name, content in files.items():
+        (repository / name).write_bytes(content)
+    git("add", ".")
+    git("update-index", "--chmod=+x", "main.py")
+    git("-c", "user.name=Test User", "-c", "user.email=test@example.invalid",
+        "commit", "--quiet", "-m", "Source fixture")
+    ordinary_commit = git("rev-parse", "HEAD")
+    legacy = tmp_path / "native-git.zip"
+    git("archive", "--format=zip", f"--output={legacy}", ordinary_commit)
+    files[".gitattributes"] = b"ignored.txt export-ignore\nmain.py export-subst\n"
+    (repository / ".gitattributes").write_bytes(files[".gitattributes"])
+    git("add", ".gitattributes")
+    git("-c", "user.name=Test User", "-c", "user.email=test@example.invalid",
+        "commit", "--quiet", "-m", "Archive attribute fixture")
+    commit = git("rev-parse", "HEAD")
+    (repository / "main.py").write_bytes(b"dirty working tree\n")
+    monkeypatch.setattr(release_assets, "__file__", str(repository / "scripts" / "prepare_release_assets.py"))
+    return commit, ordinary_commit, files, legacy
+
+
+def test_application_source_cli_preserves_native_git_modes_and_committed_blobs(
+    tmp_path, application_source_git_repository,
+):
+    commit, ordinary_commit, files, legacy = application_source_git_repository
+    with zipfile.ZipFile(legacy) as archive:
+        legacy_mode = archive.getinfo("LICENSE").external_attr >> 16
+    if legacy_mode != 0o100644:
+        with pytest.raises(ReleaseAssetError, match="mode differs from Git tree"):
+            validate_application_source(legacy, "1.2.3", ordinary_commit)
+    source = tmp_path / "source.zip"
+
+    assert release_assets.main([
+        "create-application-source", "--output", str(source),
+        "--version", "1.2.3", "--source-commit", commit,
+    ]) == 0
+
+    validate_application_source(source, "1.2.3", commit)
+    with zipfile.ZipFile(source) as archive:
+        assert set(archive.namelist()) == set(files)
+        for name, content in files.items():
+            assert archive.read(name) == content
+            info = archive.getinfo(name)
+            assert info.create_system == 3
+            assert info.external_attr >> 16 == (0o100755 if name == "main.py" else 0o100644)
+    original_digest = release_assets.sha256_file(source)
+    with pytest.raises(ReleaseAssetError, match="already exists"):
+        release_assets.create_application_source(source, "1.2.3", commit)
+    assert release_assets.sha256_file(source) == original_digest
+    validate_application_source(source, "1.2.3", commit)
+
+
+@pytest.mark.parametrize("change,error", [
+    ("mode", "mode differs from Git tree"),
+    ("content", "differs from Git blob"),
+    ("file-set", "file set differs from its Git commit"),
+])
+def test_generated_application_source_rejects_tampering(
+    tmp_path, application_source_git_repository, change, error,
+):
+    commit, _ordinary_commit, _files, _legacy = application_source_git_repository
+    source = tmp_path / "source.zip"
+    release_assets.create_application_source(source, "1.2.3", commit)
+    tampered = tmp_path / "tampered.zip"
+    with zipfile.ZipFile(source) as original, zipfile.ZipFile(tampered, "w") as output:
+        for info in original.infolist():
+            if change == "file-set" and info.filename == "ignored.txt":
+                continue
+            content = original.read(info)
+            if info.filename == "LICENSE":
+                if change == "mode":
+                    info.create_system = 0
+                    info.external_attr = 0x20  # DOS archive flag, no Unix file mode.
+                elif change == "content":
+                    content = b"forged license\n"
+            output.writestr(info, content)
+
+    with pytest.raises(ReleaseAssetError, match=error):
+        validate_application_source(tampered, "1.2.3", commit)
+
+
 def test_generated_archive_indexes_detect_member_tampering(monkeypatch, tmp_path):
     _payload, output = _create_asset_set(tmp_path, monkeypatch)
     source_part = output / "LoLReplayTool-third-party-sources-1.2.3-01.zip"

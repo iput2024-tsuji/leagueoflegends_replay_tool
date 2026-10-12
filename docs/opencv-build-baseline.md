@@ -2,7 +2,8 @@
 
 関連: [#139](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/issues/139)、
 [#140](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/pull/140)。
-2026年9月30日時点の修正候補。正式成果物の受入完了を意味しない。
+2026年10月12日時点の入力移行と比較基準。正式成果物の受入完了を意味しない。
+9月の `4be414…` はcompiler入力を固定した時点の履歴であり、現在の基準は末尾に記録する。
 
 ## 観測した入力差
 
@@ -29,7 +30,7 @@ buildの絶対作業パスは一致している。
 旧成功時のbackend DLLの実ハッシュは残っていないため、この差までpatch更新だけで
 説明したとは扱わない。旧入力の復元ができた、という記録にも置き換えない。
 
-## 修正の範囲
+## 9月のcompiler入力移行
 
 `compliance/components.json` の `build_environment.msvc_tools` で、19.44.35229側の
 観測済み8ファイルのsize/SHA256を明示的に採用する。
@@ -147,7 +148,8 @@ producerは固定policyとの差で停止し、app・self-check・installerは�
 証明したとは扱わない。今回も期待hash・PE除外範囲は変更しない。
 
 別版MSVC 19.34の小さなcompile-only実験では、`/experimental:deterministic` が警告D9002なしで
-受理され、匿名namespace IDのseedが実ホスト名CRCから0へ変わった。lambda IDは同一だった。
+受理され、匿名namespace IDのseedが実ホスト名CRCから0へ変わった。このTUのlambdaは
+匿名namespace外にあり、そのIDは同一だった。匿名namespace内のlambdaまで不変とは扱わない。
 flagの存在は [Microsoftの17.1 release notes](https://learn.microsoft.com/en-us/visualstudio/releases/2022/release-notes-v17.1)
 にも記載されるが、19.44でのホスト名依存除去の仕様・保証を確認したものではない。
 
@@ -161,7 +163,7 @@ source／OBJ／compiler receiptを保存する。通常CIのtests・producer・a
 準備したが、共有Installer・SDK・Runtimeへの影響があるため未実行とし、先に上記診断を行う。
 既存のRuntime受入VMと10月10日に完了した受入結果は保持する。
 
-### deterministic flagの入力移行候補
+### deterministic flagの比較基準
 
 [run 38207197097](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/actions/runs/38207197097)
 の独立診断は、対象19.44でもPCHあり／なしの全6条件で、controlが実ホスト名CRC、
@@ -175,8 +177,41 @@ flagありがseed 0のforward予測に一致した。D9002はなく、保存12 O
 control／INITの実効cache、Releaseの `/O2 /Ob2 /DNDEBUG`、DLL CRT、PCH creator／consumerの
 flag継承を確認した。[固定CMakeのplatform実装](https://github.com/Kitware/CMake/blob/v3.31.6/Modules/Platform/Windows-MSVC.cmake)
 
-期待semantic SHA256は旧 `4be414…` のままとする。次の正式CIで2cleanbuildを比較し、
-追加したcmake_args／実効cacheと、事前にseed 0から予測した46 namespace IDsに出力差を対応付ける。
-固定policy差で停止したwheelを正式成果物へ流用しない。出力差を説明・レビューした後にだけ、
-明示したflag入力の移行として比較基準を検討する。IPP等の除去、dynamic CRT、対応ソースと
-FFmpeg binding、未知native、Runtime非同梱、同run／commit／artifact、32 bytesだけのPE除外は維持する。
+旧基準を保持した [run 38209241171](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/actions/runs/38209241171)
+は、head `aac1f1c` とmain `987a240` のmerge `5d78bf4` から正式2cleanbuildを完了し、
+旧semantic policyとの差だけで停止した。限定診断を静的解析し、次の根拠から明示したflag入力の
+一回の移行として、期待semantic SHA256を
+`3fa138e958e6422f90f34afd44d29686ddb0793723c44342b9c1ed141ce2346e` に固定する。
+
+- A/Bの実wheelから再計算したsemantic manifestが完全一致する。raw wheelは異なり、
+  `expected_byte_identical=false` と `expected_wheel_sha256=null` は維持する。
+- 旧成功からのmanifest差は、追加した `cmake_args`、実効 `CMAKE_CXX_FLAGS`、cv2比較用hashの
+  2項目の計4 JSON pathsだけ。固定source・11入力・8tools・NOTICE・FFmpeg binding・native imports・API/video probesは維持する。
+- 保存CL commandの各1088件を照合した。C++764件と混在libtiffのC42件へのflag 1個の追加だけで、
+  残るC282件は不変。source/OBJ対応、CRT、EH、GR、PCH作成14件・使用529件も維持する。
+  CMake cacheの既定値と、OpenCVによる既存の `/W4`・`/EHa` への変換を区別して確認した。
+- 各46 namespace IDsは、製品build前にseed 0から計算した予測とすべて一致する。
+  保存8 OBJのcode bytesとraw relocation tablesは旧controlと一致し、新A/BではOBJ全体がbyte一致する。
+- 旧controlとの `.text` の292-byte差を、実PE bytesに照合した静的disassembly・PDB・EH4 metadataで確認した。
+  address参照、ExtensionSetの2関数の配置、8 cleanup thunksの順序、build informationの長さに対応する。
+  文字列は新flagの28-byte prefixをRelease/Debugの2行へ加えた56 bytes分だけ増える。
+  EHの通常参照と圧縮されたdirect cleanupのsource/target対応も維持する。
+
+匿名namespace内のlambda IDも変化する。namespaceだけの名前aliasでは残る差を保存し、lambdaの
+hashをforward予測した、または全プログラムの同等性を証明したとは扱わない。ExtensionSetのOBJは
+未保存で、上記2関数はPE/PDB/disassemblyで照合した。この解析用対応付けを正式PE比較へ追加しない。
+A/Bの実cv2で異なる24 bytesは、従来の5 fields・合計32 bytesの除外内だけであり、除外外は完全一致する。
+
+比較元archiveは以下のとおり。失敗診断は未sealed evidenceであり、正式producer/consumerの受入を
+代替しない。停止したwheelを配布成果物へ流用せず、基準更新後のfresh CIで改めて2build、封印、
+同run/commit/artifactのconsumer、app、packaged self-check、installer監査を通す。
+
+| artifact ID | size | archive SHA256 |
+| --- | ---: | --- |
+| 11729501146 | 919424 | `9c3e2a999f2c9990b6bd4538ab031eb01af7ba8b82b0be1dc12a351c59d3a24f` |
+| 11729560919 | 78717797 | `123d723dd225ff33ac254f64218d5a72bd288db7dbdf7903c800c63a1e261da5` |
+
+IPP等の除去、dynamic CRT、対応ソースとFFmpeg binding、未知native、Runtime非同梱、
+同run/commit/artifact、32 bytesだけのPE除外は維持する。対象compilerでの実測であり、将来の
+compilerや全SDK/helpers/loaded DLL identityへの保証とは扱わない。実LoL・最終clean VM受入と
+#54の対応ソース採用は別に必要で、10月10日に完了した旧候補のRuntime受入10項目は完了結果として保持する。

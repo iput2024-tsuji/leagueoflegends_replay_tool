@@ -147,7 +147,7 @@
     "output_filename": "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl",
     "expected_byte_identical": false,
     "expected_wheel_sha256": null,
-    "expected_semantic_manifest_sha256": "4be414796959ed7f95843b2e99414b36579836eb451749b23e0ca1c4fa57dd22",
+    "expected_semantic_manifest_sha256": "3fa138e958e6422f90f34afd44d29686ddb0793723c44342b9c1ed141ce2346e",
     "license_notice_normalization": {
       "source_path": "LICENSE-3RD-PARTY.txt",
       "source_size": 174432,

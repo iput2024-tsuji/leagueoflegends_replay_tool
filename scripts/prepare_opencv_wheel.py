@@ -7,6 +7,7 @@ anything: a release build must make its network boundary explicit.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import json
 import os
@@ -19,6 +20,7 @@ import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -1924,6 +1926,24 @@ def _diagnostic_bytes(path: Path, limit: int) -> bytes:
     return data
 
 
+def _computer_name_crc32() -> str | None:
+    """Observe the OS computer name without retaining its raw value."""
+    if os.name != "nt":
+        return None
+    query = ctypes.WinDLL("kernel32.dll", winmode=0x800).GetComputerNameW
+    query.argtypes = [ctypes.POINTER(ctypes.c_wchar), ctypes.POINTER(ctypes.c_uint32)]
+    query.restype = ctypes.c_int
+    # GetComputerNameW returns the NetBIOS name, at most 15 UTF-16 code units.
+    buffer = ctypes.create_unicode_buffer(16)
+    size = ctypes.c_uint32(len(buffer))
+    if not query(buffer, ctypes.byref(size)):
+        raise OpenCVWheelError("GetComputerNameW failed")
+    name = buffer.value
+    if not 0 < size.value < len(buffer) or len(name.encode("utf-16-le")) != size.value * 2:
+        raise OpenCVWheelError("GetComputerNameW returned an invalid length")
+    return f"{zlib.crc32(name.encode('utf-8')):08x}"
+
+
 def _capture_build_diagnostics(
     source_tree: Path, evidence: Path, command: list[str], *, returncode: int | None
 ) -> None:
@@ -1939,6 +1959,12 @@ def _capture_build_diagnostics(
         "tool_process_paths_status": "not_observed_configured_or_inferred_only",
         "build_tool_options": DIAGNOSTIC_BUILD_OPTIONS,
         "build_returncode": returncode,
+        "computer_name_crc32": {
+            "source": "GetComputerNameW",
+            "encoding": "utf-8_no_nul_original_case",
+            "status": "not_observed",
+            "crc32": None,
+        },
         "limits": {
             "per_file_bytes": DIAGNOSTIC_FILE_LIMIT,
             "copied_total_bytes": DIAGNOSTIC_TOTAL_LIMIT,
@@ -1948,6 +1974,16 @@ def _capture_build_diagnostics(
         "files": [],
         "errors": [],
     }
+    try:
+        computer_crc = _computer_name_crc32()
+        report["computer_name_crc32"].update(
+            status="observed" if computer_crc is not None else "not_observed_non_windows",
+            crc32=computer_crc,
+        )
+    except (OSError, ValueError, AttributeError) as exc:
+        report["computer_name_crc32"]["status"] = "error"
+        # API exception text may contain the raw name; keep only its type.
+        report["errors"].append(f"computer name CRC32 observation failed ({type(exc).__name__})")
     try:
         cache = _read_cmake_cache(source_tree)
         compiler = _configured_compiler_path(cache, source_tree)

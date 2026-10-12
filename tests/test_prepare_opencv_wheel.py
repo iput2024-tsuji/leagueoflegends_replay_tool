@@ -1350,6 +1350,7 @@ def test_build_diagnostics_capture_only_selected_static_evidence(tmp_path, monke
     evidence = tmp_path / "evidence"
     evidence.mkdir()
     monkeypatch.setenv("ACTIONS_RUNTIME_TOKEN", "private token")
+    monkeypatch.setattr(target, "_computer_name_crc32", lambda: "a79b6395")
 
     target._capture_build_diagnostics(source, evidence, ["python.exe", "setup.py"], returncode=0)
 
@@ -1361,6 +1362,12 @@ def test_build_diagnostics_capture_only_selected_static_evidence(tmp_path, monke
     assert report["compiler_process_cwd"] is None
     assert report["compiler_process_cwd_status"] == "not_observed"
     assert report["tool_process_paths_status"] == "not_observed_configured_or_inferred_only"
+    assert report["computer_name_crc32"] == {
+        "source": "GetComputerNameW",
+        "encoding": "utf-8_no_nul_original_case",
+        "status": "observed",
+        "crc32": "a79b6395",
+    }
     assert report["errors"] == []
     assert report["missing_categories"] == []
     assert report["copied_bytes"] == sum(map(len, selected.values()))
@@ -1381,6 +1388,50 @@ def test_build_diagnostics_capture_only_selected_static_evidence(tmp_path, monke
     }
     assert copied == selected
     assert not any(path.name in target.DIAGNOSTIC_TOOL_NAMES for path in evidence.rglob("*"))
+
+
+@pytest.mark.parametrize(
+    ("success", "name", "reported_size", "expected_crc"),
+    [
+        (1, "Runner-aB9", 10, "a79b6395"),
+        (1, "Runner-😀", 9, "88c93d0f"),
+        (0, "PRIVATE-NAME", 12, None),
+        (1, "", 0, None),
+        (1, "PRIVATE-NAME", 16, None),
+        (1, "PRIVATE-NAME", 11, None),
+    ],
+)
+def test_computer_name_crc32_uses_checked_os_result(
+    monkeypatch, success, name, reported_size, expected_crc,
+):
+    def query(buffer, size):
+        assert size._obj.value == 16
+        buffer.value = name
+        size._obj.value = reported_size
+        return success
+
+    def load(library, *, winmode):
+        assert (library, winmode) == ("kernel32.dll", 0x800)
+        return type("Kernel32", (), {"GetComputerNameW": staticmethod(query)})()
+
+    monkeypatch.setattr(target.os, "name", "nt")
+    monkeypatch.setattr(target.ctypes, "WinDLL", load, raising=False)
+    monkeypatch.setenv("COMPUTERNAME", "ignored environment name")
+    if expected_crc is None:
+        with pytest.raises(target.OpenCVWheelError, match="GetComputerNameW") as error:
+            target._computer_name_crc32()
+        assert "PRIVATE-NAME" not in str(error.value)
+    else:
+        assert target._computer_name_crc32() == expected_crc
+
+
+def test_computer_name_crc32_is_not_observed_outside_windows(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Windows API must not be queried")
+
+    monkeypatch.setattr(target.os, "name", "posix")
+    monkeypatch.setattr(target.ctypes, "WinDLL", forbidden, raising=False)
+    assert target._computer_name_crc32() is None
 
 
 @pytest.mark.parametrize("configuration_source", ["cmake_cache", "cmake_compiler_file"])
@@ -1476,7 +1527,10 @@ def test_build_diagnostics_do_not_walk_redirected_directory(tmp_path, monkeypatc
     assert not (evidence / "intermediates").exists()
 
 
-def test_diagnostic_failure_preserves_original_build_failure(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("computer_name_failure", [False, True])
+def test_diagnostic_failure_preserves_original_build_failure(
+    tmp_path, monkeypatch, capsys, computer_name_failure,
+):
     _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
     _mock_build_dependencies(monkeypatch)
     monkeypatch.setattr(target.subprocess, "run", lambda *args, **kwargs: type(
@@ -1484,12 +1538,24 @@ def test_diagnostic_failure_preserves_original_build_failure(tmp_path, monkeypat
     )())
 
     def fail_diagnostics(*args, **kwargs):
-        raise OSError("diagnostic storage unavailable")
+        raise OSError("PRIVATE-NAME")
 
-    monkeypatch.setattr(target, "_capture_build_diagnostics", fail_diagnostics)
+    monkeypatch.setattr(
+        target,
+        "_computer_name_crc32" if computer_name_failure else "_capture_build_diagnostics",
+        fail_diagnostics,
+    )
     with pytest.raises(target.OpenCVWheelError, match="OpenCV wheel build failed: compiler failed"):
         target.run(tmp_path, tmp_path / "output", lock_path, tmp_path / "work")
-    assert "diagnostic collection failed (OSError)" in capsys.readouterr().err
+    if computer_name_failure:
+        raw = (tmp_path / "work" / "b" / "evidence" / "build-diagnostics.json").read_text()
+        report = json.loads(raw)
+        assert report["computer_name_crc32"]["status"] == "error"
+        assert report["computer_name_crc32"]["crc32"] is None
+        assert "computer name CRC32 observation failed (OSError)" in report["errors"]
+        assert "PRIVATE-NAME" not in raw
+    else:
+        assert "diagnostic collection failed (OSError)" in capsys.readouterr().err
     assert not (tmp_path / "output").exists()
 
 

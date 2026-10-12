@@ -106,3 +106,28 @@ PCH作成元も確認する。
 固定ビルドVM案は独立したbuild専用VMとして実現性を評価する。既存のRuntime受入VMは転用しない。
 固定versionのVS/SDK取得物と実入力の封印、offlineでの2回のclean build、同runのconsumerへの接続が
 必要であり、旧成功環境を復元できたとは扱わない。配布日は原因解消と最終受入後に確定する。
+
+### 匿名namespaceの共通seed
+
+続く静的解析では、保存tlogのsource/OBJ対応を使うと、46個すべての匿名namespace IDが
+次の式で旧側・新側とも一致した。PCH使用の21個は末尾byteが1、非使用の25個は0で一致する。
+
+```text
+ID = crc32(lowercase absolute source path UTF-8 + PCH byte, seed) XOR FFFFFFFF
+old seed = 48631799
+new seed = 555ef44e
+```
+
+これは保存されたpath・PCHフラグ・IDへ完全に当てはまるモデルであり、seedを生成した入力を
+当該runで直接観測した証明ではない。旧新の完全job logにもコンピューター名は記録されていなかった。
+
+ホストに既存の別版MSVC 19.34で、headerを使わない小さなC++をcompileだけして調べたところ、
+独立した4個目のsource pathも含め、実OSのコンピューター名のUTF-8 bytes（NULなし）のCRC32が
+seedとなる式に一致した。子processの`COMPUTERNAME`だけの置換や`/Brepro`ではIDは変わらなかった。
+これを対象MSVC 19.44へ一般化せず、生成OBJのlink・実行や正式recipeのflag変更は行わない。
+
+次の正式producerで`GetComputerNameW`を読み取り、そのCRC32と取得方法だけを診断へ記録する。
+生のコンピューター名は保存しない。API失敗・空値・容量不整合は診断エラーとして記録し、元の
+build失敗を置き換えない。非Windowsでは未観測とする。このfieldは限定診断だけに追加し、
+正式provenance・semantic policy・アプリの公開API/録画JSONへ変更しない。新しいOBJのIDから得た
+seedとの直接照合が成立するまで、ホスト名を原因確定や修正完了として扱わない。

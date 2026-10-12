@@ -131,3 +131,32 @@ seedとなる式に一致した。子processの`COMPUTERNAME`だけの置換や`
 build失敗を置き換えない。非Windowsでは未観測とする。このfieldは限定診断だけに追加し、
 正式provenance・semantic policy・アプリの公開API/録画JSONへ変更しない。新しいOBJのIDから得た
 seedとの直接照合が成立するまで、ホスト名を原因確定や修正完了として扱わない。
+
+### 対象MSVC 19.44の直接照合と次の限定実験
+
+[run 38202319340](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/actions/runs/38202319340)
+の実checkoutは、head `8dd4fcd` とmain `987a240` のmerge commit `d0967c2`。
+A/B両診断の実 `GetComputerNameW` CRCは `1eeb6040` で、各46個のnamespace IDを
+source path・PCH byteからforward計算するseedとすべて一致した。対象compilerでも、
+記録された識別子と実OSホスト名CRCの直接照合が成立した。
+
+A/B semantic SHA256はともに `59c18bd1d60c7fdd975bfe4e314a376980f47af22d2fb84bd1ddad980169ef16`。
+直前run 38200049047と完全一致し、旧成功policyとの差はcv2比較用SHA256の2項目のみ。
+producerは固定policyとの差で停止し、app・self-check・installerは実行されていない。
+旧成功時のホスト名・OBJ/PDBは未保存で、全コードの同等性と実loaded tool identityまでを
+証明したとは扱わない。今回も期待hash・PE除外範囲は変更しない。
+
+別版MSVC 19.34の小さなcompile-only実験では、`/experimental:deterministic` が警告D9002なしで
+受理され、匿名namespace IDのseedが実ホスト名CRCから0へ変わった。lambda IDは同一だった。
+flagの存在は [Microsoftの17.1 release notes](https://learn.microsoft.com/en-us/visualstudio/releases/2022/release-notes-v17.1)
+にも記載されるが、19.44でのホスト名依存除去の仕様・保証を確認したものではない。
+
+次は固定8ファイルを照合した対象MSVCで、固定した小さなTUのsource path・PCH条件と
+control／flagありを比較する独立診断を行う。生成物はlink・実行せず、ホスト名CRCと限定した
+source／OBJ／compiler receiptを保存する。通常CIのtests・producer・appの依存と検査は維持する。
+診断の成功を製品wheelの証拠や配布可能判定として使用しない。対象実験と正式2cleanbuildを
+確認するまで、flagを正式recipeへ追加しない。
+
+専用Server VMのライセンス・ISOは未所持。既存PCへの固定Build Tools／SDK導入案と公式取得物は
+準備したが、共有Installer・SDK・Runtimeへの影響があるため未実行とし、先に上記診断を行う。
+既存のRuntime受入VMと10月10日に完了した受入結果は保持する。

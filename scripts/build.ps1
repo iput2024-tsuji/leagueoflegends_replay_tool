@@ -54,6 +54,9 @@ function Assert-BuildProvenance {
 }
 
 Assert-BuildProvenance
+if (-not $resolvedBuildProvenance) {
+  Write-Warning "ローカルの未検証開発ビルドです。IPP無効のソースビルド版OpenCVを使用した証明はありません。ReleaseやVMの正式な検証証拠には使用しないでください。"
+}
 
 foreach ($iconAsset in @("assets\app\app.ico", "assets\app\app.png")) {
   if (-not (Test-Path -LiteralPath $iconAsset -PathType Leaf)) {

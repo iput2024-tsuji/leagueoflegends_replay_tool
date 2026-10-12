@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -111,3 +113,33 @@ def test_build_script_invokes_mpv_policy_without_silent_cleanup():
     assert 'Join-Path $scriptDir "check_mpv_distribution.ps1"' in script
     assert "-DistributionRoot $distRootDir" in script
     assert "Remove-Item -Path $dll.FullName" not in script
+
+
+@pytest.mark.parametrize("with_provenance", [False, True])
+def test_build_script_warns_for_unattested_local_builds_only(tmp_path, with_provenance):
+    if POWERSHELL is None:
+        pytest.skip("pwsh is unavailable")
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    script = scripts / "build.ps1"
+    shutil.copy2(Path("scripts/build.ps1"), script)
+    arguments = ["-PythonExe", str(Path(sys.executable).resolve())]
+    if with_provenance:
+        provenance = tmp_path / "build provenance.json"
+        provenance.write_bytes(b'{"schema_version": 1}\n')
+        arguments += [
+            "-BuildProvenance", str(provenance),
+            "-BuildProvenanceSha256", hashlib.sha256(provenance.read_bytes()).hexdigest(),
+        ]
+    result = subprocess.run(
+        [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+         "-File", str(script), *arguments],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=30, check=False,
+    )
+    output = _combined_output(result)
+    # The isolated harness has no assets: stop before invoking any build tool.
+    assert result.returncode != 0
+    assert "固定アプリアイコンassetが見つかりません" in output
+    assert ("未検証開発ビルド" in output) is not with_provenance
+    assert not (tmp_path / "dist").exists()

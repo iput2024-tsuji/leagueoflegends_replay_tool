@@ -1066,6 +1066,31 @@ def _validated_build_provenance(
             raise RuntimeError(
                 f"Build provenance external Runtime record is invalid: {exc}"
             ) from exc
+    from scripts.prepare_opencv_wheel import (
+        OpenCVWheelError,
+        source_build_policy,
+        validate_embedded_provenance_record as validate_opencv_record,
+    )
+
+    try:
+        opencv_policy = source_build_policy(component_lock)
+    except OpenCVWheelError as exc:
+        raise RuntimeError(str(exc)) from exc
+    opencv_record = payload.get("opencv_source_build")
+    opencv_provenance = None
+    if opencv_policy is None:
+        if opencv_record is not None:
+            raise RuntimeError("Build provenance has an unexpected OpenCV build.")
+    else:
+        try:
+            opencv_provenance = validate_opencv_record(
+                opencv_record,
+                components_file,
+            )
+        except (OpenCVWheelError, OSError) as exc:
+            raise RuntimeError(
+                f"Build provenance OpenCV source-build record is invalid: {exc}"
+            ) from exc
     records = payload.get("installed_binaries")
     if not isinstance(records, list):
         raise RuntimeError("Build provenance has no installed binary list.")
@@ -1108,13 +1133,21 @@ def _validated_build_provenance(
             raise RuntimeError(
                 f"Build provenance component is not locked: {component_name}"
             )
-        try:
-            source_kind, installed_archive = expected_install_archive(
-                component_lock,
-                component,
-            )
-        except BinaryInstallPolicyError as exc:
-            raise RuntimeError(str(exc)) from exc
+        if component_name == "opencv-python" and opencv_policy is not None:
+            if opencv_provenance is None:
+                raise RuntimeError("OpenCV source-build provenance is missing.")
+            source_kind = "source-built-wheel"
+            installed_archive = opencv_provenance["wheel"]
+            expected_source_build_sha256 = opencv_record["provenance_sha256"]
+        else:
+            try:
+                source_kind, installed_archive = expected_install_archive(
+                    component_lock,
+                    component,
+                )
+            except BinaryInstallPolicyError as exc:
+                raise RuntimeError(str(exc)) from exc
+            expected_source_build_sha256 = None
         for field in ("filename", "sha256", "size"):
             if record.get(field) != installed_archive.get(field):
                 raise RuntimeError(
@@ -1124,6 +1157,13 @@ def _validated_build_provenance(
         if record.get("source") != source_kind:
             raise RuntimeError(
                 f"Build provenance source differs for {component_name}."
+            )
+        if (
+            record.get("source_build_provenance_sha256")
+            != expected_source_build_sha256
+        ):
+            raise RuntimeError(
+                f"Build provenance source-build seal differs for {component_name}."
             )
         expected_upstream = (
             {
@@ -1183,6 +1223,27 @@ def collect_licenses(
         build_provenance_sha256,
     )
 
+    def resolved_install_archive(
+        component: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        if (
+            component.get("component") == "opencv-python"
+            and _provenance is not None
+        ):
+            source_build = _provenance.get("opencv_source_build")
+            if not isinstance(source_build, dict) or not isinstance(
+                source_build.get("provenance"), dict
+            ):
+                raise RuntimeError("OpenCV source-build provenance is missing.")
+            wheel = source_build["provenance"].get("wheel")
+            if not isinstance(wheel, dict):
+                raise RuntimeError("OpenCV source-built wheel record is missing.")
+            return "source-built-wheel", wheel
+        try:
+            return expected_install_archive(component_lock, component)
+        except BinaryInstallPolicyError as exc:
+            raise RuntimeError(str(exc)) from exc
+
     destination.mkdir(parents=True, exist_ok=True)
     seen_targets: dict[str, Path] = {}
     for document in PROJECT_DOCUMENTS:
@@ -1224,13 +1285,7 @@ def collect_licenses(
         )
     ]
     for component in runtime_components:
-        try:
-            binary_source, installed_archive = expected_install_archive(
-                component_lock,
-                component,
-            )
-        except BinaryInstallPolicyError as exc:
-            raise RuntimeError(str(exc)) from exc
+        binary_source, installed_archive = resolved_install_archive(component)
         manifest.append(
             collect_distribution_licenses(
                 str(component["distribution"]),
@@ -1241,7 +1296,10 @@ def collect_licenses(
                 binary_archive=component.get("binary_archive"),
                 installed_binary_archive=(
                     installed_archive
-                    if binary_source == "external-vc-runtime-wheel"
+                    if binary_source in {
+                        "external-vc-runtime-wheel",
+                        "source-built-wheel",
+                    }
                     and str(component["component"])
                     in verified_binary_components
                     else None
@@ -1255,13 +1313,9 @@ def collect_licenses(
     for build_component in component_lock.get("build_components", []):
         distribution_name = str(build_component["distribution"])
         locked_component = locked[canonicalize_distribution_name(distribution_name)]
-        try:
-            binary_source, installed_archive = expected_install_archive(
-                component_lock,
-                locked_component,
-            )
-        except BinaryInstallPolicyError as exc:
-            raise RuntimeError(str(exc)) from exc
+        binary_source, installed_archive = resolved_install_archive(
+            locked_component
+        )
         manifest.append(
             collect_distribution_licenses(
                 distribution_name,
@@ -1272,7 +1326,10 @@ def collect_licenses(
                 binary_archive=locked_component.get("binary_archive"),
                 installed_binary_archive=(
                     installed_archive
-                    if binary_source == "external-vc-runtime-wheel"
+                    if binary_source in {
+                        "external-vc-runtime-wheel",
+                        "source-built-wheel",
+                    }
                     and str(locked_component["component"])
                     in verified_binary_components
                     else None

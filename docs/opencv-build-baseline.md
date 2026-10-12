@@ -77,3 +77,32 @@ compiler backendの実際のロード履歴を証明するものではない。
 
 instance指定の挙動は [CMake 3.31の公式文書](https://cmake.org/cmake/help/v3.31/envvar/CMAKE_GENERATOR_INSTANCE.html)
 に従う。generator/toolsetと実ファイルの検査は両方必要になる。
+
+## 2026年10月12日の継続調査
+
+[run 36705978374](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/actions/runs/36705978374)
+は上記8ファイル固定後のproducer・app・installerまで成功した。一方、対応ソース採用候補の
+[run 36728221228](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/actions/runs/36728221228)
+は、同じrun内の2回のclean buildが一致した後、固定semantic policyとの不一致で停止した。
+app buildは実行されていない。成功runの受入結果をこの失敗runへ転用しない。
+
+失敗runのsemantic SHA256は `ed37eb3a921751bc32da1ea7a3b2c07a316ce78d46a3a4314763ae27bae0c286`。
+旧成功とのsemantic差はcv2の比較用SHA256を記録する2項目だけで、8ファイルの実hash、
+固定入力、生成compile projectは一致する。runner imageの更新は観測した相関であり、
+原因の証明ではない。期待値の差し替えやPE除外範囲の拡張は行わない。
+
+保存wheelを実行せず旧成功と失敗runのcv2を比較し、失敗runの新しいPDBのsection contributionへ
+対応付けたところ、コード領域の差は8関数とその周辺にあり、4件が
+`opencv_dnn.dir/Release/topk_layer.obj`、4件が `libprotobuf.dir/Release/message.obj` に属する。
+RTTIなどの文字列にも匿名namespaceとlambdaの識別子の差がある。旧成功のOBJ/PDBは保存されて
+いないため、旧側の関数名、全コードの同等性、識別子の変化を生んだ入力はまだ確定できない。
+
+次の診断では上記2個のRelease OBJを既存の限定保存対象へ追加する。他のOBJ、Debug生成物、
+環境変数一覧やbuild binlogは保存対象へ追加しない。診断のサイズ・件数・redirect拒否と、
+本来のbuild失敗を診断失敗で置き換えない処理は維持する。正式provenanceとReleaseゲートは
+この診断追加で変更しない。topkはPCHを利用するため、header入力を調べる場合は当該TUだけでなく
+PCH作成元も確認する。
+
+固定ビルドVM案は独立したbuild専用VMとして実現性を評価する。既存のRuntime受入VMは転用しない。
+固定versionのVS/SDK取得物と実入力の封印、offlineでの2回のclean build、同runのconsumerへの接続が
+必要であり、旧成功環境を復元できたとは扱わない。配布日は原因解消と最終受入後に確定する。

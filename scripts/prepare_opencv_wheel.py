@@ -2009,7 +2009,11 @@ def _capture_build_diagnostics(
                 ) or (
                     relative.startswith("modules/imgproc/")
                     and re.fullmatch(r"morph\.dispatch.*\.obj", name, re.IGNORECASE) is not None
-                )
+                ) or relative in {
+                    # New cv2 PDB contributions localize the old/new code drift here.
+                    "modules/dnn/opencv_dnn.dir/release/topk_layer.obj",
+                    "3rdparty/protobuf/libprotobuf.dir/release/message.obj",
+                }
                 selected_pdb = re.fullmatch(
                     r"(?:lib|bin)/release/(?:opencv_imgproc[0-9]*|opencv_python3[0-9]*|cv2)\.pdb",
                     relative,

@@ -190,6 +190,7 @@ def _configured_toolchain() -> dict:
             "CMAKE_GENERATOR": target.REQUIRED_GENERATOR,
             "CMAKE_GENERATOR_TOOLSET": target.REQUIRED_TOOLSET_NAME,
             "CMAKE_SYSTEM_VERSION": target.REQUIRED_WINDOWS_SDK,
+            "CMAKE_CXX_FLAGS": target.REQUIRED_CXX_FLAGS,
             "WITH_IPP": "OFF",
             "BUILD_IPP_IW": "OFF",
             "BUILD_opencv_gapi": "OFF",
@@ -403,6 +404,44 @@ def test_policy_requires_exact_disabled_features(
         target._load_lock(lock_path)
 
 
+@pytest.mark.parametrize("replacement", [
+    None,
+    "-DCMAKE_CXX_FLAGS=/experimental:deterministic",
+    "-DCMAKE_CXX_FLAGS_INIT=",
+    "-DCMAKE_CXX_FLAGS_INIT=/experimental:deterministic /DTEST",
+])
+def test_policy_requires_exact_cxx_flags_initialization(tmp_path, replacement):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    cmake_args = payload[target.POLICY_KEY]["build_environment"]["cmake_args"]
+    cmake_args.remove("-DCMAKE_CXX_FLAGS_INIT=/experimental:deterministic")
+    if replacement is not None:
+        cmake_args.append(replacement)
+    lock_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(target.OpenCVWheelError, match="CMake flags"):
+        target._load_lock(lock_path)
+
+
+@pytest.mark.parametrize("value", [
+    None,
+    "",
+    "/experimental:deterministic",
+    "/DWIN32 /D_WINDOWS /W3 /GR /EHsc /experimental:deterministic",
+    "/experimental:deterministic /DWIN32 /D_WINDOWS /W3 /GR /EHsc /DTEST",
+])
+def test_configured_toolchain_requires_preserved_effective_cxx_flags(
+    tmp_path, monkeypatch, value
+):
+    cache = dict(_configured_toolchain()["cmake_cache"])
+    if value is None:
+        del cache["CMAKE_CXX_FLAGS"]
+    else:
+        cache["CMAKE_CXX_FLAGS"] = value
+    monkeypatch.setattr(target, "_read_cmake_cache", lambda source: cache)
+    with pytest.raises(target.OpenCVWheelError, match="feature flags differ"):
+        target._capture_configured_toolchain(tmp_path)
+
+
 def test_configured_toolchain_rejects_ade_enabled(tmp_path, monkeypatch):
     cache = dict(_configured_toolchain()["cmake_cache"])
     cache["WITH_ADE"] = "ON"
@@ -443,6 +482,7 @@ def _write_configured_toolchain(tmp_path: Path, *, selected: str | None = None) 
         "CMAKE_GENERATOR": target.REQUIRED_GENERATOR,
         "CMAKE_GENERATOR_TOOLSET": target.REQUIRED_TOOLSET_NAME,
         "CMAKE_SYSTEM_VERSION": target.REQUIRED_WINDOWS_SDK,
+        "CMAKE_CXX_FLAGS": target.REQUIRED_CXX_FLAGS,
         "WITH_IPP": "OFF",
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
@@ -476,6 +516,9 @@ def test_configured_toolchain_uses_compiler_evidence_when_cache_version_missing(
     assert observed["compiler"]["filename"] == "cl.exe"
     assert observed["compiler"]["size"] == compiler.stat().st_size
     assert observed["c_compiler"] == observed["compiler"]
+    assert observed["cmake_cache"]["CMAKE_CXX_FLAGS"] == (
+        "/experimental:deterministic /DWIN32 /D_WINDOWS /W3 /GR /EHsc"
+    )
     assert "compile_projects" in observed
 
 
@@ -975,7 +1018,8 @@ def test_run_builds_composed_tree_and_records_provenance(tmp_path, monkeypatch):
             "-DWITH_IPP=OFF -DBUILD_IPP_IW=OFF -DBUILD_opencv_gapi=OFF "
             "-DWITH_ADE=OFF -DPYTHON3_LIMITED_API=ON "
             "-DCMAKE_SYSTEM_VERSION=10.0.26100.0 "
-            "-DBUILD_WITH_STATIC_CRT=OFF"
+            "-DBUILD_WITH_STATIC_CRT=OFF "
+            "-DCMAKE_CXX_FLAGS_INIT=/experimental:deterministic"
         )
         assert env["CMAKE_GENERATOR_TOOLSET"] == target.REQUIRED_TOOLSET
         assert env["PYTHONHASHSEED"] == "0"
@@ -1148,6 +1192,9 @@ def test_embedded_provenance_rejects_msvc_receipt_tampering(tmp_path, monkeypatc
 
 def test_required_cmake_args_pin_dynamic_crt_and_static_libraries():
     assert "-DBUILD_WITH_STATIC_CRT=OFF" in target.REQUIRED_CMAKE_ARGS
+    assert "-DCMAKE_CXX_FLAGS_INIT=/experimental:deterministic" in target.REQUIRED_CMAKE_ARGS
+    assert not any(arg.startswith("-DCMAKE_CXX_FLAGS=") for arg in target.REQUIRED_CMAKE_ARGS)
+    assert not any(arg.startswith("-DCMAKE_C_FLAGS=") for arg in target.REQUIRED_CMAKE_ARGS)
     assert len(target.REQUIRED_CMAKE_ARGS) == len(set(target.REQUIRED_CMAKE_ARGS))
 
 
@@ -1645,6 +1692,42 @@ def test_output_observed_environment_tampering_is_rejected(tmp_path, monkeypatch
 
     with pytest.raises(target.OpenCVWheelError, match="provenance|environment|toolchain|hash seed|source date"):
         target.validate_output_directory(output, lock_path)
+
+
+@pytest.mark.parametrize("value", [
+    None,
+    "",
+    "/experimental:deterministic",
+    "/DWIN32 /D_WINDOWS /W3 /GR /EHsc /experimental:deterministic",
+    "/experimental:deterministic /DWIN32 /D_WINDOWS /W3 /GR /EHsc /DTEST",
+])
+def test_provenance_requires_preserved_effective_cxx_flags(tmp_path, monkeypatch, value):
+    _policy_data, lock_path, _source, _opencv = _lock(tmp_path)
+    output = tmp_path / "output"
+    _mock_build_dependencies(monkeypatch)
+
+    def fake_run(command, *, cwd, env, check, capture_output, text):
+        wheel_dir = Path(command[-1])
+        _wheel(wheel_dir / "opencv_python-4.13.0.90-cp37-abi3-win_amd64.whl")
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(target.subprocess, "run", fake_run)
+    payload = target.run(tmp_path, output, lock_path, tmp_path / "work")
+    cache = payload["observed_build_environment"]["configured_toolchain"]["cmake_cache"]
+    if value is None:
+        del cache["CMAKE_CXX_FLAGS"]
+    else:
+        cache["CMAKE_CXX_FLAGS"] = value
+    raw = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode()
+    (output / target.PROVENANCE_NAME).write_bytes(raw)
+    with pytest.raises(target.OpenCVWheelError, match="configured CMake cache differs"):
+        target.validate_output_directory(output, lock_path)
+    wrapper = {
+        "provenance": payload,
+        "provenance_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    with pytest.raises(target.OpenCVWheelError, match="configured CMake cache differs"):
+        target.validate_embedded_provenance_record(wrapper, lock_path)
 
 
 def test_output_msbuild_project_path_tampering_is_rejected(tmp_path, monkeypatch):

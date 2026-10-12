@@ -155,8 +155,28 @@ flagの存在は [Microsoftの17.1 release notes](https://learn.microsoft.com/en
 control／flagありを比較する独立診断を行う。生成物はlink・実行せず、ホスト名CRCと限定した
 source／OBJ／compiler receiptを保存する。通常CIのtests・producer・appの依存と検査は維持する。
 診断の成功を製品wheelの証拠や配布可能判定として使用しない。対象実験と正式2cleanbuildを
-確認するまで、flagを正式recipeへ追加しない。
+確認するまで、flagの採用完了とは扱わない。
 
 専用Server VMのライセンス・ISOは未所持。既存PCへの固定Build Tools／SDK導入案と公式取得物は
 準備したが、共有Installer・SDK・Runtimeへの影響があるため未実行とし、先に上記診断を行う。
 既存のRuntime受入VMと10月10日に完了した受入結果は保持する。
+
+### deterministic flagの入力移行候補
+
+[run 38207197097](https://github.com/iput2024-tsuji/leagueoflegends_replay_tool/actions/runs/38207197097)
+の独立診断は、対象19.44でもPCHあり／なしの全6条件で、controlが実ホスト名CRC、
+flagありがseed 0のforward予測に一致した。D9002はなく、保存12 OBJの独立静的解析でも一致した。
+これは小さなTUでの結果であり、OpenCV全体のnative出力やアプリ互換性の受入ではない。
+
+候補recipeは `-DCMAKE_CXX_FLAGS_INIT=/experimental:deterministic` を固定追加する。
+既定のflagを置き換える `CMAKE_CXX_FLAGS` の直接指定は使わない。producerとconsumerは
+実効cacheを `/experimental:deterministic /DWIN32 /D_WINDOWS /W3 /GR /EHsc` と完全照合する。
+固定CMake 3.31.6のplatform初期化は既定値をappendする。別版19.34でのprivate configureでも、
+control／INITの実効cache、Releaseの `/O2 /Ob2 /DNDEBUG`、DLL CRT、PCH creator／consumerの
+flag継承を確認した。[固定CMakeのplatform実装](https://github.com/Kitware/CMake/blob/v3.31.6/Modules/Platform/Windows-MSVC.cmake)
+
+期待semantic SHA256は旧 `4be414…` のままとする。次の正式CIで2cleanbuildを比較し、
+追加したcmake_args／実効cacheと、事前にseed 0から予測した46 namespace IDsに出力差を対応付ける。
+固定policy差で停止したwheelを正式成果物へ流用しない。出力差を説明・レビューした後にだけ、
+明示したflag入力の移行として比較基準を検討する。IPP等の除去、dynamic CRT、対応ソースと
+FFmpeg binding、未知native、Runtime非同梱、同run／commit／artifact、32 bytesだけのPE除外は維持する。

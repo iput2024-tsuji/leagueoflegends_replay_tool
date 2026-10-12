@@ -267,7 +267,8 @@
         "-DWITH_ADE=OFF",
         "-DPYTHON3_LIMITED_API=ON",
         "-DCMAKE_SYSTEM_VERSION=10.0.26100.0",
-        "-DBUILD_WITH_STATIC_CRT=OFF"
+        "-DBUILD_WITH_STATIC_CRT=OFF",
+        "-DCMAKE_CXX_FLAGS_INIT=/experimental:deterministic"
       ]
     }
   },

@@ -14,6 +14,42 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  opencv-namespace-probe:
+    name: Probe MSVC namespace determinism
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+    runs-on: windows-2022
+    timeout-minutes: 10
+    env:
+      PYTHONIOENCODING: utf8
+      OPENCV_NAMESPACE_PROBE_ONLY: "1"
+    steps:
+      - name: Checkout diagnostic source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6 post-6.0.0; Windows pip cache fix (#1040)
+        with:
+          python-version: "3.14.6"
+
+      - name: Compare synthetic namespace IDs
+        shell: pwsh
+        run: python -m scripts.probe_opencv_namespace
+
+      - name: Preserve bounded synthetic diagnostic
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: opencv-namespace-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            ${{ runner.temp }}/opencv-namespace-probe/report.json
+            ${{ runner.temp }}/opencv-namespace-probe/**/*.cpp
+            ${{ runner.temp }}/opencv-namespace-probe/**/*.h
+            ${{ runner.temp }}/opencv-namespace-probe/**/*.obj
+
   lint-test:
     name: Lint & Test
     runs-on: ubuntu-latest
@@ -396,39 +432,3 @@ jobs:
           include-hidden-files: true
           retention-days: 7
           path: ci-evidence/
-
-  opencv-namespace-probe:
-    name: Probe MSVC namespace determinism
-    if: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
-    runs-on: windows-2022
-    timeout-minutes: 10
-    env:
-      PYTHONIOENCODING: utf8
-      OPENCV_NAMESPACE_PROBE_ONLY: "1"
-    steps:
-      - name: Checkout diagnostic source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6 post-6.0.0; Windows pip cache fix (#1040)
-        with:
-          python-version: "3.14.6"
-
-      - name: Compare synthetic namespace IDs
-        shell: pwsh
-        run: python -m scripts.probe_opencv_namespace
-
-      - name: Preserve bounded synthetic diagnostic
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: opencv-namespace-probe-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: error
-          retention-days: 7
-          path: |
-            ${{ runner.temp }}/opencv-namespace-probe/report.json
-            ${{ runner.temp }}/opencv-namespace-probe/**/*.cpp
-            ${{ runner.temp }}/opencv-namespace-probe/**/*.h
-            ${{ runner.temp }}/opencv-namespace-probe/**/*.obj

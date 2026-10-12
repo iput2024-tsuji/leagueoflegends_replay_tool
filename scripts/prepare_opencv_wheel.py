@@ -42,6 +42,11 @@ COMPILER_FLAG_ENVIRONMENT = (
     "CL", "_CL_", "LINK", "_LINK_", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS",
     "SKBUILD_BUILD_OPTIONS", "CMAKE_TOOLCHAIN_FILE", "OPENCV_CMAKE_HOOKS_DIR",
 )
+REQUIRED_CXX_FLAGS_INIT = "/experimental:deterministic"
+# INIT retains the pinned CMake/MSVC platform defaults in the effective cache.
+REQUIRED_CXX_FLAGS = (
+    f"{REQUIRED_CXX_FLAGS_INIT} /DWIN32 /D_WINDOWS /W3 /GR /EHsc"
+)
 REQUIRED_CMAKE_ARGS = (
     "-DWITH_IPP=OFF",
     "-DBUILD_IPP_IW=OFF",
@@ -50,6 +55,7 @@ REQUIRED_CMAKE_ARGS = (
     "-DPYTHON3_LIMITED_API=ON",
     "-DCMAKE_SYSTEM_VERSION=10.0.26100.0",
     "-DBUILD_WITH_STATIC_CRT=OFF",
+    f"-DCMAKE_CXX_FLAGS_INIT={REQUIRED_CXX_FLAGS_INIT}",
 )
 VERSION_PY_BYTES = (
     b'opencv_version = "4.13.0.90"\n'
@@ -197,8 +203,7 @@ def _policy(lock: dict[str, Any]) -> dict[str, Any]:
     _validate_msvc_tools(environment["msvc_tools"])
     if environment["cmake_args"] != list(REQUIRED_CMAKE_ARGS):
         raise OpenCVWheelError(
-            "OpenCV CMake flags must disable IPP, G-API, and ADE and enable "
-            "the CPython Limited API"
+            "OpenCV CMake flags must match the fixed feature and C++ flag policy"
         )
     if {
         "generator": environment["generator"],
@@ -1013,6 +1018,7 @@ def _capture_configured_toolchain(
         "CMAKE_GENERATOR": REQUIRED_GENERATOR,
         "CMAKE_GENERATOR_TOOLSET": REQUIRED_TOOLSET_NAME,
         "CMAKE_SYSTEM_VERSION": REQUIRED_WINDOWS_SDK,
+        "CMAKE_CXX_FLAGS": REQUIRED_CXX_FLAGS,
         "WITH_IPP": "OFF",
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
@@ -1748,6 +1754,7 @@ def _validate_provenance_payload(
         "CMAKE_GENERATOR": REQUIRED_GENERATOR,
         "CMAKE_GENERATOR_TOOLSET": REQUIRED_TOOLSET_NAME,
         "CMAKE_SYSTEM_VERSION": REQUIRED_WINDOWS_SDK,
+        "CMAKE_CXX_FLAGS": REQUIRED_CXX_FLAGS,
         "WITH_IPP": "OFF",
         "BUILD_IPP_IW": "OFF",
         "BUILD_opencv_gapi": "OFF",
